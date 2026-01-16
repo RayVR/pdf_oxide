@@ -1,0 +1,281 @@
+name: Java Bindings Build and Test
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/jni/**'
+      - 'java/**'
+      - 'Cargo.toml'
+      - '.github/workflows/java-build.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'src/jni/**'
+      - 'java/**'
+      - 'Cargo.toml'
+      - '.github/workflows/java-build.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  JAVA_VERSION: '8'
+
+jobs:
+  build-natives:
+    name: Build Native Libraries
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib_name: libpdf_oxide_jni.so
+            native_dir: linux-x86_64
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            lib_name: libpdf_oxide_jni.dylib
+            native_dir: macos-x86_64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib_name: libpdf_oxide_jni.dylib
+            native_dir: macos-aarch64
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib_name: pdf_oxide_jni.dll
+            native_dir: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Cache Rust Build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-rust-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-rust-
+
+      - name: Build native library
+        run: cargo build --release --features java --target ${{ matrix.target }}
+
+      - name: Verify library exists
+        run: |
+          ls -la target/${{ matrix.target }}/release/${{ matrix.lib_name }}
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v3
+        with:
+          name: natives-${{ matrix.native_dir }}
+          path: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
+          retention-days: 1
+
+  build-java:
+    name: Build Java Bindings
+    runs-on: ubuntu-latest
+    needs: build-natives
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: java/src/main/resources/natives
+
+      - name: Reorganize artifacts
+        run: |
+          # Create platform directories and move artifacts
+          mkdir -p java/src/main/resources/natives/linux-x86_64
+          mkdir -p java/src/main/resources/natives/macos-x86_64
+          mkdir -p java/src/main/resources/natives/macos-aarch64
+          mkdir -p java/src/main/resources/natives/windows-x86_64
+
+          # Move native libraries to correct locations
+          mv java/src/main/resources/natives/natives-linux-x86_64/* java/src/main/resources/natives/linux-x86_64/ 2>/dev/null || true
+          mv java/src/main/resources/natives/natives-macos-x86_64/* java/src/main/resources/natives/macos-x86_64/ 2>/dev/null || true
+          mv java/src/main/resources/natives/natives-macos-aarch64/* java/src/main/resources/natives/macos-aarch64/ 2>/dev/null || true
+          mv java/src/main/resources/natives/natives-windows-x86_64/* java/src/main/resources/natives/windows-x86_64/ 2>/dev/null || true
+
+          # Clean up artifact directories
+          rmdir java/src/main/resources/natives/natives-* 2>/dev/null || true
+
+          # Verify structure
+          find java/src/main/resources/natives -type f -name '*.so' -o -name '*.dylib' -o -name '*.dll'
+
+      - name: Build Java project
+        run: cd java && mvn clean verify -X
+
+      - name: Run tests
+        run: cd java && mvn test
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: java/target/surefire-reports/
+
+      - name: Package JAR
+        if: success()
+        run: cd java && mvn package -DskipTests
+
+      - name: Upload JAR artifact
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: pdf-oxide-java-jar
+          path: java/target/pdf-oxide-*.jar
+          retention-days: 30
+
+      - name: Publish to Maven Local (for now)
+        if: success()
+        run: cd java && mvn install -DskipTests
+
+  test-on-multiple-jvms:
+    name: Test on Java ${{ matrix.java-version }}
+    runs-on: ubuntu-latest
+    needs: build-java
+
+    strategy:
+      matrix:
+        java-version: [ '8', '11', '17', '21' ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK ${{ matrix.java-version }}
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: temurin
+          cache: maven
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: pdf-oxide-java-jar
+          path: java/target/
+
+      - name: Extract JAR
+        run: |
+          cd java/target
+          ls -la *.jar
+          jar tf pdf-oxide-*.jar | head -20
+
+      - name: Run integration tests with Java ${{ matrix.java-version }}
+        run: cd java && mvn test -e
+
+  codecov:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: build-java
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Download native library
+        uses: actions/download-artifact@v3
+        with:
+          name: natives-linux-x86_64
+          path: java/src/main/resources/natives/linux-x86_64/
+
+      - name: Generate coverage
+        run: cd java && mvn test jacoco:report
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: java/target/site/jacoco/jacoco.xml
+          flags: java-bindings
+          name: java-coverage
+
+  security-scan:
+    name: Security Scan (OWASP Dependency Check)
+    runs-on: ubuntu-latest
+    needs: build-java
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'pdf-oxide-java'
+          path: 'java'
+          format: 'XML'
+          args: >
+            --enable-experimental
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: dependency-check-report
+          path: reports/
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('reports/dependency-check-report.xml', 'utf8');
+            // Parse and comment on PR
+
+  release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    needs: [ build-java, test-on-multiple-jvms, security-scan ]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download final JAR
+        uses: actions/download-artifact@v3
+        with:
+          name: pdf-oxide-java-jar
+          path: ./release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: release/pdf-oxide-*.jar
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to Maven Central
+        if: startsWith(github.ref, 'refs/tags/')
+        run: cd java && mvn deploy -DskipTests
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}

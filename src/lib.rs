@@ -205,6 +205,10 @@ pub mod ocr;
 #[cfg(feature = "python")]
 mod python;
 
+// Java bindings via JNI (optional)
+#[cfg(feature = "java")]
+mod jni;
+
 // WASM bindings (optional)
 #[cfg(target_arch = "wasm32")]
 #[cfg(feature = "wasm")]
