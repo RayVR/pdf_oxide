@@ -1,0 +1,77 @@
+using System;
+using Microsoft.Win32.SafeHandles;
+
+namespace PdfOxide.Internal
+{
+    /// <summary>
+    /// Safe handle wrapper for native Rust pointers with automatic cleanup.
+    /// Uses SafeHandle for guaranteed resource cleanup and thread safety.
+    /// </summary>
+    /// <remarks>
+    /// This class ensures that native resources are properly released even if an exception occurs.
+    /// It is derived from SafeHandleZeroOrMinusOneIsInvalid which treats zero and -1 as invalid handles.
+    /// </remarks>
+    internal sealed class NativeHandle : SafeHandleZeroOrMinusOneIsInvalid
+    {
+        private readonly Action<IntPtr>? _finalizer;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="NativeHandle"/> class.
+        /// </summary>
+        /// <remarks>
+        /// This constructor creates an invalid handle that can be set later.
+        /// </remarks>
+        public NativeHandle() : base(true)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="NativeHandle"/> class with a handle and finalizer.
+        /// </summary>
+        /// <param name="handle">The native pointer.</param>
+        /// <param name="finalizer">The cleanup action to call when the handle is released.</param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="finalizer"/> is null.</exception>
+        public NativeHandle(IntPtr handle, Action<IntPtr> finalizer) : base(true)
+        {
+            _finalizer = finalizer ?? throw new ArgumentNullException(nameof(finalizer));
+            SetHandle(handle);
+        }
+
+        /// <summary>
+        /// Gets the underlying pointer value.
+        /// </summary>
+        /// <value>The native pointer.</value>
+        /// <exception cref="ObjectDisposedException">Thrown if the handle has been disposed.</exception>
+        public IntPtr Ptr
+        {
+            get
+            {
+                if (IsInvalid || IsClosed)
+                    throw new ObjectDisposedException(nameof(NativeHandle));
+                return handle;
+            }
+        }
+
+        /// <summary>
+        /// Releases the native handle.
+        /// </summary>
+        /// <returns>True if the handle was successfully released, false otherwise.</returns>
+        protected override bool ReleaseHandle()
+        {
+            if (!IsInvalid && _finalizer != null)
+            {
+                try
+                {
+                    _finalizer(handle);
+                    return true;
+                }
+                catch
+                {
+                    // Suppress exceptions during finalization
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+}

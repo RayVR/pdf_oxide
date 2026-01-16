@@ -13,7 +13,7 @@ import java.util.Optional;
  *
  * @since 1.0.0
  */
-public final class LinkAnnotation implements Annotation {
+public final class LinkAnnotation extends Annotation {
     private final Rect rect;
     private final String contents;
     private final Optional<String> author;
@@ -272,98 +272,5 @@ public final class LinkAnnotation implements Annotation {
     @Override
     public String toString() {
         return String.format("LinkAnnotation(action=%s, rect=%s)", action, rect);
-    }
-}
-
-/**
- * Link target action - where clicking the link navigates to.
- */
-final class LinkAction {
-    private final Type type;
-    private final String target;
-
-    public enum Type {
-        URI,           // External URL
-        EMAIL,         // Email address
-        PAGE,          // Internal page reference
-        NAMED_ACTION   // Named action (FirstPage, NextPage, etc.)
-    }
-
-    private LinkAction(Type type, String target) {
-        this.type = type;
-        this.target = target;
-    }
-
-    /**
-     * Creates a URI link action.
-     *
-     * @param uri external URL
-     * @return link action
-     */
-    public static LinkAction uri(String uri) {
-        return new LinkAction(Type.URI, uri);
-    }
-
-    /**
-     * Creates a URI link action from a URI object.
-     *
-     * @param uri external URI
-     * @return link action
-     */
-    public static LinkAction uri(URI uri) {
-        return new LinkAction(Type.URI, uri.toString());
-    }
-
-    /**
-     * Creates an email link action.
-     *
-     * @param email email address
-     * @return link action
-     */
-    public static LinkAction email(String email) {
-        return new LinkAction(Type.EMAIL, email);
-    }
-
-    /**
-     * Creates an internal page reference link action.
-     *
-     * @param pageIndex zero-based page number
-     * @return link action
-     */
-    public static LinkAction page(int pageIndex) {
-        return new LinkAction(Type.PAGE, String.valueOf(pageIndex));
-    }
-
-    /**
-     * Creates a named action link.
-     *
-     * @param action named action ("FirstPage", "NextPage", "PrevPage", "LastPage")
-     * @return link action
-     */
-    public static LinkAction namedAction(String action) {
-        return new LinkAction(Type.NAMED_ACTION, action);
-    }
-
-    /**
-     * Gets the action type.
-     *
-     * @return type
-     */
-    public Type getType() {
-        return type;
-    }
-
-    /**
-     * Gets the target.
-     *
-     * @return URI, email, page index, or action name
-     */
-    public String getTarget() {
-        return target;
-    }
-
-    @Override
-    public String toString() {
-        return String.format("LinkAction(%s: %s)", type, target);
     }
 }

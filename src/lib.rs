@@ -209,6 +209,10 @@ mod python;
 #[cfg(feature = "java")]
 mod jni;
 
+// C# bindings via P/Invoke FFI (optional)
+#[cfg(feature = "csharp")]
+mod ffi;
+
 // WASM bindings (optional)
 #[cfg(target_arch = "wasm32")]
 #[cfg(feature = "wasm")]

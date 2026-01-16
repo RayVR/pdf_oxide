@@ -101,6 +101,9 @@ getrandom = { version = "0.2", features = ["js"], optional = true }
 # Java bindings via JNI (optional)
 jni = { version = "0.21", optional = true }
 
+# C# bindings via P/Invoke (optional)
+# No additional dependencies needed - uses cdylib with C FFI layer
+
 # Table detection - page rendering (optional)
 pdfium-render = { version = "0.8", optional = true }
 
@@ -138,6 +141,9 @@ python = ["pyo3"]
 
 # Java bindings via JNI (v1.0.0)
 java = ["dep:jni"]
+
+# C# bindings via P/Invoke (v1.0.0)
+csharp = []
 
 # The following features are planned for v1.0 and are not yet production-ready.
 # We define them here to avoid check-cfg warnings, but their dependencies are commented out.

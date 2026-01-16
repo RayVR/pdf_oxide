@@ -13,7 +13,7 @@ import java.util.Optional;
  *
  * @since 1.0.0
  */
-public final class WatermarkAnnotation implements Annotation {
+public final class WatermarkAnnotation extends Annotation {
     private final Rect rect;
     private final String contents;
     private final Optional<String> author;

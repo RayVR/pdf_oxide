@@ -12,7 +12,7 @@ import java.util.Optional;
  *
  * @since 1.0.0
  */
-public final class ScreenAnnotation implements Annotation {
+public final class ScreenAnnotation extends Annotation {
     private final Rect rect;
     private final String contents;
     private final Optional<String> author;

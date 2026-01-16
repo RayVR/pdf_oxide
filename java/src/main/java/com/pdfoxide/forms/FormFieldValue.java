@@ -6,24 +6,19 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Form field value - sealed interface for type-safe field values.
+ * Form field value - abstract class for type-safe field values.
  *
  * <p>Represents different value types that form fields can hold: text,
  * boolean, named values, or arrays of values.
  *
  * @since 1.0.0
  */
-public sealed interface FormFieldValue permits
-    FormFieldValue.TextValue,
-    FormFieldValue.BooleanValue,
-    FormFieldValue.NameValue,
-    FormFieldValue.ArrayValue,
-    FormFieldValue.NullValue {
+public abstract class FormFieldValue {
 
     /**
      * Text field value.
      */
-    final class TextValue implements FormFieldValue {
+    public static final class TextValue extends FormFieldValue {
         private final String value;
 
         public TextValue(String value) {
@@ -55,7 +50,7 @@ public sealed interface FormFieldValue permits
     /**
      * Boolean field value.
      */
-    final class BooleanValue implements FormFieldValue {
+    public static final class BooleanValue extends FormFieldValue {
         private final boolean value;
 
         public BooleanValue(boolean value) {
@@ -87,7 +82,7 @@ public sealed interface FormFieldValue permits
     /**
      * Named value (like radio button or dropdown selection).
      */
-    final class NameValue implements FormFieldValue {
+    public static final class NameValue extends FormFieldValue {
         private final String value;
 
         public NameValue(String value) {
@@ -119,7 +114,7 @@ public sealed interface FormFieldValue permits
     /**
      * Array value (like multi-select list).
      */
-    final class ArrayValue implements FormFieldValue {
+    public static final class ArrayValue extends FormFieldValue {
         private final List<String> values;
 
         public ArrayValue(String... values) {
@@ -155,7 +150,7 @@ public sealed interface FormFieldValue permits
     /**
      * Null/empty value.
      */
-    final class NullValue implements FormFieldValue {
+    public static final class NullValue extends FormFieldValue {
         public static final NullValue INSTANCE = new NullValue();
 
         private NullValue() {}

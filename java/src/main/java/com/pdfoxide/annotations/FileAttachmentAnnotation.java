@@ -13,7 +13,7 @@ import java.util.Optional;
  *
  * @since 1.0.0
  */
-public final class FileAttachmentAnnotation implements Annotation {
+public final class FileAttachmentAnnotation extends Annotation {
     private final Rect rect;
     private final String contents;
     private final Optional<String> author;

@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;netstandard2.1;net5.0;net6.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageId>PdfOxide</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>pdf_oxide Contributors</Authors>
+    <Description>Complete .NET bindings for pdf_oxide Rust library with support for reading, creating, and editing PDFs. P/Invoke-based with full .NET async/await support.</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/yfedoseev/pdf_oxide</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>pdf;text-extraction;pdf-creation;pdf-editing;rust;pinvoke</PackageTags>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <DebugType>embedded</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+  </PropertyGroup>
+
+  <!-- Include native libraries in NuGet package -->
+  <ItemGroup>
+    <None Include="../../target/release/pdf_oxide.dll" Pack="true" PackagePath="runtimes/win-x64/native" Condition="Exists('../../target/release/pdf_oxide.dll')" />
+    <None Include="../../target/release/libpdf_oxide.so" Pack="true" PackagePath="runtimes/linux-x64/native" Condition="Exists('../../target/release/libpdf_oxide.so')" />
+    <None Include="../../target/release/libpdf_oxide.dylib" Pack="true" PackagePath="runtimes/osx-x64/native" Condition="Exists('../../target/release/libpdf_oxide.dylib')" />
+  </ItemGroup>
+
+  <!-- Runtime configuration for P/Invoke -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.Globalization.Invariant" Value="true" />
+  </ItemGroup>
+
+</Project>
