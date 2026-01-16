@@ -394,6 +394,53 @@ namespace PdfOxide.Internal
 
         #endregion
 
+        #region DOM API
+
+        /// <summary>
+        /// Gets the width of a page.
+        /// </summary>
+        /// <param name="handle">The page handle.</param>
+        /// <returns>The page width in points, or 0 if invalid.</returns>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern float PdfPageGetWidth(IntPtr handle);
+
+        /// <summary>
+        /// Gets the height of a page.
+        /// </summary>
+        /// <param name="handle">The page handle.</param>
+        /// <returns>The page height in points, or 0 if invalid.</returns>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern float PdfPageGetHeight(IntPtr handle);
+
+        /// <summary>
+        /// Gets the page index.
+        /// </summary>
+        /// <param name="handle">The page handle.</param>
+        /// <returns>The page index (0-based), or -1 if invalid.</returns>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern int PdfPageGetIndex(IntPtr handle);
+
+        /// <summary>
+        /// Gets the page dimensions.
+        /// </summary>
+        /// <param name="handle">The page handle.</param>
+        /// <param name="widthOut">Output parameter for page width.</param>
+        /// <param name="heightOut">Output parameter for page height.</param>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern void PdfPageGetDimensions(
+            IntPtr handle,
+            out float widthOut,
+            out float heightOut);
+
+        /// <summary>
+        /// Frees a PdfPage handle.
+        /// </summary>
+        /// <param name="handle">The handle to free.</param>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern void PdfPageFree(IntPtr handle);
+
+        #endregion
+
         #region Utility Functions
 
         /// <summary>
