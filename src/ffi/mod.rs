@@ -29,4 +29,5 @@ pub mod forms;
 pub mod geometry;
 pub mod pdf;
 pub mod pdf_document;
+pub mod search;
 pub mod utils;

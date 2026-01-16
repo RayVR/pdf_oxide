@@ -743,6 +743,70 @@ namespace PdfOxide.Internal
 
         #endregion
 
+        #region Search API
+
+        /// <summary>
+        /// Searches for text on a page.
+        /// </summary>
+        /// <param name="pageHandle">The page handle.</param>
+        /// <param name="searchTerm">The UTF-8 search term to find.</param>
+        /// <param name="caseSensitive">Whether to match case (1=yes, 0=no).</param>
+        /// <param name="errorCode">Output parameter for error code.</param>
+        /// <returns>The number of occurrences found, or -1 on error.</returns>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention, CharSet = CharSet.Ansi)]
+        public static extern int PdfPageSearchText(
+            IntPtr pageHandle,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string searchTerm,
+            int caseSensitive,
+            out int errorCode);
+
+        /// <summary>
+        /// Gets the text content of a search result.
+        /// </summary>
+        /// <param name="handle">The search result handle.</param>
+        /// <param name="errorCode">Output parameter for error code.</param>
+        /// <returns>UTF-8 null-terminated string pointer. Must be freed with FreeString().</returns>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern IntPtr PdfSearchResultGetText(
+            IntPtr handle,
+            out int errorCode);
+
+        /// <summary>
+        /// Gets the bounding box of a search result.
+        /// </summary>
+        /// <param name="handle">The search result handle.</param>
+        /// <param name="x">Output parameter for x coordinate.</param>
+        /// <param name="y">Output parameter for y coordinate.</param>
+        /// <param name="width">Output parameter for width.</param>
+        /// <param name="height">Output parameter for height.</param>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern void PdfSearchResultGetBbox(
+            IntPtr handle,
+            out float x,
+            out float y,
+            out float width,
+            out float height);
+
+        /// <summary>
+        /// Gets the page index of a search result.
+        /// </summary>
+        /// <param name="handle">The search result handle.</param>
+        /// <param name="errorCode">Output parameter for error code.</param>
+        /// <returns>The page index, or -1 on error.</returns>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern int PdfSearchResultGetPage(
+            IntPtr handle,
+            out int errorCode);
+
+        /// <summary>
+        /// Frees a search result handle.
+        /// </summary>
+        /// <param name="handle">The search result handle to free.</param>
+        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
+        public static extern void PdfSearchResultFree(IntPtr handle);
+
+        #endregion
+
         #region Utility Functions
 
         /// <summary>
