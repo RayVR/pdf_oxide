@@ -836,21 +836,6 @@ namespace PdfOxide.Internal
         #region Utility Functions
 
         /// <summary>
-        /// Frees a UTF-8 string allocated by Rust.
-        /// </summary>
-        /// <param name="ptr">Pointer to the string to free.</param>
-        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
-        public static extern void FreeString(IntPtr ptr);
-
-        /// <summary>
-        /// Frees a byte buffer allocated by Rust.
-        /// </summary>
-        /// <param name="ptr">Pointer to the buffer to free.</param>
-        /// <param name="len">Length of the buffer.</param>
-        [DllImport(LibName, CallingConvention = DefaultCallingConvention)]
-        public static extern void FreeBytes(IntPtr ptr, int len);
-
-        /// <summary>
         /// Allocates a string in Rust memory.
         /// </summary>
         /// <param name="s">UTF-8 null-terminated string pointer.</param>

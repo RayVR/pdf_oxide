@@ -150,7 +150,7 @@ namespace PdfOxide.Core
             get
             {
                 ThrowIfDisposed();
-                var count = NativeMethods.PdfGetPageCount(_handle, out var errorCode);
+                var count = NativeMethods.PdfGetPageCount(_handle.DangerousGetHandle(), out var errorCode);
                 ExceptionMapper.ThrowIfError(errorCode);
                 return count;
             }

@@ -11,7 +11,7 @@ namespace PdfOxide.Internal
     /// This class ensures that native resources are properly released even if an exception occurs.
     /// It is derived from SafeHandleZeroOrMinusOneIsInvalid which treats zero and -1 as invalid handles.
     /// </remarks>
-    internal sealed class NativeHandle : SafeHandleZeroOrMinusOneIsInvalid
+    public sealed class NativeHandle : SafeHandleZeroOrMinusOneIsInvalid
     {
         private readonly Action<IntPtr>? _finalizer;
 
