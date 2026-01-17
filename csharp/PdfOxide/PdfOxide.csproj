@@ -1,20 +1,74 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>netstandard2.0;netstandard2.1;net5.0;net6.0</TargetFrameworks>
+    <!-- Target Frameworks -->
+    <TargetFrameworks>netstandard2.0;netstandard2.1;net5.0;net6.0;net8.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- NuGet Package Configuration -->
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <PackageId>PdfOxide</PackageId>
     <Version>1.0.0</Version>
+    <Title>PdfOxide</Title>
     <Authors>pdf_oxide Contributors</Authors>
-    <Description>Complete .NET bindings for pdf_oxide Rust library with support for reading, creating, and editing PDFs. P/Invoke-based with full .NET async/await support.</Description>
+    <Company>pdf_oxide Project</Company>
+    <Product>pdf_oxide</Product>
+
+    <!-- Package Description and Metadata -->
+    <Description>Complete .NET bindings for pdf_oxide Rust PDF processing library. Provides idiomatic C# APIs for reading, creating, and editing PDFs with support for text extraction, format conversion (Markdown/HTML), element and annotation access, full text search, and async operations.</Description>
+    <Summary>Production-ready C# bindings for the pdf_oxide Rust PDF library</Summary>
+    <PackageIcon>icon.png</PackageIcon>
+    <ReadmeFile>README.md</ReadmeFile>
+
+    <!-- Release Notes -->
+    <PackageReleaseNotes>
+v1.0.0 - Initial Release
+- Phase 1: Core PDF reading API with PdfDocument for text extraction and format conversion
+- Phase 2: PDF creation with Pdf/PdfBuilder classes and DocumentEditor for PDF modification
+- Phase 3: Advanced DOM access with 5 element types and 28 annotation types, full text search
+- Phase 4: Comprehensive testing framework (107 unit tests) and performance benchmarks (61 benchmarks)
+- Phase 5: Real test fixtures, production benchmark implementation, CI/CD integration
+
+Fully idiomatic C# with P/Invoke-based FFI, SafeHandle resource management, IDisposable pattern, async/await support, LINQ-friendly collections, and comprehensive error handling.
+    </PackageReleaseNotes>
+
+    <!-- Licensing -->
     <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <LicenseUrl>https://github.com/yfedoseev/pdf_oxide/blob/main/LICENSE-MIT</LicenseUrl>
+
+    <!-- Repository Information -->
     <RepositoryUrl>https://github.com/yfedoseev/pdf_oxide</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>pdf;text-extraction;pdf-creation;pdf-editing;rust;pinvoke</PackageTags>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RepositoryBranch>main</RepositoryBranch>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+
+    <!-- Project URLs -->
+    <ProjectUrl>https://github.com/yfedoseev/pdf_oxide</ProjectUrl>
+    <DocumentationUrl>https://github.com/yfedoseev/pdf_oxide/wiki</DocumentationUrl>
+    <BugReportUrl>https://github.com/yfedoseev/pdf_oxide/issues</BugReportUrl>
+
+    <!-- Package Tags and Categories -->
+    <PackageTags>pdf;text-extraction;pdf-creation;pdf-editing;rust;pinvoke;ffi;interop;pdf-processing</PackageTags>
+    <Category>Data;Text Processing</Category>
+
+    <!-- Symbol Package Configuration -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EmbedAllSources>true</EmbedAllSources>
+
+    <!-- Documentation and Code Analysis -->
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <DocumentationFile>bin\$(Configuration)\$(TargetFramework)\PdfOxide.xml</DocumentationFile>
+
+    <!-- Code Generation and Safety -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+
+    <!-- Package Metadata -->
+    <PackageProjectUrl>https://github.com/yfedoseev/pdf_oxide</PackageProjectUrl>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
