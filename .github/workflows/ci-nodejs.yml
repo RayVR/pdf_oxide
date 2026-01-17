@@ -1,0 +1,173 @@
+name: Node.js CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'nodejs/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - '.github/workflows/ci-nodejs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'nodejs/**'
+      - 'src/**'
+      - 'Cargo.toml'
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: '20'
+
+jobs:
+  build:
+    name: Build - ${{ matrix.settings.os }} / ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Cache Rust build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-${{ matrix.settings.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install dependencies
+        run: cd nodejs && npm install
+
+      - name: Build
+        run: cd nodejs && npm run build -- --target ${{ matrix.settings.target }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: nodejs/*.node
+          retention-days: 1
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: bindings-x86_64-unknown-linux-gnu
+          path: nodejs/
+
+      - name: Install dependencies
+        run: cd nodejs && npm install
+
+      - name: Run tests
+        run: cd nodejs && npm test
+
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: cd nodejs && npm install
+
+      - name: Check formatting
+        run: cd nodejs && npm run format -- --check
+        continue-on-error: true
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: [build, test, code-quality]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: nodejs/
+
+      - name: Install dependencies
+        run: cd nodejs && npm install
+
+      - name: Prepare for publishing
+        run: cd nodejs && npm run prepublishOnly
+
+      - name: Publish to npm
+        run: cd nodejs && npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  summary:
+    name: CI Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [build, test, code-quality]
+    if: always()
+
+    steps:
+      - name: Check job statuses
+        run: |
+          echo "=== Node.js CI/CD Pipeline Summary ==="
+          echo "Build: ${{ needs.build.result }}"
+          echo "Test: ${{ needs.test.result }}"
+          echo "Code Quality: ${{ needs.code-quality.result }}"
+
+          if [ "${{ needs.build.result }}" = "failure" ] || \
+             [ "${{ needs.test.result }}" = "failure" ]; then
+            echo "Pipeline Status: ⚠ Some checks failed"
+            exit 1
+          else
+            echo "Pipeline Status: ✓ All checks passed"
+          fi

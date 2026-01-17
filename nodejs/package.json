@@ -1,0 +1,80 @@
+{
+  "name": "@pdf-oxide/core",
+  "version": "1.0.0",
+  "description": "Node.js/TypeScript bindings for pdf_oxide Rust library - Complete PDF toolkit for extraction, creation, and editing",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "homepage": "https://github.com/yfedoseev/pdf_oxide",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yfedoseev/pdf_oxide.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yfedoseev/pdf_oxide/issues"
+  },
+  "keywords": [
+    "pdf",
+    "text-extraction",
+    "pdf-creation",
+    "pdf-editing",
+    "pdf-forms",
+    "pdf-annotations",
+    "pdf-metadata",
+    "full-text-search",
+    "rust",
+    "napi",
+    "typescript",
+    "acroform",
+    "xmp-metadata"
+  ],
+  "author": "Yury Fedoseev <yfedoseev@gmail.com>",
+  "license": "MIT OR Apache-2.0",
+  "napi": {
+    "name": "pdf-oxide",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi prepublish -t npm",
+    "test": "node --test tests/**/*.test.js",
+    "test:watch": "node --test tests/**/*.test.js --watch",
+    "test:verbose": "node --test --verbose tests/**/*.test.js",
+    "artifacts": "napi artifacts",
+    "bench": "node benchmarks/extraction.bench.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint src/ --ext .rs",
+    "docs": "typedoc --out docs src/lib.rs",
+    "clean": "rm -rf *.node target/"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
+    "@types/node": "^20.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.3.0"
+  },
+  "optionalDependencies": {
+    "@pdf-oxide/darwin-x64": "1.0.0",
+    "@pdf-oxide/darwin-arm64": "1.0.0",
+    "@pdf-oxide/linux-x64-gnu": "1.0.0",
+    "@pdf-oxide/linux-arm64-gnu": "1.0.0",
+    "@pdf-oxide/win32-x64-msvc": "1.0.0",
+    "@pdf-oxide/win32-arm64-msvc": "1.0.0"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

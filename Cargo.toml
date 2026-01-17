@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "nodejs"]
+resolver = "2"
+
 [package]
 name = "pdf_oxide"
 version = "0.3.1"
@@ -138,6 +142,9 @@ logging = []
 
 # Python bindings (v0.1.0)
 python = ["pyo3"]
+
+# Node.js/TypeScript bindings via napi-rs (v1.0.0)
+nodejs = []
 
 # Java bindings via JNI (v1.0.0)
 java = ["dep:jni"]
