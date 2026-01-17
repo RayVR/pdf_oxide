@@ -2,74 +2,40 @@
 
 use napi_derive::napi;
 
-mod document;
-mod pdf;
-mod builder;
-mod page;
-mod elements;
 mod annotations;
-mod search;
-mod types;
-mod errors;
-mod utils;
+mod builder;
+mod document;
 mod dom;
+mod elements;
+mod errors;
 mod forms;
 mod metadata;
+mod page;
+mod pdf;
+mod search;
+mod types;
+mod utils;
 
 // Re-export main classes for napi
-pub use document::PdfDocument;
-pub use pdf::Pdf;
-pub use builder::PdfBuilder;
-pub use page::PdfPage;
-pub use errors::{PdfError, PdfIoError, PdfParseError};
-pub use dom::AnnotationData;
 pub use annotations::{
-  AnnotationType,
-  TextAnnotation,
-  LinkAnnotation,
-  FreeTextAnnotation,
-  LineAnnotation,
-  SquareAnnotation,
-  CircleAnnotation,
-  PolygonAnnotation,
-  PolyLineAnnotation,
-  HighlightAnnotation,
-  UnderlineAnnotation,
-  SquigglyAnnotation,
-  StrikeOutAnnotation,
-  StampAnnotation,
-  CaretAnnotation,
-  InkAnnotation,
-  PopupAnnotation,
-  FileAttachmentAnnotation,
-  SoundAnnotation,
-  RedactAnnotation,
-  WidgetAnnotation,
-  ScreenAnnotation,
-  ThreeDAnnotation,
-  WatermarkAnnotation,
+    AnnotationType, CaretAnnotation, CircleAnnotation, FileAttachmentAnnotation,
+    FreeTextAnnotation, HighlightAnnotation, InkAnnotation, LineAnnotation, LinkAnnotation,
+    PolyLineAnnotation, PolygonAnnotation, PopupAnnotation, RedactAnnotation, ScreenAnnotation,
+    SoundAnnotation, SquareAnnotation, SquigglyAnnotation, StampAnnotation, StrikeOutAnnotation,
+    TextAnnotation, ThreeDAnnotation, UnderlineAnnotation, WatermarkAnnotation, WidgetAnnotation,
 };
-pub use search::{TextSearcher, TextSearchResult};
+pub use builder::PdfBuilder;
+pub use document::PdfDocument;
+pub use dom::AnnotationData;
+pub use errors::{PdfError, PdfIoError, PdfParseError};
 pub use forms::{
-  FormFieldType,
-  FormField,
-  TextFormField,
-  CheckboxField,
-  RadioButtonField,
-  ListField,
-  ButtonField,
-  SignatureField,
-  AcroForm,
-  XFAForm,
-  FormSubmission,
-  FormReset,
+    AcroForm, ButtonField, CheckboxField, FormField, FormFieldType, FormReset, FormSubmission,
+    ListField, RadioButtonField, SignatureField, TextFormField, XFAForm,
 };
-pub use metadata::{
-  XMPMetadata,
-  PageLabel,
-  EmbeddedFile,
-  DocumentInfo,
-};
+pub use metadata::{DocumentInfo, EmbeddedFile, PageLabel, XMPMetadata};
+pub use page::PdfPage;
+pub use pdf::Pdf;
+pub use search::{TextSearchResult, TextSearcher};
 
 /// pdf_oxide Node.js bindings
 ///
@@ -77,10 +43,10 @@ pub use metadata::{
 /// Exposes all 4 interfaces: read (PdfDocument), create (Pdf), edit (Pdf), universal (PdfBuilder)
 #[napi]
 pub fn get_version() -> String {
-  "1.0.0".to_string()
+    "1.0.0".to_string()
 }
 
 #[napi]
 pub fn get_pdf_oxide_version() -> String {
-  env!("CARGO_PKG_VERSION").to_string()
+    env!("CARGO_PKG_VERSION").to_string()
 }
