@@ -23,7 +23,9 @@ fn issue_395_user_pdf_renders_without_error() {
     use pdf_oxide::document::PdfDocument;
     use pdf_oxide::rendering::{render_page, RenderOptions};
 
-    let Ok(home) = std::env::var("HOME") else { return };
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
     let path = std::path::PathBuf::from(home)
         .join("projects/pdf_oxide_tests/pdfs_issue_regression/issue_395_csharp_render.pdf");
     if !path.exists() {

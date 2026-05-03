@@ -22,11 +22,7 @@ fn open_path_populates_source_bytes() {
          see the document content"
     );
     // Sanity: bytes start with the PDF header.
-    assert_eq!(
-        &doc.source_bytes[..5],
-        b"%PDF-",
-        "source_bytes should start with %PDF-"
-    );
+    assert_eq!(&doc.source_bytes[..5], b"%PDF-", "source_bytes should start with %PDF-");
 }
 
 #[test]

@@ -1635,15 +1635,14 @@ const KNOWN_UNEMBEDDABLE_FONTS: &[&str] = &["Symbol", "ZapfDingbats"];
 fn downgrade_known_unembeddable_fonts(validation: &mut crate::compliance::types::ValidationResult) {
     use crate::compliance::types::{ComplianceWarning, ErrorCode, WarningCode};
 
-    let (downgraded, kept): (Vec<_>, Vec<_>) =
-        std::mem::take(&mut validation.errors)
-            .into_iter()
-            .partition(|e| {
-                e.code == ErrorCode::FontNotEmbedded
-                    && e.location
-                        .as_deref()
-                        .is_some_and(|loc| KNOWN_UNEMBEDDABLE_FONTS.iter().any(|n| loc.contains(n)))
-            });
+    let (downgraded, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut validation.errors)
+        .into_iter()
+        .partition(|e| {
+            e.code == ErrorCode::FontNotEmbedded
+                && e.location
+                    .as_deref()
+                    .is_some_and(|loc| KNOWN_UNEMBEDDABLE_FONTS.iter().any(|n| loc.contains(n)))
+        });
 
     validation.errors = kept;
     for err in downgraded {
@@ -1680,9 +1679,7 @@ mod tests {
         // `Symbol` font (which has no open-source equivalent) gets moved
         // from `errors` to `warnings`, and the validation flips to
         // compliant if it was the sole remaining error.
-        use crate::compliance::types::{
-            ComplianceError, ErrorCode, ValidationResult, WarningCode,
-        };
+        use crate::compliance::types::{ComplianceError, ErrorCode, ValidationResult, WarningCode};
 
         let mut v = ValidationResult::new(PdfALevel::A1b);
         v.errors.push(
