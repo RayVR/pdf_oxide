@@ -1935,6 +1935,23 @@ Napi::Value RenderPageZoom(const Napi::CallbackInfo& info) {
   return Napi::External<void>::New(env, image);
 }
 
+// Render a page to fit inside a target pixel bounding box (preserving
+// aspect ratio). Picks the largest DPI such that both rendered
+// dimensions are ≤ the target box. Issue #448.
+Napi::Value RenderPageFit(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  void* handle = info[0].As<Napi::External<void>>().Data();
+  int pageIndex = info[1].As<Napi::Number>().Int32Value();
+  int width = info[2].As<Napi::Number>().Int32Value();
+  int height = info[3].As<Napi::Number>().Int32Value();
+  int format = info.Length() > 4 ? info[4].As<Napi::Number>().Int32Value() : 0;
+  int errorCode = 0;
+  void* image = pdf_render_page_fit(handle, pageIndex, width, height, format, &errorCode);
+  if (errorCode != 0) throw Napi::Error::New(env, getErrorMessage(errorCode));
+  if (!image) throw Napi::Error::New(env, "Rendering failed");
+  return Napi::External<void>::New(env, image);
+}
+
 Napi::Value SaveRenderedImage(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   void* image = info[0].As<Napi::External<void>>().Data();
@@ -3591,6 +3608,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   // Rendering variants
   exports.Set("estimateRenderTime", Napi::Function::New(env, EstimateRenderTime));
   exports.Set("renderPageZoom", Napi::Function::New(env, RenderPageZoom));
+  exports.Set("renderPageFit", Napi::Function::New(env, RenderPageFit));
   exports.Set("saveRenderedImage", Napi::Function::New(env, SaveRenderedImage));
   exports.Set("renderedImageWidth", Napi::Function::New(env, RenderedImageWidth));
   exports.Set("renderedImageHeight", Napi::Function::New(env, RenderedImageHeight));

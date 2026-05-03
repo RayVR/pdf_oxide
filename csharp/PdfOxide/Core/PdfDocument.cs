@@ -871,6 +871,40 @@ namespace PdfOxide.Core
             finally { NativeMethods.pdf_rendered_image_free(imgHandle); }
         }
 
+        /// <summary>
+        /// Renders a page to fit inside a <paramref name="fitWidth"/> × <paramref name="fitHeight"/>
+        /// pixel box, preserving aspect ratio. Picks the largest DPI such that
+        /// both rendered dimensions are ≤ the target box, so the output may be
+        /// smaller than the requested box on one axis. Issue #448.
+        /// </summary>
+        /// <param name="pageIndex">Zero-based page index.</param>
+        /// <param name="fitWidth">Target box width in pixels (must be &gt; 0).</param>
+        /// <param name="fitHeight">Target box height in pixels (must be &gt; 0).</param>
+        /// <param name="format">0 = PNG (default), 1 = JPEG.</param>
+        public byte[] RenderPageFit(int pageIndex, int fitWidth, int fitHeight, int format = 0)
+        {
+            ThrowIfDisposed();
+            if (fitWidth <= 0 || fitHeight <= 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(fitWidth),
+                    $"fitWidth and fitHeight must be > 0, got {fitWidth}x{fitHeight}");
+            }
+            var imgHandle = NativeMethods.pdf_render_page_fit(_handle.Ptr, pageIndex, fitWidth, fitHeight, format, out var errorCode);
+            ExceptionMapper.ThrowIfError(errorCode);
+            if (imgHandle == IntPtr.Zero) return Array.Empty<byte>();
+            try
+            {
+                var data = NativeMethods.pdf_get_rendered_image_data(imgHandle, out var dataLen, out _);
+                if (data == IntPtr.Zero) return Array.Empty<byte>();
+                var bytes = new byte[dataLen];
+                System.Runtime.InteropServices.Marshal.Copy(data, bytes, 0, dataLen);
+                NativeMethods.FreeBytes(data);
+                return bytes;
+            }
+            finally { NativeMethods.pdf_rendered_image_free(imgHandle); }
+        }
+
         /// <summary>Renders a page thumbnail (72 DPI). Returns PNG bytes.</summary>
         public byte[] RenderThumbnail(int pageIndex, int format = 0)
         {

@@ -375,6 +375,7 @@ extern char* pdf_document_get_outline(void* handle, int* error_code);
 // Rendering
 extern void* pdf_render_page(void* doc, int32_t page_index, int32_t format, int* error_code);
 extern void* pdf_render_page_zoom(void* doc, int32_t page_index, float zoom, int32_t format, int* error_code);
+extern void* pdf_render_page_fit(void* doc, int32_t page_index, int32_t fit_width, int32_t fit_height, int32_t format, int* error_code);
 extern void* pdf_render_page_thumbnail(void* doc, int32_t page_index, int32_t size, int32_t format, int* error_code);
 extern int32_t pdf_get_rendered_image_width(const void* img, int* error_code);
 extern int32_t pdf_get_rendered_image_height(const void* img, int* error_code);
@@ -3134,6 +3135,31 @@ func (doc *PdfDocument) RenderPageZoom(pageIndex int, zoom float32, format int) 
 	defer doc.mu.Unlock()
 	var errorCode C.int
 	handle := C.pdf_render_page_zoom(doc.handle, C.int32_t(pageIndex), C.float(zoom), C.int32_t(format), &errorCode)
+	if errorCode != 0 {
+		return nil, ffiError(errorCode)
+	}
+	if handle == nil {
+		return nil, ErrInternal
+	}
+	w := int(C.pdf_get_rendered_image_width(handle, &errorCode))
+	h := int(C.pdf_get_rendered_image_height(handle, &errorCode))
+	return &RenderedImage{handle: handle, Width: w, Height: h}, nil
+}
+
+// RenderPageFit renders a page to fit inside a fitWidth × fitHeight pixel
+// box, preserving aspect ratio. Picks the largest DPI such that both
+// rendered dimensions are ≤ the target box, so the output may be smaller
+// than the requested box on one axis. Issue #448.
+func (doc *PdfDocument) RenderPageFit(pageIndex, fitWidth, fitHeight, format int) (*RenderedImage, error) {
+	if fitWidth <= 0 || fitHeight <= 0 {
+		return nil, fmt.Errorf("RenderPageFit: fitWidth and fitHeight must be > 0, got %dx%d", fitWidth, fitHeight)
+	}
+	if err := doc.acquireRead(); err != nil {
+		return nil, err
+	}
+	defer doc.mu.Unlock()
+	var errorCode C.int
+	handle := C.pdf_render_page_fit(doc.handle, C.int32_t(pageIndex), C.int32_t(fitWidth), C.int32_t(fitHeight), C.int32_t(format), &errorCode)
 	if errorCode != 0 {
 		return nil, ffiError(errorCode)
 	}

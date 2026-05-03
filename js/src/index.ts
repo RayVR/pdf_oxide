@@ -488,6 +488,39 @@ class PdfDocumentImpl {
     return native.estimateRenderTime(this._handle, pageIndex, dpi);
   }
 
+  /**
+   * Render a page to fit inside a `width × height` pixel box, preserving
+   * aspect ratio. Picks the largest DPI such that both rendered
+   * dimensions are ≤ the target box, so the output may be smaller than
+   * `width × height` on one axis. Issue #448.
+   *
+   * @param pageIndex   zero-based page index
+   * @param width       target box width (pixels, must be > 0)
+   * @param height      target box height (pixels, must be > 0)
+   * @param format      `'png'` (default) or `'jpeg'`
+   */
+  renderPageFit(
+    pageIndex: number,
+    width: number,
+    height: number,
+    format: 'png' | 'jpeg' = 'png'
+  ): Uint8Array {
+    this.ensureOpen();
+    if (width <= 0 || height <= 0) {
+      throw new RangeError(`width and height must be > 0, got ${width}×${height}`);
+    }
+    const fmt = format === 'jpeg' ? 1 : 0;
+    const imgHandle = native.renderPageFit(this._handle, pageIndex, width, height, fmt);
+    try {
+      const buf = native.pdfGetRenderedImageData(imgHandle);
+      return new Uint8Array(buf);
+    } finally {
+      if (native.freeRenderedImage) {
+        native.freeRenderedImage(imgHandle);
+      }
+    }
+  }
+
   page(index: number): Page {
     this.ensureOpen();
     const count = this.pageCount();
@@ -503,6 +536,26 @@ class PdfDocumentImpl {
     const doc = this;
     return {
       next(): IteratorResult<Page> {
+        if (i >= count) return { value: undefined as any, done: true };
+        return { value: new Page(doc, i++), done: false };
+      },
+    };
+  }
+
+  /**
+   * Async iteration over the document's pages — issue #447. The body
+   * is identical to the sync iterator (page handles are constructed
+   * synchronously) but exposing this surface lets consumers `for await`
+   * uniformly with other async resources without an explicit
+   * `Promise.resolve(...)`.
+   */
+  [Symbol.asyncIterator](): AsyncIterator<Page> {
+    this.ensureOpen();
+    const count = this.pageCount();
+    let i = 0;
+    const doc = this;
+    return {
+      async next(): Promise<IteratorResult<Page>> {
         if (i >= count) return { value: undefined as any, done: true };
         return { value: new Page(doc, i++), done: false };
       },

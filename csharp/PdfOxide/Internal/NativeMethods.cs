@@ -5719,6 +5719,10 @@ namespace PdfOxide.Internal
 
         [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial IntPtr pdf_render_page_fit(IntPtr doc, int pageIndex, int fitWidth, int fitHeight, int format, out int errorCode);
+
+        [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         public static partial IntPtr pdf_render_page_thumbnail(IntPtr doc, int pageIndex, int size, int format, out int errorCode);
 
         [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
