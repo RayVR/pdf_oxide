@@ -151,6 +151,41 @@ jobs:
         run: cargo build --no-default-features
         if: matrix.features == ''
 
+  # FIPS-validated CryptoProvider build + test gate (issue #236).
+  # Confirms `--features crypto-aws-lc` compiles, that AwsLcProvider's
+  # 11-test policy/round-trip suite passes, and that the cross-provider
+  # AES byte-equality assertion catches API drift between
+  # `aws-lc-rs` and the default RustCrypto stack.
+  fips:
+    name: FIPS CryptoProvider (aws-lc-rs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install build deps for aws-lc-rs
+        run: sudo apt-get update && sudo apt-get install -y cmake nasm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: fips
+
+      - name: Build with crypto-aws-lc
+        run: cargo build --features python,crypto-aws-lc
+
+      - name: Run AwsLcProvider tests + cross-provider AES compat
+        run: cargo test --features python,crypto-aws-lc --lib crypto::aws_lc_provider
+
+      - name: Run full lib test suite under FIPS feature
+        run: cargo test --features python,crypto-aws-lc --lib
+
+      - name: Clippy under FIPS feature
+        run: cargo clippy --features python,crypto-aws-lc --lib --tests -- -D warnings
+
   # Rust examples smoke-test
   rust-examples:
     name: Rust Examples
