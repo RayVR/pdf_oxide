@@ -26,13 +26,15 @@ All notable changes to PDFOxide are documented here.
   CI now gates that the WASI build stays green. Closes
   [#214](https://github.com/yfedoseev/pdf_oxide/issues/214).
 - **Spurious-table fix on dense word grids** — Roland's #405 lands
-  via cherry-pick. A second density gate after the regular-row-ratio
-  check rejects 6-column word grids derived from two-column prose
-  that the existing validators were accepting as tables (compose
-  cleanly with the v0.3.42 `Table::is_real_grid` filter). Validated
-  against the 86-PDF cross-build corpus: 888 / 888 byte-equal —
-  zero observable change on common documents, the gate's value is
-  in the safety net for adversarial cases.
+  via cherry-pick. A new `has_split_modal_column_groups` validator
+  inspects the column co-occurrence graph across modal rows and
+  rejects candidates whose populated columns split into two or more
+  disconnected components — the signature of two adjacent text
+  flows mis-clustered as one table. Composes cleanly with v0.3.42's
+  `Table::is_real_grid` filter. Validated against the 86-PDF
+  cross-build corpus: 888 / 888 byte-equal — zero observable change
+  on common documents, the gate's value is in the safety net for
+  adversarial cases.
 
 ### Fixes
 
@@ -118,12 +120,14 @@ sampled `(pdf, page, method)` triples across `extract_text`,
 This release exists because of the community. Special thanks to:
 
 - **[@RolandWArnold](https://github.com/RolandWArnold)** — landed
-  the spurious-table fix in [#405](https://github.com/yfedoseev/pdf_oxide/pull/405)
-  with a clean conservative threshold (`most_common_count / num_cols
-  ≥ 2/3`) and a doc-comment that explicitly flags it as a
-  heuristic, making it easy to revisit later. The fix composes
-  with v0.3.42's struct-tree-aware reading-order rewire without
-  any merge conflict.
+  the spurious-table fix in [#405](https://github.com/yfedoseev/pdf_oxide/pull/405).
+  After iterating away from an earlier density-gate framing, the
+  shipped form is `has_split_modal_column_groups`: a connected-
+  component check on the column co-occurrence graph across modal
+  rows that flags two-flow grids the regular-row-ratio gate
+  accepts. Roland's doc-comment explicitly flags it as a heuristic,
+  making it easy to revisit later. The fix composes with v0.3.42's
+  struct-tree-aware reading-order rewire without any merge conflict.
 - **[@RALaBarge](https://github.com/RALaBarge)** — built an
   external WASI binary wrapper for pdf_oxide
   ([pdf-oxide-wasi](https://github.com/RALaBarge/pdf-oxide-wasi))
