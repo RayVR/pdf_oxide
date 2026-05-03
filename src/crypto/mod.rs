@@ -19,10 +19,12 @@
 
 mod error;
 mod provider;
+mod rust_provider;
 mod types;
 
 pub use error::{not_permitted, AlgorithmKind, Error, Result};
 pub use provider::{CryptoProvider, Hasher, SignatureVerifier, Signer, SigningKeyMaterial, SymmetricCipher};
+pub use rust_provider::RustCryptoProvider;
 pub use types::{
     AesKeySize, AsymmetricAlgorithm, EcCurve, HashAlgorithm, Padding, RsaPublicKey, RsaScheme,
     SigningAlgorithm,
