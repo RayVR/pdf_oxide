@@ -96,7 +96,7 @@ pub trait SymmetricCipher: Send + Sync {
     /// covers both directions).
     ///
     /// Required for PDF Standard Security R≤4 (ISO 32000-1 §7.6.3).
-    /// Returns [`Error::AlgorithmNotPermitted`] under FIPS providers.
+    /// Returns [`super::error::Error::AlgorithmNotPermitted`] under FIPS providers.
     fn rc4(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>>;
 }
 

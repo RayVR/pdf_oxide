@@ -45,7 +45,7 @@ impl fmt::Display for AlgorithmKind {
     }
 }
 
-/// Errors emitted by a [`CryptoProvider`] or any of its sub-traits.
+/// Errors emitted by a [`super::provider::CryptoProvider`] or any of its sub-traits.
 #[derive(Debug)]
 pub enum Error {
     /// The provider does not permit this algorithm under its current

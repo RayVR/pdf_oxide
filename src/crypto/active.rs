@@ -52,7 +52,8 @@ static ACTIVE: OnceLock<Arc<dyn CryptoProvider>> = OnceLock::new();
 /// [`SetProviderError::AlreadySet`] if a provider is already
 /// installed.
 ///
-/// FIPS deployments call this once with [`super::AwsLcProvider`] at
+/// FIPS deployments call this once with `AwsLcProvider` (behind the
+/// `crypto-aws-lc` feature) at
 /// process startup. Tests that need a fresh provider should run in
 /// separate process namespaces (e.g., `cargo test`'s default
 /// per-test-binary isolation).

@@ -31,7 +31,7 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
-    /// Output size in bytes (matches [`hash`-style] crates' `OutputSize`).
+    /// Output size in bytes (matches `hash`-style crates' `OutputSize`).
     pub const fn output_size(self) -> usize {
         match self {
             HashAlgorithm::Md5 => 16,
