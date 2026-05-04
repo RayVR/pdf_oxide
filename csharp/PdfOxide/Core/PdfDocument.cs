@@ -1167,14 +1167,17 @@ namespace PdfOxide.Core
             switch (code)
             {
                 case 0: return;
-                case 1: throw new InvalidOperationException(
-                    "FIPS provider not compiled into pdf_oxide native lib; " +
-                    "rebuild with `cargo build --features crypto-aws-lc`.");
-                case 2: throw new InvalidOperationException(
-                    "Cryptographic provider already installed — " +
-                    "UseFipsCryptoProvider must be called before any PDF operation.");
-                default: throw new InvalidOperationException(
-                    $"pdf_oxide_crypto_use_fips returned unknown error code {code}.");
+                case 1:
+                    throw new InvalidOperationException(
+                        "FIPS provider not compiled into pdf_oxide native lib; " +
+                        "rebuild with `cargo build --features crypto-aws-lc`.");
+                case 2:
+                    throw new InvalidOperationException(
+                        "Cryptographic provider already installed — " +
+                        "UseFipsCryptoProvider must be called before any PDF operation.");
+                default:
+                    throw new InvalidOperationException(
+                        $"pdf_oxide_crypto_use_fips returned unknown error code {code}.");
             }
         }
     }
