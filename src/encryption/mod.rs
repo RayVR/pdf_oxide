@@ -37,9 +37,11 @@ mod algorithms;
 mod certificate;
 mod handler;
 // `pub(crate)` so the `crypto::RustCryptoProvider::SymmetricCipher`
-// impl in `src/crypto/rust_provider.rs` can call `rc4::rc4_crypt`
-// without re-implementing the cipher. RC4 is required by PDF
-// Standard Security Handler R≤4 (ISO 32000-1 §7.6.3).
+// impl in `src/crypto/rust_provider.rs` can call
+// `rc4::rc4_crypt_impl` (the cipher-only entry point that does NOT
+// re-route through the active provider, breaking the
+// `provider.rc4() → rc4_crypt → provider.rc4()` cycle). RC4 is
+// required by PDF Standard Security Handler R≤4 (ISO 32000-1 §7.6.3).
 pub(crate) mod rc4;
 mod write_handler;
 

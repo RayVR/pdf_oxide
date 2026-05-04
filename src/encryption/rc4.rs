@@ -76,25 +76,40 @@ pub(crate) fn rc4_crypt_impl(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Required by PDF Standard Security Handler R≤4 (ISO 32000-1
 /// §7.6.3 Algorithm 1). Under the default
 /// [`crate::crypto::RustCryptoProvider`] this succeeds; under the
-/// FIPS-validated `AwsLcProvider` it returns
-/// [`crate::Error::InvalidPdf`] (mapped from
-/// `crate::crypto::Error::AlgorithmNotPermitted`) so callers can
-/// surface a clean error to users rather than crashing the process.
+/// FIPS-validated `AwsLcProvider` (or any other non-legacy provider)
+/// it returns [`crate::Error::InvalidPdf`] preserving the underlying
+/// `crypto::Error` cause so debugging stays actionable for *all*
+/// failure modes — wrong key length (`InvalidInput`), backend failure
+/// (`Backend`), and the FIPS-policy `AlgorithmNotPermitted`. Only the
+/// last one carries the "rebuild without crypto-aws-lc" remediation
+/// hint.
 ///
 /// [`CryptoProvider`]: crate::crypto::CryptoProvider
 pub fn rc4_crypt(key: &[u8], data: &[u8]) -> crate::Result<Vec<u8>> {
     crate::crypto::active()
         .symmetric()
         .rc4(key, data)
-        .map_err(|e| {
-            crate::Error::InvalidPdf(format!(
-                "RC4 rejected by active CryptoProvider '{}': {}. \
-                 RC4 is required for PDF Standard Security R≤4. \
-                 Re-encrypt at R=6 (AES-256) or build pdf_oxide \
-                 without the 'crypto-aws-lc' feature.",
-                crate::crypto::active().name(),
-                e
-            ))
+        .map_err(|e| match &e {
+            crate::crypto::Error::AlgorithmNotPermitted { .. } => {
+                crate::Error::InvalidPdf(format!(
+                    "RC4 rejected by active CryptoProvider '{}': {}. \
+                     RC4 is required for PDF Standard Security R≤4. \
+                     Re-encrypt at R=6 (AES-256) or build pdf_oxide \
+                     without the 'crypto-aws-lc' feature so the default \
+                     'rust-crypto' provider stays active.",
+                    crate::crypto::active().name(),
+                    e
+                ))
+            },
+            crate::crypto::Error::InvalidInput(s) => {
+                crate::Error::InvalidPdf(format!("RC4 invalid input: {s}"))
+            },
+            crate::crypto::Error::Backend(s) => {
+                crate::Error::InvalidPdf(format!("RC4 backend error: {s}"))
+            },
+            crate::crypto::Error::Verification(s) => {
+                crate::Error::InvalidPdf(format!("RC4 verification error: {s}"))
+            },
         })
 }
 

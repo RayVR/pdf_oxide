@@ -19,12 +19,21 @@
 
 use crate::crypto::{active, AesKeySize, Padding};
 
-fn map_err(_e: crate::crypto::Error) -> &'static str {
-    // Existing API surface returns `&'static str`; we collapse the
-    // richer `crypto::Error` variants to a generic message here.
-    // Callers that need detail will get it once Phase 7 / 8 lands a
-    // higher-level Error type.
-    "AES-CBC operation failed"
+fn map_err(e: crate::crypto::Error) -> &'static str {
+    // Preserve the actionable distinction between provider variants
+    // even though the existing public API surface only carries
+    // `&'static str`. The richer variants in `crypto::Error` already
+    // hold `&'static str` payloads, so we forward those without
+    // allocating; only the structured `AlgorithmNotPermitted` and
+    // unknown-future variants get folded to a generic message.
+    match e {
+        crate::crypto::Error::InvalidInput(s) => s,
+        crate::crypto::Error::Verification(s) => s,
+        crate::crypto::Error::Backend(s) => s,
+        crate::crypto::Error::AlgorithmNotPermitted { .. } => {
+            "AES algorithm rejected by active CryptoProvider's policy"
+        },
+    }
 }
 
 /// Encrypt data using AES-128 in CBC mode with PKCS#7 padding.

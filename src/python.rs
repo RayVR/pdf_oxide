@@ -7215,7 +7215,9 @@ fn crypto_available_providers() -> Vec<String> {
 /// Must be called before any PDF operation that uses crypto (open
 /// encrypted document, verify signature). Set-once: a second call,
 /// or any call after a default provider was lazily-installed,
-/// raises ``RuntimeError`` with reason ``"already set"``.
+/// raises ``RuntimeError`` (the message is forwarded from
+/// ``SetProviderError::to_string()`` and is not part of the public
+/// contract — match on the exception type, not its text).
 ///
 /// Raises ``RuntimeError("FIPS feature not compiled in")`` when the
 /// wheel was built without ``--features crypto-aws-lc``.

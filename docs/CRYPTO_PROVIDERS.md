@@ -79,8 +79,9 @@ opening one of these documents under `AwsLcProvider` fails with:
 ```
 active CryptoProvider 'aws-lc-rs' rejects PDF Standard Security R=4
 (R≤4 requires MD5; FIPS 140-3 forbids MD5).
-Re-encrypt the document at R=6 (AES-256) or build pdf_oxide with
-the default 'crypto-rust' provider.
+Re-encrypt the document at R=6 (AES-256) or build pdf_oxide
+without the 'crypto-aws-lc' feature so the default 'rust-crypto'
+provider stays active.
 ```
 
 The remediation is to re-encrypt the document at R=6 (PDF 2.0

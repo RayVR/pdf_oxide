@@ -53,10 +53,14 @@ static ACTIVE: OnceLock<Arc<dyn CryptoProvider>> = OnceLock::new();
 /// installed.
 ///
 /// FIPS deployments call this once with `AwsLcProvider` (behind the
-/// `crypto-aws-lc` feature) at
-/// process startup. Tests that need a fresh provider should run in
-/// separate process namespaces (e.g., `cargo test`'s default
-/// per-test-binary isolation).
+/// `crypto-aws-lc` feature) at process startup.
+///
+/// Tests that need a fresh provider registry must run in their own
+/// process — `cargo test` reuses one binary per crate target, so
+/// `#[test]` functions in the same lib/integration target share this
+/// `OnceLock`. Use a separate integration-test target (`tests/<name>.rs`
+/// invoked via `cargo test --test <name>`) or a custom test harness so
+/// each test gets its own process and a fresh `ACTIVE` cell.
 pub fn set_provider(provider: Arc<dyn CryptoProvider>) -> Result<(), SetProviderError> {
     ACTIVE
         .set(provider)

@@ -255,7 +255,7 @@ js-sys = { version = "0.3", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 # Forwards Rust `log` macros to the browser console (issue #280)
 console_log = { version = "1", optional = true, features = ["color"] }
-getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom = "0.4"
 getrandom_02 = { package = "getrandom", version = "0.2", optional = true, features = ["js"] }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 
@@ -279,6 +279,14 @@ zip = { version = "8.5", optional = true, default-features = false, features = [
 x509-tsp = { version = "0.1", optional = true }
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
 cmpv2 = { version = "0.2", optional = true }
+
+# `getrandom`'s `wasm_js` backend is only meaningful when targeting
+# `wasm32-unknown-unknown` (browser / WASI runtimes that route entropy
+# via `crypto.getRandomValues`). Pinning it here avoids dragging
+# wasm-specific cfg into native dependency graphs while still keeping
+# the WASM build's RNG functional.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 criterion = "0.8"

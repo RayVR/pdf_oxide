@@ -45,7 +45,8 @@ The `is_legacy_allowed()` policy bit lets each provider declare
 whether MD5 / SHA-1-sign / RC4 are permitted. PDF Standard Security
 R≤4 documents are gated at `EncryptionHandler::new`: under a FIPS
 provider they fail with a remediation message ("re-encrypt at R=6
-or build with the default crypto-rust provider") rather than panic
+or build pdf_oxide without the 'crypto-aws-lc' feature so the default
+'rust-crypto' provider stays active") rather than panic
 deep inside the cipher path.
 
 ### Usage
