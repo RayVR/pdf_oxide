@@ -954,11 +954,37 @@ jobs:
           name: python-type-stubs
           path: python/pdf_oxide/
 
-      - name: Build wheels
+      # Linux glibc wheels build inside the manylinux_2_28 container so the
+      # produced .whl is tagged manylinux_2_28 (glibc ≥ 2.28). This covers
+      # AL2023 / AWS Lambda Python (glibc 2.34), RHEL 8, Ubuntu 20.04,
+      # Debian 11. Building directly on ubuntu-latest tags wheels with the
+      # runner's glibc (2_35+) and locks those distros out — see PR #463
+      # comment thread on 0.3.42/0.3.43 install failure on Lambda Python.
+      - name: Build wheels (linux glibc — manylinux_2_28)
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          manylinux: '2_28'
+          args: --release --features python --out dist
+
+      - name: Build wheels (macOS / Windows)
+        if: runner.os != 'Linux'
         shell: bash
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
         run: maturin build --release --features python --target ${{ matrix.target }} --out dist
+
+      - name: Verify manylinux_2_28 tag
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! ls dist/*manylinux_2_28*.whl >/dev/null 2>&1; then
+            echo "::error::Expected a manylinux_2_28 wheel for ${{ matrix.target }} but found:"
+            ls -la dist/
+            exit 1
+          fi
+          echo "manylinux_2_28 wheel produced:"
+          ls dist/*manylinux_2_28*.whl
 
       - name: Build sdist
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -990,7 +1016,7 @@ jobs:
           path: python/pdf_oxide/
 
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           manylinux: musllinux_1_2

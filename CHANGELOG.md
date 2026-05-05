@@ -2,7 +2,7 @@
 
 All notable changes to PDFOxide are documented here.
 
-## [0.3.44] - unreleased
+## [0.3.44] - 2026-05-05
 
 > Pluggable cryptographic provider — FIPS 140-3 compliance for
 > government / regulated deployments.
@@ -125,6 +125,24 @@ HSMs), and the legacy-PDF policy table.
   ```
   Both submodules re-export the same Go API; only the linked native
   static lib differs.
+
+### Fixes
+
+- **Restore `manylinux_2_28` glibc floor for Python wheels.** 0.3.42 and
+  0.3.43 published only `manylinux_2_35` Linux glibc wheels because the
+  release workflow ran `maturin build` directly on `ubuntu-latest`
+  (Ubuntu 24.04, glibc 2.39), letting the runner's glibc set the wheel
+  tag. That excluded Amazon Linux 2023 / AWS Lambda Python (glibc 2.34),
+  RHEL 8, Ubuntu 20.04 and Debian 11 — pip rejected the wheel and fell
+  back to a source build that OOM-killed `rustup-init` inside the Lambda
+  build container. Reported by @potatochipcoconut on
+  [PR #463](https://github.com/yfedoseev/pdf_oxide/pull/463#issuecomment-4376490292).
+  Both `release.yml` (default wheels) and `release-fips.yml`
+  (`pdf_oxide_fips` wheels) now build the Linux glibc wheels via
+  `PyO3/maturin-action` inside the `manylinux_2_28` container, and a CI
+  guard step fails the job if a `manylinux_2_28` wheel is not produced
+  for either Linux target — preventing this regression from recurring.
+  The 0.3.21 baseline (originally added in #284) is restored.
 
 ### Tests
 

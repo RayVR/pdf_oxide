@@ -122,7 +122,43 @@ jobs:
           (Get-Content pyproject.toml) -replace '^name = "pdf_oxide"$', 'name = "pdf_oxide_fips"' |
             Set-Content pyproject.toml
 
-      - name: Build FIPS wheel
+      # Linux glibc wheels: build inside manylinux_2_28 container so the
+      # tag matches the platform floor advertised in the v0.3.44 release
+      # notes (AL2023 / AWS Lambda Python, RHEL 8, Ubuntu 20.04, Debian 11).
+      # Building natively on ubuntu-latest tags wheels with the runner's
+      # glibc (2_35+) and excludes those distros — same regression that
+      # hit the default wheels in 0.3.42/0.3.43.
+      - name: Build FIPS wheel (linux glibc — manylinux_2_28)
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          manylinux: '2_28'
+          # AWS-LC build needs nasm + cmake. cmake is preinstalled in the
+          # manylinux_2_28 image; nasm is not.
+          before-script-linux: |
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y nasm || (dnf install -y epel-release && dnf install -y nasm)
+            else
+              yum install -y nasm || (yum install -y epel-release && yum install -y nasm)
+            fi
+          args: --release --target ${{ matrix.target }} --features python,fips --out dist
+
+      - name: Verify manylinux_2_28 tag
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! ls dist/*manylinux_2_28*.whl >/dev/null 2>&1; then
+            echo "::error::Expected a manylinux_2_28 FIPS wheel for ${{ matrix.target }} but found:"
+            ls -la dist/
+            exit 1
+          fi
+          echo "manylinux_2_28 FIPS wheel produced:"
+          ls dist/*manylinux_2_28*.whl
+
+      - name: Build FIPS wheel (macOS / Windows)
+        if: runner.os != 'Linux'
         run: |
           uv tool install maturin
           maturin build --release \
