@@ -102,7 +102,7 @@ impl EncryptionWriteHandler {
         // to compute_encryption_key which rejects R<=4 without the feature.
         #[cfg(not(feature = "legacy-crypto"))]
         {
-            return self.encryption_key.clone();
+            self.encryption_key.clone()
         }
 
         #[cfg(feature = "legacy-crypto")]

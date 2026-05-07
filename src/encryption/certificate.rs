@@ -531,7 +531,7 @@ fn generate_random_key(length: usize) -> Result<Vec<u8>> {
         crate::crypto::active()
             .random_bytes(&mut key)
             .map_err(|e| crate::Error::InvalidPdf(format!("failed to generate random key: {e}")))?;
-        return Ok(key);
+        Ok(key)
     }
 
     #[cfg(feature = "legacy-crypto")]

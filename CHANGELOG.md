@@ -23,6 +23,15 @@ All notable changes to PDFOxide are documented here.
   new call path uses aws-lc-rs's `RSA_PKCS1_2048_8192_SHA{256,384,512}`
   verifiers — RSA-PKCS#1 v1.5 signature verification now works under
   FIPS instead of returning `SignerVerify::Unknown`.
+- **`render_page_fit` produces images smaller than the requested box
+  ([#480](https://github.com/yfedoseev/pdf_oxide/issues/480))** —
+  Integer-DPI conversion via `floor()` lost up to 3 pixels from the
+  constrained dimension (e.g. a 1040 px fit yielded 1037 px on Letter).
+  The renderer now computes a float scale directly (`fit_px / page_pt`)
+  and stores it in the crate-private `RenderOptions::scale_override`
+  field, bypassing the DPI round-trip entirely. The constrained
+  dimension is now exact for all integer pixel inputs. Reported by
+  @gevorgter.
 
 ### Added
 

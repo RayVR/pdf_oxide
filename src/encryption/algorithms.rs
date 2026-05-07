@@ -156,7 +156,7 @@ pub fn authenticate_user_password(
 
     #[cfg(not(feature = "legacy-crypto"))]
     {
-        return None;
+        None
     }
 
     #[cfg(feature = "legacy-crypto")]

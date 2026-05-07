@@ -8,6 +8,7 @@ wider Cargo features than the installed wheel (issue #464).
 Usage:
     python scripts/check_stub_parity.py <path-to-pyi>
 """
+
 from __future__ import annotations
 
 import ast
@@ -36,7 +37,11 @@ def pyi_top_level_names(pyi_path: str) -> set[str]:
             for t in node.targets:
                 if isinstance(t, ast.Name) and not t.id.startswith("_"):
                     names.add(t.id)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and not node.target.id.startswith("_"):
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and not node.target.id.startswith("_")
+        ):
             names.add(node.target.id)
         # ImportFrom intentionally skipped: stdlib type-annotation imports
         # (pathlib.Path, __future__.annotations, typing.*) are not module

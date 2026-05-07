@@ -259,11 +259,11 @@ impl SymmetricCipher for RustSymmetric {
     fn rc4(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         #[cfg(not(feature = "legacy-crypto"))]
         {
-            return Err(Error::AlgorithmNotPermitted {
+            Err(Error::AlgorithmNotPermitted {
                 kind: crate::crypto::error::AlgorithmKind::SymmetricCipher,
                 name: "RC4",
                 reason: "legacy-crypto feature disabled at compile time",
-            });
+            })
         }
         #[cfg(feature = "legacy-crypto")]
         {

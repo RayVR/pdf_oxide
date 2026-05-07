@@ -34,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g. v0.3.44)'
+        description: 'Version tag (e.g. v0.3.45)'
         required: true
       publish:
         description: 'Publish to package indexes (false = dry-run, build artifacts only)'
