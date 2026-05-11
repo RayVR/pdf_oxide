@@ -394,6 +394,9 @@ fn escape_pdf_string(s: &str) -> String {
 
 /// Format current time as a PDF date string.
 fn format_pdf_date() -> String {
+    // WASM note: if signatures are ever enabled for wasm32, SystemTime::now()
+    // here will also need cfg-gating (currently masked because the `signatures`
+    // feature is not enabled in the wasm build).
     use std::time::SystemTime;
 
     let now = SystemTime::now()

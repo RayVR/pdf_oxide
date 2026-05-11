@@ -287,6 +287,9 @@ fn pdf_text_hex(s: &str) -> String {
 }
 
 fn format_pdf_date() -> String {
+    // WASM note: if signatures are ever enabled for wasm32, SystemTime::now()
+    // here will also need cfg-gating (currently masked because the `signatures`
+    // feature is not enabled in the wasm build).
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

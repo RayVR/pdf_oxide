@@ -622,9 +622,19 @@ pub fn generate_file_id() -> (Vec<u8>, Vec<u8>) {
     let uuid = uuid::Uuid::new_v4();
     let uuid_bytes = uuid.as_bytes();
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    // SystemTime::now() is not available on wasm32-unknown-unknown.
+    // The UUID v4 already provides sufficient entropy for a unique opaque
+    // file identifier (ISO 32000-1 §14.4), so we skip the time contribution
+    // on that target.
+    #[cfg(not(target_arch = "wasm32"))]
+    let now_bytes: Option<[u8; 16]> = {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Some(now.as_nanos().to_le_bytes())
+    };
+    #[cfg(target_arch = "wasm32")]
+    let now_bytes: Option<[u8; 16]> = None;
 
     // PDF spec (ISO 32000-1 §14.4) specifies MD5; when legacy-crypto is off
     // we use SHA-256 truncated to 16 bytes — still a unique opaque identifier.
@@ -633,7 +643,9 @@ pub fn generate_file_id() -> (Vec<u8>, Vec<u8>) {
         use md5::{Digest, Md5};
         let mut h = Md5::new();
         h.update(uuid_bytes);
-        h.update(now.as_nanos().to_le_bytes());
+        if let Some(b) = now_bytes {
+            h.update(b);
+        }
         h.finalize().to_vec()
     };
 
@@ -642,7 +654,9 @@ pub fn generate_file_id() -> (Vec<u8>, Vec<u8>) {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(uuid_bytes);
-        h.update(now.as_nanos().to_le_bytes());
+        if let Some(b) = now_bytes {
+            h.update(b);
+        }
         h.finalize()[..16].to_vec()
     };
 
@@ -1337,6 +1351,13 @@ mod tests {
         let (id2, _) = generate_file_id();
         // It's extremely unlikely these would be equal
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_generate_file_id_uniqueness() {
+        let id1 = generate_file_id();
+        let id2 = generate_file_id();
+        assert_ne!(id1, id2, "file IDs must be unique across calls");
     }
 
     // === EncryptDict roundtrip tests ===

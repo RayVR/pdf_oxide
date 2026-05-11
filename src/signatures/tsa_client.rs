@@ -197,6 +197,9 @@ fn random_nonce() -> der::asn1::Int {
         // happen on our targets), fall back to a time-derived nonce.
         // Timestamps alone don't give crypto security, but they do
         // prevent the trivial replay case.
+        // WASM note: if signatures are ever enabled for wasm32, SystemTime::now()
+        // here will also need cfg-gating (currently masked because the `signatures`
+        // feature is not enabled in the wasm build).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
