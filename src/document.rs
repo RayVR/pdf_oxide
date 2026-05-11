@@ -10643,9 +10643,45 @@ impl PdfDocument {
         // Safety guards:
         // - Only fires when the main pipeline returned no tables (avoids double-counting).
         // - Only fires when the caller is a converter (text_fallback=true).
+        // - Skipped for tagged PDFs: the structure tree already provides the authoritative
+        //   layout; spatial heuristics produce false-positive tables from structure elements
+        //   (e.g. headings detected as single-row tables — issue #486 regression).
+        // - Skipped for predominantly-RTL pages: Arabic/Hebrew text alignment patterns
+        //   mimic table columns in spatial heuristics — issue #486 regression.
         // - When ruling lines exist, spans are filtered to the line-bounded region to
         //   prevent page headers/footers from being erroneously included in the table.
         // - Results must pass is_real_grid() just like main-pipeline tables.
+
+        // Guard 1 — Tagged PDFs: presence of a structure tree means the document has an
+        // explicit semantic layout.  Spatial text-only detection would misfire on
+        // structure elements (headings, paragraphs) that happen to share a Y band.
+        if config.text_fallback && struct_tree_opt.is_some() {
+            log::debug!(
+                "Text-only spatial fallback skipped for page {} — document has a structure tree (tagged PDF)",
+                page_index
+            );
+            return tables;
+        }
+
+        // Guard 2 — RTL pages: Arabic and Hebrew text naturally aligns horizontally in
+        // patterns that the column-clustering algorithm mistakes for table columns.
+        // Skip spatial detection when more than 30 % of the input spans are RTL.
+        if config.text_fallback {
+            let rtl_count = input_spans
+                .iter()
+                .filter(|s| crate::text::bidi::looks_rtl(&s.text))
+                .count();
+            let rtl_fraction = rtl_count as f32 / input_spans.len().max(1) as f32;
+            if rtl_fraction > 0.30 {
+                log::debug!(
+                    "Text-only spatial fallback skipped for page {} — {:.0}% RTL spans (threshold 30%)",
+                    page_index,
+                    rtl_fraction * 100.0
+                );
+                return tables;
+            }
+        }
+
         if config.text_fallback && tables.is_empty() {
             use crate::structure::spatial_table_detector::detect_tables_from_spans_column_aware;
             // Build a relaxed config derived from the caller's config.
