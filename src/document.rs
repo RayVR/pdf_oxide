@@ -5679,17 +5679,35 @@ impl PdfDocument {
         let prev_end_x = prev.bbox.x + prev.bbox.width;
         let gap = current.bbox.x - prev_end_x;
 
-        // CJK ↔ non-CJK boundary: pdftotext (and the GT it produces) inserts
-        // a space wherever a CJK ideograph meets a Latin/digit character on
-        // the same line, regardless of how tightly the two glyphs were
-        // typeset.  Without this, mixed-script content like "神鹰集团" + "2015"
-        // collapses into one word-F1 token "神鹰集团2015", which never matches
-        // GT's separate "神鹰集团" and "2015" tokens (issue 484, pr-136).
-        // Force a space at the script boundary as long as the two glyphs are
-        // not horizontally overlapping (genuine kerning) and the gap is
-        // within the same-line column.
+        // CJK script ↔ non-CJK boundary: pdftotext (and the GT it produces)
+        // inserts a space wherever a CJK *script* glyph (ideograph, kana, or
+        // hangul) meets a Latin/digit character on the same line, regardless
+        // of how tightly the two were typeset.  Without this, mixed-script
+        // content like "神鹰集团" + "2015" collapses into one token
+        // "神鹰集团2015", which never matches GT's separate "神鹰集团" and
+        // "2015" tokens (issue 484, pr-136).
+        //
+        // IMPORTANT: this MUST exclude fullwidth ASCII variants (U+FF01..FF5E
+        // — ＜＞＝＠ etc.) and CJK Symbols and Punctuation (U+3000..303F) even
+        // though they are technically "CJK characters".  Those are *operator*
+        // glyphs that sit inline with adjacent digits and Latin in CJK
+        // technical documents — pdftotext keeps "60000≤Q＜80000" and
+        // "20＜μ≤30" as compound tokens (issue 484, issue-336).  Forcing a
+        // boundary space there destroys the compound and regresses Jaccard.
+        let is_cjk_script = |c: char| {
+            matches!(
+                c as u32,
+                0x3040..=0x309F      // Hiragana
+                | 0x30A0..=0x30FF    // Katakana
+                | 0x3400..=0x4DBF    // CJK Unified Ideographs Extension A
+                | 0x4E00..=0x9FFF    // CJK Unified Ideographs
+                | 0xAC00..=0xD7AF    // Hangul Syllables
+                | 0x20000..=0x2A6DF  // CJK Unified Ideographs Extension B
+                | 0xFF66..=0xFF9F    // Halfwidth Katakana
+            )
+        };
         let crosses_cjk_boundary = match (prev_tail, curr_head) {
-            (Some(p), Some(c)) => is_cjk(p) != is_cjk(c),
+            (Some(p), Some(c)) => is_cjk_script(p) != is_cjk_script(c),
             _ => false,
         };
         if crosses_cjk_boundary

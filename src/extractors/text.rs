@@ -3361,6 +3361,12 @@ impl<'doc> TextExtractor<'doc> {
             // boundary) then loses both the trailing CJK token and the
             // leading Latin/digit token.  Skip cross-font glue when the
             // boundary crosses CJK / non-CJK scripts.
+            //
+            // EXCLUDES fullwidth ASCII (U+FF01..FF5E) and CJK Symbols and
+            // Punctuation (U+3000..303F) — those operator-style glyphs sit
+            // inline with adjacent Latin/digit in CJK technical writing
+            // (e.g. "60000≤Q＜80000" in issue-336).  Treating them as a CJK
+            // boundary would split the compound token.
             let is_cjk_char = |c: char| {
                 matches!(
                     c as u32,
@@ -3370,8 +3376,7 @@ impl<'doc> TextExtractor<'doc> {
                     | 0x4E00..=0x9FFF    // CJK Unified Ideographs
                     | 0xAC00..=0xD7AF    // Hangul Syllables
                     | 0x20000..=0x2A6DF  // CJK Unified Ideographs Extension B
-                    | 0xFF00..=0xFFEF    // Halfwidth and Fullwidth Forms
-                    | 0x3000..=0x303F    // CJK Symbols and Punctuation
+                    | 0xFF66..=0xFF9F    // Halfwidth Katakana
                 )
             };
             let prev_tail_char = current.text.chars().last();
