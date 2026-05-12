@@ -278,8 +278,14 @@ fn quality_gate_issue_336_html() {
         let mut in_tag = false;
         for c in html.chars() {
             match c {
-                '<' => { in_tag = true; out.push(' '); },
-                '>' => { in_tag = false; out.push(' '); },
+                '<' => {
+                    in_tag = true;
+                    out.push(' ');
+                },
+                '>' => {
+                    in_tag = false;
+                    out.push(' ');
+                },
                 _ if in_tag => {},
                 _ => out.push(c),
             }
@@ -431,12 +437,7 @@ fn check_html(label: &str, pdf: &str, gt: &str, threshold: f32) {
 #[test]
 #[ignore = "requires /tmp/pdfa_036.pdf and /tmp/gt_pdfa_036_kreuzberg.txt"]
 fn quality_gate_pdfa_036_html() {
-    check_html(
-        "pdfa_036 (html)",
-        "/tmp/pdfa_036.pdf",
-        "/tmp/gt_pdfa_036_kreuzberg.txt",
-        0.78,
-    );
+    check_html("pdfa_036 (html)", "/tmp/pdfa_036.pdf", "/tmp/gt_pdfa_036_kreuzberg.txt", 0.78);
 }
 
 // nougat_026.pdf — to_html quality gate (#487)
@@ -534,10 +535,5 @@ fn check_markdown(label: &str, pdf: &str, gt: &str, threshold: f32) {
 #[test]
 #[ignore = "requires /tmp/nougat_018.pdf and /tmp/gt_nougat_018.txt"]
 fn quality_gate_nougat_018_markdown() {
-    check_markdown(
-        "nougat_018 (markdown)",
-        "/tmp/nougat_018.pdf",
-        "/tmp/gt_nougat_018.txt",
-        0.90,
-    );
+    check_markdown("nougat_018 (markdown)", "/tmp/nougat_018.pdf", "/tmp/gt_nougat_018.txt", 0.90);
 }

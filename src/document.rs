@@ -4245,11 +4245,12 @@ impl PdfDocument {
                     // Fall back to checking the catalog directly when MarkInfo is
                     // absent or /Marked is false — presence of /StructTreeRoot is
                     // authoritative for "is this a tagged PDF" per the spec.
-                    let has_struct_tree_root = !is_marked && self
-                        .catalog()
-                        .ok()
-                        .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
-                        .unwrap_or(false);
+                    let has_struct_tree_root = !is_marked
+                        && self
+                            .catalog()
+                            .ok()
+                            .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
+                            .unwrap_or(false);
                     let tree = if is_marked || has_struct_tree_root {
                         self.structure_tree().ok().flatten().map(Arc::new)
                     } else {
@@ -5710,10 +5711,7 @@ impl PdfDocument {
             (Some(p), Some(c)) => is_cjk_script(p) != is_cjk_script(c),
             _ => false,
         };
-        if crosses_cjk_boundary
-            && gap > -0.5
-            && gap < font_size * 5.0
-        {
+        if crosses_cjk_boundary && gap > -0.5 && gap < font_size * 5.0 {
             return true;
         }
 
@@ -6406,7 +6404,11 @@ impl PdfDocument {
             let text = {
                 let from_contents = if let Some(Object::String(s)) = dict.get("Contents") {
                     let decoded = Self::decode_pdf_text_string(s).trim().to_string();
-                    if decoded.is_empty() { None } else { Some(decoded) }
+                    if decoded.is_empty() {
+                        None
+                    } else {
+                        Some(decoded)
+                    }
                 } else {
                     None
                 };
@@ -7887,8 +7889,10 @@ impl PdfDocument {
         // NOT a page-number-containing header — it is substantive content that
         // happens to repeat.  Only suppress signatures where the literal text
         // varies (at least two distinct forms) meaning digits change per page.
-        let mut literal_variants: std::collections::HashMap<String, std::collections::HashSet<String>> =
-            std::collections::HashMap::new();
+        let mut literal_variants: std::collections::HashMap<
+            String,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
         for pi in 0..page_count {
             let spans = match self.extract_spans_raw(pi) {
                 Ok(s) => s,
@@ -7931,7 +7935,9 @@ impl PdfDocument {
                 if sig.is_empty() || sig.chars().count() < 2 {
                     continue;
                 }
-                seen_this_page.entry(sig).or_insert_with(|| trimmed.to_string());
+                seen_this_page
+                    .entry(sig)
+                    .or_insert_with(|| trimmed.to_string());
             }
             // Track first-seen across ALL pages (even body-content-skipped)
             for sig in seen_this_page.keys() {
@@ -10549,11 +10555,12 @@ impl PdfDocument {
                 Some(tree) => tree,
                 None => {
                     let is_marked = self.mark_info().map(|m| m.marked).unwrap_or(false);
-                    let has_struct_tree_root = !is_marked && self
-                        .catalog()
-                        .ok()
-                        .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
-                        .unwrap_or(false);
+                    let has_struct_tree_root = !is_marked
+                        && self
+                            .catalog()
+                            .ok()
+                            .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
+                            .unwrap_or(false);
                     let tree = if is_marked || has_struct_tree_root {
                         self.structure_tree().ok().flatten().map(Arc::new)
                     } else {
@@ -10810,15 +10817,12 @@ impl PdfDocument {
             // while V-lines are confined to the interior table region.
             let candidate_spans: Vec<crate::layout::TextSpan>;
             let fallback_spans: &[crate::layout::TextSpan] = {
-                let v_lines: Vec<_> = paths
-                    .iter()
-                    .filter(|p| {
-                        p.is_vertical_line(2.0)
-                    })
-                    .collect();
+                let v_lines: Vec<_> = paths.iter().filter(|p| p.is_vertical_line(2.0)).collect();
                 if !v_lines.is_empty() {
-                    let vline_y_min =
-                        v_lines.iter().map(|p| p.bbox.y).fold(f32::INFINITY, f32::min);
+                    let vline_y_min = v_lines
+                        .iter()
+                        .map(|p| p.bbox.y)
+                        .fold(f32::INFINITY, f32::min);
                     let vline_y_max = v_lines
                         .iter()
                         .map(|p| p.bbox.y + p.bbox.height)

@@ -3814,23 +3814,24 @@ impl<'doc> TextExtractor<'doc> {
                 // keep accumulating into the existing buffer instead of flushing
                 // (avoids creating thousands of 1-char TextSpans per page).
                 // When merge_tm_tj_runs is false, every Tm always starts a fresh span.
-                let is_continuation = self.merging_config.merge_tm_tj_runs && match self.tj_span_buffer {
-                    Some(ref mut buffer)
-                        if !buffer.is_empty()
-                            && f.round() as i32 == buffer.start_matrix.f.round() as i32
-                            && a == buffer.start_matrix.a
-                            && b == buffer.start_matrix.b
-                            && c == buffer.start_matrix.c
-                            && d == buffer.start_matrix.d
-                            && e >= buffer.start_matrix.e =>
-                    {
-                        // Same line, same transform, LTR progression →
-                        // update width to reflect actual visual extent
-                        buffer.accumulated_width = e - buffer.start_matrix.e;
-                        true
-                    },
-                    _ => false,
-                };
+                let is_continuation = self.merging_config.merge_tm_tj_runs
+                    && match self.tj_span_buffer {
+                        Some(ref mut buffer)
+                            if !buffer.is_empty()
+                                && f.round() as i32 == buffer.start_matrix.f.round() as i32
+                                && a == buffer.start_matrix.a
+                                && b == buffer.start_matrix.b
+                                && c == buffer.start_matrix.c
+                                && d == buffer.start_matrix.d
+                                && e >= buffer.start_matrix.e =>
+                        {
+                            // Same line, same transform, LTR progression →
+                            // update width to reflect actual visual extent
+                            buffer.accumulated_width = e - buffer.start_matrix.e;
+                            true
+                        },
+                        _ => false,
+                    };
 
                 if !is_continuation {
                     self.flush_tj_span_buffer()?;
@@ -9955,8 +9956,11 @@ mod tests {
 
         // All three characters must be present
         let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(text.contains('A') && text.contains('B') && text.contains('C'),
-            "All chars must be extracted, got: {:?}", text);
+        assert!(
+            text.contains('A') && text.contains('B') && text.contains('C'),
+            "All chars must be extracted, got: {:?}",
+            text
+        );
 
         // The default merging should combine them into fewer spans than the number
         // of Tm operators (3 Tms should not produce 3 separate spans)
@@ -9985,8 +9989,11 @@ mod tests {
 
         // All three characters must still be present
         let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(text.contains('A') && text.contains('B') && text.contains('C'),
-            "All chars must be extracted even with merging disabled, got: {:?}", text);
+        assert!(
+            text.contains('A') && text.contains('B') && text.contains('C'),
+            "All chars must be extracted even with merging disabled, got: {:?}",
+            text
+        );
 
         // With merge disabled, each Tm flushes the buffer, so we get more spans
         // than with merging enabled (post-processing merge_adjacent_spans may combine

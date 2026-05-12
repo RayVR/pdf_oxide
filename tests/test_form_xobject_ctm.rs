@@ -50,8 +50,7 @@ fn build_form_xobject_two_ctm_pdf() -> Vec<u8> {
 
     // Object 4: Page content stream
     // Two `q … cm … Do … Q` blocks with different y-translations.
-    let page_content =
-        b"q 1 0 0 1 0 0 cm /Fm0 Do Q q 1 0 0 1 0 400 cm /Fm0 Do Q";
+    let page_content = b"q 1 0 0 1 0 0 cm /Fm0 Do Q q 1 0 0 1 0 400 cm /Fm0 Do Q";
     offsets.push(pdf.len());
     let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
     pdf.extend_from_slice(hdr.as_bytes());
@@ -116,9 +115,7 @@ fn build_form_xobject_two_pages_pdf() -> Vec<u8> {
 
     // Object 2: Pages (two pages)
     offsets.push(pdf.len());
-    pdf.extend_from_slice(
-        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n\n",
-    );
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n\n");
 
     // Object 3: Page 1 — paints Form at y-offset 0 (identity cm)
     offsets.push(pdf.len());
@@ -216,14 +213,20 @@ fn test_same_form_xobject_twice_different_ctm_same_page() {
     let spans = doc.extract_spans(0).expect("extract spans");
 
     // Collect spans that contain "FORM_TEXT"
-    let matching: Vec<_> = spans.iter().filter(|s| s.text.contains("FORM_TEXT")).collect();
+    let matching: Vec<_> = spans
+        .iter()
+        .filter(|s| s.text.contains("FORM_TEXT"))
+        .collect();
 
     assert!(
         matching.len() >= 2,
         "Expected at least 2 'FORM_TEXT' spans (one per CTM invocation), \
          got {}: {:?}",
         matching.len(),
-        matching.iter().map(|s| (s.text.as_str(), s.bbox.y)).collect::<Vec<_>>()
+        matching
+            .iter()
+            .map(|s| (s.text.as_str(), s.bbox.y))
+            .collect::<Vec<_>>()
     );
 
     // The two spans must be at different y positions — the second invocation

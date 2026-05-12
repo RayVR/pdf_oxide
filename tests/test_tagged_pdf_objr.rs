@@ -41,7 +41,10 @@ mod tests {
     fn test_objr_in_struct_elem_k_array_is_resolved() {
         let doc =
             pdf_oxide::document::PdfDocument::from_bytes(HELLO_STRUCTURE_PDF.to_vec()).unwrap();
-        let tree = doc.structure_tree().unwrap().expect("structure tree present");
+        let tree = doc
+            .structure_tree()
+            .unwrap()
+            .expect("structure tree present");
 
         // Walk the tree and collect all MCIDs and pages
         let mut found_mcids: Vec<(u32, u32)> = Vec::new(); // (page, mcid)
@@ -64,7 +67,10 @@ mod tests {
     fn test_objr_at_struct_tree_root_k_level_is_resolved() {
         let doc =
             pdf_oxide::document::PdfDocument::from_bytes(HELLO_STRUCTURE_PDF.to_vec()).unwrap();
-        let tree = doc.structure_tree().unwrap().expect("structure tree present");
+        let tree = doc
+            .structure_tree()
+            .unwrap()
+            .expect("structure tree present");
 
         let mut found_mcids: Vec<(u32, u32)> = Vec::new();
         collect_mcids(&tree.root_elements, &mut found_mcids);
@@ -87,8 +93,10 @@ mod tests {
             pdf_oxide::document::PdfDocument::from_bytes(HELLO_STRUCTURE_PDF.to_vec()).unwrap();
         let page_count = doc.page_count().unwrap_or(0);
 
-        let all_text: String =
-            (0..page_count).map(|i| doc.extract_text(i).unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let all_text: String = (0..page_count)
+            .map(|i| doc.extract_text(i).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(
             all_text.contains("Hello World"),
@@ -101,7 +109,8 @@ mod tests {
             all_text
         );
         assert!(
-            all_text.contains("I'll be back shortly!") || all_text.contains("I\u{2019}ll be back shortly!"),
+            all_text.contains("I'll be back shortly!")
+                || all_text.contains("I\u{2019}ll be back shortly!"),
             "page 1 paragraph missing from: {:?}",
             all_text
         );
@@ -123,7 +132,9 @@ mod tests {
         // Page 1 contains "Goodbye Cruel World" as a heading element in the structure tree.
         // With the text-only spatial fallback guard absent, this heading was mistakenly
         // rendered as a pipe-delimited table row.
-        let md = doc.to_markdown(1, &options).expect("to_markdown page 1 should succeed");
+        let md = doc
+            .to_markdown(1, &options)
+            .expect("to_markdown page 1 should succeed");
 
         assert!(
             !md.contains('|'),
@@ -154,9 +165,9 @@ mod tests {
         // Verify that Arabic-script text is recognised as RTL by the function
         // used in the guard.  If this fails the guard itself is broken.
         let arabic_samples = [
-            "مرحبا",           // "Hello" in Arabic
-            "كيف حالك",        // "How are you"
-            "شكراً",           // "Thank you"
+            "مرحبا",                    // "Hello" in Arabic
+            "كيف حالك",                 // "How are you"
+            "شكراً",                     // "Thank you"
             "\u{0628}\u{064A}\u{062A}", // بيت (house)
         ];
         for sample in &arabic_samples {
@@ -178,10 +189,7 @@ mod tests {
         }
     }
 
-    fn collect_mcids(
-        elems: &[pdf_oxide::structure::types::StructElem],
-        out: &mut Vec<(u32, u32)>,
-    ) {
+    fn collect_mcids(elems: &[pdf_oxide::structure::types::StructElem], out: &mut Vec<(u32, u32)>) {
         for elem in elems {
             for child in &elem.children {
                 match child {

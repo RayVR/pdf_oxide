@@ -2441,9 +2441,8 @@ impl FontInfo {
                 // entry is NOT a definitive mapping — the CID-as-Unicode path gives the
                 // correct character (CID == Unicode codepoint).  Treat it as a CMap miss
                 // so we fall through to the Identity fallback below.
-                let effective_hit = raw_unicode.filter(|u| {
-                    *u != "\u{FFFD}" || !matches!(self.encoding, Encoding::Identity)
-                });
+                let effective_hit = raw_unicode
+                    .filter(|u| *u != "\u{FFFD}" || !matches!(self.encoding, Encoding::Identity));
 
                 if let Some(unicode) = effective_hit {
                     // Fix B: filter bare C0 control characters (U+0000–U+001F except
@@ -4369,7 +4368,9 @@ fn lookup_predefined_cmap(
     if cid > max_cid {
         log::debug!(
             "CID {} exceeds max {} for ordering '{}' → returning None (OOB)",
-            cid, max_cid, system_info.ordering
+            cid,
+            max_cid,
+            system_info.ordering
         );
         return None;
     }
@@ -7611,7 +7612,7 @@ mod tests {
             "<0000> <FFFF>\n",
             "endcodespacerange\n",
             "26 beginbfchar\n",
-            "<0041> <0041>\n",   // A
+            "<0041> <0041>\n", // A
             "<0042> <0042>\n",
             "<0043> <0043>\n",
             "<0044> <0044>\n",
@@ -7636,7 +7637,7 @@ mod tests {
             "<0057> <0057>\n",
             "<0058> <0058>\n",
             "<0059> <0059>\n",
-            "<005A> <005A>\n",   // Z
+            "<005A> <005A>\n", // Z
             "endbfchar\n",
             "endcmap\n",
             "CMapName currentdict /CMap defineresource pop\n",
@@ -7663,7 +7664,7 @@ mod tests {
             "<0000> <FFFF>\n",
             "endcodespacerange\n",
             "1 beginbfchar\n",
-            "<0001> <0007>\n",   // BEL control character
+            "<0001> <0007>\n", // BEL control character
             "endbfchar\n",
             "endcmap\n",
             "CMapName currentdict /CMap defineresource pop\n",
@@ -7719,11 +7720,7 @@ mod tests {
             ordering: "GB1".to_string(),
             supplement: 2,
         });
-        let font = make_type0_font(
-            Some(make_tounicode_az()),
-            "Identity-H",
-            cid_system_info,
-        );
+        let font = make_type0_font(Some(make_tounicode_az()), "Identity-H", cid_system_info);
 
         // Code 0x0061 ('a') is NOT in the ToUnicode CMap (which only covers A–Z).
         // The Priority-3 predefined CMap for Adobe-GB1 would map CID 97 to some
@@ -7802,11 +7799,7 @@ mod tests {
     /// The function must return U+FFFD, not the BEL character.
     #[test]
     fn test_fix_b_control_char_filter_returns_fffd() {
-        let font = make_type0_font(
-            Some(make_tounicode_bel()),
-            "Identity-H",
-            None,
-        );
+        let font = make_type0_font(Some(make_tounicode_bel()), "Identity-H", None);
 
         // Code 0x0001 maps to U+0007 (BEL) in the ToUnicode CMap.
         // Fix B must intercept this and return U+FFFD.

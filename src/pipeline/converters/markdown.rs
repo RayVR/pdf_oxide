@@ -3215,11 +3215,7 @@ mod tests {
             "spurious bold markers found in Arabic output: {:?}",
             result
         );
-        assert!(
-            result.contains("مرحبا"),
-            "Arabic text lost in output: {:?}",
-            result
-        );
+        assert!(result.contains("مرحبا"), "Arabic text lost in output: {:?}", result);
     }
 
     /// D7 — is_rtl_text / looks_rtl must return true for Arabic Unicode ranges
@@ -3227,29 +3223,17 @@ mod tests {
     #[test]
     fn test_rtl_detection_arabic_and_ascii() {
         // Arabic main block
-        assert!(
-            crate::text::bidi::looks_rtl("مرحبا"),
-            "Arabic U+0600-U+06FF must be RTL"
-        );
+        assert!(crate::text::bidi::looks_rtl("مرحبا"), "Arabic U+0600-U+06FF must be RTL");
         // Arabic Presentation Forms-B (common in PDFs using contextual forms)
         assert!(
             crate::text::bidi::looks_rtl("\u{FE80}"),
             "Arabic Presentation Forms-B U+FE80 must be RTL"
         );
         // Hebrew
-        assert!(
-            crate::text::bidi::looks_rtl("שלום"),
-            "Hebrew U+0590-U+05FF must be RTL"
-        );
+        assert!(crate::text::bidi::looks_rtl("שלום"), "Hebrew U+0590-U+05FF must be RTL");
         // Pure ASCII must not trigger the RTL path.
-        assert!(
-            !crate::text::bidi::looks_rtl("hello world"),
-            "ASCII must not be RTL"
-        );
-        assert!(
-            !crate::text::bidi::looks_rtl(""),
-            "empty string must not be RTL"
-        );
+        assert!(!crate::text::bidi::looks_rtl("hello world"), "ASCII must not be RTL");
+        assert!(!crate::text::bidi::looks_rtl(""), "empty string must not be RTL");
     }
 
     /// D7 — strip_inline_emphasis_in_rtl must remove `**…**` and `*…*`
@@ -3259,11 +3243,7 @@ mod tests {
     fn test_strip_inline_emphasis_removes_rtl_markers() {
         // `**bold**` around Arabic text → markers stripped
         let out = strip_inline_emphasis_in_rtl("**مرح**با");
-        assert!(
-            !out.contains("**"),
-            "bold markers must be stripped from Arabic: {:?}",
-            out
-        );
+        assert!(!out.contains("**"), "bold markers must be stripped from Arabic: {:?}", out);
         assert!(
             out.contains("مرح") && out.contains("با"),
             "Arabic chars must survive stripping: {:?}",
@@ -3272,11 +3252,7 @@ mod tests {
 
         // `*italic*` around Arabic text → markers stripped
         let out2 = strip_inline_emphasis_in_rtl("*مرحبا*");
-        assert!(
-            !out2.contains('*'),
-            "italic markers must be stripped from Arabic: {:?}",
-            out2
-        );
+        assert!(!out2.contains('*'), "italic markers must be stripped from Arabic: {:?}", out2);
         assert!(out2.contains("مرحبا"), "Arabic text lost: {:?}", out2);
 
         // Emphasis around LTR content must be preserved.

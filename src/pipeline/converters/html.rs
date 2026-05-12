@@ -474,8 +474,7 @@ impl HtmlOutputConverter {
             if i > 0 {
                 let prev = &cell.spans[i - 1];
                 let has_gap = super::has_horizontal_gap(prev, span);
-                let already_has_space =
-                    out.ends_with(' ') || span.text.starts_with(' ');
+                let already_has_space = out.ends_with(' ') || span.text.starts_with(' ');
                 if has_gap && !already_has_space {
                     out.push(' ');
                 }
@@ -1009,8 +1008,10 @@ mod tests {
         use crate::structure::table_extractor::TableCell;
         let mut cell = TableCell::new(String::new(), false);
         // Place spans directly adjacent: span1 ends at x=50, span2 starts at x=50.
-        cell.spans.push(make_raw_span("hello", 0.0, 0.0, 50.0, 12.0, FontWeight::Normal, false));
-        cell.spans.push(make_raw_span(" world", 50.0, 0.0, 50.0, 12.0, FontWeight::Normal, false));
+        cell.spans
+            .push(make_raw_span("hello", 0.0, 0.0, 50.0, 12.0, FontWeight::Normal, false));
+        cell.spans
+            .push(make_raw_span(" world", 50.0, 0.0, 50.0, 12.0, FontWeight::Normal, false));
         let result = HtmlOutputConverter::render_cell_html(&cell);
         // No gap inserted since span2 already starts with a space.
         assert_eq!(result, "hello world");
@@ -1020,7 +1021,8 @@ mod tests {
     fn test_render_cell_html_bold_span() {
         use crate::structure::table_extractor::TableCell;
         let mut cell = TableCell::new(String::new(), false);
-        cell.spans.push(make_raw_span("Total", 0.0, 0.0, 30.0, 12.0, FontWeight::Bold, false));
+        cell.spans
+            .push(make_raw_span("Total", 0.0, 0.0, 30.0, 12.0, FontWeight::Bold, false));
         let result = HtmlOutputConverter::render_cell_html(&cell);
         assert_eq!(result, "<strong>Total</strong>");
     }
@@ -1029,7 +1031,8 @@ mod tests {
     fn test_render_cell_html_italic_span() {
         use crate::structure::table_extractor::TableCell;
         let mut cell = TableCell::new(String::new(), false);
-        cell.spans.push(make_raw_span("Note", 0.0, 0.0, 25.0, 12.0, FontWeight::Normal, true));
+        cell.spans
+            .push(make_raw_span("Note", 0.0, 0.0, 25.0, 12.0, FontWeight::Normal, true));
         let result = HtmlOutputConverter::render_cell_html(&cell);
         assert_eq!(result, "<em>Note</em>");
     }
@@ -1038,7 +1041,8 @@ mod tests {
     fn test_render_cell_html_bold_italic_span() {
         use crate::structure::table_extractor::TableCell;
         let mut cell = TableCell::new(String::new(), false);
-        cell.spans.push(make_raw_span("Warn", 0.0, 0.0, 25.0, 12.0, FontWeight::Bold, true));
+        cell.spans
+            .push(make_raw_span("Warn", 0.0, 0.0, 25.0, 12.0, FontWeight::Bold, true));
         let result = HtmlOutputConverter::render_cell_html(&cell);
         assert_eq!(result, "<strong><em>Warn</em></strong>");
     }
@@ -1048,8 +1052,10 @@ mod tests {
         // Span1 ends at x=30, span2 starts at x=35. Gap=5 > 12*0.15=1.8 → space inserted.
         use crate::structure::table_extractor::TableCell;
         let mut cell = TableCell::new(String::new(), false);
-        cell.spans.push(make_raw_span("Label", 0.0, 0.0, 30.0, 12.0, FontWeight::Normal, false));
-        cell.spans.push(make_raw_span("Value", 35.0, 0.0, 30.0, 12.0, FontWeight::Normal, false));
+        cell.spans
+            .push(make_raw_span("Label", 0.0, 0.0, 30.0, 12.0, FontWeight::Normal, false));
+        cell.spans
+            .push(make_raw_span("Value", 35.0, 0.0, 30.0, 12.0, FontWeight::Normal, false));
         let result = HtmlOutputConverter::render_cell_html(&cell);
         assert_eq!(result, "Label Value", "Gap should produce a space: {}", result);
     }
@@ -1059,8 +1065,10 @@ mod tests {
         // Span1 ends at x=30, span2 starts at x=30. Gap=0 → no space inserted.
         use crate::structure::table_extractor::TableCell;
         let mut cell = TableCell::new(String::new(), false);
-        cell.spans.push(make_raw_span("foo", 0.0, 0.0, 30.0, 12.0, FontWeight::Normal, false));
-        cell.spans.push(make_raw_span("bar", 30.0, 0.0, 30.0, 12.0, FontWeight::Normal, false));
+        cell.spans
+            .push(make_raw_span("foo", 0.0, 0.0, 30.0, 12.0, FontWeight::Normal, false));
+        cell.spans
+            .push(make_raw_span("bar", 30.0, 0.0, 30.0, 12.0, FontWeight::Normal, false));
         let result = HtmlOutputConverter::render_cell_html(&cell);
         assert_eq!(result, "foobar", "No gap should produce no space: {}", result);
     }
@@ -1070,8 +1078,10 @@ mod tests {
         // A bold label with a gap before a plain value — matches real table cell pattern.
         use crate::structure::table_extractor::TableCell;
         let mut cell = TableCell::new(String::new(), false);
-        cell.spans.push(make_raw_span("Subtotal", 0.0, 0.0, 40.0, 12.0, FontWeight::Bold, false));
-        cell.spans.push(make_raw_span("500.00", 50.0, 0.0, 35.0, 12.0, FontWeight::Normal, false));
+        cell.spans
+            .push(make_raw_span("Subtotal", 0.0, 0.0, 40.0, 12.0, FontWeight::Bold, false));
+        cell.spans
+            .push(make_raw_span("500.00", 50.0, 0.0, 35.0, 12.0, FontWeight::Normal, false));
         let result = HtmlOutputConverter::render_cell_html(&cell);
         assert_eq!(result, "<strong>Subtotal</strong> 500.00", "Result: {}", result);
     }
@@ -1083,7 +1093,8 @@ mod tests {
         let mut table = Table::new();
         let mut row = TableRow::new(false);
         let mut cell = TableCell::new(String::new(), false);
-        cell.spans.push(make_raw_span("Total", 0.0, 0.0, 30.0, 12.0, FontWeight::Bold, false));
+        cell.spans
+            .push(make_raw_span("Total", 0.0, 0.0, 30.0, 12.0, FontWeight::Bold, false));
         row.add_cell(cell);
         table.add_row(row);
 

@@ -116,21 +116,6 @@ fn is_fullwidth_or_math_op(c: char) -> bool {
     )
 }
 
-/// Clause-boundary delimiters that always warrant a space even next to CJK text.
-/// Parentheses, brackets, and quotation marks mark syntactic boundaries and must
-/// not have their surrounding space suppressed by the CJK gap-suppression logic.
-fn is_clause_delimiter(c: char) -> bool {
-    matches!(c,
-        '(' | ')' | '[' | ']' | '{' | '}' |
-        '\u{FF08}' | '\u{FF09}' | // （ ）fullwidth parens
-        '\u{FF3B}' | '\u{FF3D}' | // ［ ］fullwidth brackets
-        '\u{300C}' | '\u{300D}' | // 「 」corner brackets
-        '\u{300E}' | '\u{300F}' | // 『 』white corner brackets
-        '\u{2018}' | '\u{2019}' | // ' ' single smart quotes
-        '\u{201C}' | '\u{201D}'   // " " double smart quotes
-    )
-}
-
 /// Check whether two horizontally adjacent spans have a visible gap between them.
 ///
 /// Returns `true` when the horizontal distance between the end of `prev` and
@@ -427,33 +412,36 @@ mod tests {
     #[test]
     fn test_has_horizontal_gap_cjk_cjk_suppressed() {
         // CJK char followed by CJK char with a gap > 0.15em → no space.
-        let prev = make_span(0.0, 10.0, "数");   // ends with CJK
-        let curr = make_span(12.0, 10.0, "学");  // starts with CJK; gap = 2.0 > 1.5
-        assert!(!has_horizontal_gap(&prev, &curr),
-            "CJK→CJK should suppress space insertion");
+        let prev = make_span(0.0, 10.0, "数"); // ends with CJK
+        let curr = make_span(12.0, 10.0, "学"); // starts with CJK; gap = 2.0 > 1.5
+        assert!(!has_horizontal_gap(&prev, &curr), "CJK→CJK should suppress space insertion");
     }
 
     #[test]
     fn test_has_horizontal_gap_cjk_fullwidth_suppressed() {
         // CJK char followed by fullwidth operator → no space.
-        let prev = make_span(0.0, 10.0, "Q");    // ends with ASCII (not CJK alone)
-        // override: use a CJK ending character
+        let prev = make_span(0.0, 10.0, "Q"); // ends with ASCII (not CJK alone)
+                                              // override: use a CJK ending character
         let prev_cjk = make_span(0.0, 10.0, "量");
-        let curr = make_span(12.0, 10.0, "＜");  // starts with fullwidth '<'; gap = 2.0
-        assert!(!has_horizontal_gap(&prev_cjk, &curr),
-            "CJK→fullwidth-op should suppress space insertion");
+        let curr = make_span(12.0, 10.0, "＜"); // starts with fullwidth '<'; gap = 2.0
+        assert!(
+            !has_horizontal_gap(&prev_cjk, &curr),
+            "CJK→fullwidth-op should suppress space insertion"
+        );
         let _ = prev; // silence unused warning
     }
 
     #[test]
     fn test_has_horizontal_gap_fullwidth_cjk_suppressed() {
         // Fullwidth operator followed by CJK char → no space.
-        let prev = make_span(0.0, 10.0, "≤");   // ends with math op
-        let curr = make_span(12.0, 10.0, "Q");  // pure ASCII start — not suppressed
-        // For suppression we need curr to start with CJK
+        let prev = make_span(0.0, 10.0, "≤"); // ends with math op
+        let curr = make_span(12.0, 10.0, "Q"); // pure ASCII start — not suppressed
+                                               // For suppression we need curr to start with CJK
         let curr_cjk = make_span(12.0, 10.0, "量");
-        assert!(!has_horizontal_gap(&prev, &curr_cjk),
-            "fullwidth-op→CJK should suppress space insertion");
+        assert!(
+            !has_horizontal_gap(&prev, &curr_cjk),
+            "fullwidth-op→CJK should suppress space insertion"
+        );
         let _ = curr; // silence unused warning
     }
 
@@ -462,8 +450,10 @@ mod tests {
         // Latin→Latin: gap-based logic unchanged — gap > threshold → true.
         let prev = make_span(0.0, 10.0, "hello");
         let curr = make_span(12.0, 10.0, "world"); // gap = 2.0 > 1.5
-        assert!(has_horizontal_gap(&prev, &curr),
-            "Latin→Latin with gap > threshold should still insert space");
+        assert!(
+            has_horizontal_gap(&prev, &curr),
+            "Latin→Latin with gap > threshold should still insert space"
+        );
     }
 
     #[test]
@@ -471,8 +461,10 @@ mod tests {
         // Latin→Latin: gap ≤ threshold → false (no change from CJK fix).
         let prev = make_span(0.0, 10.0, "hello");
         let curr = make_span(11.0, 10.0, "world"); // gap = 1.0 < 1.5
-        assert!(!has_horizontal_gap(&prev, &curr),
-            "Latin→Latin below threshold should not insert space");
+        assert!(
+            !has_horizontal_gap(&prev, &curr),
+            "Latin→Latin below threshold should not insert space"
+        );
     }
 
     #[test]
@@ -480,7 +472,9 @@ mod tests {
         // Two pure math operators (neither is CJK): gap-based logic unchanged.
         let prev = make_span(0.0, 10.0, "≤");
         let curr = make_span(12.0, 10.0, "≥"); // gap = 2.0 > 1.5; neither is CJK
-        assert!(has_horizontal_gap(&prev, &curr),
-            "math-op→math-op (no CJK) should still apply gap-based logic");
+        assert!(
+            has_horizontal_gap(&prev, &curr),
+            "math-op→math-op (no CJK) should still apply gap-based logic"
+        );
     }
 }
