@@ -463,7 +463,13 @@ impl MarkdownOutputConverter {
                             active_italic = is_italic;
                         }
 
-                        let mut text = span.text.replace('|', "\\|").replace('\n', " ");
+                        // Apply column-spanning-decimal split (issue 487
+                        // nougat_018): sailing-score cells emitted as a
+                        // single Tj "1.10" with sparse char_widths split
+                        // into two tokens "1 10".
+                        let mut processed_text = String::new();
+                        crate::document::PdfDocument::push_span_text(&mut processed_text, span);
+                        let mut text = processed_text.replace('|', "\\|").replace('\n', " ");
                         let just_opened = is_bold || is_italic;
                         if just_opened && (cell_md.ends_with("**") || cell_md.ends_with('*')) {
                             while text.starts_with(' ') {
@@ -900,7 +906,13 @@ impl MarkdownOutputConverter {
                 continue;
             }
 
-            let mut text_str = span.span.text.clone();
+            // Apply column-spanning-decimal / char_widths-boundary split
+            // (issue 487 nougat_018).  Mirrors `push_span_text` in the text
+            // extractor so sailing-score cells like "1.10" (sparse cw,
+            // really `1` + `10` in adjacent columns) split into two tokens
+            // for markdown output too.
+            let mut text_str = String::new();
+            crate::document::PdfDocument::push_span_text(&mut text_str, &span.span);
 
             // Normalize known mis-extracted bullet glyphs (DEL from Zapf
             // Dingbats mappings, ❍ from ligature remaps) to U+2022 so the
@@ -1027,7 +1039,12 @@ impl MarkdownOutputConverter {
                     if !result.ends_with(' ') && !result.ends_with('\n') {
                         result.push(' ');
                     }
-                    result.push_str(&orphan.span.text);
+                    // Apply column-spanning-decimal / char_widths-boundary
+                    // split (issue 487 nougat_018): orphan score spans
+                    // emitted as "25.10" with sparse cw split into "25 10".
+                    let mut processed = String::new();
+                    crate::document::PdfDocument::push_span_text(&mut processed, &orphan.span);
+                    result.push_str(&processed);
                 }
             }
         }
@@ -1108,6 +1125,18 @@ impl MarkdownOutputConverter {
         // detector emits around Arabic contextual glyph forms — is
         // safe and stays.
         if crate::text::bidi::looks_rtl(&final_result) {
+            // `str::lines()` strips trailing newlines, so `join("\n")` would
+            // silently drop a terminal `\n` (or `\n\n`) that the whitespace
+            // normalisation step above carefully preserved.  Restore the
+            // suffix after reassembly so callers see a consistent document.
+            let trailing_newlines: String = final_result
+                .chars()
+                .rev()
+                .take_while(|&c| c == '\n')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             final_result = final_result
                 .lines()
                 .map(|line| {
@@ -1119,6 +1148,9 @@ impl MarkdownOutputConverter {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            if !trailing_newlines.is_empty() {
+                final_result.push_str(&trailing_newlines);
+            }
         }
 
         Ok(final_result)
@@ -3179,6 +3211,98 @@ mod tests {
             result.contains("Grand Total $750.00"),
             "Should merge label with value on same line: {:?}",
             result,
+        );
+    }
+
+    /// D7 — Arabic text with Bold font-weight must NOT produce `**` markers in
+    /// the markdown output.  Reproduces the right_to_left_02 fixture where
+    /// contextual glyph forms (initial/medial/final) triggered the bold
+    /// detector, inserting spurious `**مرح**با` fragments.
+    #[test]
+    fn test_arabic_bold_span_no_spurious_bold_markers() {
+        let converter = MarkdownOutputConverter::new();
+        let config = TextPipelineConfig::default();
+        // Even when the font is reported as Bold, Arabic text must NOT be
+        // wrapped in `**…**` in the final markdown (the bold detector fires on
+        // Latin-font-weight heuristics that are unreliable for Arabic glyphs).
+        let span = make_span("مرحبا", 0.0, 100.0, 12.0, FontWeight::Bold);
+        let result = converter.convert(&[span], &config).unwrap();
+        assert!(
+            !result.contains("**"),
+            "spurious bold markers found in Arabic output: {:?}",
+            result
+        );
+        assert!(result.contains("مرحبا"), "Arabic text lost in output: {:?}", result);
+    }
+
+    /// D7 — is_rtl_text / looks_rtl must return true for Arabic Unicode ranges
+    /// and false for ASCII.  Pins the detector contract used by the converter.
+    #[test]
+    fn test_rtl_detection_arabic_and_ascii() {
+        // Arabic main block
+        assert!(crate::text::bidi::looks_rtl("مرحبا"), "Arabic U+0600-U+06FF must be RTL");
+        // Arabic Presentation Forms-B (common in PDFs using contextual forms)
+        assert!(
+            crate::text::bidi::looks_rtl("\u{FE80}"),
+            "Arabic Presentation Forms-B U+FE80 must be RTL"
+        );
+        // Hebrew
+        assert!(crate::text::bidi::looks_rtl("שלום"), "Hebrew U+0590-U+05FF must be RTL");
+        // Pure ASCII must not trigger the RTL path.
+        assert!(!crate::text::bidi::looks_rtl("hello world"), "ASCII must not be RTL");
+        assert!(!crate::text::bidi::looks_rtl(""), "empty string must not be RTL");
+    }
+
+    /// D7 — strip_inline_emphasis_in_rtl must remove `**…**` and `*…*`
+    /// markers when the inner content is RTL (Arabic / Hebrew) and preserve
+    /// them when the inner content is LTR.
+    #[test]
+    fn test_strip_inline_emphasis_removes_rtl_markers() {
+        // `**bold**` around Arabic text → markers stripped
+        let out = strip_inline_emphasis_in_rtl("**مرح**با");
+        assert!(!out.contains("**"), "bold markers must be stripped from Arabic: {:?}", out);
+        assert!(
+            out.contains("مرح") && out.contains("با"),
+            "Arabic chars must survive stripping: {:?}",
+            out
+        );
+
+        // `*italic*` around Arabic text → markers stripped
+        let out2 = strip_inline_emphasis_in_rtl("*مرحبا*");
+        assert!(!out2.contains('*'), "italic markers must be stripped from Arabic: {:?}", out2);
+        assert!(out2.contains("مرحبا"), "Arabic text lost: {:?}", out2);
+
+        // Emphasis around LTR content must be preserved.
+        let out3 = strip_inline_emphasis_in_rtl("*Hello*");
+        assert_eq!(out3, "*Hello*", "LTR emphasis must be preserved: {:?}", out3);
+
+        // No asterisks → identity.
+        let out4 = strip_inline_emphasis_in_rtl("مرحبا");
+        assert_eq!(out4, "مرحبا", "no-asterisk path must be identity: {:?}", out4);
+    }
+
+    /// D7 — the RTL emphasis cleanup block must preserve the trailing newline
+    /// that the whitespace-normalisation pass added.  Previously `lines().join()`
+    /// silently dropped the terminal `\n`, corrupting multi-paragraph documents.
+    #[test]
+    fn test_rtl_cleanup_preserves_trailing_newline() {
+        let converter = MarkdownOutputConverter::new();
+        let config = TextPipelineConfig::default();
+        // Two Arabic paragraphs separated by `\n\n`.  The result must end with
+        // the same suffix the normaliser emits (a single `\n` in default mode).
+        let mut s1 = make_span("مرحبا", 0.0, 200.0, 12.0, FontWeight::Normal);
+        s1.block_id = Some(1);
+        let mut s2 = make_span("عالم", 0.0, 100.0, 12.0, FontWeight::Normal);
+        s2.block_id = Some(2);
+        let result = converter.convert(&[s1, s2], &config).unwrap();
+        // Must contain both words.
+        assert!(result.contains("مرحبا"), "first Arabic word lost: {:?}", result);
+        assert!(result.contains("عالم"), "second Arabic word lost: {:?}", result);
+        // Result must end with a newline (the document-level trailing `\n`).
+        assert!(
+            result.ends_with('\n'),
+            "trailing newline was dropped by RTL cleanup: {:?}",
+            result
         );
     }
 }

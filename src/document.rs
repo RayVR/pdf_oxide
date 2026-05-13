@@ -393,9 +393,12 @@ pub struct PdfDocument {
     pub(crate) xobject_stream_cache_bytes: AtomicUsize,
     /// Cache of extracted TextSpan results from self-contained Form XObjects
     /// (those with own /Resources/Font). None = processed but no spans.
+    /// Key is `(ObjectRef, [i64; 6])` where the array encodes the caller's CTM
+    /// as millipoint-rounded integers, allowing the same Form XObject to cache
+    /// distinct results for each unique CTM it is painted with.
     /// Bounded at [`DEFAULT_XOBJECT_CACHE_MAX_ENTRIES`] entries with FIFO eviction.
     pub(crate) xobject_spans_cache:
-        Mutex<BoundedEntryCache<ObjectRef, Option<Vec<crate::layout::TextSpan>>>>,
+        Mutex<BoundedEntryCache<(ObjectRef, [i64; 6]), Option<Vec<crate::layout::TextSpan>>>>,
     /// Cache of extracted images from Form XObjects (keyed by ObjectRef).
     /// Images are stored without CTM applied — caller applies its own CTM.
     /// Bounded at [`DEFAULT_XOBJECT_CACHE_MAX_ENTRIES`] entries with FIFO eviction.
@@ -1781,6 +1784,26 @@ impl PdfDocument {
         }
     }
 
+    /// Resolve a single-level indirect reference (PDF spec §7.3.10).
+    ///
+    /// If `obj` is `Object::Reference(...)`, loads and returns the target object.
+    /// For any other object type, returns a clone unchanged.  This is the
+    /// canonical way to handle "any value may be a direct or indirect reference"
+    /// throughout the parser.
+    fn resolve_obj_ref(&self, obj: &Object) -> Object {
+        if let Some(obj_ref) = obj.as_reference() {
+            match self.load_object(obj_ref) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    log::warn!("Failed to resolve indirect reference {:?}: {}", obj_ref, e);
+                    obj.clone()
+                },
+            }
+        } else {
+            obj.clone()
+        }
+    }
+
     /// Peek at an XObject's /Subtype without loading the full object.
     /// Returns true if the XObject is a Form XObject, false if Image or unknown.
     /// For compressed objects or on any error, returns true (conservative — will load fully).
@@ -3106,9 +3129,14 @@ impl PdfDocument {
             .as_dict()
             .ok_or_else(|| Error::InvalidPdf("Page is not a dictionary".to_string()))?;
 
-        let media_box = page_dict
+        // Resolve indirect reference if present — PDF spec §7.3.10 permits any value
+        // to be an indirect reference, e.g. `/MediaBox 174 0 R` where 174 0 R is `[0 0 612 792]`.
+        let media_box_obj_raw = page_dict
             .get("MediaBox")
-            .and_then(|o| o.as_array())
+            .ok_or_else(|| Error::InvalidPdf("MediaBox not found or not an array".to_string()))?;
+        let media_box_obj = self.resolve_obj_ref(media_box_obj_raw);
+        let media_box = media_box_obj
+            .as_array()
             .ok_or_else(|| Error::InvalidPdf("MediaBox not found or not an array".to_string()))?;
 
         if media_box.len() < 4 {
@@ -4203,14 +4231,27 @@ impl PdfDocument {
             base_spans = base_spans.filter_by_rect(region, mode);
         }
 
-        // Structure tree: check MarkInfo first (cheap) to skip non-tagged PDFs.
+        // Structure tree: try to load when MarkInfo says "marked" OR when the
+        // catalog directly references a StructTreeRoot (PDF 1.4 documents such
+        // as hello_structure.pdf predate the MarkInfo dictionary but are still
+        // valid tagged PDFs per §14.7.1).  Checking the catalog for
+        // /StructTreeRoot is cheap — it's a single dictionary key lookup.
         let cached_tree = {
             let cached = self.structure_tree_cache.lock_or_recover().clone();
             match cached {
                 Some(tree) => tree,
                 None => {
                     let is_marked = self.mark_info().map(|m| m.marked).unwrap_or(false);
-                    let tree = if is_marked {
+                    // Fall back to checking the catalog directly when MarkInfo is
+                    // absent or /Marked is false — presence of /StructTreeRoot is
+                    // authoritative for "is this a tagged PDF" per the spec.
+                    let has_struct_tree_root = !is_marked
+                        && self
+                            .catalog()
+                            .ok()
+                            .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
+                            .unwrap_or(false);
+                    let tree = if is_marked || has_struct_tree_root {
                         self.structure_tree().ok().flatten().map(Arc::new)
                     } else {
                         None
@@ -4224,7 +4265,10 @@ impl PdfDocument {
 
         // Table detection uses base spans only (no widget spans).
         let tables = if options.extract_tables {
-            self.extract_page_tables(page_index, &base_spans, options)
+            // text_fallback=false: extract_text preserves the pre-v0.3.47 behaviour
+            // where line-less pages return no tables.  Only the structured-output
+            // converters (to_markdown, to_html) opt in to text-only spatial fallback.
+            self.extract_page_tables(page_index, &base_spans, options, false)
         } else {
             Vec::new()
         };
@@ -4345,7 +4389,7 @@ impl PdfDocument {
                     // Using per-cell bboxes (rather than the coarser table bbox) prevents
                     // dropping paragraph spans that lie inside the table's outer bounding
                     // box but were not captured as table cells by the spatial detector.
-                    tables.iter().any(|t| {
+                    if tables.iter().any(|t| {
                         t.rows.iter().any(|r| {
                             r.cells.iter().any(|c| {
                                 c.bbox.is_some_and(|b| {
@@ -4356,6 +4400,37 @@ impl PdfDocument {
                                     )
                                 })
                             })
+                        })
+                    }) {
+                        return true;
+                    }
+                    // Fallback: text-based match. The bbox check above uses
+                    // a tight 0.1pt tolerance and rejects spans whose font
+                    // ascent extends slightly above the cell's ink box (issue
+                    // 484: "FY 15 1st Q TTL" labels in JAL traffic table —
+                    // span height = font_size = 10.7pt, but cell bbox height
+                    // = 15.96pt covers two ink rows so the label glyphs reach
+                    // ~0.4pt above the cell's top edge). When a span's
+                    // trimmed text exactly matches some cell's text, the cell
+                    // already owns it — keeping it in flow would duplicate.
+                    let trimmed = s.text.trim();
+                    if trimmed.is_empty() {
+                        return false;
+                    }
+                    if !table_cell_texts.contains(trimmed) {
+                        return false;
+                    }
+                    // Require spatial proximity: the span must lie inside
+                    // some table's outer bbox so we don't drop body text that
+                    // coincidentally matches a cell's text elsewhere on the page.
+                    tables.iter().any(|t| {
+                        t.bbox.is_some_and(|tb| {
+                            let cx = s.bbox.x + s.bbox.width / 2.0;
+                            let cy = s.bbox.y + s.bbox.height / 2.0;
+                            cx >= tb.x - RETAIN_TOLERANCE
+                                && cx <= tb.x + tb.width + RETAIN_TOLERANCE
+                                && cy >= tb.y - RETAIN_TOLERANCE
+                                && cy <= tb.y + tb.height + RETAIN_TOLERANCE
                         })
                     })
                 };
@@ -4658,19 +4733,14 @@ impl PdfDocument {
         let final_text = Self::normalize_arabic_presentation_forms(&final_text);
 
         // Apply whitespace cleanup
-        let mut cleaned_text = crate::converters::whitespace::cleanup_plain_text(&final_text);
+        let cleaned_text = crate::converters::whitespace::cleanup_plain_text(&final_text);
 
-        // Tagged PDFs use their own structure-tree traversal path and
-        // still need the historical end-of-page table block. Untagged
-        // PDFs now inline tables with the flow spans above, so the
-        // end-of-page dump is only run when we came through the
-        // structure-tree branch.
-        if cached_tree.is_some() && !tables.is_empty() {
-            for table in tables {
-                cleaned_text.push_str("\n\n");
-                cleaned_text.push_str(&table.render_text());
-            }
-        }
+        // For tagged PDFs, the structure-tree traversal at line 4306 already
+        // captures all table-cell content via MCIDs. Appending tables here
+        // would double-emit that content (structure-tree text + table render),
+        // dropping precision. For untagged PDFs, tables are inlined via
+        // pending_tables above, so this block is never reached (cached_tree
+        // is None → condition would be false). The block is removed.
 
         // #317 UTF-8 mojibake repair: a run of Latin-1 Supplement chars
         // whose raw bytes form valid UTF-8 decoding to non-Latin-1 code
@@ -5598,6 +5668,8 @@ impl PdfDocument {
                 | 0x4E00..=0x9FFF // CJK Unified Ideographs
                 | 0xAC00..=0xD7AF // Hangul Syllables
                 | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+                | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+                | 0x3000..=0x303F // CJK Symbols and Punctuation
             )
         };
         if prev_tail.is_some_and(is_cjk) && curr_head.is_some_and(is_cjk) {
@@ -5608,14 +5680,63 @@ impl PdfDocument {
         let prev_end_x = prev.bbox.x + prev.bbox.width;
         let gap = current.bbox.x - prev_end_x;
 
+        // CJK script ↔ non-CJK boundary: pdftotext (and the GT it produces)
+        // inserts a space wherever a CJK *script* glyph (ideograph, kana, or
+        // hangul) meets a Latin/digit character on the same line, regardless
+        // of how tightly the two were typeset.  Without this, mixed-script
+        // content like "神鹰集团" + "2015" collapses into one token
+        // "神鹰集团2015", which never matches GT's separate "神鹰集团" and
+        // "2015" tokens (issue 484, pr-136).
+        //
+        // IMPORTANT: this MUST exclude fullwidth ASCII variants (U+FF01..FF5E
+        // — ＜＞＝＠ etc.) and CJK Symbols and Punctuation (U+3000..303F) even
+        // though they are technically "CJK characters".  Those are *operator*
+        // glyphs that sit inline with adjacent digits and Latin in CJK
+        // technical documents — pdftotext keeps "60000≤Q＜80000" and
+        // "20＜μ≤30" as compound tokens (issue 484, issue-336).  Forcing a
+        // boundary space there destroys the compound and regresses Jaccard.
+        let is_cjk_script = |c: char| {
+            matches!(
+                c as u32,
+                0x3040..=0x309F      // Hiragana
+                | 0x30A0..=0x30FF    // Katakana
+                | 0x3400..=0x4DBF    // CJK Unified Ideographs Extension A
+                | 0x4E00..=0x9FFF    // CJK Unified Ideographs
+                | 0xAC00..=0xD7AF    // Hangul Syllables
+                | 0x20000..=0x2A6DF  // CJK Unified Ideographs Extension B
+                | 0xFF66..=0xFF9F    // Halfwidth Katakana
+            )
+        };
+        let crosses_cjk_boundary = match (prev_tail, curr_head) {
+            (Some(p), Some(c)) => is_cjk_script(p) != is_cjk_script(c),
+            _ => false,
+        };
+        // ASCII punctuation hugs the preceding token in every script —
+        // pdftotext's GT renders "する." with no space and "神鹰，2015"
+        // with no space before the comma either.  Suppress the boundary
+        // forced-space when the transitioning glyph IS the punctuation;
+        // the space-threshold path below still handles real gaps.
+        let is_clause_punct =
+            |c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}');
+        let punct_at_boundary = curr_head.is_some_and(is_clause_punct)
+            || prev_tail.is_some_and(|c| matches!(c, '(' | '[' | '{'));
+        if crosses_cjk_boundary && !punct_at_boundary && gap > -0.5 && gap < font_size * 5.0 {
+            return true;
+        }
+
         // Space threshold: 0.15 × font size
         // Typical space width is ~0.25em, so 0.15em catches gaps > 60% of a space.
         // This aligns with the text extractor's font-aware threshold (~50% of space width).
         let space_threshold = font_size * 0.15;
 
-        // Insert space if gap is significant
-        // Also check that gap is not too large (might indicate column boundary)
-        gap > space_threshold && gap < font_size * 5.0
+        // Insert space if gap is significant.  Previously the upper bound was
+        // `gap < font_size * 5.0` on the rationale that very large gaps mean
+        // "column boundary, no space needed" — but downstream the caller
+        // concatenates the two spans together when this returns false, so
+        // "column boundary" actually rendered as `3.80%4.41%` on wide rate
+        // tables (issue 487 pr-138-example.pdf).  Drop the upper bound so any
+        // gap above the inter-glyph threshold gets at least a single space.
+        gap > space_threshold
     }
 
     /// Detect a span whose text is `N.M` (all-digit groups around one dot) and whose
@@ -5623,7 +5744,7 @@ impl PdfDocument {
     /// sailing-score / competition-table PDFs where two adjacent columns (e.g. Q8=1,
     /// F9=10) are stored as a single Tj text run "1.10" spanning both column cells.
     /// kreuzberg's GT tokenises them as separate words; we must split at the dot.
-    fn is_column_spanning_decimal(span: &TextSpan) -> bool {
+    pub(crate) fn is_column_spanning_decimal(span: &TextSpan) -> bool {
         let text = &span.text;
         let dot_pos = match text.find('.') {
             Some(p) if p > 0 && p < text.len() - 1 => p,
@@ -5639,6 +5760,21 @@ impl PdfDocument {
             return false;
         }
         let char_count = text.chars().count();
+        // Signal 1: sparse char_widths array.  When the font's glyph
+        // iteration produces fewer advance-width entries than there are
+        // characters in the decoded string, the span was assembled from two
+        // (or more) concatenated Tj runs whose widths come from different
+        // points in the glyph table.  This is the exact pattern issue 487
+        // nougat_018 sailing-score grids hit: each score cell is emitted as
+        // a single Tj like `1.10` with `char_widths=[w]` while the PDF
+        // semantically means "1" followed by "10" in adjacent score
+        // columns.  bbox.width can still be tight here (the producer set
+        // it to cover just the rendered glyph run), so the existing
+        // bbox-inflation check below misses these.  Catch them via the
+        // sparse-cw signal directly.
+        if !span.char_widths.is_empty() && span.char_widths.len() < char_count {
+            return true;
+        }
         let expected_width = if !span.char_widths.is_empty() {
             let cw_sum: f32 = span.char_widths.iter().sum();
             cw_sum * (char_count as f32 / span.char_widths.len() as f32)
@@ -5665,7 +5801,7 @@ impl PdfDocument {
     /// where "Theorem" widths come from the font's glyph table and "1.7" doesn't have
     /// matching glyph entries).  Return the byte offset at which to insert a space,
     /// or None if no split is appropriate.
-    fn char_widths_boundary_split(span: &TextSpan) -> Option<usize> {
+    pub(crate) fn char_widths_boundary_split(span: &TextSpan) -> Option<usize> {
         let cw_len = span.char_widths.len();
         if cw_len == 0 {
             return None;
@@ -5875,7 +6011,7 @@ impl PdfDocument {
     /// Priority 1: column-spanning decimal (nougat_018 sailing tables).
     /// Priority 2: char_widths boundary split (pdfa_004 CID-font merge artifacts).
     #[inline]
-    fn push_span_text(out: &mut String, span: &TextSpan) {
+    pub(crate) fn push_span_text(out: &mut String, span: &TextSpan) {
         // A span whose entire text is one or more newline/CR characters is a
         // ToUnicode line-break signal.  Treat it as a logical newline separator rather
         // than emitting the raw control characters verbatim as visible content.
@@ -6283,29 +6419,36 @@ impl PdfDocument {
                 }
             }
 
-            // Only subtypes whose /Contents is rendered as visible page content.
-            // Per ISO 32000-1 §12.5.6.2 (Table 166), the /Contents key in ALL markup
-            // Per ISO 32000-1 §12.5.6.2 (Table 166), the /Contents of markup
-            // annotations — including Highlight, Underline, StrikeOut, Squiggly,
-            // Ink, Caret, FileAttachment, Redact, and geometric shapes (Line,
-            // Circle, Square, Polygon, PolyLine) — is popup/comment text written
-            // by a reviewer, NOT text displayed on the page. Only FreeText, Text
-            // (note icon), and Stamp annotations have /Contents that represents the
-            // annotation's visible label or overlay.
-            let has_contents = matches!(subtype_lc.as_str(), "text" | "freetext" | "stamp");
-            if !has_contents {
+            // Only FreeText and Stamp have /Contents representing visible page text.
+            // Text (sticky-note) /Contents is reviewer comment text shown in a pop-up
+            // window, not rendered on the page — exclude it to avoid injecting popup
+            // notes into the body text stream.
+            // For FreeText/Stamp: try /Contents first; fall back to AP stream so that
+            // Stamp annotations with empty /Contents but a rendered AP stream are included.
+            let is_visible = matches!(subtype_lc.as_str(), "freetext" | "stamp");
+            if !is_visible {
                 continue;
             }
 
-            let text = match dict.get("Contents") {
-                Some(Object::String(s)) => {
+            let text = {
+                let from_contents = if let Some(Object::String(s)) = dict.get("Contents") {
                     let decoded = Self::decode_pdf_text_string(s).trim().to_string();
                     if decoded.is_empty() {
-                        continue;
+                        None
+                    } else {
+                        Some(decoded)
                     }
-                    decoded
-                },
-                _ => continue,
+                } else {
+                    None
+                };
+                if let Some(t) = from_contents {
+                    t
+                } else {
+                    match self.extract_text_from_ap_stream(&dict) {
+                        Some(ap_text) if !ap_text.trim().is_empty() => ap_text.trim().to_string(),
+                        _ => continue,
+                    }
+                }
             };
 
             // Use /Rect as the annotation's bounding box.
@@ -6535,7 +6678,7 @@ impl PdfDocument {
                     // Skip them here to avoid duplicate text at the end of output.
                     continue;
                 },
-                "freetext" | "stamp" | "text" => {
+                "freetext" | "stamp" => {
                     if let Some(Object::String(s)) = dict.get("Contents") {
                         let decoded = Self::decode_pdf_text_string(s);
                         let trimmed = decoded.trim().to_string();
@@ -6544,6 +6687,9 @@ impl PdfDocument {
                         }
                     }
                 },
+                // Text (sticky-note) /Contents is reviewer popup comment text, not
+                // visible page content — skip to avoid injecting popup notes.
+                "text" => {},
                 // Geometric shape annotations — per §12.5.6.2, their /Contents is
                 // also popup/comment text, same as the markup group below.
                 "line" | "circle" | "square" | "polygon" | "polyline" => {
@@ -7767,6 +7913,15 @@ impl PdfDocument {
             std::collections::HashMap::new();
         let mut first_seen_any: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        // Track distinct literal texts per signature.  A signature whose digits
+        // are stable across every page (i.e. the literal text never changes) is
+        // NOT a page-number-containing header — it is substantive content that
+        // happens to repeat.  Only suppress signatures where the literal text
+        // varies (at least two distinct forms) meaning digits change per page.
+        let mut literal_variants: std::collections::HashMap<
+            String,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
         for pi in 0..page_count {
             let spans = match self.extract_spans_raw(pi) {
                 Ok(s) => s,
@@ -7793,7 +7948,8 @@ impl PdfDocument {
             // Collect per-page unique signatures from the chrome bands.
             // Runs even when there's no body content so `first_seen_any`
             // registers the cover page even if it's all-chrome.
-            let mut seen_this_page = std::collections::HashSet::new();
+            let mut seen_this_page: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for s in spans.iter() {
                 let trimmed = s.text.trim();
                 if trimmed.is_empty() {
@@ -7808,17 +7964,27 @@ impl PdfDocument {
                 if sig.is_empty() || sig.chars().count() < 2 {
                     continue;
                 }
-                seen_this_page.insert(sig);
+                seen_this_page
+                    .entry(sig)
+                    .or_insert_with(|| trimmed.to_string());
             }
             // Track first-seen across ALL pages (even body-content-skipped)
-            for sig in &seen_this_page {
+            for sig in seen_this_page.keys() {
                 first_seen_any.entry(sig.clone()).or_insert(pi);
+            }
+            // Track literal variants — if the literal text for a signature
+            // differs across pages, the digits are varying (page numbers).
+            for (sig, literal) in &seen_this_page {
+                literal_variants
+                    .entry(sig.clone())
+                    .or_default()
+                    .insert(literal.clone());
             }
             if !has_body_content {
                 continue;
             }
             // Count only pages with body content for the recurrence threshold
-            for sig in seen_this_page {
+            for sig in seen_this_page.into_keys() {
                 let entry = occurrences.entry(sig).or_insert((0, pi));
                 entry.0 += 1;
                 if pi < entry.1 {
@@ -7829,7 +7995,18 @@ impl PdfDocument {
         let threshold = (page_count as f32 * 0.5).ceil() as usize;
         let signatures: std::collections::HashMap<String, usize> = occurrences
             .into_iter()
-            .filter(|(_, (count, _))| *count >= threshold.max(2))
+            .filter(|(sig, (count, _))| {
+                if *count < threshold.max(2) {
+                    return false;
+                }
+                // Only suppress if the literal text varied across pages — i.e., the
+                // digits changed, indicating a page number or date that updates per page.
+                // Signatures where all occurrences have the same literal text are
+                // substantive content (facility names, document IDs, etc.) that pdftotext
+                // and pdfium both preserve; suppressing them hurts word-F1 scores.
+                let variants = literal_variants.get(sig).map(|s| s.len()).unwrap_or(0);
+                variants >= 2
+            })
             .map(|(sig, _)| {
                 // Use the earliest page the signature appeared on — which
                 // may be a body-content-skipped cover page that `occurrences`
@@ -9902,10 +10079,13 @@ impl PdfDocument {
             }
         }
 
-        // Get MediaBox (required, may be inherited)
+        // Get MediaBox (required, may be inherited).
+        // PDF spec §7.3.10: any value may be a direct or indirect reference.
         let media_box = page_dict
             .get("MediaBox")
-            .and_then(|o| o.as_array())
+            .map(|o| self.resolve_obj_ref(o))
+            .as_ref()
+            .and_then(|o| o.as_array().map(|a| a.to_owned()))
             .map(|arr| {
                 let x0 = arr.first().and_then(obj_to_f32).unwrap_or(0.0);
                 let y0 = arr.get(1).and_then(obj_to_f32).unwrap_or(0.0);
@@ -9917,10 +10097,13 @@ impl PdfDocument {
                 0.0, 0.0, 612.0, 792.0, // Letter size default
             ));
 
-        // Get CropBox (optional, falls back to MediaBox)
+        // Get CropBox (optional, falls back to MediaBox).
+        // PDF spec §7.3.10: any value may be a direct or indirect reference.
         let crop_box = page_dict
             .get("CropBox")
-            .and_then(|o| o.as_array())
+            .map(|o| self.resolve_obj_ref(o))
+            .as_ref()
+            .and_then(|o| o.as_array().map(|a| a.to_owned()))
             .map(|arr| {
                 let x0 = arr.first().and_then(obj_to_f32).unwrap_or(0.0);
                 let y0 = arr.get(1).and_then(obj_to_f32).unwrap_or(0.0);
@@ -9929,9 +10112,12 @@ impl PdfDocument {
                 crate::geometry::Rect::from_points(x0, y0, x1, y1)
             });
 
-        // Get rotation (optional, default 0)
+        // Get rotation (optional, default 0).
+        // PDF spec §7.3.10: Rotate may also be an indirect reference.
         let rotation = page_dict
             .get("Rotate")
+            .map(|o| self.resolve_obj_ref(o))
+            .as_ref()
             .and_then(|o| match o {
                 Object::Integer(i) => Some(*i as i32),
                 _ => None,
@@ -10389,6 +10575,7 @@ impl PdfDocument {
         page_index: usize,
         spans: &[TextSpan],
         options: &crate::converters::ConversionOptions,
+        text_fallback: bool,
     ) -> Vec<crate::structure::Table> {
         // Strategy 1: Structure tree (tagged PDFs)
         let struct_tree_opt = {
@@ -10397,7 +10584,13 @@ impl PdfDocument {
                 Some(tree) => tree,
                 None => {
                     let is_marked = self.mark_info().map(|m| m.marked).unwrap_or(false);
-                    let tree = if is_marked {
+                    let has_struct_tree_root = !is_marked
+                        && self
+                            .catalog()
+                            .ok()
+                            .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
+                            .unwrap_or(false);
+                    let tree = if is_marked || has_struct_tree_root {
                         self.structure_tree().ok().flatten().map(Arc::new)
                     } else {
                         None
@@ -10465,7 +10658,12 @@ impl PdfDocument {
         }
 
         // Strategy 2: Hybrid spatial detection (v0.3.14)
-        let config = options.table_detection_config.clone().unwrap_or_default();
+        let mut config = options.table_detection_config.clone().unwrap_or_default();
+        // Honour the caller's text_fallback choice regardless of the default
+        // on `TableDetectionConfig` — `extract_text` / `to_plain_text` pass
+        // `text_fallback=false` to opt out of text-only spatial fallback even
+        // though the type-level default is `true`.
+        config.text_fallback = text_fallback;
 
         // Extract vector paths (lines/rects) for visual detection
         let paths = self.extract_paths(page_index).unwrap_or_default();
@@ -10488,8 +10686,14 @@ impl PdfDocument {
                 (config.horizontal_strategy, config.vertical_strategy),
                 (TableStrategy::Text, TableStrategy::Text)
             );
-            if !is_text_only {
+            if !is_text_only && !config.text_fallback {
                 return Vec::new();
+            }
+            if !is_text_only && config.text_fallback {
+                log::debug!(
+                    "No ruling lines on page {} — using text-only spatial fallback (issue #486)",
+                    page_index
+                );
             }
         }
         let paths = table_paths;
@@ -10536,14 +10740,35 @@ impl PdfDocument {
             &config,
         );
 
+        // Issue 484/486/487: when a logical multi-row table is drawn with a
+        // horizontal ruling line between every pair of rows, the line-based
+        // detector emits one Table per row strip. Each fragment is a 1- or
+        // 2-row table that fails is_real_grid below and gets dropped, after
+        // which the cells fall through to paragraph flow with column-based
+        // reading order — producing orphan `<p>40000≤Q</p>` /
+        // `<p>＜55000</p>` pairs.  Consolidate vertically-adjacent fragments
+        // that share an identical column structure BEFORE applying
+        // is_real_grid so the merged multi-row table survives the filter.
+        let raw_tables =
+            crate::structure::spatial_table_detector::consolidate_adjacent_table_fragments(
+                raw_tables,
+            );
+
         // Per #457 Step 4: spatial detection without struct-tree backing
         // is prone to false positives on form-style layouts (label-colon-
         // value pairs that align horizontally, form fillable boxes drawn
         // with thin lines). Drop tables that don't look like real grids.
         let raw_count = raw_tables.len();
-        let tables: Vec<crate::structure::Table> = raw_tables
+        let mut tables: Vec<crate::structure::Table> = raw_tables
             .into_iter()
             .filter(|t| t.is_real_grid())
+            // Prose-shape filter — applies to line-based detection too: a
+            // PDF with decorative horizontal rules (newsletter mastheads,
+            // press-release banners) can hand `is_real_grid` a "wide data
+            // table" that is actually wrapped paragraphs partitioned by
+            // word x-alignment.  Reject those before they reach the
+            // converter.  See `looks_like_prose_table` for the heuristic.
+            .filter(|t| !looks_like_prose_table(t))
             .collect();
 
         if raw_count != tables.len() {
@@ -10560,6 +10785,151 @@ impl PdfDocument {
                 page_index
             );
         }
+
+        // Text-only spatial fallback for converter paths (to_markdown / to_html — issue #486).
+        //
+        // Wide data tables (e.g. sailing-score grids with 16-18 columns) exceed the default
+        // `max_table_columns: 15` limit and are rejected by the main pipeline.  When the
+        // caller explicitly opted in to text-only detection (text_fallback=true), retry with
+        // a relaxed config that raises the column ceiling and adjusts tolerances so that
+        // genuinely wide data tables are captured.
+        //
+        // Safety guards:
+        // - Only fires when the main pipeline returned no tables (avoids double-counting).
+        // - Only fires when the caller is a converter (text_fallback=true).
+        // - Skipped for tagged PDFs: the structure tree already provides the authoritative
+        //   layout; spatial heuristics produce false-positive tables from structure elements
+        //   (e.g. headings detected as single-row tables — issue #486 regression).
+        // - Skipped for predominantly-RTL pages: Arabic/Hebrew text alignment patterns
+        //   mimic table columns in spatial heuristics — issue #486 regression.
+        // - When ruling lines exist, spans are filtered to the line-bounded region to
+        //   prevent page headers/footers from being erroneously included in the table.
+        // - Results must pass is_real_grid() just like main-pipeline tables.
+
+        // Guard 1 — Tagged PDFs: presence of a structure tree means the document has an
+        // explicit semantic layout.  Spatial text-only detection would misfire on
+        // structure elements (headings, paragraphs) that happen to share a Y band.
+        if config.text_fallback && struct_tree_opt.is_some() {
+            log::debug!(
+                "Text-only spatial fallback skipped for page {} — document has a structure tree (tagged PDF)",
+                page_index
+            );
+            return tables;
+        }
+
+        // Guard 2 — RTL pages: Arabic and Hebrew text naturally aligns horizontally in
+        // patterns that the column-clustering algorithm mistakes for table columns.
+        // Skip spatial detection when more than 30 % of the input spans are RTL.
+        if config.text_fallback {
+            let rtl_count = input_spans
+                .iter()
+                .filter(|s| crate::text::bidi::looks_rtl(&s.text))
+                .count();
+            let rtl_fraction = rtl_count as f32 / input_spans.len().max(1) as f32;
+            if rtl_fraction > 0.30 {
+                log::debug!(
+                    "Text-only spatial fallback skipped for page {} — {:.0}% RTL spans (threshold 30%)",
+                    page_index,
+                    rtl_fraction * 100.0
+                );
+                return tables;
+            }
+        }
+
+        if config.text_fallback && tables.is_empty() {
+            use crate::structure::spatial_table_detector::detect_tables_from_spans_column_aware;
+            // Build a relaxed config derived from the caller's config.
+            // We only raise the limits known to block wide data tables (e.g. sailing
+            // score grids with 16-18 columns that exceed the default max_table_columns=15).
+            let relaxed_config = crate::structure::spatial_table_detector::TableDetectionConfig {
+                // Allow up to 25 columns — covers 17-column sailing score tables.
+                max_table_columns: config.max_table_columns.max(25),
+                // Tighter column grouping than the default 15 pt so that nearby
+                // score columns are not merged into each other.
+                column_tolerance: config.column_tolerance.min(10.0),
+                // Looser merge threshold so that columns with slight X scatter
+                // (e.g. centred numeric cells) are aggregated correctly.
+                column_merge_threshold: config.column_merge_threshold.max(30.0),
+                // Inherit all other settings from caller's config.
+                ..config.clone()
+            };
+
+            // When ruling lines are present on the page, restrict text detection to
+            // spans that fall within the VERTICAL-LINE Y bounds.  Vertical lines
+            // define the table's column structure and their Y extent precisely
+            // delineates the table rows, excluding page headers and footers which
+            // sit above/below the table frame.
+            //
+            // Note: we use V-line Y bounds specifically (not total path bbox) because
+            // H-lines in these PDFs often span the full page height (outer frame),
+            // while V-lines are confined to the interior table region.
+            let candidate_spans: Vec<crate::layout::TextSpan>;
+            let fallback_spans: &[crate::layout::TextSpan] = {
+                let v_lines: Vec<_> = paths.iter().filter(|p| p.is_vertical_line(2.0)).collect();
+                if !v_lines.is_empty() {
+                    let vline_y_min = v_lines
+                        .iter()
+                        .map(|p| p.bbox.y)
+                        .fold(f32::INFINITY, f32::min);
+                    let vline_y_max = v_lines
+                        .iter()
+                        .map(|p| p.bbox.y + p.bbox.height)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    // Small margin to include spans whose centres just touch the frame.
+                    const V_MARGIN: f32 = 5.0;
+                    candidate_spans = input_spans
+                        .iter()
+                        .filter(|s| {
+                            let cy = s.bbox.y + s.bbox.height * 0.5;
+                            cy >= vline_y_min - V_MARGIN && cy <= vline_y_max + V_MARGIN
+                        })
+                        .cloned()
+                        .collect();
+                    log::debug!(
+                        "Text fallback (page {}): V-lines Y=[{:.1},{:.1}] — filtered {} spans to {}",
+                        page_index,
+                        vline_y_min,
+                        vline_y_max,
+                        input_spans.len(),
+                        candidate_spans.len()
+                    );
+                    &candidate_spans
+                } else {
+                    input_spans
+                }
+            };
+
+            let text_candidates =
+                detect_tables_from_spans_column_aware(fallback_spans, &relaxed_config);
+            let pre_filter = text_candidates.len();
+            let text_tables: Vec<_> = text_candidates
+                .into_iter()
+                // Text-only detection infers columns from word x-alignment
+                // alone; a title + a wrapped body line (two rows) is the
+                // signature of ordinary prose, not a table.  Require ≥3
+                // rows of evidence before promoting to a table.
+                .filter(|t| t.rows.len() >= 3 && t.is_real_grid())
+                // Prose split across many "columns" is the dominant
+                // false-positive shape for text-only detection on
+                // line-less pages: a paragraph wraps to N lines, words
+                // cluster into N×K cells, and `is_real_grid` accepts the
+                // shape.  Real data-table cells almost never end with a
+                // comma or semicolon (those punctuation marks belong to
+                // running sentences), so a high comma-tail ratio is the
+                // most discriminating prose signal we have.
+                .filter(|t| !looks_like_prose_table(t))
+                .collect();
+            if !text_tables.is_empty() {
+                log::debug!(
+                    "Text-only relaxed fallback found {} table(s) on page {} ({} filtered by is_real_grid) — issue #486",
+                    text_tables.len(),
+                    page_index,
+                    pre_filter - text_tables.len(),
+                );
+                tables = text_tables;
+            }
+        }
+
         tables
     }
 
@@ -10609,7 +10979,10 @@ impl PdfDocument {
         let base_spans = self.extract_spans(page_index)?;
 
         let tables = if options.extract_tables {
-            self.extract_page_tables(page_index, &base_spans, options)
+            // text_fallback=true: to_markdown explicitly targets structured output,
+            // so we enable the text-only spatial fallback for line-less tables
+            // (e.g. sailing-score grids with no ruling lines — issue #486).
+            self.extract_page_tables(page_index, &base_spans, options, true)
         } else {
             Vec::new()
         };
@@ -11043,7 +11416,10 @@ impl PdfDocument {
         let base_spans = self.extract_spans(page_index)?;
 
         let tables = if options.extract_tables {
-            self.extract_page_tables(page_index, &base_spans, options)
+            // text_fallback=true: to_html explicitly targets structured output,
+            // so we enable the text-only spatial fallback for line-less tables
+            // (e.g. sailing-score grids with no ruling lines — issue #486).
+            self.extract_page_tables(page_index, &base_spans, options, true)
         } else {
             Vec::new()
         };
@@ -11197,7 +11573,9 @@ impl PdfDocument {
 
         // Step 2: Extract tables if enabled
         let tables = if options.extract_tables {
-            self.extract_page_tables(page_index, &spans, options)
+            // text_fallback=false: to_plain_text uses the conservative pre-v0.3.47
+            // behaviour to avoid false-positive table detection in key-value layouts.
+            self.extract_page_tables(page_index, &spans, options, false)
         } else {
             Vec::new()
         };
@@ -12227,6 +12605,69 @@ pub enum ImageFormat {
 /// Extract the /Root reference from a trailer dictionary.
 fn get_root_ref_from_trailer(trailer: &Object) -> Option<ObjectRef> {
     trailer.as_dict()?.get("Root")?.as_reference()
+}
+
+/// Heuristic: does this candidate table actually look like wrapped prose
+/// clustered into x-columns rather than a real grid?
+///
+/// Cell contents in real data tables are atomic units (numbers, codes,
+/// names, short labels): they almost always start with an uppercase
+/// letter, a digit, or a symbol (currency, +/-, punctuation marker) and
+/// rarely end with a mid-sentence comma or semicolon.  Prose-as-table
+/// cells, by contrast, are fragments of running sentences — they
+/// frequently start with a lowercase stopword ("and", "the", "to") because
+/// the column boundary fell mid-clause, and frequently end with `,` or
+/// `;` for the same reason.
+///
+/// We reject the candidate when either signal exceeds its threshold:
+///   • > 12 % of cells end in `,` or `;` (mid-sentence tails), or
+///   • > 25 % of cells start with a lowercase ASCII letter
+///     (continuation fragments).
+///
+/// Thresholds chosen to clear the false positives flagged in the 88-PDF
+/// regression (`searchable.pdf`, the WFMYY press-release, several arxiv
+/// preprints) without disturbing legitimate data tables — sailing scores,
+/// IRS forms, and the CJK traffic-volume grid all stay well below both
+/// bars.
+fn looks_like_prose_table(table: &crate::structure::Table) -> bool {
+    let mut total = 0usize;
+    let mut sentence_tails = 0usize;
+    let mut lower_starts = 0usize;
+    let mut leader_dots = 0usize;
+    for row in &table.rows {
+        for cell in &row.cells {
+            let trimmed = cell.text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            total += 1;
+            if let Some(last) = trimmed.chars().last() {
+                if matches!(last, ',' | ';') {
+                    sentence_tails += 1;
+                }
+            }
+            if let Some(first) = trimmed.chars().next() {
+                if first.is_ascii_lowercase() {
+                    lower_starts += 1;
+                }
+            }
+            // Table-of-contents leader runs (". . . . . . ." between an
+            // entry's title and its page number) cluster into their own
+            // x-columns and create phantom 10–12-column "tables" out of
+            // an ordinary three-column TOC.  A cell whose content is
+            // exclusively dots and spaces is the leader, not data.
+            if trimmed.chars().all(|c| c == '.' || c == ' ') {
+                leader_dots += 1;
+            }
+        }
+    }
+    if total < 10 {
+        return false;
+    }
+    let tail_ratio = sentence_tails as f32 / total as f32;
+    let lower_ratio = lower_starts as f32 / total as f32;
+    let leader_ratio = leader_dots as f32 / total as f32;
+    tail_ratio > 0.12 || lower_ratio > 0.25 || leader_ratio > 0.10
 }
 
 /// Check whether the object at the xref offset for `obj_ref` looks like a valid header.
@@ -13397,8 +13838,13 @@ mod tests {
     fn test_should_insert_space_column_gap() {
         let prev = make_test_span("Hello", 0.0, 100.0, 50.0, 12.0);
         let current = make_test_span("World", 200.0, 100.0, 50.0, 12.0);
-        // Column boundary gap is too large (>5x font), should return false
-        assert!(!PdfDocument::should_insert_space(&prev, &current));
+        // Issue 487 (pr-138-example.pdf rate tables): a very large
+        // same-line gap (here 150 pt > 5 em) must still produce a single
+        // space.  The earlier `gap < font_size * 5.0` upper bound made
+        // this return false, after which the caller concatenated the two
+        // spans without a separator and `3.80%` + `4.41%` came out as
+        // `3.80%4.41%`.  Large gap = different column = still a space.
+        assert!(PdfDocument::should_insert_space(&prev, &current));
     }
 
     // ========================================================================
@@ -15642,11 +16088,13 @@ mod tests {
 
     #[test]
     fn test_annotation_text_type() {
+        // Text (sticky-note) /Contents is reviewer popup comment text, not visible page
+        // content — it must NOT appear in extract_text output (ISO 32000-1 §12.5.6.2).
         let annot = b"4 0 obj\n<< /Type /Annot /Subtype /Text /Contents (Sticky note) >>\nendobj\n"
             .to_vec();
         let pdf = build_pdf_with_annotations(vec![(4, annot)]);
         let doc = PdfDocument::from_bytes(pdf).unwrap();
-        assert!(doc.extract_text(0).unwrap().contains("Sticky note"));
+        assert!(!doc.extract_text(0).unwrap().contains("Sticky note"));
     }
 
     #[test]
@@ -15721,6 +16169,8 @@ mod tests {
 
     #[test]
     fn test_annotation_multiple() {
+        // FreeText /Contents is visible page text; Text (sticky-note) /Contents is popup
+        // comment — only FreeText should appear in extract_text output.
         let a1 =
             b"4 0 obj\n<< /Type /Annot /Subtype /FreeText /Contents (First) >>\nendobj\n".to_vec();
         let a2 =
@@ -15729,7 +16179,7 @@ mod tests {
         let doc = PdfDocument::from_bytes(pdf).unwrap();
         let text = doc.extract_text(0).unwrap();
         assert!(text.contains("First"));
-        assert!(text.contains("Second"));
+        assert!(!text.contains("Second"));
     }
 
     #[test]

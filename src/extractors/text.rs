@@ -516,6 +516,19 @@ pub struct SpanMergingConfig {
     /// - Typical citation markers: 70-80% of text font size
     /// - Superscript usually: 50-80% of base font
     pub citation_font_size_ratio: f32,
+
+    /// When `false`, each `Tm` operator starts a fresh span regardless of position.
+    /// Use this to preserve column boundaries for callers that need per-positioned-run spans
+    /// (e.g. pdftotext `-bbox-layout` parity).
+    ///
+    /// # Warning
+    /// Disabling this on character-by-character-positioned PDFs (common in academic typesetting)
+    /// can produce very large span counts per page (100× or more).
+    ///
+    /// Default: `true` (existing behaviour preserved).
+    ///
+    /// Reference: ISO 32000-1 §9.4.2 / §9.4.4 NOTE 6.
+    pub merge_tm_tj_runs: bool,
 }
 
 impl Default for SpanMergingConfig {
@@ -531,6 +544,7 @@ impl Default for SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            merge_tm_tj_runs: true,
         }
     }
 }
@@ -577,6 +591,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            merge_tm_tj_runs: true,
         }
     }
 
@@ -610,6 +625,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            merge_tm_tj_runs: true,
         }
     }
 
@@ -646,6 +662,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            merge_tm_tj_runs: true,
         }
     }
 
@@ -690,6 +707,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            merge_tm_tj_runs: true,
         }
     }
 
@@ -723,6 +741,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            merge_tm_tj_runs: true,
         }
     }
 
@@ -766,6 +785,7 @@ impl SpanMergingConfig {
             email_threshold_multiplier: 2.5,
             detect_citation_markers: false,
             citation_font_size_ratio: 0.75,
+            merge_tm_tj_runs: true,
         }
     }
 }
@@ -1746,6 +1766,17 @@ enum ByteMode {
 fn get_byte_mode(font: Option<&FontInfo>) -> ByteMode {
     if let Some(font) = font {
         if font.subtype == "Type0" {
+            // If the ToUnicode CMap declares a 2-byte codespace range, always use
+            // TwoByte mode regardless of the encoding name.  This handles CJK fonts
+            // whose /Encoding name is a custom CMap stream that doesn't match the
+            // well-known keyword patterns below (e.g. "H", "V", "UniCNS-H", …).
+            // See PDF Spec §9.7.5 — `begincodespacerange` is authoritative.
+            if let Some(ref lazy_cmap) = font.to_unicode {
+                if lazy_cmap.code_width() == 2 {
+                    return ByteMode::TwoByte;
+                }
+            }
+
             match &font.encoding {
                 crate::fonts::Encoding::Identity => ByteMode::TwoByte,
                 crate::fonts::Encoding::Standard(name) => {
@@ -1955,8 +1986,14 @@ pub struct TextExtractor<'doc> {
     resources: Option<Object>,
     /// Reference to the document (for loading XObjects)
     document: Option<&'doc crate::document::PdfDocument>,
-    /// Set of processed XObject references to avoid duplicates
-    processed_xobjects: HashSet<ObjectRef>,
+    /// Set of processed XObject references to avoid duplicates.
+    /// Key is `(ObjectRef, ctm_key)` where `ctm_key` is the CTM at the time of
+    /// the `Do` operator call, encoded as 6 millipoint-rounded i64 values.
+    /// Using the CTM as part of the key allows the same Form XObject to be
+    /// processed multiple times when invoked with different transformation
+    /// matrices (e.g., the same XObject stamped at different positions on a page),
+    /// while still preventing infinite recursion (same ref + same CTM).
+    processed_xobjects: HashSet<(ObjectRef, [i64; 6])>,
     /// Cached XObject name → ObjectRef mapping for current resources context.
     /// Avoids expensive repeated resolution of the resources/XObject dict chain.
     cached_xobject_refs: HashMap<String, Option<ObjectRef>>,
@@ -3313,18 +3350,50 @@ impl<'doc> TextExtractor<'doc> {
             // and one side is a single character. Targets the drop-cap /
             // single-letter-small-caps typography pattern where per-
             // letter emphasis runs would corrupt proper nouns.
+            //
+            // Issue 484 (pr-136-example.pdf): CJK ideographs satisfy
+            // `is_alphabetic()` per Unicode, so a CJK→Latin (or Latin→CJK)
+            // transition between adjacent characters in different fonts —
+            // the standard mixed-script PDF layout pattern — was triggering
+            // cross-font glue and concatenating "神鹰集团" + "Z" into
+            // "神鹰集团Z" with no separator.  Word-F1 against pdftotext
+            // ground truth (which inserts a space at every CJK↔non-CJK
+            // boundary) then loses both the trailing CJK token and the
+            // leading Latin/digit token.  Skip cross-font glue when the
+            // boundary crosses CJK / non-CJK scripts.
+            //
+            // EXCLUDES fullwidth ASCII (U+FF01..FF5E) and CJK Symbols and
+            // Punctuation (U+3000..303F) — those operator-style glyphs sit
+            // inline with adjacent Latin/digit in CJK technical writing
+            // (e.g. "60000≤Q＜80000" in issue-336).  Treating them as a CJK
+            // boundary would split the compound token.
+            let is_cjk_char = |c: char| {
+                matches!(
+                    c as u32,
+                    0x3040..=0x309F      // Hiragana
+                    | 0x30A0..=0x30FF    // Katakana
+                    | 0x3400..=0x4DBF    // CJK Unified Ideographs Extension A
+                    | 0x4E00..=0x9FFF    // CJK Unified Ideographs
+                    | 0xAC00..=0xD7AF    // Hangul Syllables
+                    | 0x20000..=0x2A6DF  // CJK Unified Ideographs Extension B
+                    | 0xFF66..=0xFF9F    // Halfwidth Katakana
+                )
+            };
+            let prev_tail_char = current.text.chars().last();
+            let curr_head_char = span.text.chars().next();
+            let crosses_cjk_boundary = match (prev_tail_char, curr_head_char) {
+                (Some(p), Some(c)) => is_cjk_char(p) != is_cjk_char(c),
+                _ => false,
+            };
             let cross_font_word_glue = !is_same_font
                 && same_line
                 && gap > -1.0
                 && gap < font_size_ref * 0.25
                 && !current.text.is_empty()
                 && !span.text.is_empty()
-                && current
-                    .text
-                    .chars()
-                    .last()
-                    .is_some_and(|c| c.is_alphabetic())
-                && span.text.chars().next().is_some_and(|c| c.is_alphabetic())
+                && !crosses_cjk_boundary
+                && prev_tail_char.is_some_and(|c| c.is_alphabetic())
+                && curr_head_char.is_some_and(|c| c.is_alphabetic())
                 && (current.text.chars().count() == 1 || span.text.chars().count() == 1);
 
             // Merge threshold: Use configured values
@@ -3352,9 +3421,19 @@ impl<'doc> TextExtractor<'doc> {
             // of dollar amounts in separate fixed-width boxes.
             // e.g., "123456" (integer box) + "72" (cents box) with ~10pt gap.
             // Detect this pattern: both spans are pure digits, the second is
-            // exactly 1-2 digits (cents), same line, and gap < 2x font size.
+            // exactly 1-2 digits (cents), same line, and there's a meaningful
+            // column-boundary-sized gap between them.
+            //
+            // Issue 484 (pr-136-example.pdf): without a minimum-gap floor this
+            // also matches tightly-packed adjacent digit characters from CJK
+            // documents that emit each glyph as its own Tj — e.g. the year
+            // "2013" rendered as four separate TjL operators with sub-pixel
+            // gaps was being mangled into "201.3", losing the year token from
+            // word-F1 scoring.  Real "$123 _ 45" split-box layouts always have
+            // a gap > ~half the font size; tight letter spacing is < 0.1 em.
+            let min_decimal_gap = current.font_size * 0.4;
             let decimal_merge = same_line
-                && gap > 0.0
+                && gap > min_decimal_gap
                 && gap < current.font_size * 2.0
                 && !current.text.is_empty()
                 && !span.text.is_empty()
@@ -3734,23 +3813,25 @@ impl<'doc> TextExtractor<'doc> {
                 // If the new Tm is on the same line with the same transform,
                 // keep accumulating into the existing buffer instead of flushing
                 // (avoids creating thousands of 1-char TextSpans per page).
-                let is_continuation = match self.tj_span_buffer {
-                    Some(ref mut buffer)
-                        if !buffer.is_empty()
-                            && f.round() as i32 == buffer.start_matrix.f.round() as i32
-                            && a == buffer.start_matrix.a
-                            && b == buffer.start_matrix.b
-                            && c == buffer.start_matrix.c
-                            && d == buffer.start_matrix.d
-                            && e >= buffer.start_matrix.e =>
-                    {
-                        // Same line, same transform, LTR progression →
-                        // update width to reflect actual visual extent
-                        buffer.accumulated_width = e - buffer.start_matrix.e;
-                        true
-                    },
-                    _ => false,
-                };
+                // When merge_tm_tj_runs is false, every Tm always starts a fresh span.
+                let is_continuation = self.merging_config.merge_tm_tj_runs
+                    && match self.tj_span_buffer {
+                        Some(ref mut buffer)
+                            if !buffer.is_empty()
+                                && f.round() as i32 == buffer.start_matrix.f.round() as i32
+                                && a == buffer.start_matrix.a
+                                && b == buffer.start_matrix.b
+                                && c == buffer.start_matrix.c
+                                && d == buffer.start_matrix.d
+                                && e >= buffer.start_matrix.e =>
+                        {
+                            // Same line, same transform, LTR progression →
+                            // update width to reflect actual visual extent
+                            buffer.accumulated_width = e - buffer.start_matrix.e;
+                            true
+                        },
+                        _ => false,
+                    };
 
                 if !is_continuation {
                     self.flush_tj_span_buffer()?;
@@ -4909,13 +4990,42 @@ impl<'doc> TextExtractor<'doc> {
             None => return Ok(()),
         };
 
-        // Skip already-processed XObjects (permanent set — each unique XObject
-        // is processed at most once per page for text extraction)
-        if self.processed_xobjects.contains(&xobject_ref) {
+        // Build a CTM-aware deduplication key.
+        //
+        // Using just `xobject_ref` as the key incorrectly blocked re-processing
+        // the same Form XObject when it was invoked a second time on the same page
+        // with a different CTM (e.g., same header/footer XObject stamped at two
+        // different Y positions, or the nougat_005 pattern where each page's
+        // content stream sets a different `cm` translation before calling `Do`).
+        //
+        // The CTM is encoded as 6 millipoint-rounded i64 values so it can be
+        // stored in a HashSet without floating-point equality hazards.
+        // Infinite-recursion cycles are still prevented because a truly recursive
+        // call re-enters with the *same* XObject ref AND the same CTM at that
+        // nesting depth; the depth limiter (MAX_XOBJECT_DEPTH) provides a
+        // second backstop.
+        let current_ctm = self.state_stack.current().ctm;
+        // Round to nearest millipoint instead of truncating with `as i64`,
+        // so floating-point noise in the same logical CTM produces a
+        // stable hash key (truncation alone could send 0.99999... and
+        // 1.00001... to different buckets).
+        let ctm_key = [
+            (current_ctm.a * 1000.0).round() as i64,
+            (current_ctm.b * 1000.0).round() as i64,
+            (current_ctm.c * 1000.0).round() as i64,
+            (current_ctm.d * 1000.0).round() as i64,
+            (current_ctm.e * 1000.0).round() as i64,
+            (current_ctm.f * 1000.0).round() as i64,
+        ];
+        let xobj_key = (xobject_ref, ctm_key);
+
+        // Skip already-processed (XObject, CTM) pairs — each unique combination
+        // is processed at most once per page for text extraction.
+        if self.processed_xobjects.contains(&xobj_key) {
             return Ok(());
         }
 
-        self.processed_xobjects.insert(xobject_ref);
+        self.processed_xobjects.insert(xobj_key);
 
         // Get document reference for loading objects.
         let doc = match self.document {
@@ -4941,25 +5051,21 @@ impl<'doc> TextExtractor<'doc> {
 
         // Span result cache: reuse extracted spans from self-contained Form XObjects.
         //
-        // Spans are stored in CTM-transformed page coordinates, so the cache is
-        // only correct when the caller's CTM matches the one at first extraction.
-        // Issue B1 (nougat_005.pdf): a single Form XObject carries every page's
-        // content, and each page's content stream applies a different CTM
-        // translation to position its viewport into that XObject. Reusing the
-        // cached spans returned page 0's coordinates on every page, so every
-        // page emitted identical cross-page text.
+        // The cache key is (ObjectRef, ctm_key) where ctm_key encodes the caller's
+        // CTM as 6 millipoint-rounded i64 values. This allows the same Form XObject
+        // to have independent cached results for each unique CTM it is painted with,
+        // fixing the issue where cross-page reuse of a single Form XObject with
+        // different per-page CTM translations returned stale page-0 coordinates on
+        // all subsequent pages (nougat_005.pdf, Issue B1).
         //
-        // Safe path: only hit the cache when the current CTM is identity. That
-        // covers the common case (reusable headers/footers stamped at the same
-        // origin) without mixing coordinate systems. For non-identity CTMs we
-        // fall through to the fresh extraction below, which applies the caller's
-        // CTM to each span.
-        if self.extract_spans && self.state_stack.current().ctm.is_identity() {
+        // `ctm_key` was already computed above for the `processed_xobjects` guard.
+        let spans_cache_key = (xobject_ref, ctm_key);
+        if self.extract_spans {
             let cached_spans = {
                 doc.xobject_spans_cache
                     .lock()
                     .unwrap()
-                    .get(&xobject_ref)
+                    .get(&spans_cache_key)
                     .cloned()
             };
             if let Some(cached_spans) = cached_spans {
@@ -5172,21 +5278,18 @@ impl<'doc> TextExtractor<'doc> {
                     );
                 }
 
-                // Cache span results for self-contained Form XObjects. Only
-                // safe when the XObject has its own /Resources (font context
-                // is page-independent) AND the current CTM is identity —
-                // otherwise the stored spans are in caller-specific page
-                // coordinates and would poison identity-CTM hits on other
-                // pages (see issue B1).
+                // Cache span results for self-contained Form XObjects.
                 //
-                // Note: is_identity() is checked AFTER the XObject's
-                // /Matrix is concatenated, so XObjects with their own
-                // /Matrix never cache even when the caller CTM is identity.
-                // That's conservative-safe at the cost of re-extraction;
-                // storing spans in XObject-local coords would fix this but
-                // the complexity isn't justified by the current benchmark.
-                let save_identity_ctm = self.state_stack.current().ctm.is_identity();
-                if has_own_resources && self.extract_spans && save_identity_ctm {
+                // The cache key `spans_cache_key` already encodes (ObjectRef, ctm_key),
+                // so each unique (XObject, CTM) pair gets its own entry. There is no
+                // longer any need to restrict caching to identity-CTM invocations —
+                // different CTMs produce different cache entries and therefore cannot
+                // pollute each other (this was the root cause of issue B1).
+                //
+                // We still require `has_own_resources` so that font lookups are
+                // self-contained; XObjects that inherit page-level fonts would
+                // produce spans whose glyph mappings depend on caller context.
+                if has_own_resources && self.extract_spans {
                     let new_spans = if self.spans.len() > spans_before {
                         Some(self.spans[spans_before..].to_vec())
                     } else {
@@ -5195,7 +5298,7 @@ impl<'doc> TextExtractor<'doc> {
                     doc.xobject_spans_cache
                         .lock()
                         .unwrap()
-                        .insert(xobject_ref, new_spans);
+                        .insert(spans_cache_key, new_spans);
                 }
 
                 // Restore graphics state (implicit Q per ISO 32000-1 §8.10.1)
@@ -5930,15 +6033,11 @@ impl<'doc> TextExtractor<'doc> {
                 }
                 w_sum
             } else {
-                // Type0/CID font: process 2-byte CID codes (Identity-H encoding)
-                // Per ISO 32000-1:2008 Section 9.7.6.2, composite fonts use multi-byte codes
+                // Type0/CID font: use TextCharIter so that the byte-width (1 or 2)
+                // is determined by the font's encoding / ToUnicode CMap codespace,
+                // not hardcoded to 2.  Per ISO 32000-1:2008 §9.7.6.2.
                 let mut w_sum = 0.0f32;
-                for chunk in text.chunks(2) {
-                    let cid = if chunk.len() == 2 {
-                        ((chunk[0] as u16) << 8) | (chunk[1] as u16)
-                    } else {
-                        chunk[0] as u16
-                    };
+                for (cid, _) in TextCharIter::new(text, Some(font)) {
                     let mut w = font.get_glyph_width(cid) * fs_factor * hs_factor;
                     w += cs_hs;
                     // Per ISO 32000-1:2008 Section 9.3.3: Tw applied when CID == 32
@@ -6273,14 +6372,13 @@ impl<'doc> TextExtractor<'doc> {
                 w_sum
             } else {
                 buffer.append(text)?;
-                // Width calculation: process 2-byte CID codes (Identity-H encoding)
+                // Width calculation: use TextCharIter so byte-width respects the
+                // CMap codespace (1 or 2 bytes per character).  Fixes CJK fonts
+                // whose encoding name doesn't match the well-known Identity-H/EUC/…
+                // keyword patterns but whose ToUnicode CMap declares a 2-byte
+                // codespace range (§9.7.5).
                 let mut w_sum = 0.0f32;
-                for chunk in text.chunks(2) {
-                    let cid = if chunk.len() == 2 {
-                        ((chunk[0] as u16) << 8) | (chunk[1] as u16)
-                    } else {
-                        chunk[0] as u16
-                    };
+                for (cid, _) in TextCharIter::new(text, Some(font)) {
                     let mut w = font.get_glyph_width(cid) * fs_factor * hs_factor;
                     w += cs_hs;
                     if cid == 32 {
@@ -9839,6 +9937,76 @@ mod tests {
                     .join("");
                 text.contains("A") && text.contains("B")
             }
+        );
+    }
+
+    // ========================================================================
+    // TESTS: merge_tm_tj_runs opt-out (#488)
+    // ========================================================================
+
+    /// With the default config (merge_tm_tj_runs = true), multiple Tm+Tj operators
+    /// on the same line are batched into a single span.
+    #[test]
+    fn test_merge_tm_tj_runs_default_merges() {
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy(); // fixed thresholds, merging on
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        // Three separate Tm+Tj on the same baseline (same Y, same a/b/c/d, ascending e)
+        let stream =
+            b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (A) Tj 1 0 0 1 107 700 Tm (B) Tj 1 0 0 1 114 700 Tm (C) Tj ET";
+        let spans = extractor.extract_text_spans(stream).unwrap();
+
+        // All three characters must be present
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            text.contains('A') && text.contains('B') && text.contains('C'),
+            "All chars must be extracted, got: {:?}",
+            text
+        );
+
+        // The default merging should combine them into fewer spans than the number
+        // of Tm operators (3 Tms should not produce 3 separate spans)
+        assert!(
+            spans.len() < 3,
+            "Default merge_tm_tj_runs=true should combine same-line Tm+Tj into fewer than 3 spans, got {} spans",
+            spans.len()
+        );
+    }
+
+    /// With merge_tm_tj_runs = false, each Tm operator starts a fresh span.
+    #[test]
+    fn test_merge_tm_tj_runs_disabled_splits() {
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig {
+            merge_tm_tj_runs: false,
+            ..SpanMergingConfig::legacy()
+        };
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        // Three separate Tm+Tj on the same baseline
+        let stream =
+            b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (A) Tj 1 0 0 1 107 700 Tm (B) Tj 1 0 0 1 114 700 Tm (C) Tj ET";
+        let spans = extractor.extract_text_spans(stream).unwrap();
+
+        // All three characters must still be present
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            text.contains('A') && text.contains('B') && text.contains('C'),
+            "All chars must be extracted even with merging disabled, got: {:?}",
+            text
+        );
+
+        // With merge disabled, each Tm flushes the buffer, so we get more spans
+        // than with merging enabled (post-processing merge_adjacent_spans may combine
+        // some, but at minimum we should get spans >= 1; the key invariant is that
+        // the span count here is NOT reduced by the Tm-continuation shortcut)
+        assert!(
+            spans.len() >= 2,
+            "merge_tm_tj_runs=false should not batch same-line runs; expected >= 2 spans, got {}",
+            spans.len()
         );
     }
 

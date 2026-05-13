@@ -113,6 +113,14 @@ impl Table {
         // prose-split false tables have highly variable row fill counts (some rows
         // have 1-2 filled cells, others have 10+), so the fraction of "dense" rows
         // is well below 70%.
+        //
+        // Exception: a consolidated multi-row table (issue 486) can contain a mix
+        // of dense data rows and sparse header / multi-row-label rows.  The sparse
+        // rows are legitimate table content (column headers split across multiple
+        // visual rows, lane-count labels that only appear on the first row of a
+        // sub-group), so a strict dense-row ratio rejects real tables.  Accept the
+        // table if it has BOTH enough dense rows in absolute terms (≥ half the
+        // column count) AND a meaningful dense-row ratio (≥ 40 %).
         if self.col_count >= 8 {
             let min_dense = ((self.col_count as f32 * 0.6) as usize).max(2);
             let dense_rows = self
@@ -123,7 +131,13 @@ impl Table {
                 })
                 .count();
             let dense_row_ratio = dense_rows as f32 / self.rows.len() as f32;
-            return self.rows.len() >= 3 && ratio >= 0.7 && dense_row_ratio >= 0.70;
+            if self.rows.len() >= 3 && ratio >= 0.7 && dense_row_ratio >= 0.70 {
+                return true;
+            }
+            // Consolidated-table path: accept tables with many absolutely-dense
+            // rows alongside sparse header/label rows (issue 486).
+            let min_absolute_dense = (self.col_count / 2).max(3);
+            return dense_rows >= min_absolute_dense && dense_row_ratio >= 0.40;
         }
 
         ratio >= 0.5
@@ -455,6 +469,16 @@ pub(super) fn span_text_for_cell(span: &crate::layout::TextSpan) -> String {
         return text.clone();
     }
     let char_count = text.chars().count();
+    // Signal 1: sparse char_widths array (cw.len < char_count) means the
+    // span was assembled from two concatenated Tj runs — see the matching
+    // `is_column_spanning_decimal` rule in document.rs.  Catches sailing-
+    // score cells emitted as a single Tj like "1.10" (cw=[w]) where the
+    // PDF actually means "1" followed by "10" in adjacent score columns
+    // (issue 487 nougat_018).  bbox.width can still be tight here, so the
+    // bbox-inflation check below isn't sufficient.
+    if !span.char_widths.is_empty() && span.char_widths.len() < char_count {
+        return format!("{} {}", &text[..dot_pos], &text[dot_pos + 1..]);
+    }
     let expected_width = if !span.char_widths.is_empty() {
         let cw_sum: f32 = span.char_widths.iter().sum();
         cw_sum * (char_count as f32 / span.char_widths.len() as f32)
@@ -627,7 +651,49 @@ fn extract_cell(
                                 let gap = block.bbox.x - (prev.bbox.x + prev.bbox.width);
                                 let font_size =
                                     prev.avg_font_size.max(block.avg_font_size).max(1.0);
-                                gap > font_size * 0.15
+                                if gap <= font_size * 0.15 {
+                                    false
+                                } else {
+                                    // Suppress space insertion when one side is CJK and the
+                                    // other is CJK or a fullwidth/math operator (e.g. ≤, ＜, μ).
+                                    // This mirrors the CJK-pair suppression in document.rs and
+                                    // converters/mod.rs (Issue #485).
+                                    #[inline(always)]
+                                    fn is_cjk(c: char) -> bool {
+                                        matches!(c,
+                                            '\u{3040}'..='\u{309F}' |   // Hiragana
+                                            '\u{30A0}'..='\u{30FF}' |   // Katakana
+                                            '\u{4E00}'..='\u{9FFF}' |   // CJK Unified Ideographs
+                                            '\u{AC00}'..='\u{D7AF}' |   // Hangul
+                                            '\u{3400}'..='\u{4DBF}' |   // CJK Extension A
+                                            '\u{20000}'..='\u{2A6DF}'   // CJK Extension B
+                                        )
+                                    }
+                                    #[inline(always)]
+                                    fn is_fw_math(c: char) -> bool {
+                                        matches!(c,
+                                            '\u{FF0B}' | '\u{FF0D}' |
+                                            '\u{FF1A}' | '\u{FF1B}' |
+                                            '\u{FF1C}'..='\u{FF1E}' |
+                                            '\u{2260}' | '\u{2248}' |
+                                            '\u{2264}'..='\u{2265}' |
+                                            '\u{00B5}' | '\u{03BC}' |
+                                            '\u{00B1}' | '\u{00D7}' | '\u{00F7}'
+                                        )
+                                    }
+                                    let p_last = prev.text.chars().next_back();
+                                    let b_first = block.text.chars().next();
+                                    let suppress = if let (Some(p), Some(b)) = (p_last, b_first) {
+                                        let p_cjk = is_cjk(p);
+                                        let b_cjk = is_cjk(b);
+                                        (p_cjk || is_fw_math(p))
+                                            && (b_cjk || is_fw_math(b))
+                                            && (p_cjk || b_cjk)
+                                    } else {
+                                        false
+                                    };
+                                    !suppress
+                                }
                             }
                         } else {
                             !cell_text.ends_with(' ')
@@ -1157,5 +1223,137 @@ mod tests {
 
         let result = extract_table_from_spans(&table_elem, &spans).unwrap();
         assert_eq!(result.rows[0].cells[0].text, "Hello World");
+    }
+
+    /// CJK + fullwidth operator with a gap that *exceeds* the 0.15em threshold must
+    /// still suppress space insertion — this exercises the new CJK-suppression branch
+    /// added in fix #485 (the `test_extract_cell_adjacent_mcid_spans_no_space` test
+    /// above only covers the gap ≤ threshold path, which never reaches this branch).
+    #[test]
+    fn test_extract_cell_cjk_fullwidth_gap_suppresses_space() {
+        use crate::layout::text_block::{Color, FontWeight};
+
+        // Build: TD with three MCIDs: "数" (CJK), "≤" (math op), "量" (CJK)
+        // Place them with a gap of 3.0 pt (> font_size * 0.15 = 1.5 for 10 pt font)
+        // so the gap branch fires, then the CJK suppression should prevent a space.
+        let mut td = StructElem::new(StructType::TD);
+        td.add_child(StructChild::MarkedContentRef { mcid: 10, page: 0 });
+        td.add_child(StructChild::MarkedContentRef { mcid: 11, page: 0 });
+        td.add_child(StructChild::MarkedContentRef { mcid: 12, page: 0 });
+        let mut tr = StructElem::new(StructType::TR);
+        tr.add_child(StructChild::StructElem(Box::new(td)));
+        let mut table_elem = StructElem::new(StructType::Table);
+        table_elem.add_child(StructChild::StructElem(Box::new(tr)));
+
+        let base = crate::layout::TextSpan {
+            artifact_type: None,
+            text: String::new(),
+            bbox: Rect::new(0.0, 100.0, 0.0, 10.0),
+            font_name: "Test".to_string(),
+            font_size: 10.0,
+            font_weight: FontWeight::Normal,
+            is_italic: false,
+            is_monospace: false,
+            color: Color::black(),
+            mcid: None,
+            sequence: 0,
+            split_boundary_before: false,
+            offset_semantic: false,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 1.0,
+            primary_detected: false,
+            char_widths: vec![],
+        };
+        // "数" ends at x=10+10=20; "≤" starts at x=23 → gap=3.0 > 1.5 → gap branch fires
+        // CJK("数")→math_op("≤") with at least one CJK side → suppress space
+        // "≤" ends at x=23+10=33; "量" starts at x=36 → gap=3.0 → suppress space
+        let spans = vec![
+            crate::layout::TextSpan {
+                text: "数".into(),
+                bbox: Rect::new(10.0, 100.0, 10.0, 10.0),
+                mcid: Some(10),
+                ..base.clone()
+            },
+            crate::layout::TextSpan {
+                text: "≤".into(),
+                bbox: Rect::new(23.0, 100.0, 10.0, 10.0),
+                mcid: Some(11),
+                ..base.clone()
+            },
+            crate::layout::TextSpan {
+                text: "量".into(),
+                bbox: Rect::new(36.0, 100.0, 10.0, 10.0),
+                mcid: Some(12),
+                ..base.clone()
+            },
+        ];
+
+        let result = extract_table_from_spans(&table_elem, &spans).unwrap();
+        assert_eq!(
+            result.rows[0].cells[0].text, "数≤量",
+            "CJK + math-op + CJK with gap > 0.15em should not have spaces inserted: \
+             got '{}'",
+            result.rows[0].cells[0].text
+        );
+    }
+
+    /// Counterpart: Latin + Latin with a gap exceeding the threshold MUST insert a space.
+    /// This guards that the CJK-suppression branch does not affect non-CJK pairs.
+    #[test]
+    fn test_extract_cell_latin_gap_inserts_space() {
+        use crate::layout::text_block::{Color, FontWeight};
+
+        let mut td = StructElem::new(StructType::TD);
+        td.add_child(StructChild::MarkedContentRef { mcid: 20, page: 0 });
+        td.add_child(StructChild::MarkedContentRef { mcid: 21, page: 0 });
+        let mut tr = StructElem::new(StructType::TR);
+        tr.add_child(StructChild::StructElem(Box::new(td)));
+        let mut table_elem = StructElem::new(StructType::Table);
+        table_elem.add_child(StructChild::StructElem(Box::new(tr)));
+
+        let base = crate::layout::TextSpan {
+            artifact_type: None,
+            text: String::new(),
+            bbox: Rect::new(0.0, 100.0, 0.0, 10.0),
+            font_name: "Test".to_string(),
+            font_size: 10.0,
+            font_weight: FontWeight::Normal,
+            is_italic: false,
+            is_monospace: false,
+            color: Color::black(),
+            mcid: None,
+            sequence: 0,
+            split_boundary_before: false,
+            offset_semantic: false,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 1.0,
+            primary_detected: false,
+            char_widths: vec![],
+        };
+        // "Hello" ends at 50; "world" starts at 53 → gap=3.0 > 1.5 → space inserted
+        // Neither side is CJK, so the CJK suppression must NOT fire.
+        let spans = vec![
+            crate::layout::TextSpan {
+                text: "Hello".into(),
+                bbox: Rect::new(0.0, 100.0, 50.0, 10.0),
+                mcid: Some(20),
+                ..base.clone()
+            },
+            crate::layout::TextSpan {
+                text: "world".into(),
+                bbox: Rect::new(53.0, 100.0, 30.0, 10.0),
+                mcid: Some(21),
+                ..base.clone()
+            },
+        ];
+
+        let result = extract_table_from_spans(&table_elem, &spans).unwrap();
+        assert_eq!(
+            result.rows[0].cells[0].text, "Hello world",
+            "Latin→Latin with gap > 0.15em should insert a space: got '{}'",
+            result.rows[0].cells[0].text
+        );
     }
 }

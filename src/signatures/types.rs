@@ -234,6 +234,9 @@ impl SigningCredentials {
         use x509_parser::prelude::*;
         let (_, cert) = X509Certificate::from_der(&self.certificate)
             .map_err(|e| Error::InvalidPdf(format!("invalid X.509 DER: {e}")))?;
+        // WASM note: if signatures are ever enabled for wasm32, SystemTime::now()
+        // here will also need cfg-gating (currently masked because the `signatures`
+        // feature is not enabled in the wasm build).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)

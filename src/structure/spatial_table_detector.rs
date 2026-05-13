@@ -90,6 +90,24 @@ pub struct TableDetectionConfig {
     /// Default: 20.0. Use smaller values (e.g. 4.0) for strict mode, larger (e.g. 40.0)
     /// for relaxed mode where V-lines at mixed Y-ranges should stay together.
     pub v_split_gap: f32,
+    /// Enable text-only spatial detection as a fallback when no ruling lines are found.
+    ///
+    /// When `true` and the page has no table-relevant paths (no ruling lines or
+    /// rectangles), the detector falls through to `detect_tables_from_spans_column_aware`
+    /// rather than returning an empty result.  This is the right default for structured
+    /// output callers (`to_markdown`, `to_html`) that explicitly want tabular layout
+    /// and is also relied on by the public `extract_tables` API for line-less PDFs.
+    /// Set to `false` from callers that want the conservative
+    /// "no ruling lines → no tables" behaviour (e.g. plain-text extraction paths
+    /// that explicitly opt out — see `extract_page_tables`).
+    ///
+    /// False-positive prose / TOC / underline tables that this default would
+    /// previously have surfaced are filtered post-detection by the
+    /// `looks_like_prose_table` shape gate and a ≥ 3-row evidence requirement
+    /// on text-only and h-rule paths.
+    ///
+    /// Default: `true`.
+    pub text_fallback: bool,
 }
 
 impl Default for TableDetectionConfig {
@@ -106,6 +124,7 @@ impl Default for TableDetectionConfig {
             max_table_columns: 15,
             column_merge_threshold: 25.0,
             v_split_gap: 20.0,
+            text_fallback: true,
         }
     }
 }
@@ -125,6 +144,7 @@ impl TableDetectionConfig {
             max_table_columns: 12,
             column_merge_threshold: 10.0,
             v_split_gap: 4.0,
+            text_fallback: true,
         }
     }
 
@@ -142,6 +162,7 @@ impl TableDetectionConfig {
             max_table_columns: 20,
             column_merge_threshold: 30.0,
             v_split_gap: 40.0,
+            text_fallback: true,
         }
     }
 }
@@ -2960,22 +2981,44 @@ pub fn detect_tables_with_lines(
         if !h_edges.is_empty() && v_edges.is_empty() {
             snap_and_merge(&mut h_edges);
             final_tables = detect_tables_from_horizontal_rules(spans, &h_edges, config);
+            // H-rule bounded detection lacks vertical-line evidence —
+            // columns come from text-edge clustering alone (same shape as
+            // the text-only fallback below).  Two-row results are
+            // virtually always prose that happens to live between
+            // decorative rules (annotation underlines, page borders);
+            // require three rows of evidence before promoting.
+            final_tables.retain(|t| t.rows.len() >= 3);
         }
     }
     // Filter out invalid line-based tables BEFORE overlap checking so that
     // spurious line-based tables don't shadow valid text-based ones.
     final_tables.retain(is_valid_table);
 
-    // Only allow text-based fallback if BOTH strategies permit it.
-    // If horizontal_strategy is Lines, we require actual horizontal lines for row detection.
-    // If vertical_strategy is Lines, we require actual vertical lines for column detection.
-    let allow_text_fallback = config.horizontal_strategy != TableStrategy::Lines
+    // Only allow text-based fallback if BOTH strategies permit it AND the caller
+    // explicitly enabled text-only detection (config.text_fallback=true).
+    // This prevents extract_text() callers (text_fallback=false) from
+    // spuriously running span-column detection alongside ruling-line tables:
+    // report-style PDFs with decorative horizontal rules (e.g. swimming results)
+    // would otherwise have all their data detected as a text table that renders
+    // the page content a second time, causing duplicate extraction.
+    // Callers that want text-based table detection (to_markdown, to_html) set
+    // config.text_fallback=true explicitly.
+    let allow_text_fallback = config.text_fallback
+        && config.horizontal_strategy != TableStrategy::Lines
         && config.vertical_strategy != TableStrategy::Lines;
 
     if allow_text_fallback {
         let text_candidates = detect_tables_from_spans_column_aware(spans, config);
         for text_table in text_candidates {
             if !passes_spatial_quality_gate(&text_table) {
+                continue;
+            }
+            // Text-only detection (no ruling lines) infers columns from word
+            // x-alignment alone — two rows of column-aligned words is the
+            // signature of ordinary prose (a title + a wrapped body line),
+            // not a table.  Require at least three rows of evidence before
+            // promoting a span cluster to a table.
+            if text_table.rows.len() < 3 {
                 continue;
             }
             if let Some(text_bbox) = text_table.bbox {
@@ -3078,39 +3121,241 @@ fn extract_cell_text(cell_span_indices: &[usize], spans: &[TextSpan]) -> String 
     if cell_span_indices.is_empty() {
         return String::new();
     }
-    let mut span_entries: Vec<(f32, String)> = cell_span_indices
+    // Keep the span reference (not just text) so we can decide spacing based
+    // on the geometric gap and CJK/fullwidth-operator boundary state, exactly
+    // like the inline-flow path does in pipeline/converters/mod.rs.  Without
+    // this, the previous `line.join(" ")` was unconditionally inserting a
+    // space between every adjacent span on the same row, splitting compound
+    // tokens like `40000≤Q＜55000` into `40000≤Q ＜55000` and dropping word-F1
+    // for table-heavy CJK documents (issue 484, issue-336).
+    let mut span_entries: Vec<(f32, &TextSpan, String)> = cell_span_indices
         .iter()
         .filter_map(|&idx| {
             spans
                 .get(idx)
-                .map(|s| (s.bbox.center().y, span_text_for_cell(s)))
+                .map(|s| (s.bbox.center().y, s, span_text_for_cell(s)))
         })
         .collect();
     if span_entries.is_empty() {
         return String::new();
     }
     if span_entries.len() == 1 {
-        return span_entries.remove(0).1;
+        return span_entries.remove(0).2;
     }
     span_entries.sort_by(|a, b| crate::utils::safe_float_cmp(b.0, a.0));
-    let mut lines: Vec<Vec<String>> = Vec::new();
-    let mut current_line: Vec<String> = vec![span_entries[0].1.clone()];
+
+    // Group into rows by y proximity, then within a row decide separator per
+    // pair of spans using the same gap/CJK rules as inline text assembly.
+    let mut lines: Vec<Vec<(&TextSpan, String)>> = Vec::new();
+    let mut current_line: Vec<(&TextSpan, String)> =
+        vec![(span_entries[0].1, span_entries[0].2.clone())];
     let mut current_y = span_entries[0].0;
-    for (y, text) in &span_entries[1..] {
+    for (y, span, text) in &span_entries[1..] {
         if (current_y - y).abs() <= 2.0 {
-            current_line.push(text.clone());
+            current_line.push((span, text.clone()));
         } else {
             lines.push(current_line);
-            current_line = vec![text.clone()];
+            current_line = vec![(span, text.clone())];
             current_y = *y;
         }
     }
     lines.push(current_line);
+
     lines
         .iter()
-        .map(|line| line.join(" "))
+        .map(|line| {
+            let mut out = String::new();
+            for (i, (span, text)) in line.iter().enumerate() {
+                if i > 0 {
+                    let (prev_span, _) = line[i - 1];
+                    let separator = cell_span_separator(prev_span, span);
+                    out.push_str(separator);
+                }
+                out.push_str(text);
+            }
+            out
+        })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Decide what (if any) separator to put between two spans within the same
+/// table cell row.  Mirrors the inline-flow has_horizontal_gap logic from
+/// pipeline/converters/mod.rs: insert a space only when there is a real
+/// horizontal gap that exceeds the inter-glyph kerning floor AND the
+/// boundary is not a CJK ↔ CJK / CJK ↔ fullwidth-operator pair (issue 485).
+fn cell_span_separator(prev: &TextSpan, current: &TextSpan) -> &'static str {
+    // Already-present whitespace at the join point — never duplicate.
+    if prev.text.ends_with(' ') || current.text.starts_with(' ') {
+        return "";
+    }
+
+    let prev_end_x = prev.bbox.x + prev.bbox.width;
+    let gap = current.bbox.x - prev_end_x;
+    let font_size = prev.font_size.max(current.font_size).max(1.0);
+
+    // Sub-em gap: glyphs are touching or overlapping (typical inter-glyph
+    // advance).  Don't insert a space — adjacent characters in the same
+    // word/expression must stay glued.  This is what `40000≤Q` + `＜55000`
+    // hits: gap is essentially zero (the source PDF emits the operator as
+    // its own positioned Tj) but the two spans are part of one compound
+    // token in pdftotext's output.
+    let space_threshold = font_size * 0.15;
+    if gap <= space_threshold {
+        return "";
+    }
+    // No upper bound: a very large gap (≥ 5 em) used to be treated as a
+    // column boundary and yield no separator, but the caller concatenates
+    // span text when this returns "" — so tokens like `3.80%` and `4.41%`
+    // were rendered as `3.80%4.41%` on wide rate tables.  Mirroring the
+    // inline-flow rule (`pipeline::converters::has_horizontal_gap`), any
+    // gap above the inter-glyph threshold now gets at least a single
+    // space.
+
+    // CJK / fullwidth-operator suppression — same rule as
+    // pipeline::converters::has_horizontal_gap.  pdftotext keeps an
+    // ideograph + adjacent fullwidth/math operator without a separator.
+    let is_cjk = |c: char| {
+        matches!(
+            c as u32,
+            0x3040..=0x309F     // Hiragana
+            | 0x30A0..=0x30FF   // Katakana
+            | 0x4E00..=0x9FFF   // CJK Unified Ideographs
+            | 0xAC00..=0xD7AF   // Hangul
+            | 0x3400..=0x4DBF   // CJK Extension A
+            | 0x20000..=0x2A6DF // CJK Extension B
+        )
+    };
+    let is_fw_op = |c: char| {
+        matches!(
+            c as u32,
+            0xFF0B | 0xFF0D | 0xFF1A | 0xFF1B
+            | 0xFF1C..=0xFF1E       // ＜ ＝ ＞
+            | 0x2260 | 0x2248
+            | 0x2264..=0x2265       // ≤ ≥
+            | 0x00B5 | 0x03BC       // µ μ
+            | 0x00B1 | 0x00D7 | 0x00F7
+        )
+    };
+    let prev_tail = prev.text.chars().next_back();
+    let curr_head = current.text.chars().next();
+    if let (Some(p), Some(c)) = (prev_tail, curr_head) {
+        let p_cjk = is_cjk(p);
+        let c_cjk = is_cjk(c);
+        if (p_cjk || is_fw_op(p)) && (c_cjk || is_fw_op(c)) && (p_cjk || c_cjk) {
+            return "";
+        }
+    }
+
+    " "
+}
+
+/// Consolidate vertically-adjacent tables that share an identical column
+/// structure into a single multi-row table.
+///
+/// Issue 484/486/487 root cause: when a logical multi-row table is drawn
+/// with a horizontal ruling line between every pair of rows (rather than
+/// only at the top and bottom), the line-based detector emits one Table
+/// per row strip. Each fragment is a 1- or 2-row table that fails
+/// `is_real_grid()` (which requires ≥2 rows) and gets dropped, after
+/// which the cells fall through to the paragraph flow with column-based
+/// reading order — producing orphan `<p>40000≤Q</p>` / `<p>＜55000</p>`
+/// pairs instead of `<table><td>40000≤Q＜55000</td></tr></table>`.
+///
+/// Two fragments are merge-candidates when:
+///   * both have a `bbox`
+///   * X start matches within `X_TOLERANCE`
+///   * width matches within `X_TOLERANCE`
+///   * column counts are equal
+///   * the lower fragment's top edge (`bbox.y + bbox.height`) is within
+///     `Y_TOLERANCE` of the upper fragment's bottom edge (`bbox.y`)
+///
+/// Sort tables top-down (PDF y-up: largest top-Y first) and merge runs
+/// of consecutive fragments that satisfy the criteria. The merged table
+/// preserves the union of all rows and a bbox spanning both fragments.
+pub fn consolidate_adjacent_table_fragments(tables: Vec<Table>) -> Vec<Table> {
+    if tables.len() < 2 {
+        return tables;
+    }
+    const X_TOLERANCE: f32 = 2.0;
+    const Y_TOLERANCE: f32 = 3.0;
+
+    // Sort by top-Y descending (top of page first in PDF y-up coordinates).
+    let mut sorted = tables;
+    sorted.sort_by(|a, b| {
+        let a_top = a.bbox.map(|b| b.y + b.height).unwrap_or(f32::NEG_INFINITY);
+        let b_top = b.bbox.map(|b| b.y + b.height).unwrap_or(f32::NEG_INFINITY);
+        crate::utils::safe_float_cmp(b_top, a_top)
+    });
+
+    let mut consolidated: Vec<Table> = Vec::with_capacity(sorted.len());
+    for table in sorted {
+        let merge_into_last = consolidated
+            .last()
+            .map(|last| can_merge_tables(last, &table, X_TOLERANCE, Y_TOLERANCE))
+            .unwrap_or(false);
+        if merge_into_last {
+            // Safety: merge_into_last is only true when consolidated.last()
+            // returned Some, so last_mut() must also return Some.
+            if let Some(last) = consolidated.last_mut() {
+                merge_table_into(last, table);
+            }
+        } else {
+            consolidated.push(table);
+        }
+    }
+    consolidated
+}
+
+fn can_merge_tables(upper: &Table, lower: &Table, x_tol: f32, y_tol: f32) -> bool {
+    let (Some(u_bbox), Some(l_bbox)) = (upper.bbox, lower.bbox) else {
+        return false;
+    };
+    if upper.col_count != lower.col_count || upper.col_count == 0 {
+        return false;
+    }
+    if (u_bbox.x - l_bbox.x).abs() > x_tol {
+        return false;
+    }
+    if (u_bbox.width - l_bbox.width).abs() > x_tol {
+        return false;
+    }
+    // upper sits ABOVE lower in PDF y-up: upper.bbox.y is the BOTTOM of
+    // upper, lower.bbox.y + lower.bbox.height is the TOP of lower.
+    // For them to be vertically adjacent, the upper.bottom must be close
+    // to the lower.top.  We allow a small NEGATIVE gap (overlap) up to
+    // half the smaller table's height — the line-based detector
+    // occasionally produces bboxes that overhang the adjacent table by a
+    // few points when ruling-rule strokes have non-zero thickness or
+    // include the line's drawn extent above/below the baseline.  Real
+    // distinct tables almost always have a meaningful positive gap.
+    let upper_bottom = u_bbox.y;
+    let lower_top = l_bbox.y + l_bbox.height;
+    let gap = upper_bottom - lower_top;
+    if gap > y_tol {
+        return false;
+    }
+    let min_height = u_bbox.height.min(l_bbox.height);
+    if -gap > min_height * 0.5 {
+        return false;
+    }
+    true
+}
+
+fn merge_table_into(upper: &mut Table, lower: Table) {
+    if let (Some(ub), Some(lb)) = (upper.bbox, lower.bbox) {
+        let new_y = ub.y.min(lb.y);
+        let new_top = (ub.y + ub.height).max(lb.y + lb.height);
+        let new_x = ub.x.min(lb.x);
+        let new_right = (ub.x + ub.width).max(lb.x + lb.width);
+        upper.bbox = Some(crate::geometry::Rect {
+            x: new_x,
+            y: new_y,
+            width: new_right - new_x,
+            height: new_top - new_y,
+        });
+    }
+    upper.rows.extend(lower.rows);
 }
 
 fn detect_merged_cells(grid: &GridStructure, spans: &[TextSpan]) -> Vec<Vec<CellMergeInfo>> {
@@ -3341,6 +3586,89 @@ mod tests {
         };
         // Should return empty because there are no horizontal lines to define rows
         assert!(detect_tables_with_lines(&spans, &[], &config).is_empty());
+    }
+
+    /// Regression test for issue #486: text-only spatial fallback for line-less tables.
+    ///
+    /// `text_fallback = true` is now the default on `TableDetectionConfig` (the
+    /// prose-shape filter and ≥3-row guard suppress the false positives that
+    /// previously motivated a `false` default).  With the default and the `Both`
+    /// strategy, `detect_tables_with_lines` with an empty lines slice falls
+    /// through to the text-based path and detects the grid from span alignment
+    /// alone.  Callers that explicitly want the conservative
+    /// "no ruling lines → no tables" behaviour set `text_fallback = false` and
+    /// the `extract_page_tables` early-return guard in document.rs short-circuits
+    /// before this code is reached.
+    ///
+    /// This test directly calls `detect_tables_with_lines` with an empty lines
+    /// slice to verify that the text-based path inside it finds the table.
+    #[test]
+    fn test_text_fallback_detects_lineless_grid() {
+        // Simulate a 3-column, 4-row sailing-score table with no ruling lines.
+        // Columns at x=10, 50, 90; rows at y=200, 180, 160, 140.
+        let spans = vec![
+            // Row 1
+            create_test_span("Pos", 10.0, 200.0, 25.0, 10.0),
+            create_test_span("Boat", 50.0, 200.0, 25.0, 10.0),
+            create_test_span("Pts", 90.0, 200.0, 20.0, 10.0),
+            // Row 2
+            create_test_span("1", 10.0, 180.0, 25.0, 10.0),
+            create_test_span("Alpha", 50.0, 180.0, 25.0, 10.0),
+            create_test_span("14", 90.0, 180.0, 20.0, 10.0),
+            // Row 3
+            create_test_span("2", 10.0, 160.0, 25.0, 10.0),
+            create_test_span("Beta", 50.0, 160.0, 25.0, 10.0),
+            create_test_span("17", 90.0, 160.0, 20.0, 10.0),
+            // Row 4
+            create_test_span("3", 10.0, 140.0, 25.0, 10.0),
+            create_test_span("Gamma", 50.0, 140.0, 25.0, 10.0),
+            create_test_span("21", 90.0, 140.0, 20.0, 10.0),
+        ];
+
+        // With the Both strategy, NO lines, and text_fallback explicitly
+        // enabled, the text-based fallback inside detect_tables_with_lines
+        // fires and finds the grid.  Issue 484: the default no longer enables
+        // text_fallback to avoid spurious tables on report-style PDFs that
+        // would otherwise be double-emitted by extract_text.
+        let config = TableDetectionConfig {
+            text_fallback: true,
+            ..TableDetectionConfig::default()
+        };
+        let tables = detect_tables_with_lines(&spans, &[], &config);
+        assert_eq!(
+            tables.len(),
+            1,
+            "Text-only fallback in detect_tables_with_lines should detect the grid (got {:?} tables)",
+            tables.len()
+        );
+        let t = &tables[0];
+        assert_eq!(t.col_count, 3, "Should detect 3 columns");
+        assert_eq!(t.rows.len(), 4, "Should detect 4 rows");
+    }
+
+    /// Verify that when no lines are present and `text_fallback = false` (the default),
+    /// the guard in `extract_page_tables` (outside `detect_tables_with_lines`) would
+    /// prevent the text path from running.  We simulate this at the config level: using
+    /// a `Lines`-only strategy ensures `detect_tables_with_lines` returns nothing when
+    /// paths are empty — confirming the safety contract for the public API path.
+    #[test]
+    fn test_text_fallback_disabled_lines_strategy_returns_empty() {
+        let spans = vec![
+            create_test_span("Pos", 10.0, 200.0, 25.0, 10.0),
+            create_test_span("Boat", 50.0, 200.0, 25.0, 10.0),
+            create_test_span("Pts", 90.0, 200.0, 20.0, 10.0),
+            create_test_span("1", 10.0, 180.0, 25.0, 10.0),
+            create_test_span("Alpha", 50.0, 180.0, 25.0, 10.0),
+            create_test_span("14", 90.0, 180.0, 20.0, 10.0),
+        ];
+        // Lines-only strategy: no lines → no tables.  This is what the public
+        // extract_tables() API uses after the early-return guard fires.
+        let config = TableDetectionConfig::strict(); // strict() uses Lines/Lines
+        let tables = detect_tables_with_lines(&spans, &[], &config);
+        assert!(
+            tables.is_empty(),
+            "Lines-only strategy with no ruling lines should return no tables"
+        );
     }
 
     #[test]
@@ -5371,5 +5699,177 @@ mod tests {
         let grid = make_uniform_grid(3, 4, 3);
         let config = TableDetectionConfig::default();
         assert!(validate_table_structure_internal(&grid, &config));
+    }
+
+    // ========================================================================
+    // consolidate_adjacent_table_fragments (#485 / #486 / #487 regression)
+    // ========================================================================
+
+    /// Build a minimal Table with a bbox and col_count for consolidation tests.
+    fn make_fragment(x: f32, y: f32, width: f32, height: f32, cols: u32) -> Table {
+        let mut t = Table::new();
+        t.bbox = Some(Rect::new(x, y, width, height));
+        t.col_count = cols as usize;
+        // Push one empty row so consolidation has something to extend; the
+        // row count grows as fragments get merged.
+        t.rows.push(TableRow::new(false));
+        t
+    }
+
+    /// Two vertically-adjacent fragments with identical column structure
+    /// merge into a single multi-row table.  Models the issue-336 / nougat_018
+    /// fragmented-table pattern: every horizontal ruling line produces a
+    /// separate 1-row Table.
+    #[test]
+    fn consolidate_merges_adjacent_aligned_fragments() {
+        let upper = make_fragment(90.0, 480.0, 420.0, 16.0, 8);
+        let lower = make_fragment(90.0, 464.0, 420.0, 16.0, 8); // upper.bottom = 480, lower.top = 480
+        let merged = consolidate_adjacent_table_fragments(vec![upper, lower]);
+        assert_eq!(merged.len(), 1, "two aligned adjacent fragments must merge");
+        assert_eq!(merged[0].rows.len(), 2, "merged rows are concatenated");
+        let bb = merged[0].bbox.expect("merged bbox preserved");
+        assert!((bb.x - 90.0).abs() < 0.1);
+        assert!((bb.width - 420.0).abs() < 0.1);
+        // Total height covers both fragments.
+        assert!((bb.height - 32.0).abs() < 0.1);
+    }
+
+    /// Fragments separated by more than `Y_TOLERANCE = 3pt` must NOT merge —
+    /// they represent two distinct tables (e.g. two unrelated grids on the
+    /// same page).
+    #[test]
+    fn consolidate_does_not_merge_non_adjacent_fragments() {
+        let upper = make_fragment(90.0, 600.0, 420.0, 16.0, 8);
+        let lower = make_fragment(90.0, 400.0, 420.0, 16.0, 8); // 200pt gap
+        let result = consolidate_adjacent_table_fragments(vec![upper, lower]);
+        assert_eq!(result.len(), 2, "well-separated fragments stay distinct");
+    }
+
+    /// Fragments with different column counts must NOT merge even if
+    /// they sit adjacent vertically — they aren't a single logical table.
+    #[test]
+    fn consolidate_does_not_merge_different_col_counts() {
+        let upper = make_fragment(90.0, 480.0, 420.0, 16.0, 8);
+        let lower = make_fragment(90.0, 464.0, 420.0, 16.0, 5); // different col_count
+        let result = consolidate_adjacent_table_fragments(vec![upper, lower]);
+        assert_eq!(result.len(), 2, "different col_count blocks merging");
+    }
+
+    /// Fragments at different x-positions must NOT merge — they're in
+    /// different columns of the page even if their Y ranges are adjacent.
+    #[test]
+    fn consolidate_does_not_merge_misaligned_x() {
+        let upper = make_fragment(90.0, 480.0, 420.0, 16.0, 8);
+        let lower = make_fragment(50.0, 464.0, 420.0, 16.0, 8); // x offset 40pt
+        let result = consolidate_adjacent_table_fragments(vec![upper, lower]);
+        assert_eq!(result.len(), 2, "misaligned-x blocks merging");
+    }
+
+    /// A chain of three+ adjacent fragments should chain-merge into one
+    /// multi-row table.  This is the issue-336 shape: 8 column-aligned
+    /// fragments → one 18-row table after consolidation.
+    #[test]
+    fn consolidate_chains_multiple_adjacent_fragments() {
+        let f1 = make_fragment(90.0, 480.0, 420.0, 16.0, 8);
+        let f2 = make_fragment(90.0, 464.0, 420.0, 16.0, 8);
+        let f3 = make_fragment(90.0, 448.0, 420.0, 16.0, 8);
+        let f4 = make_fragment(90.0, 432.0, 420.0, 16.0, 8);
+        let merged = consolidate_adjacent_table_fragments(vec![f1, f2, f3, f4]);
+        assert_eq!(merged.len(), 1, "chain of 4 adjacent fragments → 1 table");
+        assert_eq!(merged[0].rows.len(), 4, "all rows preserved in chain merge");
+    }
+
+    /// Small vertical overlap (line-detector quirk) up to half the
+    /// smaller fragment's height is still considered adjacent.
+    #[test]
+    fn consolidate_tolerates_small_overlap() {
+        // upper bottom = 480, lower top = 484 (4pt overlap, smaller_h = 16, half = 8)
+        let upper = make_fragment(90.0, 480.0, 420.0, 16.0, 8);
+        let lower = make_fragment(90.0, 468.0, 420.0, 16.0, 8);
+        let merged = consolidate_adjacent_table_fragments(vec![upper, lower]);
+        assert_eq!(merged.len(), 1, "small overlap (< ½ row) still merges");
+    }
+
+    /// Empty input passes through unchanged.
+    #[test]
+    fn consolidate_empty_input() {
+        let merged = consolidate_adjacent_table_fragments(vec![]);
+        assert!(merged.is_empty());
+    }
+
+    /// Single-table input passes through unchanged (nothing to merge).
+    #[test]
+    fn consolidate_single_table_passthrough() {
+        let t = make_fragment(90.0, 480.0, 420.0, 16.0, 8);
+        let merged = consolidate_adjacent_table_fragments(vec![t]);
+        assert_eq!(merged.len(), 1);
+    }
+
+    // ========================================================================
+    // cell_span_separator (#485 / #487 regression)
+    // ========================================================================
+
+    /// Helper to construct a TextSpan with just the fields the separator
+    /// rule actually reads: bbox, font_size, and text.
+    fn ts(text: &str, x: f32, y: f32, width: f32, fs: f32) -> TextSpan {
+        TextSpan {
+            artifact_type: None,
+            text: text.to_string(),
+            bbox: Rect::new(x, y, width, fs),
+            font_size: fs,
+            font_name: String::new(),
+            font_weight: crate::layout::text_block::FontWeight::Normal,
+            color: Color::black(),
+            mcid: None,
+            sequence: 0,
+            split_boundary_before: false,
+            offset_semantic: false,
+            is_italic: false,
+            is_monospace: false,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 100.0,
+            primary_detected: false,
+            char_widths: vec![],
+        }
+    }
+
+    /// Adjacent spans with a sub-em gap must NOT have a separator
+    /// inserted.  Models issue-336's `60000` + `≤` + `Q` + `＜` + `80000`
+    /// where the operator glyphs touch / slightly overlap the digit
+    /// glyphs and must be rendered as a single compound token.
+    #[test]
+    fn cell_span_separator_no_space_for_tight_glyphs() {
+        let prev = ts("60000≤Q", 100.0, 200.0, 39.8, 10.6);
+        let curr = ts("＜", 139.8, 200.0, 10.6, 10.6); // gap = 0
+        assert_eq!(cell_span_separator(&prev, &curr), "");
+    }
+
+    /// Adjacent spans with a real gap (clear word boundary) get a
+    /// single space separator inserted.
+    #[test]
+    fn cell_span_separator_inserts_space_for_real_gap() {
+        let prev = ts("Quarter", 100.0, 200.0, 30.0, 10.0); // ends at x=130
+        let curr = ts("Total", 140.0, 200.0, 25.0, 10.0); // gap = 10pt = 1em
+        assert_eq!(cell_span_separator(&prev, &curr), " ");
+    }
+
+    /// CJK ↔ fullwidth-operator boundary suppresses separator even when
+    /// the geometric gap would otherwise warrant a space.
+    #[test]
+    fn cell_span_separator_suppresses_cjk_fullwidth_boundary() {
+        // "中" (U+4E2D, CJK) followed by "＜" (U+FF1C, fullwidth less-than).
+        let prev = ts("中", 100.0, 200.0, 12.0, 12.0); // ends at 112
+        let curr = ts("＜", 115.0, 200.0, 12.0, 12.0); // gap = 3pt = 0.25 em
+        assert_eq!(cell_span_separator(&prev, &curr), "");
+    }
+
+    /// Trailing whitespace on the preceding span suppresses separator
+    /// (no double-space).
+    #[test]
+    fn cell_span_separator_suppresses_on_existing_trailing_space() {
+        let prev = ts("Quarter ", 100.0, 200.0, 35.0, 10.0); // text ends with ' '
+        let curr = ts("Total", 140.0, 200.0, 25.0, 10.0);
+        assert_eq!(cell_span_separator(&prev, &curr), "");
     }
 }

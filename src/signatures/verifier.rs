@@ -208,6 +208,9 @@ impl SignatureVerifier {
                 .push("Certificate is not trusted".to_string());
         }
 
+        // WASM note: if signatures are ever enabled for wasm32, SystemTime::now()
+        // here will also need cfg-gating (currently masked because the `signatures`
+        // feature is not enabled in the wasm build).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)

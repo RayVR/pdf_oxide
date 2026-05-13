@@ -47,6 +47,7 @@ struct RangeEntry {
 /// - `chars`: HashMap for individual bfchar mappings (direct lookup O(1))
 /// - `ranges`: Sorted Vec of range entries for binary search (O(log n))
 /// - `notdef_ranges`: Sorted Vec for fallback mappings
+/// - `code_width`: Maximum code width in bytes (1 or 2), from `begincodespacerange`
 ///
 /// Keys are character codes (typically 1-4 bytes), values are Unicode strings.
 /// We use u32 to support multi-byte character codes found in CID fonts.
@@ -58,6 +59,15 @@ pub struct CMap {
     ranges: Vec<RangeEntry>,
     /// Undefined range fallbacks for unmapped codes
     notdef_ranges: Vec<RangeEntry>,
+    /// Maximum character code width in bytes, derived from `begincodespacerange`.
+    ///
+    /// - `1` (default) means single-byte codes (standard simple fonts).
+    /// - `2` means two-byte codes (CJK composite fonts, Identity-H CMaps).
+    ///
+    /// Set during parsing if any codespace entry has a 2-byte (4-hex-digit) hex string.
+    /// Used by the text extractor to decide whether to read 1 or 2 bytes per character
+    /// from the PDF content stream (§9.7.5 "CMaps").
+    pub code_width: u8,
 }
 
 impl CMap {
@@ -121,6 +131,7 @@ impl CMap {
             chars: HashMap::new(),
             ranges: Vec::new(),
             notdef_ranges: Vec::new(),
+            code_width: 1,
         }
     }
 
@@ -275,6 +286,16 @@ impl LazyCMap {
     /// Get the raw CMap stream bytes.
     pub fn raw_data(&self) -> &[u8] {
         &self.raw_stream
+    }
+
+    /// Return the character code width (1 or 2) declared by `begincodespacerange`.
+    ///
+    /// Parses and caches the CMap if not already done.
+    /// Returns `1` when the CMap is missing or unparseable (safe default for simple fonts).
+    /// Returns `2` when the codespace declares 2-byte codes, indicating a CJK composite font
+    /// whose content stream must be read two bytes at a time.
+    pub fn code_width(&self) -> u8 {
+        self.get().map(|cmap| cmap.code_width).unwrap_or(1)
     }
 
     /// Returns the parsed CMap, loading and caching it on first access.
@@ -442,6 +463,27 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
     let mut cmap = CMap::new();
     let content = String::from_utf8_lossy(data);
 
+    // Parse begincodespacerange sections (PDF Spec §9.7.5 / §9.10.3)
+    //
+    // The codespace range declares the valid domain of character codes and,
+    // critically, **their byte width**.  A range like `<00> <FF>` is 1-byte;
+    // `<0000> <FFFF>` is 2-byte.  We use the widest range found to set
+    // `cmap.code_width`, which the text extractor uses to decide how many
+    // bytes to consume per character from the PDF content stream.
+    //
+    // Without this, any CJK ToUnicode CMap that does not use one of the
+    // well-known encoding names (Identity-H, EUC, GBK, …) would be read
+    // one byte at a time, splitting every 2-byte CID into two wrong codes.
+    for section in extract_sections(&content, "begincodespacerange", "endcodespacerange") {
+        for line in section.lines() {
+            let width = parse_codespacerange_line_width(line);
+            if width > cmap.code_width {
+                cmap.code_width = width;
+                log::trace!("ToUnicode codespacerange: code_width set to {}", cmap.code_width);
+            }
+        }
+    }
+
     // Parse bfchar sections
     // PDF Spec: ISO 32000-1:2008, Section 9.10.3 - ToUnicode CMaps
     // Format: <srcCode> <dstString>
@@ -507,6 +549,31 @@ fn extract_sections<'a>(content: &'a str, begin: &str, end: &str) -> Vec<&'a str
     }
 
     sections
+}
+
+/// Parse a `begincodespacerange` line and return the maximum code byte-width found.
+///
+/// Each entry is a pair of hex strings: `<lo> <hi>`.  The number of hex digits
+/// in each string determines the byte width of the character codes:
+/// - 2 hex digits  → 1-byte code  (e.g. `<00> <FF>`)
+/// - 4 hex digits  → 2-byte code  (e.g. `<0000> <FFFF>`)
+///
+/// Returns 1 if the line does not contain a valid codespace pair, or 2 if at
+/// least one 2-byte (4-hex-digit) entry is found.
+fn parse_codespacerange_line_width(line: &str) -> u8 {
+    static RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>\s*<([^>]*)>").unwrap());
+
+    let mut max_width: u8 = 1;
+    for caps in RE.captures_iter(line) {
+        let lo_hex = caps[1].trim().replace(char::is_whitespace, "");
+        let hi_hex = caps[2].trim().replace(char::is_whitespace, "");
+        // 4 or more hex digits mean ≥2-byte codes.
+        if lo_hex.len() >= 4 || hi_hex.len() >= 4 {
+            max_width = 2;
+        }
+    }
+    max_width
 }
 
 /// Parse a bfchar line, returning all `<src> <dst>` pairs found on the line.
