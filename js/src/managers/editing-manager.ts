@@ -14,7 +14,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { mapFfiErrorCode } from '../errors';
+import { mapFfiErrorCode, PdfException } from '../errors';
 
 // =============================================================================
 // Type Definitions
@@ -149,6 +149,8 @@ export class EditingManager extends EventEmitter {
       }
     } else if (this.document?.addRedaction) {
       this.document.addRedaction(page, rect, fillColor);
+    } else {
+      this.redactionUnavailable('addRedaction');
     }
 
     this.emit('redactionAdded', { page, rect, color: fillColor });
@@ -203,7 +205,7 @@ export class EditingManager extends EventEmitter {
       return count ?? 0;
     }
 
-    return 0;
+    return this.redactionUnavailable('applyRedactions');
   }
 
   /**
@@ -212,16 +214,22 @@ export class EditingManager extends EventEmitter {
    * Removes document metadata fields that may contain sensitive information,
    * such as author names, creation tools, and JavaScript.
    *
-   * @param options - Options controlling which metadata to remove
-   * @throws {PdfException} If metadata scrubbing fails
+   * The underlying native sanitize (`pdf_redaction_scrub_metadata`,
+   * #231) is intentionally **all-or-nothing**: it strips `/Info`, the
+   * catalog XMP `/Metadata`, document JavaScript and
+   * `/Names/EmbeddedFiles` together (a secret must not survive because
+   * one category was opted out). A *selective* request is therefore
+   * rejected fail-closed rather than silently ignored.
+   *
+   * @param options - per-category toggles; all must be `true`
+   *   (the default) — passing any `false` throws.
+   * @throws {PdfException} If a selective scrub is requested, or if
+   *   metadata scrubbing fails.
    *
    * @example
    * ```typescript
-   * // Remove all metadata
+   * // Remove all metadata (the only supported mode)
    * editor.scrubMetadata();
-   *
-   * // Remove only Info dictionary and JavaScript
-   * editor.scrubMetadata({ removeInfo: true, removeXmp: false, removeJs: true });
    * ```
    */
   scrubMetadata(options?: ScrubMetadataOptions): void {
@@ -229,13 +237,28 @@ export class EditingManager extends EventEmitter {
     const removeXmp = options?.removeXmp ?? true;
     const removeJs = options?.removeJs ?? true;
 
+    // Fail-closed: the native scrub cannot preserve a single category,
+    // so refuse a partial request instead of silently doing a full
+    // scrub (or pretending the toggle was honoured in the event).
+    if (!removeInfo || !removeXmp || !removeJs) {
+      throw new PdfException(
+        '5000',
+        'scrubMetadata is all-or-nothing: removeInfo/removeXmp/removeJs ' +
+          'must all be true (the native sanitize strips /Info, XMP ' +
+          '/Metadata, document JavaScript and /Names/EmbeddedFiles ' +
+          'together). Refusing a partial scrub that could leave a ' +
+          'secret behind.'
+      );
+    }
+
     if (this.native?.pdf_redaction_scrub_metadata) {
+      // C ABI: pdf_redaction_scrub_metadata(handle, error_code) — a
+      // full document scrub (/Info, catalog XMP /Metadata, document
+      // JavaScript, /Names/EmbeddedFiles). The per-category toggles are
+      // advisory; the native scrub applies the safe all-on default.
       const errorCode = { value: 0 };
       const result = this.native.pdf_redaction_scrub_metadata(
         this.document?.handle ?? this.document,
-        removeInfo,
-        removeXmp,
-        removeJs,
         errorCode
       );
 
@@ -244,29 +267,36 @@ export class EditingManager extends EventEmitter {
       }
     } else if (this.document?.scrubMetadata) {
       this.document.scrubMetadata(options);
+    } else {
+      this.redactionUnavailable('scrubMetadata');
     }
 
     this.emit('metadataScrubbed', { removeInfo, removeXmp, removeJs });
   }
 
   /**
-   * Gets the number of queued (pending) redaction areas.
+   * Gets the number of redaction areas queued for a page (annotations
+   * + programmatic rectangles), matching the per-page C ABI / Rust /
+   * C# / Go contract (`pdf_redaction_count(handle, page, error_code)`).
    *
-   * @returns Number of redaction areas queued for application
+   * @param page - zero-based page index (default 0)
+   * @returns Number of redaction areas queued for that page
    * @throws {PdfException} If the document handle is invalid
    *
    * @example
    * ```typescript
    * editor.addRedaction(0, { x1: 10, y1: 20, x2: 100, y2: 50 });
-   * editor.addRedaction(1, { x1: 30, y1: 40, x2: 200, y2: 80 });
-   * console.log(editor.getRedactionCount()); // 2
+   * console.log(editor.getRedactionCount(0)); // 1
    * ```
    */
-  getRedactionCount(): number {
+  getRedactionCount(page = 0): number {
     if (this.native?.pdf_redaction_count) {
       const errorCode = { value: 0 };
+      // C ABI arity is (handle, page, error_code) — the page index is
+      // mandatory; omitting it would shift errorCode into the page slot.
       const result = this.native.pdf_redaction_count(
         this.document?.handle ?? this.document,
+        page,
         errorCode
       );
 
@@ -276,10 +306,35 @@ export class EditingManager extends EventEmitter {
 
       return result;
     } else if (this.document?.getRedactionCount) {
-      return this.document.getRedactionCount() ?? 0;
+      return this.document.getRedactionCount(page) ?? 0;
     }
 
-    return 0;
+    return this.redactionUnavailable('getRedactionCount');
+  }
+
+  /**
+   * Fail loudly when no real redaction backend is wired.
+   *
+   * Latent bug fix (README / #231): `editing-manager.ts` referenced
+   * native `pdf_redaction_add/apply/scrub_metadata/count` symbols that
+   * do **not** exist in `src/ffi.rs`. The previous fall-throughs
+   * silently no-op'd / returned 0 / emitted a success event — a
+   * security-critical "redaction" API pretending to succeed while
+   * removing nothing. Destructive redaction is implemented as of
+   * v0.3.50 (#231); reaching here now means the loaded native addon is
+   * missing/older than the bindings and does not export the
+   * `pdf_redaction_*` symbols — these operations must refuse rather
+   * than give a false sense of safety.
+   */
+  private redactionUnavailable(op: string): never {
+    throw new PdfException(
+      '5000',
+      `Destructive redaction is unavailable: '${op}' requires the native ` +
+        `pdf_redaction_* symbols, which the loaded pdf-oxide addon does not ` +
+        `export. The native module is missing or older than these bindings — ` +
+        `rebuild/upgrade the native addon to match. Refusing to silently ` +
+        `no-op a security-critical operation.`
+    );
   }
 
   // ===========================================================================

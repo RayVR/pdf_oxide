@@ -145,6 +145,101 @@ pub fn generate_qr_svg(data: String, error_correction: i32, size: u32) -> Result
 }
 
 // ============================================================================
+// split-by-bookmarks (#482) — free functions binding the Rust core
+// ============================================================================
+
+fn wasm_split_opts(
+    title_prefix: Option<String>,
+    ignore_case: bool,
+    level: u32,
+    include_front_matter: bool,
+) -> crate::split_bookmarks::SplitByBookmarksOptions {
+    crate::split_bookmarks::SplitByBookmarksOptions {
+        title_prefix,
+        ignore_case,
+        level: crate::split_bookmarks::BookmarkLevel::from_u32(level),
+        include_front_matter,
+        ..Default::default()
+    }
+}
+
+/// Plan a bookmark split without producing PDFs. Returns a JSON array
+/// of segment objects (`index, startPage…` shape from
+/// `BookmarkSegment`). `level`: 0 = all depths, 1 = top-level.
+#[wasm_bindgen(js_name = "planSplitByBookmarks")]
+pub fn plan_split_by_bookmarks(
+    src_bytes: &[u8],
+    title_prefix: Option<String>,
+    ignore_case: bool,
+    level: u32,
+    include_front_matter: bool,
+) -> Result<JsValue, JsValue> {
+    let doc = crate::document::PdfDocument::from_bytes(src_bytes.to_vec())
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let opts = wasm_split_opts(title_prefix, ignore_case, level, include_front_matter);
+    let segs = crate::split_bookmarks::plan_split_by_bookmarks(&doc, &opts)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_wasm_bindgen::to_value(&segs).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Split at bookmark boundaries. Returns a JSON array of
+/// `[segment, bytes]` pairs (bytes as a number array; source
+/// unmodified).
+#[wasm_bindgen(js_name = "splitByBookmarks")]
+pub fn split_by_bookmarks(
+    src_bytes: &[u8],
+    title_prefix: Option<String>,
+    ignore_case: bool,
+    level: u32,
+    include_front_matter: bool,
+) -> Result<JsValue, JsValue> {
+    let opts = wasm_split_opts(title_prefix, ignore_case, level, include_front_matter);
+    let parts = crate::split_bookmarks::split_by_bookmarks_to_bytes(src_bytes, &opts)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_wasm_bindgen::to_value(&parts).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+// ============================================================================
+// crypto governance policy (#230) — free functions binding the Rust core
+// ============================================================================
+
+/// Install the process-wide runtime crypto policy from its grammar
+/// string (`"compat"|"strict"|"fips-strict"[;…]`). Fail-closed:
+/// throws on an unparseable spec (policy NOT installed) or if a
+/// policy is already set. Default (never set) is `compat`.
+#[wasm_bindgen(js_name = "setCryptoPolicy")]
+pub fn set_crypto_policy(spec: &str) -> Result<(), JsValue> {
+    let policy: crate::crypto::SecurityPolicy = spec
+        .parse()
+        .map_err(|e: crate::crypto::PolicyParseError| JsValue::from_str(&e.to_string()))?;
+    crate::crypto::set_policy(policy).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The active crypto policy as its canonical grammar string.
+#[wasm_bindgen(js_name = "cryptoPolicy")]
+pub fn crypto_policy() -> String {
+    crate::crypto::active_policy().to_string()
+}
+
+/// The cryptographic algorithm tokens exercised so far this process
+/// (governance report), as a JSON string array.
+#[wasm_bindgen(js_name = "cryptoInventory")]
+pub fn crypto_inventory() -> Result<JsValue, JsValue> {
+    let tokens: Vec<&'static str> = crate::crypto::inventory()
+        .into_iter()
+        .map(|a| a.token())
+        .collect();
+    serde_wasm_bindgen::to_value(&tokens).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// A CycloneDX 1.6 Cryptographic Bill of Materials (JSON string) of the
+/// algorithms exercised so far this process (#230 Phase F).
+#[wasm_bindgen(js_name = "cryptoCbom")]
+pub fn crypto_cbom() -> String {
+    crate::crypto::cbom_json()
+}
+
+// ============================================================================
 // WasmPdfDocument — read, convert, search, extract, and edit PDFs
 // ============================================================================
 
@@ -257,6 +352,20 @@ impl WasmPdfDocument {
             .into_iter()
             .map(|info| WasmSignature { info })
             .collect())
+    }
+
+    /// The document's Document Security Store (`/DSS`) as a `Dss`, or
+    /// `undefined` if absent. Mirrors Rust `signatures::read_dss`.
+    #[cfg(feature = "signatures")]
+    #[wasm_bindgen(js_name = "dss")]
+    pub fn dss(&mut self) -> Result<Option<WasmDss>, JsValue> {
+        let doc = self
+            .inner
+            .lock()
+            .map_err(|_| JsValue::from_str("Mutex lock failed"))?;
+        crate::signatures::read_dss(&doc)
+            .map(|opt| opt.map(|dss| WasmDss { dss }))
+            .map_err(|e| JsValue::from_str(&format!("Failed to read DSS: {}", e)))
     }
 
     /// Get the PDF version as [major, minor].
@@ -1480,6 +1589,194 @@ pub fn wasm_sign_pdf_bytes(
         .map_err(|e| JsValue::from_str(&format!("signPdfBytes failed: {e}")))
 }
 
+// ─── PAdES LTV (#235) ───────────────────────────────────────────────────────
+
+/// PAdES baseline level. Frozen integer mapping (BB=0, BT=1, BLt=2,
+/// BLta=3) shared with the C ABI and every binding — never renumber.
+#[cfg(feature = "signatures")]
+#[wasm_bindgen(js_name = "PadesLevel")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WasmPadesLevel {
+    /// B-B: signed attrs incl. the ESS signing-certificate-v2.
+    BB = 0,
+    /// B-T: B-B + an RFC 3161 signature-time-stamp unsigned attr.
+    BT = 1,
+    /// B-LT: B-T + a Document Security Store (DSS/VRI).
+    BLt = 2,
+    /// B-LTA: B-LT + a document-scoped `/DocTimeStamp`.
+    BLta = 3,
+}
+
+#[cfg(feature = "signatures")]
+impl WasmPadesLevel {
+    fn to_core(self) -> crate::signatures::PadesLevel {
+        crate::signatures::PadesLevel::from_code(self as i32)
+            .expect("frozen PadesLevel code round-trips")
+    }
+    fn from_core(level: crate::signatures::PadesLevel) -> WasmPadesLevel {
+        match level.code() {
+            0 => WasmPadesLevel::BB,
+            1 => WasmPadesLevel::BT,
+            2 => WasmPadesLevel::BLt,
+            _ => WasmPadesLevel::BLta,
+        }
+    }
+}
+
+/// Offline B-LT validation material (DER certs / CRLs / OCSP
+/// responses). Build with `new()` then `addCert`/`addCrl`/`addOcsp`.
+#[cfg(feature = "signatures")]
+#[wasm_bindgen(js_name = "RevocationMaterial")]
+#[derive(Default)]
+pub struct WasmRevocationMaterial {
+    certs: Vec<Vec<u8>>,
+    crls: Vec<Vec<u8>>,
+    ocsps: Vec<Vec<u8>>,
+}
+
+#[cfg(feature = "signatures")]
+#[wasm_bindgen]
+impl WasmRevocationMaterial {
+    /// Create an empty revocation-material set.
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmRevocationMaterial {
+        WasmRevocationMaterial::default()
+    }
+    /// Add a DER X.509 certificate.
+    #[wasm_bindgen(js_name = "addCert")]
+    pub fn add_cert(&mut self, der: &[u8]) {
+        self.certs.push(der.to_vec());
+    }
+    /// Add a DER CRL.
+    #[wasm_bindgen(js_name = "addCrl")]
+    pub fn add_crl(&mut self, der: &[u8]) {
+        self.crls.push(der.to_vec());
+    }
+    /// Add a DER OCSP response.
+    #[wasm_bindgen(js_name = "addOcsp")]
+    pub fn add_ocsp(&mut self, der: &[u8]) {
+        self.ocsps.push(der.to_vec());
+    }
+}
+
+/// A parsed Document Security Store (`/DSS`, ISO 32000-2 §12.8.4.3).
+/// Count + index accessors mirror `WasmCertificate`'s flat shape
+/// (wasm-bindgen cannot return `Uint8Array[]` directly).
+#[cfg(feature = "signatures")]
+#[wasm_bindgen(js_name = "Dss")]
+pub struct WasmDss {
+    dss: crate::signatures::DocumentSecurityStore,
+}
+
+#[cfg(feature = "signatures")]
+#[wasm_bindgen]
+impl WasmDss {
+    /// Number of DER X.509 certificates in the DSS.
+    #[wasm_bindgen(getter, js_name = "certCount")]
+    pub fn cert_count(&self) -> usize {
+        self.dss.certificates.len()
+    }
+    /// The `i`-th DER certificate, or `undefined` if out of range.
+    #[wasm_bindgen(js_name = "getCert")]
+    pub fn get_cert(&self, i: usize) -> Option<Vec<u8>> {
+        self.dss.certificates.get(i).cloned()
+    }
+    /// Number of DER CRLs in the DSS.
+    #[wasm_bindgen(getter, js_name = "crlCount")]
+    pub fn crl_count(&self) -> usize {
+        self.dss.crls.len()
+    }
+    /// The `i`-th DER CRL, or `undefined` if out of range.
+    #[wasm_bindgen(js_name = "getCrl")]
+    pub fn get_crl(&self, i: usize) -> Option<Vec<u8>> {
+        self.dss.crls.get(i).cloned()
+    }
+    /// Number of DER OCSP responses in the DSS.
+    #[wasm_bindgen(getter, js_name = "ocspCount")]
+    pub fn ocsp_count(&self) -> usize {
+        self.dss.ocsp_responses.len()
+    }
+    /// The `i`-th DER OCSP response, or `undefined` if out of range.
+    #[wasm_bindgen(js_name = "getOcsp")]
+    pub fn get_ocsp(&self, i: usize) -> Option<Vec<u8>> {
+        self.dss.ocsp_responses.get(i).cloned()
+    }
+    /// Per-signature VRI keys (uppercase-hex SHA-1 of `/Contents`).
+    #[wasm_bindgen(getter)]
+    pub fn vri(&self) -> Vec<String> {
+        self.dss
+            .vri
+            .iter()
+            .map(|v| v.signature_digest.clone())
+            .collect()
+    }
+}
+
+/// Whether `pdf_data` carries a document-scoped RFC 3161
+/// `/DocTimeStamp` archival timestamp (PAdES-B-LTA). This is the
+/// document-level reader signal; a `WasmSignature`'s `padesLevel`
+/// getter is signature-scoped and tops out at B-LT by design.
+#[cfg(feature = "signatures")]
+#[wasm_bindgen(js_name = "hasDocumentTimestamp")]
+pub fn wasm_has_document_timestamp(pdf_data: &[u8]) -> bool {
+    crate::signatures::has_document_timestamp(pdf_data)
+}
+
+/// Sign raw PDF bytes at a PAdES baseline level and return the signed
+/// PDF as a `Uint8Array`.
+///
+/// `level` `BLTA` is reserved (→ error). For `BT`/`BLt` pass a
+/// pre-fetched RFC 3161 `timestampToken` (DER): WASM intentionally
+/// omits the online TSA client (same `ureq`-incompat carve-out as
+/// v0.3.38) — without a token the core fail-closes with `Unsupported`.
+/// `revocation` supplies the B-LT DSS material.
+#[cfg(feature = "signatures")]
+#[wasm_bindgen(js_name = "signPdfBytesPades")]
+#[allow(clippy::too_many_arguments)]
+pub fn wasm_sign_pdf_bytes_pades(
+    pdf_data: &[u8],
+    cert: &WasmCertificate,
+    level: WasmPadesLevel,
+    timestamp_token: Option<Vec<u8>>,
+    revocation: Option<WasmRevocationMaterial>,
+    reason: Option<String>,
+    location: Option<String>,
+) -> Result<Vec<u8>, JsValue> {
+    use crate::signatures::{sign_pdf_bytes_pades, RevocationMaterial, SignOptions};
+    let opts = SignOptions {
+        reason,
+        location,
+        ..Default::default()
+    };
+    let material = revocation
+        .map(|r| RevocationMaterial {
+            certificates: r.certs,
+            crls: r.crls,
+            ocsp_responses: r.ocsps,
+            ..Default::default()
+        })
+        .unwrap_or_default();
+
+    // The caller-supplied token is the timestamp source; the imprint is
+    // computed by the core over the signature value, so the closure
+    // simply returns the pre-fetched token verbatim.
+    let ts_closure: Option<Box<dyn Fn(&[u8]) -> crate::error::Result<Vec<u8>>>> = timestamp_token
+        .map(|tok| {
+            Box::new(move |_sig: &[u8]| Ok(tok.clone()))
+                as Box<dyn Fn(&[u8]) -> crate::error::Result<Vec<u8>>>
+        });
+
+    sign_pdf_bytes_pades(
+        pdf_data,
+        &cert.creds,
+        opts,
+        level.to_core(),
+        ts_closure.as_deref(),
+        &material,
+    )
+    .map_err(|e| JsValue::from_str(&format!("signPdfBytesPades failed: {e}")))
+}
+
 /// RFC 3161 timestamp parsed from a DER TimeStampToken or bare
 /// TSTInfo. Mirrors the C#, Go, and Python `Timestamp` surfaces.
 #[cfg(feature = "signatures")]
@@ -1605,6 +1902,14 @@ impl WasmSignature {
     #[wasm_bindgen(getter, js_name = "coversWholeDocument")]
     pub fn covers_whole_document(&self) -> bool {
         self.info.covers_whole_document
+    }
+
+    /// PAdES baseline level from this signature's CMS attributes alone
+    /// (`BB` vs `BT`). `BLt` additionally needs the document `/DSS` —
+    /// read it via `WasmPdfDocument.dss()` and re-classify there.
+    #[wasm_bindgen(getter, js_name = "padesLevel")]
+    pub fn pades_level(&self) -> WasmPadesLevel {
+        WasmPadesLevel::from_core(crate::signatures::classify_pades_level(&self.info, None))
     }
 
     /// Run the RFC 5652 §5.4 signer-attributes crypto check. Today
@@ -2629,6 +2934,93 @@ impl WasmPdfDocument {
         editor
             .apply_all_redactions()
             .map_err(|e| JsValue::from_str(&format!("Failed to apply redactions: {}", e)))
+    }
+
+    /// Queue an explicit destructive redaction rectangle on a page
+    /// (page user space; `fill` is an optional DeviceRGB `[r,g,b]`).
+    #[wasm_bindgen(js_name = "addRedaction")]
+    pub fn add_redaction(
+        &mut self,
+        page: usize,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        fill: Option<Vec<f32>>,
+    ) -> Result<(), JsValue> {
+        let editor_arc = self.ensure_editor()?;
+        let mut editor = editor_arc
+            .lock()
+            .map_err(|_| JsValue::from_str("Mutex lock failed"))?;
+        let fill = fill.and_then(|v| {
+            if v.len() == 3 {
+                Some([v[0], v[1], v[2]])
+            } else {
+                None
+            }
+        });
+        editor
+            .add_redaction(page, [x0, y0, x1, y1], fill)
+            .map_err(|e| JsValue::from_str(&format!("Failed to add redaction: {}", e)))
+    }
+
+    /// Number of redaction regions queued for `page`.
+    #[wasm_bindgen(js_name = "redactionCount")]
+    pub fn redaction_count(&mut self, page: usize) -> Result<usize, JsValue> {
+        let editor_arc = self.ensure_editor()?;
+        let mut editor = editor_arc
+            .lock()
+            .map_err(|_| JsValue::from_str("Mutex lock failed"))?;
+        editor
+            .redaction_count(page)
+            .map_err(|e| JsValue::from_str(&format!("Failed to count redactions: {}", e)))
+    }
+
+    /// Destructively apply all queued redactions (true content removal,
+    /// ISO 32000-1:2008 §12.5.6.23). Returns a `RedactionReport` object.
+    #[wasm_bindgen(js_name = "applyRedactionsDestructive")]
+    pub fn apply_redactions_destructive(
+        &mut self,
+        scrub_metadata: Option<bool>,
+    ) -> Result<JsValue, JsValue> {
+        let editor_arc = self.ensure_editor()?;
+        let mut editor = editor_arc
+            .lock()
+            .map_err(|_| JsValue::from_str("Mutex lock failed"))?;
+        let opts = crate::redaction::RedactionOptions {
+            scrub_metadata: scrub_metadata.unwrap_or(true),
+            ..crate::redaction::RedactionOptions::default()
+        };
+        let report = editor
+            .apply_redactions_destructive(opts)
+            .map_err(|e| JsValue::from_str(&format!("Failed to apply redactions: {}", e)))?;
+        serde_wasm_bindgen::to_value(&report).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Standalone document sanitization (#231 T10): strip `/Info`,
+    /// catalog XMP `/Metadata`, document JavaScript and embedded files
+    /// without geometric redaction. Returns a `RedactionReport` object.
+    #[wasm_bindgen(js_name = "sanitizeDocument")]
+    pub fn sanitize_document(
+        &mut self,
+        scrub_metadata: Option<bool>,
+        remove_javascript: Option<bool>,
+        remove_embedded_files: Option<bool>,
+    ) -> Result<JsValue, JsValue> {
+        let editor_arc = self.ensure_editor()?;
+        let mut editor = editor_arc
+            .lock()
+            .map_err(|_| JsValue::from_str("Mutex lock failed"))?;
+        let opts = crate::redaction::RedactionOptions {
+            scrub_metadata: scrub_metadata.unwrap_or(true),
+            remove_javascript: remove_javascript.unwrap_or(true),
+            remove_embedded_files: remove_embedded_files.unwrap_or(true),
+            ..crate::redaction::RedactionOptions::default()
+        };
+        let report = editor
+            .sanitize_document(opts)
+            .map_err(|e| JsValue::from_str(&format!("Failed to sanitize document: {}", e)))?;
+        serde_wasm_bindgen::to_value(&report).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }
 

@@ -181,6 +181,20 @@ extern void pdf_signature_free(void* handle);
 extern void pdf_certificate_free(void* handle);
 extern uint8_t* pdf_sign_bytes(const uint8_t* pdf_data, size_t pdf_len, const void* certificate_handle, const char* reason, const char* location, size_t* out_len, int* error_code);
 
+// PAdES LTV FFI declarations (#235)
+extern uint8_t* pdf_sign_bytes_pades(const uint8_t* pdf, size_t pdf_len, const void* cert_handle, int32_t level, const char* tsa_url, const char* reason, const char* location, const uint8_t* const* certs, const size_t* cert_lens, size_t n_certs, const uint8_t* const* crls, const size_t* crl_lens, size_t n_crls, const uint8_t* const* ocsps, const size_t* ocsp_lens, size_t n_ocsps, size_t* out_len, int* error_code);
+extern int32_t pdf_signature_get_pades_level(const void* sig_handle, int* error_code);
+extern void* pdf_document_get_dss(const void* doc_handle, int* error_code);
+extern int   pdf_document_has_timestamp(const void* doc_handle, int* error_code);
+extern int32_t pdf_dss_cert_count(const void* dss);
+extern int32_t pdf_dss_crl_count(const void* dss);
+extern int32_t pdf_dss_ocsp_count(const void* dss);
+extern int32_t pdf_dss_vri_count(const void* dss);
+extern uint8_t* pdf_dss_get_cert(const void* dss, int32_t index, size_t* out_len, int* error_code);
+extern uint8_t* pdf_dss_get_crl(const void* dss, int32_t index, size_t* out_len, int* error_code);
+extern uint8_t* pdf_dss_get_ocsp(const void* dss, int32_t index, size_t* out_len, int* error_code);
+extern void pdf_dss_free(void* dss);
+
 // Rendering FFI declarations (21 functions)
 extern int32_t pdf_estimate_render_time(const void* document_handle, int32_t page_index, int* error_code);
 extern void* pdf_create_renderer(int32_t dpi, int32_t format, int32_t quality, bool anti_alias, int* error_code);
@@ -328,6 +342,10 @@ extern int32_t document_editor_merge_from_bytes(void* handle, const uint8_t* dat
 extern int   document_editor_embed_file(void* handle, const char* name, const uint8_t* data, size_t len, int* error_code);
 extern int   document_editor_apply_page_redactions(void* handle, size_t page, int* error_code);
 extern int   document_editor_apply_all_redactions(void* handle, int* error_code);
+extern int   pdf_redaction_add(void* handle, size_t page, double x1, double y1, double x2, double y2, double r, double g, double b, int* error_code);
+extern int   pdf_redaction_count(void* handle, size_t page, int* error_code);
+extern int   pdf_redaction_apply(void* handle, bool scrub_metadata, double r, double g, double b, int* error_code);
+extern int   pdf_redaction_scrub_metadata(void* handle, int* error_code);
 extern int   document_editor_rotate_all_pages(void* handle, int32_t degrees, int* error_code);
 extern int   document_editor_rotate_page_by(void* handle, size_t page, int32_t degrees, int* error_code);
 extern int   document_editor_get_page_media_box(void* handle, size_t page, double* x, double* y, double* w, double* h, int* error_code);
@@ -372,6 +390,7 @@ extern void pdf_oxide_path_list_free(void* handle);
 extern char* pdf_document_get_page_labels(void* handle, int* error_code);
 extern char* pdf_document_get_xmp_metadata(void* handle, int* error_code);
 extern char* pdf_document_get_outline(void* handle, int* error_code);
+extern char* pdf_document_plan_split_by_bookmarks(void* handle, const char* options_json, int* error_code);
 
 // Rendering
 extern void* pdf_render_page(void* doc, int32_t page_index, int32_t format, int* error_code);
@@ -422,6 +441,10 @@ extern int pdf_oxide_get_log_level();
 extern char* pdf_oxide_crypto_active_provider();
 extern int pdf_oxide_crypto_fips_available();
 extern int pdf_oxide_crypto_use_fips();
+extern int pdf_oxide_crypto_set_policy(const char* spec);
+extern char* pdf_oxide_crypto_policy();
+extern char* pdf_oxide_crypto_inventory();
+extern char* pdf_oxide_crypto_cbom();
 
 // OCR (v0.3.27 — FFI bridge wrapping src/ocr::OcrEngine)
 // Returns _ERR_UNSUPPORTED when the Rust crate was built without --features ocr.
@@ -448,6 +471,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -2543,6 +2567,79 @@ func (editor *DocumentEditor) ApplyAllRedactions() error {
 	return nil
 }
 
+// AddRedaction queues an explicit destructive redaction rectangle (page
+// user space). The content is physically removed by ApplyRedactions —
+// not a cosmetic overlay (ISO 32000-1:2008 §12.5.6.23). fill is an
+// optional DeviceRGB [r,g,b]; nil uses black.
+func (editor *DocumentEditor) AddRedaction(page int, rect [4]float64, fill *[3]float64) error {
+	if err := editor.acquireWrite(); err != nil {
+		return err
+	}
+	defer editor.mu.Unlock()
+	r, g, b := 0.0, 0.0, 0.0
+	if fill != nil {
+		r, g, b = fill[0], fill[1], fill[2]
+	}
+	var errorCode C.int
+	C.pdf_redaction_add(editor.handle, C.size_t(page),
+		C.double(rect[0]), C.double(rect[1]), C.double(rect[2]), C.double(rect[3]),
+		C.double(r), C.double(g), C.double(b), &errorCode)
+	if errorCode != 0 {
+		return ffiError(errorCode)
+	}
+	return nil
+}
+
+// RedactionCount returns the number of redaction regions queued for a
+// page (annotations + programmatic rectangles).
+func (editor *DocumentEditor) RedactionCount(page int) (int, error) {
+	if err := editor.acquireWrite(); err != nil {
+		return 0, err
+	}
+	defer editor.mu.Unlock()
+	var errorCode C.int
+	n := C.pdf_redaction_count(editor.handle, C.size_t(page), &errorCode)
+	if errorCode != 0 {
+		return 0, ffiError(errorCode)
+	}
+	return int(n), nil
+}
+
+// ApplyRedactions destructively applies all queued redactions (true
+// content removal). Returns the number of glyphs physically removed.
+func (editor *DocumentEditor) ApplyRedactions(scrubMetadata bool) (int, error) {
+	if err := editor.acquireWrite(); err != nil {
+		return 0, err
+	}
+	defer editor.mu.Unlock()
+	var errorCode C.int
+	removed := C.pdf_redaction_apply(editor.handle, C.bool(scrubMetadata),
+		C.double(0), C.double(0), C.double(0), &errorCode)
+	if errorCode != 0 {
+		return 0, ffiError(errorCode)
+	}
+	return int(removed), nil
+}
+
+// SanitizeDocument performs standalone document sanitization (no
+// geometric redaction): it strips the /Info dictionary, the catalog
+// XMP /Metadata stream, document JavaScript (/OpenAction, /AA,
+// /Names/JavaScript) and /Names/EmbeddedFiles, hard-excluding the
+// removed object subtrees from the rewritten file. Returns the number
+// of annotations removed (ISO 32000 §12.5.6.23; issue #231).
+func (editor *DocumentEditor) SanitizeDocument() (int, error) {
+	if err := editor.acquireWrite(); err != nil {
+		return 0, err
+	}
+	defer editor.mu.Unlock()
+	var errorCode C.int
+	removed := C.pdf_redaction_scrub_metadata(editor.handle, &errorCode)
+	if errorCode != 0 {
+		return 0, ffiError(errorCode)
+	}
+	return int(removed), nil
+}
+
 // RotateAllPages rotates every page by degrees (additive, not absolute).
 func (editor *DocumentEditor) RotateAllPages(degrees int) error {
 	if err := editor.acquireWrite(); err != nil {
@@ -2909,6 +3006,62 @@ func (doc *PdfDocument) Outline() (string, error) {
 	text := C.GoString(cText)
 	C.free_string(cText)
 	return text, nil
+}
+
+// SplitSegment is one planned output segment of a bookmark split (#482).
+type SplitSegment struct {
+	Index     int     `json:"index"`
+	StartPage int     `json:"start_page"`
+	EndPage   int     `json:"end_page"`
+	Title     *string `json:"title"`
+	FileStem  string  `json:"file_stem"`
+	PageLabel *string `json:"page_label"`
+}
+
+// SplitByBookmarksOptions controls a bookmark split. Level: 0 = all
+// depths, 1 = top-level only (default), n = up to depth n.
+type SplitByBookmarksOptions struct {
+	TitlePrefix        *string
+	IgnoreCase         bool
+	Level              int
+	IncludeFrontMatter bool
+}
+
+// PlanSplitByBookmarks plans (does not produce) a split of the document
+// at outline/bookmark boundaries (#482), mirroring the core
+// plan_split_by_bookmarks. Returns the planned segments or an error
+// (e.g. the document has no outline / nothing resolved).
+func (doc *PdfDocument) PlanSplitByBookmarks(opts SplitByBookmarksOptions) ([]SplitSegment, error) {
+	if err := doc.acquireRead(); err != nil {
+		return nil, err
+	}
+	defer doc.mu.Unlock()
+
+	optJSON, err := json.Marshal(map[string]interface{}{
+		"title_prefix":         opts.TitlePrefix,
+		"ignore_case":          opts.IgnoreCase,
+		"level":                opts.Level,
+		"include_front_matter": opts.IncludeFrontMatter,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("pdf_oxide: marshal split options: %w", err)
+	}
+	cOpts := C.CString(string(optJSON))
+	defer C.free(unsafe.Pointer(cOpts))
+
+	var errorCode C.int
+	cText := C.pdf_document_plan_split_by_bookmarks(doc.handle, cOpts, &errorCode)
+	if errorCode != 0 {
+		return nil, ffiError(errorCode)
+	}
+	text := C.GoString(cText)
+	C.free_string(cText)
+
+	var segs []SplitSegment
+	if err := json.Unmarshal([]byte(text), &segs); err != nil {
+		return nil, fmt.Errorf("pdf_oxide: parse split plan JSON: %w", err)
+	}
+	return segs, nil
 }
 
 // FromImage creates a PDF from an image file
@@ -3565,6 +3718,258 @@ func SignPdfBytes(pdfData []byte, cert *Certificate, reason, location string) ([
 	return result, nil
 }
 
+// ─── PAdES LTV (#235) ───────────────────────────────────────────────────────
+
+// PAdESLevel is the PAdES baseline level. The integer mapping
+// (PAdESBB=0, PAdESBT=1, PAdESBLt=2, PAdESBLta=3) is frozen and shared
+// with the C ABI and every binding — never renumber.
+type PAdESLevel int32
+
+const (
+	// PAdESBB is CAdES-B-B (signed attrs incl. ESS signing-certificate-v2).
+	PAdESBB PAdESLevel = 0
+	// PAdESBT is B-B + an RFC 3161 signature-time-stamp unsigned attr.
+	PAdESBT PAdESLevel = 1
+	// PAdESBLt is B-T + a Document Security Store (DSS/VRI).
+	PAdESBLt PAdESLevel = 2
+	// PAdESBLta is reserved; producing it is not supported in this release.
+	PAdESBLta PAdESLevel = 3
+)
+
+// RevocationMaterial is the offline B-LT validation set: DER X.509
+// certificates, CRLs, and OCSP responses. Mirrors Rust
+// signatures::RevocationMaterial.
+type RevocationMaterial struct {
+	Certs [][]byte
+	CRLs  [][]byte
+	OCSPs [][]byte
+}
+
+// PAdESOptions configures SignPdfBytesPAdES. TSAURL is required for
+// Level >= PAdESBT (the RFC 3161 source; needs the cgo build — purego
+// has no signing). Reason/Location are optional. Revocation supplies
+// the B-LT DSS material.
+type PAdESOptions struct {
+	Level      PAdESLevel
+	TSAURL     string
+	Reason     string
+	Location   string
+	Revocation *RevocationMaterial
+}
+
+// cBlobArray copies blobs into C memory as parallel (ptrs, lens, n)
+// arrays for the *_pades FFI; the returned func frees everything.
+// Empty input ⇒ (nil, nil, 0, no-op).
+func cBlobArray(blobs [][]byte) (**C.uint8_t, *C.size_t, C.size_t, func()) {
+	if len(blobs) == 0 {
+		return nil, nil, 0, func() {}
+	}
+	ptrs := make([]*C.uint8_t, len(blobs))
+	lens := make([]C.size_t, len(blobs))
+	for i, b := range blobs {
+		if len(b) == 0 {
+			ptrs[i] = nil
+			lens[i] = 0
+			continue
+		}
+		ptrs[i] = (*C.uint8_t)(C.CBytes(b))
+		lens[i] = C.size_t(len(b))
+	}
+	free := func() {
+		for _, p := range ptrs {
+			if p != nil {
+				C.free(unsafe.Pointer(p))
+			}
+		}
+	}
+	return (**C.uint8_t)(unsafe.Pointer(&ptrs[0])), (*C.size_t)(unsafe.Pointer(&lens[0])), C.size_t(len(blobs)), free
+}
+
+// SignPdfBytesPAdES signs pdfData at a PAdES baseline level and returns
+// the signed PDF. The Certificate must carry a private key. PAdESBLta
+// is reserved (returns an error). For PAdESBT/PAdESBLt a TSAURL is
+// required.
+func SignPdfBytesPAdES(pdfData []byte, cert *Certificate, opts PAdESOptions) ([]byte, error) {
+	if cert == nil || cert.handle == nil {
+		return nil, ErrInternal
+	}
+	if len(pdfData) == 0 {
+		return nil, ErrEmptyContent
+	}
+	var tsaPtr, reasonPtr, locationPtr *C.char
+	if opts.TSAURL != "" {
+		cs := C.CString(opts.TSAURL)
+		defer C.free(unsafe.Pointer(cs))
+		tsaPtr = cs
+	}
+	if opts.Reason != "" {
+		cs := C.CString(opts.Reason)
+		defer C.free(unsafe.Pointer(cs))
+		reasonPtr = cs
+	}
+	if opts.Location != "" {
+		cs := C.CString(opts.Location)
+		defer C.free(unsafe.Pointer(cs))
+		locationPtr = cs
+	}
+
+	var certsP, crlsP, ocspsP **C.uint8_t
+	var certsL, crlsL, ocspsL *C.size_t
+	var nCerts, nCRLs, nOCSPs C.size_t
+	if r := opts.Revocation; r != nil {
+		var fc, fr, fo func()
+		certsP, certsL, nCerts, fc = cBlobArray(r.Certs)
+		crlsP, crlsL, nCRLs, fr = cBlobArray(r.CRLs)
+		ocspsP, ocspsL, nOCSPs, fo = cBlobArray(r.OCSPs)
+		defer fc()
+		defer fr()
+		defer fo()
+	}
+
+	var outLen C.size_t
+	var errorCode C.int
+	out := C.pdf_sign_bytes_pades(
+		(*C.uint8_t)(unsafe.Pointer(&pdfData[0])),
+		C.size_t(len(pdfData)),
+		cert.handle,
+		C.int32_t(opts.Level),
+		tsaPtr,
+		reasonPtr,
+		locationPtr,
+		certsP, certsL, nCerts,
+		crlsP, crlsL, nCRLs,
+		ocspsP, ocspsL, nOCSPs,
+		&outLen,
+		&errorCode,
+	)
+	if errorCode != 0 {
+		return nil, ffiError(errorCode)
+	}
+	if out == nil {
+		return nil, ErrInternal
+	}
+	result := C.GoBytes(unsafe.Pointer(out), C.int(outLen))
+	C.free_bytes(unsafe.Pointer(out))
+	return result, nil
+}
+
+// PAdESLevel classifies this signature from its CMS attributes alone
+// (PAdESBB vs PAdESBT). PAdESBLt additionally needs the document /DSS —
+// read it via (*PdfDocument).DSS and re-classify there.
+func (s *Signature) PAdESLevel() (PAdESLevel, error) {
+	if s == nil || s.handle == nil {
+		return PAdESBB, ErrInternal
+	}
+	var errorCode C.int
+	lvl := C.pdf_signature_get_pades_level(s.handle, &errorCode)
+	if errorCode != 0 {
+		return PAdESBB, ffiError(errorCode)
+	}
+	return PAdESLevel(lvl), nil
+}
+
+// DSS is a parsed Document Security Store (/DSS, ISO 32000-2 §12.8.4.3).
+type DSS struct {
+	// Certs/CRLs/OCSPs are the document-level DER blobs; VRICount is
+	// the number of per-signature /VRI entries.
+	Certs    [][]byte
+	CRLs     [][]byte
+	OCSPs    [][]byte
+	VRICount int
+}
+
+// DSS reads the document's Document Security Store, or nil if the PDF
+// has no /DSS (not an error). Mirrors Rust signatures::read_dss.
+func (doc *PdfDocument) DSS() (*DSS, error) {
+	if err := doc.acquireRead(); err != nil {
+		return nil, err
+	}
+	defer doc.mu.Unlock()
+	var errorCode C.int
+	h := C.pdf_document_get_dss(doc.handle, &errorCode)
+	if errorCode != 0 {
+		return nil, ffiError(errorCode)
+	}
+	if h == nil {
+		return nil, nil // no DSS present
+	}
+	defer C.pdf_dss_free(h)
+
+	read := func(
+		count func(unsafe.Pointer) C.int32_t,
+		get func(unsafe.Pointer, C.int32_t, *C.size_t, *C.int) *C.uint8_t,
+	) ([][]byte, error) {
+		n := int(count(h))
+		if n <= 0 {
+			return nil, nil
+		}
+		blobs := make([][]byte, 0, n)
+		for i := 0; i < n; i++ {
+			var l C.size_t
+			var ec C.int
+			p := get(h, C.int32_t(i), &l, &ec)
+			if ec != 0 {
+				return nil, ffiError(ec)
+			}
+			if p == nil {
+				continue
+			}
+			blobs = append(blobs, C.GoBytes(unsafe.Pointer(p), C.int(l)))
+			C.free_bytes(unsafe.Pointer(p))
+		}
+		return blobs, nil
+	}
+
+	certs, err := read(
+		func(d unsafe.Pointer) C.int32_t { return C.pdf_dss_cert_count(d) },
+		func(d unsafe.Pointer, i C.int32_t, l *C.size_t, ec *C.int) *C.uint8_t {
+			return C.pdf_dss_get_cert(d, i, l, ec)
+		})
+	if err != nil {
+		return nil, err
+	}
+	crls, err := read(
+		func(d unsafe.Pointer) C.int32_t { return C.pdf_dss_crl_count(d) },
+		func(d unsafe.Pointer, i C.int32_t, l *C.size_t, ec *C.int) *C.uint8_t {
+			return C.pdf_dss_get_crl(d, i, l, ec)
+		})
+	if err != nil {
+		return nil, err
+	}
+	ocsps, err := read(
+		func(d unsafe.Pointer) C.int32_t { return C.pdf_dss_ocsp_count(d) },
+		func(d unsafe.Pointer, i C.int32_t, l *C.size_t, ec *C.int) *C.uint8_t {
+			return C.pdf_dss_get_ocsp(d, i, l, ec)
+		})
+	if err != nil {
+		return nil, err
+	}
+	return &DSS{
+		Certs:    certs,
+		CRLs:     crls,
+		OCSPs:    ocsps,
+		VRICount: int(C.pdf_dss_vri_count(h)),
+	}, nil
+}
+
+// HasDocumentTimestamp reports whether the document carries a
+// document-scoped RFC 3161 /DocTimeStamp archival timestamp
+// (PAdES-B-LTA, ISO 32000-2:2020 §12.8.5). This is the document-level
+// reader signal; (*Signature).PAdESLevel is signature-scoped and tops
+// out at B-LT by design.
+func (doc *PdfDocument) HasDocumentTimestamp() (bool, error) {
+	if err := doc.acquireRead(); err != nil {
+		return false, err
+	}
+	defer doc.mu.Unlock()
+	var errorCode C.int
+	r := C.pdf_document_has_timestamp(doc.handle, &errorCode)
+	if errorCode != 0 {
+		return false, ffiError(errorCode)
+	}
+	return r == 1, nil
+}
+
 // certReadString is the shared body for Subject / Issuer / Serial — each FFI
 // call returns a `*C.char` that must be copied to Go memory and freed.
 func (cert *Certificate) certReadString(fn func(unsafe.Pointer, *C.int) *C.char) (string, error) {
@@ -4151,6 +4556,65 @@ func UseFipsCryptoProvider() error {
 	default:
 		return fmt.Errorf("pdf_oxide_crypto_use_fips returned unknown error code")
 	}
+}
+
+// SetCryptoPolicy installs the process-wide runtime crypto-governance
+// policy (#230) from its grammar string, e.g. "strict",
+// "fips-strict", or "compat;deny:rc4@write". Set-once; treat any
+// error as fatal (the policy is not installed on failure).
+func SetCryptoPolicy(spec string) error {
+	cSpec := C.CString(spec)
+	defer C.free(unsafe.Pointer(cSpec))
+	switch C.pdf_oxide_crypto_set_policy(cSpec) {
+	case 0:
+		return nil
+	case 1:
+		return ErrCryptoPolicyInvalidArg
+	case 2:
+		return ErrCryptoPolicyParse
+	case 3:
+		return ErrCryptoPolicyAlreadySet
+	default:
+		return fmt.Errorf("pdf_oxide_crypto_set_policy returned unknown error code")
+	}
+}
+
+// CryptoPolicy returns the active crypto policy as its canonical
+// grammar string (e.g. "compat", "strict;deny:md5@write").
+func CryptoPolicy() string {
+	cstr := C.pdf_oxide_crypto_policy()
+	if cstr == nil {
+		return "compat"
+	}
+	defer C.free_string(cstr)
+	return C.GoString(cstr)
+}
+
+// CryptoInventory returns the cryptographic algorithm tokens
+// exercised so far this process (governance report); empty slice
+// when nothing has been exercised.
+func CryptoInventory() []string {
+	cstr := C.pdf_oxide_crypto_inventory()
+	if cstr == nil {
+		return nil
+	}
+	defer C.free_string(cstr)
+	joined := C.GoString(cstr)
+	if joined == "" {
+		return nil
+	}
+	return strings.Split(joined, ",")
+}
+
+// CryptoCBOM returns a CycloneDX 1.6 Cryptographic Bill of Materials
+// (JSON) of the algorithms exercised so far this process (#230 Phase F).
+func CryptoCBOM() string {
+	cstr := C.pdf_oxide_crypto_cbom()
+	if cstr == nil {
+		return ""
+	}
+	defer C.free_string(cstr)
+	return C.GoString(cstr)
 }
 
 // ================================================================

@@ -325,6 +325,60 @@ pub extern "C" fn pdf_oxide_crypto_use_fips() -> i32 {
     }
 }
 
+// ─── Crypto governance policy (#230) ───────────────────────────────────────
+
+/// Install the process-wide runtime crypto policy from its grammar
+/// string (`"compat"|"strict"|"fips-strict"[;<allow|deny>:<alg>@<use>]`).
+///
+/// Error codes (fail-closed):
+///   0 = success
+///   1 = invalid argument (null/non-UTF-8 spec)
+///   2 = parse error (spec rejected — policy NOT installed)
+///   3 = a policy is already set (set-once)
+#[no_mangle]
+pub extern "C" fn pdf_oxide_crypto_set_policy(spec: *const c_char) -> i32 {
+    let s = match c_str(spec) {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+    let policy: crate::crypto::SecurityPolicy = match s.parse() {
+        Ok(p) => p,
+        Err(_) => return 2,
+    };
+    match crate::crypto::set_policy(policy) {
+        Ok(()) => 0,
+        Err(_) => 3,
+    }
+}
+
+/// The active crypto policy as its canonical grammar string. Caller
+/// frees via [`free_string`]. Never null on success.
+#[no_mangle]
+pub extern "C" fn pdf_oxide_crypto_policy() -> *mut c_char {
+    to_c_string(&crate::crypto::active_policy().to_string())
+}
+
+/// Comma-joined lowercase tokens of the algorithms exercised so far
+/// this process (governance inventory). Caller frees via
+/// [`free_string`]; `""` when nothing has been exercised.
+#[no_mangle]
+pub extern "C" fn pdf_oxide_crypto_inventory() -> *mut c_char {
+    let joined = crate::crypto::inventory()
+        .into_iter()
+        .map(|a| a.token())
+        .collect::<Vec<_>>()
+        .join(",");
+    to_c_string(&joined)
+}
+
+/// A CycloneDX 1.6 Cryptographic Bill of Materials (JSON) of the
+/// algorithms exercised so far this process (#230 Phase F). Caller
+/// frees via [`free_string`].
+#[no_mangle]
+pub extern "C" fn pdf_oxide_crypto_cbom() -> *mut c_char {
+    to_c_string(&crate::crypto::cbom_json())
+}
+
 // ─── Memory management ──────────────────────────────────────────────────────
 
 /// Free a string returned by any FFI function.
@@ -1353,6 +1407,131 @@ pub extern "C" fn document_editor_apply_all_redactions(
         Ok(()) => {
             set_error(error_code, ERR_SUCCESS);
             0
+        },
+        Err(e) => {
+            set_error(error_code, classify_error(&e));
+            -1
+        },
+    }
+}
+
+/// Queue an explicit destructive redaction rectangle on `page`
+/// (#231). Coordinates and colour are page user-space / DeviceRGB.
+/// Returns 0 on success, -1 on error. Matches the symbol the Node
+/// `editing-manager` already calls.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn pdf_redaction_add(
+    handle: *mut DocumentEditor,
+    page: usize,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    r: f64,
+    g: f64,
+    b: f64,
+    error_code: *mut i32,
+) -> i32 {
+    if handle.is_null() {
+        set_error(error_code, ERR_INVALID_ARG);
+        return -1;
+    }
+    let editor = handle_mut(handle);
+    let rect = [x1 as f32, y1 as f32, x2 as f32, y2 as f32];
+    let fill = Some([r as f32, g as f32, b as f32]);
+    match editor.add_redaction(page, rect, fill) {
+        Ok(()) => {
+            set_error(error_code, ERR_SUCCESS);
+            0
+        },
+        Err(e) => {
+            set_error(error_code, classify_error(&e));
+            -1
+        },
+    }
+}
+
+/// Number of queued redaction regions for `page` (annotations +
+/// programmatic). Returns the count, or -1 on error.
+#[no_mangle]
+pub extern "C" fn pdf_redaction_count(
+    handle: *mut DocumentEditor,
+    page: usize,
+    error_code: *mut i32,
+) -> i32 {
+    if handle.is_null() {
+        set_error(error_code, ERR_INVALID_ARG);
+        return -1;
+    }
+    let editor = handle_mut(handle);
+    match editor.redaction_count(page) {
+        Ok(n) => {
+            set_error(error_code, ERR_SUCCESS);
+            n as i32
+        },
+        Err(e) => {
+            set_error(error_code, classify_error(&e));
+            -1
+        },
+    }
+}
+
+/// Destructively apply all queued redactions (true content removal +
+/// opaque overlay, ISO 32000-1 §12.5.6.23). `scrub_metadata` reserved
+/// for the document-scrub pass. Returns the number of glyphs physically
+/// removed, or -1 on error (e.g. composite-font content — fail closed).
+#[no_mangle]
+pub extern "C" fn pdf_redaction_apply(
+    handle: *mut DocumentEditor,
+    scrub_metadata: bool,
+    r: f64,
+    g: f64,
+    b: f64,
+    error_code: *mut i32,
+) -> i32 {
+    if handle.is_null() {
+        set_error(error_code, ERR_INVALID_ARG);
+        return -1;
+    }
+    let editor = handle_mut(handle);
+    let opts = crate::redaction::RedactionOptions {
+        scrub_metadata,
+        default_fill: [r as f32, g as f32, b as f32],
+        ..crate::redaction::RedactionOptions::default()
+    };
+    match editor.apply_redactions_destructive(opts) {
+        Ok(report) => {
+            set_error(error_code, ERR_SUCCESS);
+            report.glyphs_removed.min(i32::MAX as usize) as i32
+        },
+        Err(e) => {
+            set_error(error_code, classify_error(&e));
+            -1
+        },
+    }
+}
+
+/// Standalone document sanitization without geometric redaction
+/// (#231 T10): strips `/Info`, catalog XMP `/Metadata`, document
+/// JavaScript (`/OpenAction`, `/AA`, `/Names/JavaScript`) and
+/// `/Names/EmbeddedFiles`; the removed subtrees are hard-excluded from
+/// the output (G6). Returns the number of top-level constructs removed,
+/// or -1 on error.
+#[no_mangle]
+pub extern "C" fn pdf_redaction_scrub_metadata(
+    handle: *mut DocumentEditor,
+    error_code: *mut i32,
+) -> i32 {
+    if handle.is_null() {
+        set_error(error_code, ERR_INVALID_ARG);
+        return -1;
+    }
+    let editor = handle_mut(handle);
+    match editor.sanitize_document(crate::redaction::RedactionOptions::default()) {
+        Ok(report) => {
+            set_error(error_code, ERR_SUCCESS);
+            report.annotations_removed.min(i32::MAX as usize) as i32
         },
         Err(e) => {
             set_error(error_code, classify_error(&e));
@@ -3906,6 +4085,385 @@ pub extern "C" fn pdf_signature_free(handle: *mut FfiSignatureInfo) {
     if !handle.is_null() {
         unsafe {
             drop(Box::from_raw(handle));
+        }
+    }
+}
+
+// ─── PAdES LTV (#235) ───────────────────────────────────────────────────────
+//
+// FROZEN ENUM CONTRACT — `PadesLevel` integer mapping is part of the
+// stable C ABI and every binding depends on it (#235 plan §7.1).
+// Mirrors the discipline of `pdf_timestamp_get_hash_algorithm`:
+//
+//     0 = B-B   1 = B-T   2 = B-LT   3 = B-LTA
+//
+// NEVER renumber. Adding a level later must append a new code only.
+// The single source of truth is `signatures::PadesLevel::code` /
+// `from_code` (asserted frozen in `pades/mod.rs` tests).
+
+/// Opaque handle for a parsed Document Security Store (`/DSS`), freed
+/// with [`pdf_dss_free`].
+#[cfg(feature = "signatures")]
+pub struct FfiDss {
+    dss: crate::signatures::DocumentSecurityStore,
+}
+#[cfg(not(feature = "signatures"))]
+pub struct FfiDss {
+    _private: [u8; 0],
+}
+
+/// Gather a parallel-array of DER blobs (`ptrs[i]` of length `lens[i]`)
+/// into owned `Vec<Vec<u8>>`. Null inner pointers are skipped.
+///
+/// Callers must ensure `ptrs`/`lens`, when non-null, point to `n` valid
+/// entries (mirrors the safe-wrapper convention of [`raw_slice`]).
+#[cfg(feature = "signatures")]
+#[allow(unsafe_code)]
+fn gather_der_blobs(ptrs: *const *const u8, lens: *const usize, n: usize) -> Vec<Vec<u8>> {
+    if ptrs.is_null() || lens.is_null() || n == 0 {
+        return Vec::new();
+    }
+    // SAFETY: non-null, caller guarantees `n` valid entries per FFI contract.
+    let p = unsafe { std::slice::from_raw_parts(ptrs, n) };
+    let l = unsafe { std::slice::from_raw_parts(lens, n) };
+    p.iter()
+        .zip(l)
+        .filter(|(pp, _)| !pp.is_null())
+        .map(|(pp, &ll)| raw_slice(*pp, ll).to_vec())
+        .collect()
+}
+
+/// Sign raw PDF bytes at a PAdES baseline level. `level`: 0=B-B 1=B-T
+/// 2=B-LT (3=B-LTA ⇒ `ERR_UNSUPPORTED`). `tsa_url` must be non-null for
+/// `level >= 1` (the RFC 3161 timestamp source); requires the
+/// `tsa-client` feature, else `ERR_UNSUPPORTED`. The three parallel
+/// arrays carry the B-LT revocation material (DER certs/CRLs/OCSPs).
+///
+/// Returns a `malloc`'d buffer (free with [`free_bytes`]) / `NULL` on
+/// failure (check `*error_code`).
+#[no_mangle]
+pub unsafe extern "C" fn pdf_sign_bytes_pades(
+    pdf_data: *const u8,
+    pdf_len: usize,
+    certificate_handle: *const std::ffi::c_void,
+    level: i32,
+    tsa_url: *const c_char,
+    reason: *const c_char,
+    location: *const c_char,
+    certs: *const *const u8,
+    cert_lens: *const usize,
+    n_certs: usize,
+    crls: *const *const u8,
+    crl_lens: *const usize,
+    n_crls: usize,
+    ocsps: *const *const u8,
+    ocsp_lens: *const usize,
+    n_ocsps: usize,
+    out_len: *mut usize,
+    error_code: *mut i32,
+) -> *mut u8 {
+    #[cfg(feature = "signatures")]
+    {
+        use crate::signatures::{sign_pdf_bytes_pades, RevocationMaterial, SignOptions};
+        if pdf_data.is_null() || certificate_handle.is_null() || out_len.is_null() {
+            set_error(error_code, ERR_INVALID_ARG);
+            return ptr::null_mut();
+        }
+        let Some(level_enum) = crate::signatures::PadesLevel::from_code(level) else {
+            set_error(error_code, ERR_INVALID_ARG);
+            return ptr::null_mut();
+        };
+        let data = raw_slice(pdf_data, pdf_len);
+        let creds = handle_ref(certificate_handle as *const crate::signatures::SigningCredentials);
+        let opts = SignOptions {
+            reason: c_str_lossy(reason),
+            location: c_str_lossy(location),
+            ..Default::default()
+        };
+        let material = RevocationMaterial {
+            certificates: gather_der_blobs(certs, cert_lens, n_certs),
+            crls: gather_der_blobs(crls, crl_lens, n_crls),
+            ocsp_responses: gather_der_blobs(ocsps, ocsp_lens, n_ocsps),
+            ..Default::default()
+        };
+
+        // Build a TSA-fetch timestamper from `tsa_url` (B-T/B-LT). The
+        // core fail-closes with `Unsupported` if a timestamper is
+        // required but absent, so a missing URL / missing `tsa-client`
+        // feature surfaces as a clear error rather than a silent B-B.
+        #[cfg(feature = "tsa-client")]
+        let ts_closure: Option<Box<dyn Fn(&[u8]) -> crate::error::Result<Vec<u8>>>> =
+            c_str_lossy(tsa_url).map(|u| {
+                let client =
+                    crate::signatures::TsaClient::new(crate::signatures::TsaClientConfig::new(u));
+                Box::new(move |sig: &[u8]| {
+                    client
+                        .request_timestamp(sig)
+                        .map(|t| t.token_bytes().to_vec())
+                }) as Box<dyn Fn(&[u8]) -> crate::error::Result<Vec<u8>>>
+            });
+        #[cfg(not(feature = "tsa-client"))]
+        let ts_closure: Option<Box<dyn Fn(&[u8]) -> crate::error::Result<Vec<u8>>>> = {
+            let _ = tsa_url;
+            None
+        };
+
+        match sign_pdf_bytes_pades(data, creds, opts, level_enum, ts_closure.as_deref(), &material)
+        {
+            Ok(signed) => {
+                set_error(error_code, ERR_SUCCESS);
+                write_out(out_len, signed.len());
+                vec_to_ffi_bytes(signed)
+            },
+            Err(e) => {
+                set_error(error_code, classify_error(&e));
+                ptr::null_mut()
+            },
+        }
+    }
+    #[cfg(not(feature = "signatures"))]
+    {
+        let _ = (
+            pdf_data,
+            pdf_len,
+            certificate_handle,
+            level,
+            tsa_url,
+            reason,
+            location,
+            certs,
+            cert_lens,
+            n_certs,
+            crls,
+            crl_lens,
+            n_crls,
+            ocsps,
+            ocsp_lens,
+            n_ocsps,
+            out_len,
+        );
+        set_error(error_code, _ERR_UNSUPPORTED);
+        ptr::null_mut()
+    }
+}
+
+/// Classify a signature's PAdES level from its CMS attributes alone
+/// (B-B vs B-T). B-LT additionally needs the document `/DSS` — read it
+/// via [`pdf_document_get_dss`] and inspect its VRI. Returns the frozen
+/// `PadesLevel` code, or `-1` on error.
+#[no_mangle]
+pub extern "C" fn pdf_signature_get_pades_level(
+    signature_handle: *const std::ffi::c_void,
+    error_code: *mut i32,
+) -> i32 {
+    #[cfg(feature = "signatures")]
+    {
+        if signature_handle.is_null() {
+            set_error(error_code, ERR_INVALID_ARG);
+            return -1;
+        }
+        let ffi = handle_ref(signature_handle as *const FfiSignatureInfo);
+        set_error(error_code, ERR_SUCCESS);
+        crate::signatures::classify_pades_level(&ffi.info, None).code()
+    }
+    #[cfg(not(feature = "signatures"))]
+    {
+        let _ = signature_handle;
+        set_error(error_code, _ERR_UNSUPPORTED);
+        -1
+    }
+}
+
+/// Read the document `/DSS` into an opaque handle. Returns `NULL` with
+/// `*error_code == ERR_SUCCESS` when the document simply has no DSS
+/// (not an error); `NULL` with a non-zero code on a real failure. Free
+/// the handle with [`pdf_dss_free`].
+#[no_mangle]
+pub extern "C" fn pdf_document_get_dss(
+    document_handle: *const std::ffi::c_void,
+    error_code: *mut i32,
+) -> *mut std::ffi::c_void {
+    #[cfg(feature = "signatures")]
+    {
+        if document_handle.is_null() {
+            set_error(error_code, ERR_INVALID_ARG);
+            return ptr::null_mut();
+        }
+        let doc = handle_ref(document_handle as *const PdfDocument);
+        match crate::signatures::read_dss(doc) {
+            Ok(Some(dss)) => {
+                set_error(error_code, ERR_SUCCESS);
+                Box::into_raw(Box::new(FfiDss { dss })) as *mut std::ffi::c_void
+            },
+            Ok(None) => {
+                set_error(error_code, ERR_SUCCESS);
+                ptr::null_mut()
+            },
+            Err(e) => {
+                set_error(error_code, classify_error(&e));
+                ptr::null_mut()
+            },
+        }
+    }
+    #[cfg(not(feature = "signatures"))]
+    {
+        let _ = document_handle;
+        set_error(error_code, _ERR_UNSUPPORTED);
+        ptr::null_mut()
+    }
+}
+
+/// Whether the document carries a document-scoped RFC 3161
+/// `/DocTimeStamp` archival timestamp (PAdES-B-LTA, ISO 32000-2:2020
+/// §12.8.5). This is the document-level reader signal that
+/// `pdf_signature_get_pades_level` cannot report — that call is
+/// signature-scoped and tops out at B-LT by design. Returns `1` when a
+/// document timestamp is present, `0` when not, `-1` on a null handle
+/// or when the `signatures` feature is disabled.
+#[no_mangle]
+pub extern "C" fn pdf_document_has_timestamp(
+    document_handle: *const std::ffi::c_void,
+    error_code: *mut i32,
+) -> i32 {
+    #[cfg(feature = "signatures")]
+    {
+        if document_handle.is_null() {
+            set_error(error_code, ERR_INVALID_ARG);
+            return -1;
+        }
+        let doc = handle_ref(document_handle as *const PdfDocument);
+        set_error(error_code, ERR_SUCCESS);
+        i32::from(crate::signatures::has_document_timestamp(&doc.source_bytes))
+    }
+    #[cfg(not(feature = "signatures"))]
+    {
+        let _ = document_handle;
+        set_error(error_code, _ERR_UNSUPPORTED);
+        -1
+    }
+}
+
+#[cfg(feature = "signatures")]
+macro_rules! dss_count_fn {
+    ($name:ident, $field:ident) => {
+        /// Number of entries; `-1` if the handle is null.
+        #[no_mangle]
+        pub extern "C" fn $name(dss: *const std::ffi::c_void) -> i32 {
+            if dss.is_null() {
+                return -1;
+            }
+            handle_ref(dss as *const FfiDss).dss.$field.len() as i32
+        }
+    };
+}
+#[cfg(feature = "signatures")]
+dss_count_fn!(pdf_dss_cert_count, certificates);
+#[cfg(feature = "signatures")]
+dss_count_fn!(pdf_dss_crl_count, crls);
+#[cfg(feature = "signatures")]
+dss_count_fn!(pdf_dss_ocsp_count, ocsp_responses);
+#[cfg(feature = "signatures")]
+dss_count_fn!(pdf_dss_vri_count, vri);
+
+#[cfg(not(feature = "signatures"))]
+#[no_mangle]
+pub extern "C" fn pdf_dss_cert_count(_dss: *const std::ffi::c_void) -> i32 {
+    -1
+}
+#[cfg(not(feature = "signatures"))]
+#[no_mangle]
+pub extern "C" fn pdf_dss_crl_count(_dss: *const std::ffi::c_void) -> i32 {
+    -1
+}
+#[cfg(not(feature = "signatures"))]
+#[no_mangle]
+pub extern "C" fn pdf_dss_ocsp_count(_dss: *const std::ffi::c_void) -> i32 {
+    -1
+}
+#[cfg(not(feature = "signatures"))]
+#[no_mangle]
+pub extern "C" fn pdf_dss_vri_count(_dss: *const std::ffi::c_void) -> i32 {
+    -1
+}
+
+#[cfg(feature = "signatures")]
+macro_rules! dss_get_fn {
+    ($name:ident, $field:ident) => {
+        /// Copy the i-th DER blob into a `malloc`'d buffer (free with
+        /// [`free_bytes`]); `NULL` + error on out-of-range/null.
+        #[no_mangle]
+        pub extern "C" fn $name(
+            dss: *const std::ffi::c_void,
+            index: i32,
+            out_len: *mut usize,
+            error_code: *mut i32,
+        ) -> *mut u8 {
+            if dss.is_null() || index < 0 {
+                set_error(error_code, ERR_INVALID_ARG);
+                return ptr::null_mut();
+            }
+            let d = handle_ref(dss as *const FfiDss);
+            match d.dss.$field.get(index as usize) {
+                Some(der) => {
+                    set_error(error_code, ERR_SUCCESS);
+                    write_out(out_len, der.len());
+                    vec_to_ffi_bytes(der.clone())
+                },
+                None => {
+                    set_error(error_code, ERR_INVALID_ARG);
+                    ptr::null_mut()
+                },
+            }
+        }
+    };
+}
+#[cfg(feature = "signatures")]
+dss_get_fn!(pdf_dss_get_cert, certificates);
+#[cfg(feature = "signatures")]
+dss_get_fn!(pdf_dss_get_crl, crls);
+#[cfg(feature = "signatures")]
+dss_get_fn!(pdf_dss_get_ocsp, ocsp_responses);
+
+#[cfg(not(feature = "signatures"))]
+#[no_mangle]
+pub extern "C" fn pdf_dss_get_cert(
+    _dss: *const std::ffi::c_void,
+    _index: i32,
+    _out_len: *mut usize,
+    error_code: *mut i32,
+) -> *mut u8 {
+    set_error(error_code, _ERR_UNSUPPORTED);
+    ptr::null_mut()
+}
+#[cfg(not(feature = "signatures"))]
+#[no_mangle]
+pub extern "C" fn pdf_dss_get_crl(
+    _dss: *const std::ffi::c_void,
+    _index: i32,
+    _out_len: *mut usize,
+    error_code: *mut i32,
+) -> *mut u8 {
+    set_error(error_code, _ERR_UNSUPPORTED);
+    ptr::null_mut()
+}
+#[cfg(not(feature = "signatures"))]
+#[no_mangle]
+pub extern "C" fn pdf_dss_get_ocsp(
+    _dss: *const std::ffi::c_void,
+    _index: i32,
+    _out_len: *mut usize,
+    error_code: *mut i32,
+) -> *mut u8 {
+    set_error(error_code, _ERR_UNSUPPORTED);
+    ptr::null_mut()
+}
+
+/// Free a DSS handle from [`pdf_document_get_dss`].
+#[no_mangle]
+pub extern "C" fn pdf_dss_free(dss: *mut std::ffi::c_void) {
+    if !dss.is_null() {
+        unsafe {
+            drop(Box::from_raw(dss as *mut FfiDss));
         }
     }
 }
@@ -7216,6 +7774,95 @@ pub extern "C" fn pdf_document_get_outline(
         Err(_) => {
             set_error(error_code, ERR_SUCCESS);
             to_c_string("[]")
+        },
+    }
+}
+
+// ─── Split by bookmarks (#482) — JSON in, JSON out ─────────────────────────
+
+#[derive(serde::Deserialize)]
+struct FfiSplitOpts {
+    #[serde(default)]
+    title_prefix: Option<String>,
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default = "ffi_split_level_default")]
+    level: u32,
+    #[serde(default = "ffi_split_true")]
+    include_front_matter: bool,
+}
+fn ffi_split_level_default() -> u32 {
+    1
+}
+fn ffi_split_true() -> bool {
+    true
+}
+impl Default for FfiSplitOpts {
+    fn default() -> Self {
+        Self {
+            title_prefix: None,
+            ignore_case: false,
+            level: 1,
+            include_front_matter: true,
+        }
+    }
+}
+
+/// Plan a bookmark split. `options_json` is `{}`-tolerant
+/// (`title_prefix`, `ignore_case`, `level` [0=all,1=top],
+/// `include_front_matter`). Returns a malloc'd JSON array of segment
+/// objects (free via the existing string-free). On any failure sets
+/// `error_code` (non-zero) and returns null — errors are surfaced, not
+/// swallowed (foundation §3.3; this is not pure read-extraction).
+#[no_mangle]
+pub extern "C" fn pdf_document_plan_split_by_bookmarks(
+    handle: *mut PdfDocument,
+    options_json: *const c_char,
+    error_code: *mut i32,
+) -> *mut c_char {
+    if handle.is_null() {
+        set_error(error_code, ERR_INVALID_ARG);
+        return ptr::null_mut();
+    }
+    let opts_in: FfiSplitOpts = match c_str(options_json) {
+        Ok(s) if !s.trim().is_empty() => match serde_json::from_str(s) {
+            Ok(o) => o,
+            Err(_) => {
+                set_error(error_code, ERR_INVALID_ARG);
+                return ptr::null_mut();
+            },
+        },
+        Ok(_) => FfiSplitOpts::default(),
+        Err(_) => {
+            set_error(error_code, ERR_INVALID_ARG);
+            return ptr::null_mut();
+        },
+    };
+    let opts = crate::split_bookmarks::SplitByBookmarksOptions {
+        title_prefix: opts_in.title_prefix,
+        ignore_case: opts_in.ignore_case,
+        level: crate::split_bookmarks::BookmarkLevel::from_u32(opts_in.level),
+        include_front_matter: opts_in.include_front_matter,
+        ..Default::default()
+    };
+    let doc = handle_ref(handle);
+    match crate::split_bookmarks::plan_split_by_bookmarks(doc, &opts) {
+        Ok(segs) => match serde_json::to_string(&segs) {
+            Ok(j) => {
+                set_error(error_code, ERR_SUCCESS);
+                to_c_string(&j)
+            },
+            Err(e) => {
+                set_error(
+                    error_code,
+                    classify_error(&crate::error::Error::InvalidOperation(e.to_string())),
+                );
+                ptr::null_mut()
+            },
+        },
+        Err(e) => {
+            set_error(error_code, classify_error(&e));
+            ptr::null_mut()
         },
     }
 }

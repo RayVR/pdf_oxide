@@ -76,6 +76,28 @@ impl EncryptionHandler {
             )));
         }
 
+        // Runtime crypto-governance policy (#230). Orthogonal to the
+        // provider: under the default `compat` policy this is a no-op
+        // (byte-stable); a `strict`/`fips-strict` policy can forbid
+        // reading legacy R≤4 (which fundamentally needs the MD5 KDF,
+        // ISO 32000-1 §7.6.3 Algorithm 2).
+        if dict.revision <= 4 {
+            crate::crypto::record_algorithm_use(crate::crypto::AlgorithmId::HashMd5);
+        }
+        if dict.revision <= 4
+            && !crate::crypto::active_policy()
+                .allows(crate::crypto::AlgorithmId::HashMd5, crate::crypto::AlgorithmUse::Read)
+        {
+            return Err(Error::InvalidPdf(format!(
+                "active crypto SecurityPolicy (mode={}) forbids opening PDF \
+                 Standard Security R={} (R≤4 requires MD5 key derivation, \
+                 denied for read). Set a 'compat' crypto policy to read \
+                 legacy-encrypted documents.",
+                crate::crypto::active_policy().mode().token(),
+                dict.revision
+            )));
+        }
+
         Ok(Self {
             dict,
             encryption_key: None,
@@ -261,9 +283,11 @@ impl EncryptionHandler {
 
         #[cfg(feature = "legacy-crypto")]
         {
-            use md5::{Digest, Md5};
-
-            let mut hasher = Md5::new();
+            // #230 Phase C: route the Algorithm-1 per-object-key MD5
+            // through the governed provider (byte-identical under the
+            // default `compat` policy; a strict/FIPS policy denies it
+            // at the primitive, not just the operation gate).
+            let mut hasher = super::md5_kdf_hasher()?;
 
             // Step a: Extend key with object/generation number
             hasher.update(base_key);

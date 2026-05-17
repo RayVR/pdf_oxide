@@ -204,7 +204,13 @@ pub mod annotation_types;
 pub mod annotations;
 /// Content elements for PDF generation
 pub mod elements;
+/// Cross-platform-safe filename slug helpers (shared, pure).
+pub mod filename;
 pub mod outline;
+/// True/destructive redaction + document sanitization (#231).
+pub mod redaction;
+/// Split a PDF into multiple PDFs at outline (bookmark) boundaries (#482).
+pub mod split_bookmarks;
 /// PDF logical structure (Tagged PDFs)
 pub mod structure;
 
@@ -305,6 +311,10 @@ pub use document::{ExtractedImageRef, ImageFormat, PdfDocument, ReadingOrder};
 pub use error::{Error, Result};
 pub use layout::PageText;
 pub use outline::{Destination, OutlineItem};
+pub use redaction::{
+    redact_content_stream, Classification, FontInfoMetrics, OcgPolicy, RedactionOptions,
+    RedactionRegion, RedactionReport, RegionSet,
+};
 
 // Global font cache for batch processing
 pub use fonts::global_cache::{

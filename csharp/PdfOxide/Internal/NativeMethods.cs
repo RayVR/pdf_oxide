@@ -308,6 +308,30 @@ namespace PdfOxide.Internal
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         public static partial int PdfOxideCryptoUseFips();
 
+        /// <summary>
+        /// Install the runtime crypto-governance policy (#230) from its
+        /// grammar string. 0 = ok, 1 = invalid arg, 2 = parse error
+        /// (not installed), 3 = already set.
+        /// </summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_oxide_crypto_set_policy", StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int PdfOxideCryptoSetPolicy(string spec);
+
+        /// <summary>Active crypto policy as a UTF-8 grammar string; caller frees with FreeString.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_oxide_crypto_policy")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial nint PdfOxideCryptoPolicy();
+
+        /// <summary>Comma-joined exercised-algorithm tokens; caller frees with FreeString.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_oxide_crypto_inventory")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial nint PdfOxideCryptoInventory();
+
+        /// <summary>CycloneDX 1.6 crypto BOM (JSON); caller frees with FreeString.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_oxide_crypto_cbom")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial nint PdfOxideCryptoCbom();
+
         #endregion
 
         #region Pdf Creation API
@@ -4663,6 +4687,68 @@ namespace PdfOxide.Internal
             string? reason, string? location,
             out nuint outLen, out int errorCode);
 
+        // --- PAdES LTV (#235) ---
+
+        /// <summary>Signs raw PDF bytes at a PAdES baseline level. Free the result with FreeBytes.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_sign_bytes_pades", StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static unsafe partial byte* PdfSignBytesPades(
+            byte* pdf, nuint pdfLen,
+            IntPtr certHandle,
+            int level,
+            string? tsaUrl, string? reason, string? location,
+            byte** certs, nuint* certLens, nuint nCerts,
+            byte** crls, nuint* crlLens, nuint nCrls,
+            byte** ocsps, nuint* ocspLens, nuint nOcsps,
+            out nuint outLen, out int errorCode);
+
+        /// <summary>Classifies a signature's PAdES level (B-B/B-T) from its CMS attributes.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_signature_get_pades_level")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_signature_get_pades_level(NativeHandle sig, out int errorCode);
+
+        /// <summary>Reads the document /DSS into an opaque handle (IntPtr.Zero ⇒ no DSS). Free with pdf_dss_free.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_document_get_dss")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial IntPtr pdf_document_get_dss(NativeHandle doc, out int errorCode);
+
+        /// <summary>1 if the document carries a /DocTimeStamp (PAdES-B-LTA), 0 if not, -1 on error.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_document_has_timestamp")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_document_has_timestamp(NativeHandle doc, out int errorCode);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_dss_cert_count")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_dss_cert_count(IntPtr dss);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_dss_crl_count")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_dss_crl_count(IntPtr dss);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_dss_ocsp_count")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_dss_ocsp_count(IntPtr dss);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_dss_vri_count")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_dss_vri_count(IntPtr dss);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_dss_get_cert")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static unsafe partial byte* pdf_dss_get_cert(IntPtr dss, int index, out nuint outLen, out int errorCode);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_dss_get_crl")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static unsafe partial byte* pdf_dss_get_crl(IntPtr dss, int index, out nuint outLen, out int errorCode);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_dss_get_ocsp")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static unsafe partial byte* pdf_dss_get_ocsp(IntPtr dss, int index, out nuint outLen, out int errorCode);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_dss_free")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial void pdf_dss_free(IntPtr dss);
+
         /// <summary>
         /// Gets the common name (CN) from a certificate handle.
         /// </summary>
@@ -5715,6 +5801,11 @@ namespace PdfOxide.Internal
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         public static partial IntPtr pdf_document_get_outline(IntPtr handle, out int errorCode);
 
+        [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial IntPtr pdf_document_plan_split_by_bookmarks(
+            IntPtr handle, string optionsJson, out int errorCode);
+
         // Chars
         [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -6230,6 +6321,52 @@ namespace PdfOxide.Internal
         [LibraryImport(LibName, EntryPoint = "document_editor_apply_all_redactions")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         public static partial int document_editor_apply_all_redactions(
+            NativeHandle handle,
+            out int errorCode);
+
+        /// <summary>Queues an explicit destructive redaction rectangle (#231).</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_redaction_add")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_redaction_add(
+            NativeHandle handle,
+            nuint page,
+            double x1,
+            double y1,
+            double x2,
+            double y2,
+            double r,
+            double g,
+            double b,
+            out int errorCode);
+
+        /// <summary>Number of queued redaction regions for a page.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_redaction_count")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_redaction_count(
+            NativeHandle handle,
+            nuint page,
+            out int errorCode);
+
+        /// <summary>Destructively applies all queued redactions; returns glyphs removed.</summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_redaction_apply")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_redaction_apply(
+            NativeHandle handle,
+            [MarshalAs(UnmanagedType.U1)] bool scrubMetadata,
+            double r,
+            double g,
+            double b,
+            out int errorCode);
+
+        /// <summary>
+        /// Standalone document sanitization: strips /Info, the catalog XMP
+        /// /Metadata stream, document JavaScript and /Names/EmbeddedFiles
+        /// without any geometric redaction. Returns the annotation count
+        /// removed, or -1 on error.
+        /// </summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_redaction_scrub_metadata")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial int pdf_redaction_scrub_metadata(
             NativeHandle handle,
             out int errorCode);
 

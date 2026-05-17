@@ -57,8 +57,42 @@ pub fn sign_pdf_bytes(
     credentials: &SigningCredentials,
     opts: SignOptions,
 ) -> Result<Vec<u8>> {
+    // Legacy adbe.pkcs7.detached path — CMS via PdfSigner::sign,
+    // byte-for-byte unchanged from prior releases.
     let signer = PdfSigner::new(credentials.clone(), opts);
+    sign_pdf_bytes_with(pdf_data, signer, &|s, sb| s.sign(sb))
+}
 
+/// Thin wrapper over [`sign_pdf_bytes_with_cms`] that discards the CMS
+/// blob — the byte-for-byte-unchanged legacy entry point.
+fn sign_pdf_bytes_with(
+    pdf_data: &[u8],
+    signer: PdfSigner,
+    cms_fn: &dyn Fn(&PdfSigner, &[u8]) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    sign_pdf_bytes_with_cms(pdf_data, signer, cms_fn).map(|(out, _cms)| out)
+}
+
+/// The shared byte-range / incremental-update assembler. The CMS blob
+/// is produced by `cms_fn` — the *only* variation point between the
+/// legacy and PAdES paths; the byte-range math is identical (and must
+/// stay so — #235 plan §2.3 "do not modify the byte-range logic").
+///
+/// Returns `(signed_pdf, contents_string)`. `contents_string` is the
+/// exact byte string stored in `/Contents` (the CMS DER **plus the
+/// zero-padding** that fills the fixed-width placeholder) — i.e. the
+/// literal value a reader's PDF parser hex-decodes. The B-LT path keys
+/// its DSS `/VRI` off `SHA-1(contents_string)`; computing it here from
+/// the same bytes the reader will (`SignatureInfo::contents`, used by
+/// `classify_pades_level`) makes the write-side and read-side keys
+/// identical *by construction* — and avoids `enumerate_signatures`,
+/// which only surfaces AcroForm-linked fields, not the bare
+/// `/Type /Sig` object this minimal incremental update emits.
+fn sign_pdf_bytes_with_cms(
+    pdf_data: &[u8],
+    signer: PdfSigner,
+    cms_fn: &dyn Fn(&PdfSigner, &[u8]) -> Result<Vec<u8>>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     // ── 1. Extract the minimum structural info from the existing PDF ──────
     let prev_startxref = scan_startxref(pdf_data)
         .ok_or_else(|| Error::InvalidPdf("cannot find startxref in existing PDF".into()))?;
@@ -129,12 +163,100 @@ pub fn sign_pdf_bytes(
     // ── 7. Extract signed bytes and sign ─────────────────────────────────
     let signed_bytes =
         super::byterange::ByteRangeCalculator::extract_signed_bytes(&output, &byte_range)?;
-    let cms_blob = signer.sign(&signed_bytes)?;
+    let cms_blob = cms_fn(&signer, &signed_bytes)?;
 
     // ── 8. Insert signature ───────────────────────────────────────────────
     signer.insert_signature(&mut output, contents_abs, &cms_blob)?;
 
-    Ok(output)
+    // The `/Contents` *value* a reader parses is the CMS DER followed by
+    // the zero-padding that fills the fixed-width hex placeholder
+    // (`insert_signature` pads with `'0'` hex chars ⇒ `0x00` bytes).
+    // `(placeholder_size - 2) / 2` is that decoded length in bytes
+    // (`< … >` minus the two angle brackets, two hex chars per byte).
+    let contents_len = (signer.placeholder_size() - 2) / 2;
+    let mut contents_string = cms_blob;
+    contents_string.resize(contents_len, 0);
+
+    Ok((output, contents_string))
+}
+
+/// Sign a PDF at a PAdES baseline level (#235 TODO #12) — the
+/// level-driven public entry point that ties the pieces together
+/// (ETSI EN 319 142-1 §5). Reuses the proven byte-range assembler
+/// verbatim; B-B/B-T differ only in the CMS builder, B-LT adds the DSS
+/// as a *second* incremental update so the B-T signature byte-range is
+/// untouched (feature plan §4.1), and B-LTA adds a `/DocTimeStamp`
+/// (ETSI.RFC3161) over the whole file incl. the DSS as a *third*
+/// incremental update (ETSI EN 319 142-1 §5).
+///
+/// `timestamper` (required for `BT`/`BLt`/`BLta`) returns the RFC 3161
+/// token over the supplied digest input — an offline pre-fetched token
+/// or a live TSA call by the caller. `material` is the DSS validation
+/// set for `BLt`/`BLta`.
+///
+/// # Errors
+/// - [`Error::Unsupported`] — `BT`/`BLt`/`BLta` without a `timestamper`.
+/// - [`Error::InvalidPdf`] — unparseable PDF / signature.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_pdf_bytes_pades(
+    pdf_data: &[u8],
+    credentials: &SigningCredentials,
+    opts: SignOptions,
+    level: crate::signatures::PadesLevel,
+    timestamper: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>>>,
+    material: &crate::signatures::RevocationMaterial,
+) -> Result<Vec<u8>> {
+    use crate::signatures::PadesLevel;
+
+    // B-T, B-LT and B-LTA all need an RFC 3161 token source (B-LTA's
+    // document timestamp included).
+    if matches!(level, PadesLevel::BT | PadesLevel::BLt | PadesLevel::BLta) && timestamper.is_none()
+    {
+        return Err(Error::Unsupported(
+            "PAdES-B-T/B-LT/B-LTA require a timestamper (RFC 3161 token source)".into(),
+        ));
+    }
+
+    let dts_size = opts.estimated_size.max(8192);
+    let signer = PdfSigner::new(credentials.clone(), opts);
+    let (signed, contents_string) = match level {
+        PadesLevel::BB => sign_pdf_bytes_with_cms(pdf_data, signer, &|s, sb| s.sign_pades(sb)),
+        PadesLevel::BT | PadesLevel::BLt | PadesLevel::BLta => {
+            let ts = timestamper.expect("checked above");
+            sign_pdf_bytes_with_cms(pdf_data, signer, &|s, sb| s.sign_pades_t(sb, ts))
+        },
+    }?;
+
+    if level == PadesLevel::BB || level == PadesLevel::BT {
+        return Ok(signed);
+    }
+
+    // B-LT: append the DSS as a SECOND incremental update keyed by the
+    // signature's uppercase-hex SHA-1(/Contents) (the B-T byte range is
+    // a strict prefix and stays valid — feature plan §4.1 / I1/I2). The
+    // VRI key is computed over the *padded* /Contents byte string the
+    // assembler returned — byte-identical to what a reader parses into
+    // `SignatureInfo::contents` and feeds to `classify_pades_level`, so
+    // the write-side and read-side keys match by construction. (Using
+    // `enumerate_signatures` here would yield an empty VRI set —
+    // silently degrading B-LT — for the bare `/Type /Sig` object this
+    // path emits, since it only surfaces AcroForm-linked fields.)
+    let doc = crate::document::PdfDocument::from_bytes(signed.clone())?;
+    let keys: Vec<String> = crate::signatures::pades::vri_key(&contents_string)
+        .into_iter()
+        .collect();
+    let blt = crate::signatures::pades::append_dss(&signed, &doc, material, &keys)?;
+
+    if level == PadesLevel::BLt {
+        return Ok(blt);
+    }
+
+    // B-LTA = B-LT + a `/DocTimeStamp` (ETSI.RFC3161) over the whole
+    // file *including* the DSS, as a third incremental update — so the
+    // archival timestamp covers the signature and its validation
+    // material (ETSI EN 319 142-1 §5; feature plan §1.2).
+    let ts = timestamper.expect("checked above");
+    append_doc_timestamp(&blt, ts, dts_size)
 }
 
 // ─── Text builders ───────────────────────────────────────────────────────────
@@ -173,6 +295,94 @@ fn build_sig_dict_text(signer: &PdfSigner, obj_num: u64) -> String {
     dict.push_str(&format!("/M ({})\n", format_pdf_date()));
     dict.push_str(">>\nendobj\n");
     dict
+}
+
+/// Build a `/Type /DocTimeStamp` dictionary (PAdES-B-LTA, ETSI EN
+/// 319 142-1 §5 / ISO 32000-2 §12.8.5): a `SubFilter /ETSI.RFC3161`
+/// object whose `/Contents` is a bare RFC 3161 timestamp token over the
+/// `/ByteRange`-covered bytes — *no* CMS SignerInfo, *no* signer
+/// certificate. Same fixed-width placeholders as `build_sig_dict_text`.
+fn build_doctimestamp_dict_text(obj_num: u64, contents_placeholder: &str) -> String {
+    let mut dict = format!(
+        "{} 0 obj\n<< /Type /DocTimeStamp\n/Filter /Adobe.PPKLite\n/SubFilter /ETSI.RFC3161\n",
+        obj_num,
+    );
+    dict.push_str(&format!("/ByteRange [{}]\n", BR_PLACEHOLDER));
+    dict.push_str(&format!("/Contents {}\n", contents_placeholder));
+    dict.push_str(&format!("/M ({})\n", format_pdf_date()));
+    dict.push_str(">>\nendobj\n");
+    dict
+}
+
+/// Append a PAdES-B-LTA document timestamp as a further incremental
+/// update over `pdf_data` (which already carries the B-T signature and
+/// the B-LT DSS). The whole current file is the `/ByteRange`-covered
+/// region, so the timestamp protects the signature *and* its DSS
+/// (archival LTV — feature plan §1.2). `timestamper` returns the
+/// RFC 3161 token over the supplied digest input (same closure contract
+/// as B-T). The byte-range math is the proven protocol from
+/// [`sign_pdf_bytes_with_cms`], replicated standalone so that function
+/// stays byte-for-byte unmodified (#235 plan §2.3).
+fn append_doc_timestamp(
+    pdf_data: &[u8],
+    timestamper: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
+    est_size: usize,
+) -> Result<Vec<u8>> {
+    let prev_startxref = scan_startxref(pdf_data)
+        .ok_or_else(|| Error::InvalidPdf("B-LTA: cannot find startxref".into()))?;
+    let root_ref = scan_root_ref(pdf_data)
+        .ok_or_else(|| Error::InvalidPdf("B-LTA: cannot find /Root ref".into()))?;
+    let next_obj_num = scan_next_obj_num(pdf_data)
+        .ok_or_else(|| Error::InvalidPdf("B-LTA: cannot determine next object number".into()))?;
+
+    let calc = super::byterange::ByteRangeCalculator::with_placeholder_size(est_size * 2 + 2);
+    let placeholder = calc.generate_placeholder();
+    let dict_text = build_doctimestamp_dict_text(next_obj_num, &placeholder);
+    let contents_in_dict = find_contents_offset_in_text(dict_text.as_bytes())
+        .ok_or_else(|| Error::InvalidPdf("B-LTA: cannot find /Contents in DocTimeStamp".into()))?;
+
+    let sig_dict_start = pdf_data.len();
+    let xref_start = sig_dict_start + dict_text.len();
+    let xref_entry = format!("{:010} 00000 n \r\n", sig_dict_start);
+    let xref_section = format!("xref\n{} 1\n{}", next_obj_num, xref_entry);
+    let trailer_section = format!(
+        "trailer\n<< /Size {} /Prev {} /Root {} >>\n",
+        next_obj_num + 1,
+        prev_startxref,
+        root_ref,
+    );
+    let startxref_section = format!("startxref\n{}\n%%EOF\n", xref_start);
+    let total_len = sig_dict_start
+        + dict_text.len()
+        + xref_section.len()
+        + trailer_section.len()
+        + startxref_section.len();
+
+    let contents_abs = sig_dict_start + contents_in_dict;
+    let contents_size = calc.placeholder_size();
+    let after_contents = contents_abs + contents_size;
+    let byte_range: [i64; 4] = [
+        0,
+        contents_abs as i64,
+        after_contents as i64,
+        (total_len - after_contents) as i64,
+    ];
+
+    let patched = patch_byterange(dict_text, &byte_range);
+    let mut output = Vec::with_capacity(total_len);
+    output.extend_from_slice(pdf_data);
+    output.extend_from_slice(patched.as_bytes());
+    output.extend_from_slice(xref_section.as_bytes());
+    output.extend_from_slice(trailer_section.as_bytes());
+    output.extend_from_slice(startxref_section.as_bytes());
+    debug_assert_eq!(output.len(), total_len, "B-LTA assembled length mismatch");
+
+    let signed_bytes =
+        super::byterange::ByteRangeCalculator::extract_signed_bytes(&output, &byte_range)?;
+    let token = timestamper(&signed_bytes)?;
+    let token_hex: String = token.iter().map(|b| format!("{b:02X}")).collect();
+    calc.insert_signature(&mut output, contents_abs, &token_hex)?;
+    Ok(output)
 }
 
 /// Patch the `0000000000 0000000000 0000000000 0000000000` placeholder in the
@@ -287,22 +497,13 @@ fn pdf_text_hex(s: &str) -> String {
 }
 
 fn format_pdf_date() -> String {
-    // WASM note: if signatures are ever enabled for wasm32, SystemTime::now()
-    // here will also need cfg-gating (currently masked because the `signatures`
-    // feature is not enabled in the wasm build).
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs_per_day = 86400u64;
-    let days = now / secs_per_day;
-    let today = now % secs_per_day;
-    let year = 1970 + days / 365;
-    let h = today / 3600;
-    let m = (today % 3600) / 60;
-    let s = today % 60;
-    format!("D:{:04}0101{:02}{:02}{:02}Z", year, h, m, s)
+    // Delegates to the single leap-year-correct implementation. The
+    // prior local copy hard-coded month/day to "0101" and approximated
+    // the year as 1970 + days/365 — corrupting every signature /M date
+    // (README latent bug). WASM note: SystemTime::now() in the shared
+    // helper still needs cfg-gating if signatures are ever enabled for
+    // wasm32 (currently masked — `signatures` is off in the wasm build).
+    super::pdf_date::format_pdf_date_utc()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -453,6 +654,217 @@ mod tests {
     }
 
     // ── Finding 3 regression: scan_root_ref must ignore /Root in body ────────
+
+    /// Parse + verify the appended signature exactly as a reader would
+    /// (mirrors `test_sign_pdf_bytes_roundtrip`'s extraction). Returns
+    /// `(verification, decoded_cms, contents_string)`:
+    /// - `decoded_cms` — the CMS trimmed to its DER length, for
+    ///   inspecting signed/unsigned attributes (the OID bytes are
+    ///   hex-encoded in `/Contents`, never raw in the file).
+    /// - `contents_string` — the **full** `/Contents` value incl. the
+    ///   zero-padding (every hex pair decoded), i.e. byte-identical to
+    ///   what a PDF parser stores in `SignatureInfo::contents` and what
+    ///   `classify_pades_level` / `vri_key` hash. Lets the VRI key be
+    ///   checked for write/read parity without an AcroForm.
+    fn verify_appended_signature(
+        orig_len: usize,
+        signed: &[u8],
+    ) -> (SignerVerify, Vec<u8>, Vec<u8>) {
+        // Byte-oriented scan: a B-LT file appends *binary* DSS streams
+        // after the signature, so the tail is not valid UTF-8 — only
+        // the small ASCII `/ByteRange [...]` and `/Contents <...>` runs
+        // are. `windows().position()` finds the first match, i.e. the
+        // signature appended at `orig_len` (before any DSS increment).
+        let tail = &signed[orig_len..];
+        let br = tail
+            .windows(12)
+            .position(|w| w == b"/ByteRange [")
+            .expect("/ByteRange");
+        let after = &tail[br + 12..];
+        let end = after.iter().position(|&b| b == b']').unwrap();
+        let n: Vec<i64> = std::str::from_utf8(&after[..end])
+            .unwrap()
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let byte_range = [n[0], n[1], n[2], n[3]];
+        let ct = tail
+            .windows(11)
+            .position(|w| w == b"/Contents <")
+            .expect("/Contents");
+        let after_ct = &tail[ct + 11..];
+        let close = after_ct.iter().position(|&b| b == b'>').unwrap();
+        let hex_str = std::str::from_utf8(&after_ct[..close]).unwrap();
+        let cms_len = der_sequence_len_from_hex(hex_str);
+        let cms = hex_decode(&hex_str[..cms_len * 2]);
+        let contents_string = hex_decode(hex_str);
+        let content = ByteRangeCalculator::extract_signed_bytes(signed, &byte_range).unwrap();
+        let v = verify_signer_detached(&cms, &content).expect("verify must not error");
+        (v, cms, contents_string)
+    }
+
+    #[test]
+    #[cfg(feature = "signatures")]
+    fn test_sign_pdf_bytes_pades_levels() {
+        use crate::signatures::pades::vri_key;
+        use crate::signatures::{
+            classify_pades_level, read_dss, sign_pdf_bytes_pades, PadesLevel, RevocationMaterial,
+            SignatureInfo,
+        };
+
+        // Build a `SignatureInfo` carrying just the parsed `/Contents`
+        // (all `classify_pades_level` needs) — AcroForm-independent, so
+        // it works on the bare `/Type /Sig` object `sign_pdf_bytes`
+        // emits (which `enumerate_signatures` deliberately won't surface).
+        let info_with = |contents: Vec<u8>| SignatureInfo {
+            contents: Some(contents),
+            ..Default::default()
+        };
+
+        let pdf = minimal_pdf();
+        let creds = load_test_creds();
+        let mk_opts = || SignOptions {
+            estimated_size: 4096,
+            ..Default::default()
+        };
+        let ts: &dyn Fn(&[u8]) -> Result<Vec<u8>> =
+            &|_sig| Ok(vec![0x30, 0x07, 0x02, 0x01, 0x01, 0x04, 0x02, b't', b's']);
+
+        // B-B: signs, verifies, and carries the ESS attribute.
+        let bb = sign_pdf_bytes_pades(
+            &pdf,
+            &creds,
+            mk_opts(),
+            PadesLevel::BB,
+            None,
+            &RevocationMaterial::default(),
+        )
+        .expect("B-B sign");
+        let (v_bb, cms_bb, contents_bb) = verify_appended_signature(pdf.len(), &bb);
+        assert_eq!(v_bb, SignerVerify::Valid);
+        // id-aa-signingCertificateV2 = 1.2.840.113549.1.9.16.2.47.
+        const ESS_OID: &[u8] = &[
+            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F,
+        ];
+        // The ESS OID lives in the *decoded* CMS (hex-encoded in the PDF).
+        assert!(
+            cms_bb.windows(ESS_OID.len()).any(|w| w == ESS_OID),
+            "B-B CMS carries the ESS signing-certificate-v2 attribute"
+        );
+        // No timestamp attr ⇒ classifies as plain B-B.
+        assert_eq!(classify_pades_level(&info_with(contents_bb), None), PadesLevel::BB);
+
+        // B-T without a timestamper → fail-closed Unsupported.
+        assert!(matches!(
+            sign_pdf_bytes_pades(
+                &pdf,
+                &creds,
+                mk_opts(),
+                PadesLevel::BT,
+                None,
+                &RevocationMaterial::default()
+            ),
+            Err(Error::Unsupported(_))
+        ));
+
+        // B-T: signs with the timestamp attr, still verifies, classifies BT.
+        let bt = sign_pdf_bytes_pades(
+            &pdf,
+            &creds,
+            mk_opts(),
+            PadesLevel::BT,
+            Some(ts),
+            &RevocationMaterial::default(),
+        )
+        .expect("B-T sign");
+        let (v_bt, cms_bt, contents_bt) = verify_appended_signature(pdf.len(), &bt);
+        assert_eq!(v_bt, SignerVerify::Valid);
+        // id-aa-signatureTimeStampToken = 1.2.840.113549.1.9.16.2.14 —
+        // the B-T unsigned attr must be spliced into the SignerInfo.
+        const TS_OID: &[u8] = &[
+            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0E,
+        ];
+        assert!(
+            cms_bt.windows(TS_OID.len()).any(|w| w == TS_OID),
+            "B-T CMS carries the signature-time-stamp unsigned attribute"
+        );
+        // The timestamp attr present (no DSS) ⇒ classifies as B-T.
+        assert_eq!(classify_pades_level(&info_with(contents_bt), None), PadesLevel::BT);
+
+        // B-LT: B-T + a DSS appended as a 2nd incremental update.
+        let material = RevocationMaterial {
+            certificates: vec![creds.certificate.clone()],
+            ..RevocationMaterial::default()
+        };
+        let blt =
+            sign_pdf_bytes_pades(&pdf, &creds, mk_opts(), PadesLevel::BLt, Some(ts), &material)
+                .expect("B-LT sign");
+        // The DSS is an append-only 2nd incremental update (I2): the
+        // B-T signature's own /ByteRange self-delimits the bytes it
+        // signed (the DSS append falls outside it), so the signature
+        // still verifies within the full B-LT file — I1. (Slicing to
+        // `bt.len()` would be wrong: `bt` and `blt` are separate sign
+        // calls whose `/M` signing time differs byte-for-byte.)
+        assert!(blt.len() > bt.len());
+        let (v_blt, _cms_blt, contents_blt) = verify_appended_signature(pdf.len(), &blt);
+        assert_eq!(
+            v_blt,
+            SignerVerify::Valid,
+            "I1: the B-T signature still verifies in the full B-LT file"
+        );
+        let doc_blt = crate::document::PdfDocument::from_bytes(blt).unwrap();
+        let dss = read_dss(&doc_blt)
+            .expect("read_dss ok")
+            .expect("DSS present after B-LT");
+        assert_eq!(dss.certificates, vec![creds.certificate.clone()]);
+        // Write/read VRI-key parity: the DSS must carry a /VRI entry
+        // keyed by SHA-1 of the *exact* /Contents bytes a reader parses
+        // — proving the write-side key (computed in `sign_pdf_bytes_pades`
+        // over the padded contents) equals the read-side key.
+        let key = vri_key(&contents_blt).expect("provider supports SHA-1");
+        assert!(
+            dss.vri_for(&key).is_some(),
+            "DSS /VRI is keyed by SHA-1(/Contents) — write/read parity"
+        );
+        // …and the public read API agrees: timestamp attr + matching
+        // VRI ⇒ B-LT.
+        assert_eq!(
+            classify_pades_level(&info_with(contents_blt), Some(&dss)),
+            PadesLevel::BLt,
+            "signature classifies as B-LT with the DSS+VRI present"
+        );
+
+        // B-LTA: B-LT + a /DocTimeStamp (ETSI.RFC3161) over the whole
+        // file *including* the DSS, as a 3rd incremental update.
+        let blta =
+            sign_pdf_bytes_pades(&pdf, &creds, mk_opts(), PadesLevel::BLta, Some(ts), &material)
+                .expect("B-LTA sign");
+        // The B-T signature still verifies — its ByteRange self-delimits;
+        // the DSS and DocTimeStamp appends fall outside it.
+        let (v_blta, _, _) = verify_appended_signature(pdf.len(), &blta);
+        assert_eq!(v_blta, SignerVerify::Valid, "B-LTA: original sig still valid");
+        // The archival document timestamp object is present…
+        assert!(
+            crate::signatures::has_document_timestamp(&blta),
+            "B-LTA carries a /DocTimeStamp ETSI.RFC3161 object"
+        );
+        // …and it is appended *after* the DSS (so it covers it).
+        let dts_pos = blta
+            .windows(13)
+            .position(|w| w == b"/DocTimeStamp")
+            .expect("/DocTimeStamp present");
+        let dss_pos = blta
+            .windows(4)
+            .position(|w| w == b"/DSS")
+            .expect("/DSS present");
+        assert!(dss_pos < dts_pos, "DocTimeStamp is appended after the DSS");
+
+        // Fail-closed: B-LTA without a timestamper is Unsupported.
+        assert!(matches!(
+            sign_pdf_bytes_pades(&pdf, &creds, mk_opts(), PadesLevel::BLta, None, &material),
+            Err(Error::Unsupported(_))
+        ));
+    }
 
     #[test]
     fn test_scan_root_ref_ignores_body_occurrence() {

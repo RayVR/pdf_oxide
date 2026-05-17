@@ -2,6 +2,217 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [0.3.50] - 2026-05-16
+
+> True destructive PDF redaction, PAdES-B-T/B-LT long-term-validation
+> signatures, a runtime cryptographic algorithm-governance policy, and
+> split-PDF-by-bookmarks across all seven bindings, plus a
+> signature-date correctness fix.
+
+### Added
+
+- **True destructive redaction
+  ([#231](https://github.com/yfedoseev/pdf_oxide/issues/231))** — the
+  prior "redaction" only drew a filled rectangle over content whose
+  bytes survived (recoverable by copy-paste / `pdftotext` / a hex
+  editor). Redaction is now **destructive**: the text under each region
+  is physically removed from the content stream — every glyph whose
+  ISO 32000-1:2008 §9.4.4 text-rendering box intersects the
+  (edge-padded) region is deleted, survivors are re-emitted with a
+  fresh absolute `Tm` and **no** `TJ` deltas so neither the glyphs nor
+  a width/shift side channel (Bland et al., PETS 2023) remain; the page
+  is rewritten so the original content object is dropped by the
+  garbage-collected full rewrite (no residual recoverable bytes); an
+  opaque overlay marks the area (ISO 32000-1:2008 §12.5.6.23, "remove
+  all traces … clipping shall not be used"). Composite/Type0/unknown
+  fonts are **refused** rather than risk a silent under-redaction
+  (fail-closed). New `DocumentEditor::add_redaction` /
+  `redaction_count` / `apply_redactions_destructive` plus the
+  `pdf_redaction_add/count/apply/scrub_metadata` C ABI and Python,
+  WASM, Node, C#, Go bindings and a `pdf-oxide redact INPUT --rect
+  PAGE:x0,y0,x1,y1 [--from-annotations] [--fill R,G,B]
+  [--no-scrub-metadata]` CLI. The legacy
+  `apply_page_redactions`/`apply_all_redactions` keep their signatures.
+  Standalone document sanitization (`DocumentEditor::sanitize_document`,
+  the live `pdf_redaction_scrub_metadata` C ABI, Python
+  `sanitize_document`, WASM `sanitizeDocument`, and the already-wired
+  Node/C#/Go scrub paths) strips the `/Info` dictionary, the catalog
+  XMP `/Metadata` stream, document JavaScript (`/OpenAction`, `/AA`,
+  `/Names/JavaScript`) and `/Names/EmbeddedFiles`; the removed object
+  subtrees are hard-excluded from the rewritten file so a secret cannot
+  survive even as a GC-missed orphan (G6). Geometric image/path/XObject
+  pruning remains roadmap; composite-font text and encrypted documents
+  are refused (not under-redacted).
+- **PAdES long-term-validation signatures
+  ([#235](https://github.com/yfedoseev/pdf_oxide/issues/235))** —
+  signing now produces ETSI EN 319 142-1 PAdES baseline signatures, not
+  just bare `adbe.pkcs7.detached`: **B-B** embeds the RFC 5035 ESS
+  `signing-certificate-v2` signed attribute; **B-T** adds an RFC 3161
+  `signature-time-stamp` unsigned attribute over the signature value;
+  **B-LT** appends a Document Security Store (ISO 32000-2:2020
+  §12.8.4.3 — certs/CRLs/OCSPs + a per-signature `/VRI` keyed by the
+  uppercase-hex SHA-1 of the signature's `/Contents`) as an
+  **append-only second incremental update**, so the original
+  signature's byte range is untouched and stays `Valid`. Read side:
+  `read_dss` parses a `/DSS` and `classify_pades_level` reports a
+  signature's level (B-B/B-T/B-LT). New
+  `sign_pdf_bytes_pades` / `PadesLevel` / `RevocationMaterial` /
+  `DocumentSecurityStore` in core, the `pdf_sign_bytes_pades` /
+  `pdf_signature_get_pades_level` / `pdf_document_get_dss` /
+  `pdf_dss_*` C ABI, and Python, WASM, Node, C#, Go bindings. **B-LTA**
+  is also produced: a `/Type /DocTimeStamp` (`/SubFilter
+  /ETSI.RFC3161`) RFC 3161 timestamp over the whole file *including*
+  the DSS, appended as a third incremental update so the archival
+  timestamp covers the signature and its validation material;
+  `has_document_timestamp` is the document-scoped reader signal
+  (`classify_pades_level` stays signature-scoped and tops out at B-LT
+  by design — the frozen `pdf_signature_get_pades_level` C ABI has no
+  document handle). The legacy `sign_pdf_bytes` `adbe.pkcs7.detached`
+  path is byte-for-byte unchanged. Final ETSI conformance is gated on
+  the EU DSS demonstration-validator release check (online TSA fetch is
+  CGo/native-only — WASM takes a pre-fetched RFC 3161 token).
+- **Runtime crypto-governance policy
+  ([#230](https://github.com/yfedoseev/pdf_oxide/issues/230))** — a
+  process-wide `crypto::SecurityPolicy` (modes `compat` / `strict` /
+  `fips-strict`, plus an `allow:`/`deny:<alg>@<read|write>` override
+  grammar) layered as an orthogonal, set-once decorator over the
+  existing `CryptoProvider`. Read/write asymmetry lets a deployment
+  *read* legacy RC4/MD5 PDFs while *forbidding* weak crypto on write or
+  new signatures; fail-closed throughout (unknown algorithm /
+  unparseable spec ⇒ deny). Includes a content-keyed `inventory()`
+  governance report and a pluggable `AuditSink`. Exposed across all
+  seven surfaces (Rust, Python, C ABI, Go, C#, WASM, Node) as
+  `set_crypto_policy` / `crypto_policy` / `crypto_inventory`. Default
+  (`compat`) behaviour is byte-for-byte unchanged. The residual
+  password-key-derivation MD5 (ISO 32000-1 §7.6.3 Algorithm 1/2/3/5/7)
+  is now also routed through the governed provider, so a
+  `strict`/`fips-strict` policy denies legacy R≤4 at the **primitive**
+  level, not only the operation gate — closing the gap noted in the
+  v0.3.50 slice. The hashing is byte-identical under `compat`
+  (existing encrypted PDFs still decrypt; newly written ones are
+  bit-for-bit unchanged). Non-security opaque MD5 (file identifier,
+  embedded-file `/CheckSum`) is deliberately left direct so a strict
+  policy still permits AES-256 writes. A machine-readable **CycloneDX
+  1.6 Cryptographic Bill of Materials** of the algorithms a run
+  actually exercised is exported via `crypto_cbom` (core `cbom_json` +
+  C ABI / Python / WASM / Go / Node / C# bindings) — the structured
+  complement to `crypto_inventory` for CBOM/SPDX-crypto governance.
+  The policy now also **recognises and governs post-quantum
+  algorithms**: `PolicyMode::Cnsa2` (CNSA 2.0 — new crypto must be
+  FIPS-approved *and* 192-bit-class or stronger; 128-bit classical and
+  L1/L2 PQC denied for write) and `PolicyMode::PqcReady` (Strict
+  semantics that additionally recognise/permit ML-DSA/ML-KEM for
+  classical+PQC dual-stacking during migration), plus ML-DSA-44/65/87
+  (FIPS 204)
+  and ML-KEM-512/768/1024 (FIPS 203) `AlgorithmId`s in
+  `inventory()`/CBOM/the policy grammar. This is governance vocabulary
+  (the policy decides; the actual ML-DSA/ML-KEM primitives are a
+  separate provider concern — a sign attempt fails closed until they
+  land). Set via the string grammar (`crypto_policy("cnsa2")`), so all
+  seven bindings get it with no API change; frozen `AlgorithmId` bit
+  indices are preserved (PQC ids appended). A governed **RSA
+  modulus-size floor** is also enforced for *signing*:
+  `SecurityPolicy::min_rsa_modulus_bits` (per-mode default — Compat 0,
+  Strict/PqcReady 2048, FipsStrict/Cnsa2 3072 per NIST SP 800-131A /
+  CNSA 2.0) makes `sign_pdf_bytes`/`sign_pdf_bytes_pades` fail closed
+  with a weak RSA key — the key-strength gate the algorithm-level
+  `min_security_bits` cannot see. Default `compat` keeps no floor
+  (byte-for-byte unchanged). (Finer X.509 cert-policy governance —
+  keyUsage / extendedKeyUsage / validity-window enforcement for the
+  signing certificate — is the remaining #230 roadmap item, tracked as
+  a focused follow-up. Per-document policy override (Phase G) was
+  design-assessed and deliberately deferred: the active policy is
+  set-once specifically because a mid-flight downgrade is an attack
+  vector, so a runtime *widening* override (e.g. relax-for-one-document)
+  cannot be added safely; the only sound shape is an explicit
+  per-document policy threaded through every crypto call site — a large
+  cross-cutting change, tracked as a separate follow-up, not a set-once
+  relaxation.)
+- **Split a PDF by bookmarks
+  ([#482](https://github.com/yfedoseev/pdf_oxide/issues/482))** — new
+  `pdf-oxide split --by-bookmarks [--bookmark-prefix P]
+  [--bookmark-level N] [--ignore-case] [--no-front-matter]` CLI, plus
+  `plan_split_by_bookmarks` / `split_by_bookmarks*` in core and every
+  binding (Python, WASM, C ABI, Go, C#, Node). Splits at outline
+  boundaries into one PDF per (optionally prefix-filtered) bookmark,
+  with collision-free, filesystem-safe filenames. Outline parsing now
+  resolves **named destinations** (catalog `/Dests` dictionary and the
+  `/Names` → `/Dests` name tree, ISO 32000-1 §12.3.2.3 / §7.9.6),
+  bounded against malformed/cyclic name trees. Plain per-page `split`
+  is unchanged (backward compatible).
+- **Full idiomatic cross-binding parity for #230/#231/#235/#482** —
+  every feature is now exposed *idiomatically* in **all** supported
+  bindings (Rust, Python, C ABI, WASM, C#, Go-cgo, Go-purego, Node/TS):
+  - A new additive C ABI `pdf_document_has_timestamp(doc)` exposes the
+    document-scoped PAdES-**B-LTA** reader signal that
+    `pdf_signature_get_pades_level` (signature-scoped, ≤B-LT by design)
+    cannot report; surfaced as Python `has_document_timestamp`, WASM
+    `hasDocumentTimestamp`, C# `PdfDocument.HasDocumentTimestamp`, Go
+    `(*PdfDocument).HasDocumentTimestamp`, and Node
+    `PdfDocument.hasDocumentTimestamp` / `SignatureManager`.
+  - Python now re-exports the entire signing/PAdES surface
+    (`sign_pdf_bytes`, `sign_pdf_bytes_pades`, `Certificate`,
+    `Signature`, `PadesLevel`, `RevocationMaterial`, `Dss`) plus
+    `crypto_cbom` from the top-level `pdf_oxide` package under idiomatic
+    names (the functions were previously reachable only as
+    `py_`-prefixed symbols on the private extension module).
+  - The standalone document **sanitization** entrypoint (#231) is now a
+    first-class `SanitizeDocument()` on the C# and Go (cgo + purego)
+    `DocumentEditor` (previously the live `pdf_redaction_scrub_metadata`
+    C ABI had no managed/Go wrapper).
+  - The Go **purego** (CGO-free) backend, previously read-side only,
+    now covers crypto-governance (#230), destructive redaction +
+    sanitize (#231), PAdES signing + DSS read + B-LTA (#235), and
+    split-by-bookmarks (#482) with signatures identical to the cgo
+    backend.
+  - Node/TS gains idiomatic `signPdfBytesPades`, `PadesLevel`,
+    `PdfDocument.getDocumentSecurityStore/hasDocumentTimestamp/
+    planSplitByBookmarks`, `setCryptoPolicy/cryptoPolicy/
+    cryptoInventory/cryptoCbom`, and `SecurityManager` /
+    `SignatureManager` / `OutlineManager` methods, all with generated
+    TypeScript declarations. Behaviour and the frozen `PadesLevel`
+    integer mapping are unchanged.
+
+### Fixed
+
+- **Wrong dates in digital-signature timestamps** — `format_pdf_date`
+  hard-coded the month/day to `0101` and approximated the year as
+  `1970 + days/365`, so every signature `/M` value (and document
+  timestamps) was an incorrect ≈Jan-1-of-leap-drifted-year
+  (ISO 32000-1 §7.9.4). Replaced with one leap-year-correct,
+  de-duplicated implementation (the two divergent copies are gone).
+
+### Security
+
+- **Redaction now actually removes content
+  ([#231](https://github.com/yfedoseev/pdf_oxide/issues/231))** — the
+  Node `editing-manager` redaction methods previously called native
+  `pdf_redaction_*` symbols that did not exist (silently no-op'ing — a
+  security-critical operation pretending to succeed while removing
+  nothing). Those C ABI symbols now exist and perform **true
+  destructive** redaction (see Added); the binding gap is closed across
+  all surfaces. A `[BLOCK]` integration test builds a real PDF
+  containing a secret, redacts it through the public API, and asserts
+  the secret is absent from **both** re-extracted text and the raw
+  saved bytes (idempotent).
+- **PAdES long-term-validation signatures
+  ([#235](https://github.com/yfedoseev/pdf_oxide/issues/235))** — PDF
+  signatures can now carry the ESS `signing-certificate-v2` binding
+  (RFC 5035, defeats certificate-substitution), an RFC 3161 timestamp
+  (B-T), and a Document Security Store for offline long-term validation
+  (B-LT). The DSS is added as an append-only incremental update so
+  pre-existing signatures provably remain `Valid` (asserted by the
+  I1–I7 integrity-invariant suite in `tests/pades_ltv.rs`); a tampered
+  signed region still fails verification (negative test). See Added for
+  scope and the EU-DSS conformance gate.
+
+### Thanks
+
+- [@Suleman-Elahi](https://github.com/Suleman-Elahi) for requesting
+  split-by-bookmarks (#482).
+- [@jedzill4](https://github.com/jedzill4) for volunteering on
+  destructive redaction (#231).
+
 ## [0.3.49] - 2026-05-15
 
 > Off-byte-0 PDF header recovery, sparse-trailer Catalog discovery,

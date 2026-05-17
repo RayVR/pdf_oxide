@@ -46,6 +46,8 @@ mod byterange;
 mod cms;
 #[cfg(feature = "signatures")]
 mod cms_verify;
+#[cfg(feature = "signatures")]
+pub(crate) mod der_util;
 // `pub(crate)` so `RustCryptoProvider::verify_rsa_pkcs1v15` in
 // `src/crypto/rust_provider.rs` can re-use `digest_info_prefix` (the
 // OID → PKCS#1 DigestInfo prefix table) — same source of truth used
@@ -53,6 +55,8 @@ mod cms_verify;
 #[cfg(feature = "signatures")]
 pub(crate) mod crypto;
 mod enumerate;
+#[cfg(feature = "signatures")]
+pub mod pades;
 mod pdf_date;
 #[cfg(feature = "signatures")]
 mod sign_bytes;
@@ -70,9 +74,14 @@ pub use cms::extract_signer_certificate_der;
 #[cfg(feature = "signatures")]
 pub use cms_verify::{verify_signer, verify_signer_detached, SignerVerify};
 pub use enumerate::{count_signatures, enumerate_signatures};
+#[cfg(feature = "signatures")]
+pub use pades::{
+    classify_pades_level, has_document_timestamp, read_dss, DocumentSecurityStore, PadesLevel,
+    RevocationMaterial, VriEntry,
+};
 pub use pdf_date::parse_pdf_date_to_epoch;
 #[cfg(feature = "signatures")]
-pub use sign_bytes::sign_pdf_bytes;
+pub use sign_bytes::{sign_pdf_bytes, sign_pdf_bytes_pades};
 pub use signer::PdfSigner;
 #[cfg(feature = "signatures")]
 pub use timestamp::{HashAlgorithm, Timestamp};

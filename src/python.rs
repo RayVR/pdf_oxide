@@ -173,6 +173,22 @@ impl PyPdfDocument {
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to count signatures: {}", e)))
     }
 
+    /// The document's Document Security Store (`/DSS`) as a :class:`Dss`,
+    /// or ``None`` if the PDF has no DSS. Mirrors Rust
+    /// `signatures::read_dss`.
+    fn dss(&self) -> PyResult<Option<PyDss>> {
+        #[cfg(feature = "signatures")]
+        {
+            crate::signatures::read_dss(&self.inner)
+                .map(|opt| opt.map(|dss| PyDss { dss }))
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to read DSS: {}", e)))
+        }
+        #[cfg(not(feature = "signatures"))]
+        {
+            Ok(None)
+        }
+    }
+
     /// Extract text from a page.
     #[pyo3(signature = (page, region=None))]
     fn extract_text(
@@ -1383,6 +1399,124 @@ impl PyPdfDocument {
         if let Some(ref mut editor) = self.editor {
             editor.unmark_page_for_redaction(page);
         }
+    }
+
+    /// Queue an explicit destructive redaction rectangle on a page.
+    ///
+    /// Args:
+    ///     page (int): zero-based page index.
+    ///     rect (tuple[float,float,float,float]): ``(x0, y0, x1, y1)`` in
+    ///         page user space.
+    ///     fill (tuple[float,float,float] | None): overlay DeviceRGB
+    ///         colour; ``None`` uses the default.
+    #[pyo3(signature = (page, rect, fill=None))]
+    fn add_redaction(
+        &mut self,
+        page: usize,
+        rect: (f32, f32, f32, f32),
+        fill: Option<(f32, f32, f32)>,
+    ) -> PyResult<()> {
+        self.ensure_editor()?;
+        if let Some(ref mut editor) = self.editor {
+            editor
+                .add_redaction(
+                    page,
+                    [rect.0, rect.1, rect.2, rect.3],
+                    fill.map(|(r, g, b)| [r, g, b]),
+                )
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Number of redaction regions queued for ``page`` (annotations +
+    /// programmatic rectangles).
+    fn redaction_count(&mut self, page: usize) -> PyResult<usize> {
+        self.ensure_editor()?;
+        match self.editor {
+            Some(ref mut editor) => editor
+                .redaction_count(page)
+                .map_err(|e| PyValueError::new_err(e.to_string())),
+            None => Err(PyRuntimeError::new_err("No document source available")),
+        }
+    }
+
+    /// Destructively apply all queued redactions (true content removal,
+    /// ISO 32000-1:2008 §12.5.6.23) and return a report dict.
+    ///
+    /// Raises ``RuntimeError`` if content uses a composite/Type0 font
+    /// (refused rather than risk a silent under-redaction).
+    #[pyo3(signature = (scrub_metadata=true, remove_javascript=true, remove_embedded_files=true, fill=(0.0, 0.0, 0.0)))]
+    fn apply_redactions_destructive(
+        &mut self,
+        py: Python<'_>,
+        scrub_metadata: bool,
+        remove_javascript: bool,
+        remove_embedded_files: bool,
+        fill: (f32, f32, f32),
+    ) -> PyResult<Py<pyo3::types::PyDict>> {
+        self.ensure_editor()?;
+        let opts = crate::redaction::RedactionOptions {
+            scrub_metadata,
+            remove_javascript,
+            remove_embedded_files,
+            default_fill: [fill.0, fill.1, fill.2],
+            ..crate::redaction::RedactionOptions::default()
+        };
+        let report = match self.editor {
+            Some(ref mut editor) => editor
+                .apply_redactions_destructive(opts)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            None => return Err(PyRuntimeError::new_err("No document source available")),
+        };
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("regions", report.regions)?;
+        d.set_item("glyphs_removed", report.glyphs_removed)?;
+        d.set_item("images_modified", report.images_modified)?;
+        d.set_item("images_removed", report.images_removed)?;
+        d.set_item("paths_pruned", report.paths_pruned)?;
+        d.set_item("xobjects_specialized", report.xobjects_specialized)?;
+        d.set_item("annotations_removed", report.annotations_removed)?;
+        d.set_item("fonts_scrubbed", report.fonts_scrubbed)?;
+        d.set_item("bytes_removed", report.bytes_removed)?;
+        Ok(d.unbind())
+    }
+
+    /// Standalone document sanitization (#231 T10): strip `/Info`,
+    /// catalog XMP `/Metadata`, document JavaScript and embedded files
+    /// without geometric redaction. Returns a report dict.
+    #[pyo3(signature = (scrub_metadata=true, remove_javascript=true, remove_embedded_files=true))]
+    fn sanitize_document(
+        &mut self,
+        py: Python<'_>,
+        scrub_metadata: bool,
+        remove_javascript: bool,
+        remove_embedded_files: bool,
+    ) -> PyResult<Py<pyo3::types::PyDict>> {
+        self.ensure_editor()?;
+        let opts = crate::redaction::RedactionOptions {
+            scrub_metadata,
+            remove_javascript,
+            remove_embedded_files,
+            ..crate::redaction::RedactionOptions::default()
+        };
+        let report = match self.editor {
+            Some(ref mut editor) => editor
+                .sanitize_document(opts)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            None => return Err(PyRuntimeError::new_err("No document source available")),
+        };
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("regions", report.regions)?;
+        d.set_item("glyphs_removed", report.glyphs_removed)?;
+        d.set_item("images_modified", report.images_modified)?;
+        d.set_item("images_removed", report.images_removed)?;
+        d.set_item("paths_pruned", report.paths_pruned)?;
+        d.set_item("xobjects_specialized", report.xobjects_specialized)?;
+        d.set_item("annotations_removed", report.annotations_removed)?;
+        d.set_item("fonts_scrubbed", report.fonts_scrubbed)?;
+        d.set_item("bytes_removed", report.bytes_removed)?;
+        Ok(d.unbind())
     }
 
     /// Get page images info.
@@ -7111,6 +7245,21 @@ impl PySignature {
         self.info.covers_whole_document
     }
 
+    /// PAdES baseline level from this signature's CMS attributes alone
+    /// (`B_B` vs `B_T`). `B_LT` additionally needs the document `/DSS`
+    /// — combine with :meth:`PdfDocument.dss` and re-classify there.
+    #[getter]
+    fn pades_level(&self) -> PyPadesLevel {
+        #[cfg(feature = "signatures")]
+        {
+            PyPadesLevel::from_core(crate::signatures::classify_pades_level(&self.info, None))
+        }
+        #[cfg(not(feature = "signatures"))]
+        {
+            PyPadesLevel::BB
+        }
+    }
+
     /// Run the RFC 5652 §5.4 signer-attributes crypto check against the
     /// certificate embedded in this signature's CMS blob. Today this
     /// covers RSA-PKCS#1 v1.5 over SHA-1/256/384/512 — the padding
@@ -7253,7 +7402,12 @@ fn pdf_oxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCertificate>()?;
     m.add_class::<PyTimestamp>()?;
     m.add_class::<PyTsaClient>()?;
+    m.add_class::<PyPadesLevel>()?;
+    m.add_class::<PyRevocationMaterial>()?;
+    m.add_class::<PyDss>()?;
     m.add_function(pyo3::wrap_pyfunction!(py_sign_pdf_bytes, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_sign_pdf_bytes_pades, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_has_document_timestamp, m)?)?;
     #[cfg(feature = "barcodes")]
     m.add_function(pyo3::wrap_pyfunction!(generate_barcode_svg, m)?)?;
     #[cfg(feature = "barcodes")]
@@ -7265,7 +7419,102 @@ fn pdf_oxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(crypto_active_provider, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(crypto_available_providers, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(crypto_use_fips, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_set_policy, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_policy, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_inventory, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_cbom, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(plan_split_by_bookmarks, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(split_by_bookmarks, m)?)?;
     Ok(())
+}
+
+fn split_opts(
+    title_prefix: Option<String>,
+    ignore_case: bool,
+    level: u32,
+    include_front_matter: bool,
+) -> crate::split_bookmarks::SplitByBookmarksOptions {
+    crate::split_bookmarks::SplitByBookmarksOptions {
+        title_prefix,
+        ignore_case,
+        level: crate::split_bookmarks::BookmarkLevel::from_u32(level),
+        include_front_matter,
+        ..Default::default()
+    }
+}
+
+fn seg_to_pydict<'py>(
+    py: pyo3::Python<'py>,
+    seg: &crate::split_bookmarks::BookmarkSegment,
+) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("index", seg.index)?;
+    d.set_item("start_page", seg.start_page)?;
+    d.set_item("end_page", seg.end_page)?;
+    d.set_item("title", seg.title.clone())?;
+    d.set_item("file_stem", &seg.file_stem)?;
+    d.set_item("page_label", seg.page_label.clone())?;
+    Ok(d)
+}
+
+/// Plan a bookmark split for `src_bytes` without producing PDFs.
+///
+/// Returns ``list[dict]`` (keys: index, start_page, end_page, title,
+/// file_stem, page_label). ``level``: 0 = all depths, 1 = top-level
+/// (default), n = up to depth n. Raises ``RuntimeError`` if the
+/// document has no outline or nothing resolves.
+#[pyfunction]
+#[pyo3(signature = (src_bytes, title_prefix=None, ignore_case=false, level=1, include_front_matter=true))]
+fn plan_split_by_bookmarks(
+    py: pyo3::Python<'_>,
+    src_bytes: &[u8],
+    title_prefix: Option<String>,
+    ignore_case: bool,
+    level: u32,
+    include_front_matter: bool,
+) -> pyo3::PyResult<pyo3::Py<pyo3::types::PyList>> {
+    let doc = crate::document::PdfDocument::from_bytes(src_bytes.to_vec())
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let opts = split_opts(title_prefix, ignore_case, level, include_front_matter);
+    let segs = crate::split_bookmarks::plan_split_by_bookmarks(&doc, &opts)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let list = pyo3::types::PyList::empty(py);
+    for s in &segs {
+        list.append(seg_to_pydict(py, s)?)?;
+    }
+    Ok(list.unbind())
+}
+
+/// Split `src_bytes` at bookmark boundaries.
+///
+/// Returns ``list[tuple[dict, bytes]]`` — each segment's metadata
+/// (see :func:`plan_split_by_bookmarks`) paired with its PDF bytes.
+/// The source is not modified. Raises ``RuntimeError`` on failure.
+#[pyfunction]
+#[pyo3(signature = (src_bytes, title_prefix=None, ignore_case=false, level=1, include_front_matter=true))]
+fn split_by_bookmarks(
+    py: pyo3::Python<'_>,
+    src_bytes: &[u8],
+    title_prefix: Option<String>,
+    ignore_case: bool,
+    level: u32,
+    include_front_matter: bool,
+) -> pyo3::PyResult<pyo3::Py<pyo3::types::PyList>> {
+    let opts = split_opts(title_prefix, ignore_case, level, include_front_matter);
+    let parts = crate::split_bookmarks::split_by_bookmarks_to_bytes(src_bytes, &opts)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let list = pyo3::types::PyList::empty(py);
+    for (seg, blob) in &parts {
+        let tup = pyo3::types::PyTuple::new(
+            py,
+            [
+                seg_to_pydict(py, seg)?.into_any(),
+                pyo3::types::PyBytes::new(py, blob).into_any(),
+            ],
+        )?;
+        list.append(tup)?;
+    }
+    Ok(list.unbind())
 }
 
 /// Return the name of the currently active cryptographic provider
@@ -7333,6 +7582,54 @@ fn crypto_use_fips() -> pyo3::PyResult<()> {
     }
 }
 
+/// Install the process-wide runtime crypto-governance policy (#230).
+///
+/// ``spec`` grammar: ``mode[;clause]*`` where
+/// ``mode ∈ {compat, strict, fips-strict}`` and
+/// ``clause = (allow|deny):<alg>@<read|write>`` — e.g.
+/// ``"compat;deny:rc4@write;deny:md5@write"`` or ``"fips-strict"``.
+///
+/// Set-once (a runtime policy downgrade is an attack vector). Raises
+/// ``RuntimeError`` on an unparseable spec (**fail-closed** — treat
+/// this as fatal; the policy is *not* installed) or if a policy is
+/// already set. Default (never set) behaviour is ``compat`` —
+/// byte-for-byte identical to pre-#230.
+#[pyfunction]
+fn crypto_set_policy(spec: &str) -> pyo3::PyResult<()> {
+    let policy: crate::crypto::SecurityPolicy =
+        spec.parse().map_err(|e: crate::crypto::PolicyParseError| {
+            pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+        })?;
+    crate::crypto::set_policy(policy)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Return the active crypto policy as its canonical grammar string
+/// (e.g. ``"strict"`` or ``"compat;deny:rc4@write"``). Non-mutating
+/// beyond the lazy ``compat`` default that every crypto path shares.
+#[pyfunction]
+fn crypto_policy() -> String {
+    crate::crypto::active_policy().to_string()
+}
+
+/// The cryptographic algorithms exercised so far this process, as
+/// stable lowercase tokens (e.g. ``["md5", "aes256"]``) — the minimal
+/// crypto-inventory / CBOM-adjacent governance report.
+#[pyfunction]
+fn crypto_inventory() -> Vec<String> {
+    crate::crypto::inventory()
+        .into_iter()
+        .map(|a| a.token().to_string())
+        .collect()
+}
+
+/// A CycloneDX 1.6 Cryptographic Bill of Materials (JSON string) of the
+/// algorithms exercised so far this process (#230 Phase F).
+#[pyfunction]
+fn crypto_cbom() -> String {
+    crate::crypto::cbom_json()
+}
+
 /// Sign raw PDF bytes and return the signed PDF as `bytes`.
 ///
 /// `cert` must be a :class:`Certificate` loaded via
@@ -7351,6 +7648,7 @@ fn crypto_use_fips() -> pyo3::PyResult<()> {
 ///     f.write(signed)
 /// ```
 #[pyfunction]
+#[pyo3(name = "sign_pdf_bytes")]
 #[pyo3(signature = (pdf_data, cert, reason=None, location=None))]
 pub fn py_sign_pdf_bytes<'py>(
     py: pyo3::Python<'py>,
@@ -7378,5 +7676,252 @@ pub fn py_sign_pdf_bytes<'py>(
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
             "sign_pdf_bytes(): pdf_oxide was built without --features signatures",
         ))
+    }
+}
+
+// ─── PAdES LTV (#235) ───────────────────────────────────────────────────────
+
+/// PAdES baseline level. Frozen integer mapping (B_B=0, B_T=1, B_LT=2,
+/// B_LTA=3) shared with the C ABI and every binding — never renumber.
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "PadesLevel",
+    eq,
+    eq_int,
+    skip_from_py_object
+)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PyPadesLevel {
+    BB = 0,
+    BT = 1,
+    BLt = 2,
+    BLta = 3,
+}
+
+#[cfg(feature = "signatures")]
+impl PyPadesLevel {
+    fn to_core(self) -> crate::signatures::PadesLevel {
+        // `from_code` is total over the four frozen codes.
+        crate::signatures::PadesLevel::from_code(self as i32)
+            .expect("frozen PadesLevel code round-trips")
+    }
+    fn from_core(level: crate::signatures::PadesLevel) -> PyPadesLevel {
+        match level.code() {
+            0 => PyPadesLevel::BB,
+            1 => PyPadesLevel::BT,
+            2 => PyPadesLevel::BLt,
+            _ => PyPadesLevel::BLta,
+        }
+    }
+}
+
+#[pymethods]
+impl PyPadesLevel {
+    #[classattr]
+    const B_B: PyPadesLevel = PyPadesLevel::BB;
+    #[classattr]
+    const B_T: PyPadesLevel = PyPadesLevel::BT;
+    #[classattr]
+    const B_LT: PyPadesLevel = PyPadesLevel::BLt;
+    #[classattr]
+    const B_LTA: PyPadesLevel = PyPadesLevel::BLta;
+
+    fn __int__(&self) -> i32 {
+        *self as i32
+    }
+
+    fn __repr__(&self) -> &'static str {
+        match self {
+            PyPadesLevel::BB => "PadesLevel.B_B",
+            PyPadesLevel::BT => "PadesLevel.B_T",
+            PyPadesLevel::BLt => "PadesLevel.B_LT",
+            PyPadesLevel::BLta => "PadesLevel.B_LTA",
+        }
+    }
+}
+
+/// Offline validation material for B-LT (DER certificates / CRLs /
+/// OCSP responses). Mirrors Rust `signatures::RevocationMaterial`.
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "RevocationMaterial",
+    skip_from_py_object
+)]
+#[derive(Clone, Default)]
+pub struct PyRevocationMaterial {
+    certs: Vec<Vec<u8>>,
+    crls: Vec<Vec<u8>>,
+    ocsps: Vec<Vec<u8>>,
+}
+
+#[pymethods]
+impl PyRevocationMaterial {
+    #[new]
+    #[pyo3(signature = (certs=None, crls=None, ocsps=None))]
+    fn new(
+        certs: Option<Vec<Vec<u8>>>,
+        crls: Option<Vec<Vec<u8>>>,
+        ocsps: Option<Vec<Vec<u8>>>,
+    ) -> Self {
+        PyRevocationMaterial {
+            certs: certs.unwrap_or_default(),
+            crls: crls.unwrap_or_default(),
+            ocsps: ocsps.unwrap_or_default(),
+        }
+    }
+}
+
+/// A parsed Document Security Store (`/DSS`, ISO 32000-2 §12.8.4.3).
+/// `certs`/`crls`/`ocsps` are document-level DER blobs; `vri` is the
+/// list of per-signature VRI keys (uppercase-hex SHA-1 of `/Contents`).
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Dss")]
+pub struct PyDss {
+    #[cfg(feature = "signatures")]
+    dss: crate::signatures::DocumentSecurityStore,
+}
+
+#[cfg(feature = "signatures")]
+#[pymethods]
+impl PyDss {
+    #[getter]
+    fn certs<'py>(&self, py: pyo3::Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        self.dss
+            .certificates
+            .iter()
+            .map(|d| PyBytes::new(py, d))
+            .collect()
+    }
+    #[getter]
+    fn crls<'py>(&self, py: pyo3::Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        self.dss.crls.iter().map(|d| PyBytes::new(py, d)).collect()
+    }
+    #[getter]
+    fn ocsps<'py>(&self, py: pyo3::Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        self.dss
+            .ocsp_responses
+            .iter()
+            .map(|d| PyBytes::new(py, d))
+            .collect()
+    }
+    #[getter]
+    fn vri(&self) -> Vec<String> {
+        self.dss
+            .vri
+            .iter()
+            .map(|v| v.signature_digest.clone())
+            .collect()
+    }
+}
+
+/// Sign raw PDF bytes at a PAdES baseline level and return the signed
+/// PDF as `bytes`.
+///
+/// `level` is a :class:`PadesLevel` (``B_LTA`` is reserved →
+/// ``NotImplementedError``). For ``B_T``/``B_LT`` a `tsa_url` is
+/// required (RFC 3161 source; needs the ``tsa-client`` build feature).
+/// `revocation` supplies the B-LT DSS material.
+///
+/// ```python
+/// from pdf_oxide import Certificate, PadesLevel, RevocationMaterial, sign_pdf_bytes_pades
+///
+/// cert = Certificate.load_pkcs12(open("id.p12","rb").read(), "pw")
+/// signed = sign_pdf_bytes_pades(
+///     open("in.pdf","rb").read(), cert, PadesLevel.B_LT,
+///     tsa_url="https://freetsa.org/tsr",
+///     revocation=RevocationMaterial(certs=[cert_der]),
+/// )
+/// ```
+#[pyfunction]
+#[pyo3(name = "sign_pdf_bytes_pades")]
+#[pyo3(signature = (pdf_data, cert, level, tsa_url=None, reason=None, location=None, revocation=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn py_sign_pdf_bytes_pades<'py>(
+    py: pyo3::Python<'py>,
+    pdf_data: &Bound<'py, PyBytes>,
+    cert: &PyCertificate,
+    level: &PyPadesLevel,
+    tsa_url: Option<&str>,
+    reason: Option<&str>,
+    location: Option<&str>,
+    revocation: Option<&PyRevocationMaterial>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    #[cfg(feature = "signatures")]
+    {
+        use crate::signatures::{sign_pdf_bytes_pades, RevocationMaterial, SignOptions};
+        let opts = SignOptions {
+            reason: reason.map(str::to_owned),
+            location: location.map(str::to_owned),
+            ..Default::default()
+        };
+        let material = revocation
+            .map(|r| RevocationMaterial {
+                certificates: r.certs.clone(),
+                crls: r.crls.clone(),
+                ocsp_responses: r.ocsps.clone(),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+
+        #[cfg(feature = "tsa-client")]
+        let ts_closure: Option<Box<dyn Fn(&[u8]) -> crate::error::Result<Vec<u8>>>> =
+            tsa_url.map(|u| {
+                let client = crate::signatures::TsaClient::new(
+                    crate::signatures::TsaClientConfig::new(u.to_owned()),
+                );
+                Box::new(move |sig: &[u8]| {
+                    client
+                        .request_timestamp(sig)
+                        .map(|t| t.token_bytes().to_vec())
+                }) as Box<dyn Fn(&[u8]) -> crate::error::Result<Vec<u8>>>
+            });
+        #[cfg(not(feature = "tsa-client"))]
+        let ts_closure: Option<Box<dyn Fn(&[u8]) -> crate::error::Result<Vec<u8>>>> = {
+            let _ = tsa_url;
+            None
+        };
+
+        let signed = sign_pdf_bytes_pades(
+            pdf_data.as_bytes(),
+            &cert.creds,
+            opts,
+            level.to_core(),
+            ts_closure.as_deref(),
+            &material,
+        )
+        .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("sign_pdf_bytes_pades failed: {e}"))
+        })?;
+        Ok(PyBytes::new(py, &signed))
+    }
+    #[cfg(not(feature = "signatures"))]
+    {
+        let _ = (pdf_data, cert, level, tsa_url, reason, location, revocation);
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "sign_pdf_bytes_pades(): pdf_oxide was built without --features signatures",
+        ))
+    }
+}
+
+/// Whether `pdf_data` carries a document-scoped RFC 3161
+/// `/DocTimeStamp` archival timestamp (PAdES-B-LTA). This is the
+/// document-level reader signal; `Signature.pades_level` is
+/// signature-scoped and tops out at B-LT by design.
+///
+/// ```python
+/// from pdf_oxide import has_document_timestamp
+/// with open("ltv.pdf", "rb") as f:
+///     is_lta = has_document_timestamp(f.read())
+/// ```
+#[pyfunction]
+#[pyo3(name = "has_document_timestamp")]
+pub fn py_has_document_timestamp(pdf_data: &Bound<'_, PyBytes>) -> bool {
+    #[cfg(feature = "signatures")]
+    {
+        crate::signatures::has_document_timestamp(pdf_data.as_bytes())
+    }
+    #[cfg(not(feature = "signatures"))]
+    {
+        let _ = pdf_data;
+        false
     }
 }

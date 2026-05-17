@@ -112,20 +112,62 @@ impl PdfSigner {
     /// `/Contents` placeholder using [`PdfSigner::insert_signature`].
     #[cfg(feature = "signatures")]
     pub fn sign(&self, signed_bytes: &[u8]) -> Result<Vec<u8>> {
-        self.create_pkcs7_signature(signed_bytes)
+        // Legacy / adbe.pkcs7.detached path — no ESS attr, byte-identical
+        // to prior releases (#235 plan Q3: ESS is PAdES-only in v0.3.50).
+        self.create_pkcs7_signature_inner(signed_bytes, None, None)
     }
 
-    /// Build a detached CMS SignedData (RFC 5652) over `signed_bytes`.
+    /// Sign producing a CAdES/PAdES-B-B-conformant CMS: adds the RFC 5035
+    /// ESS `signing-certificate-v2` signed attribute (#235 TODO #4).
     ///
-    /// Produces a DER-encoded ContentInfo that wraps a SignedData with:
-    /// - SHA-256 digest (or the algorithm in `self.options.digest_algorithm`)
-    /// - RSA-PKCS#1 v1.5 signature
-    /// - Signed attributes: id-contentType + id-messageDigest
-    /// - Signer certificate embedded in the certificates field
-    ///
-    /// The blob is compatible with [`crate::signatures::verify_signer_detached`].
+    /// The ESS attribute is *signed* (it changes the hashed
+    /// `signedAttrs`), so it is built and inserted **before** the RSA
+    /// sign step, in canonical SET-OF order. End-to-end CMS conformance
+    /// is gated by the EU-DSS validator (feature plan §5.5); this path
+    /// is self-checked by sign→`verify_signer_detached` round-trip and
+    /// the attribute's presence in the parsed CMS.
     #[cfg(feature = "signatures")]
-    fn create_pkcs7_signature(&self, signed_bytes: &[u8]) -> Result<Vec<u8>> {
+    pub fn sign_pades(&self, signed_bytes: &[u8]) -> Result<Vec<u8>> {
+        let ess = crate::signatures::pades::build_signing_certificate_v2(
+            &self.credentials.certificate,
+            self.options.digest_algorithm,
+        )?;
+        self.create_pkcs7_signature_inner(signed_bytes, Some(&ess), None)
+    }
+
+    /// Sign producing PAdES-**B-T**: B-B (with ESS) + an RFC 3161
+    /// `signature-time-stamp` *unsigned* attribute over the signature
+    /// value (#235 TODO #7). `timestamper` receives the raw signature
+    /// value (`SignerInfo.signature` content) and returns the DER
+    /// `TimeStampToken` — in production this calls a TSA over the
+    /// imprint; offline callers pass a pre-fetched token. Because the
+    /// attribute is *unsigned*, the signed bytes are byte-identical to
+    /// the B-B form ([`Self::sign_pades`]) — invariant I7.
+    #[cfg(feature = "signatures")]
+    pub fn sign_pades_t(
+        &self,
+        signed_bytes: &[u8],
+        timestamper: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let ess = crate::signatures::pades::build_signing_certificate_v2(
+            &self.credentials.certificate,
+            self.options.digest_algorithm,
+        )?;
+        self.create_pkcs7_signature_inner(signed_bytes, Some(&ess), Some(timestamper))
+    }
+
+    /// Build a detached CMS SignedData (RFC 5652) over `signed_bytes`:
+    /// SHA-256 (or `options.digest_algorithm`), RSA-PKCS#1 v1.5, signed
+    /// attrs (content-type + message-digest [+ ESS when `ess_attr`]),
+    /// optional B-T `signature-time-stamp` unsigned attr via
+    /// `timestamper`. Compatible with `verify_signer_detached`.
+    #[cfg(feature = "signatures")]
+    fn create_pkcs7_signature_inner(
+        &self,
+        signed_bytes: &[u8],
+        ess_attr: Option<&[u8]>,
+        timestamper: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>>>,
+    ) -> Result<Vec<u8>> {
         use super::crypto::digest_info_prefix;
         use cms::cert::x509::Certificate as X509Certificate;
         use der::oid::db::rfc5912::{ID_SHA_1, ID_SHA_256, ID_SHA_384, ID_SHA_512};
@@ -185,6 +227,27 @@ impl PdfSigner {
                 Error::InvalidPdf("private key is not valid PKCS#8 or PKCS#1 RSA DER".into())
             })?;
 
+        // ── #230 Phase D: governed RSA modulus-size floor ─────────────
+        // A `strict`/`fips-strict`/`cnsa2` policy refuses to *sign* with
+        // a weak RSA key (NIST SP 800-131A ≥2048; CNSA 2.0 ≥3072) — the
+        // strength gate that `min_security_bits` (algorithm-level)
+        // cannot see, since key size is a property of the key, not the
+        // algorithm id. Default `compat` keeps the floor at 0 (no
+        // behaviour change).
+        let modulus_bits = {
+            use rsa::traits::PublicKeyParts;
+            rsa_key.n().bits()
+        };
+        if crate::crypto::active_policy().rsa_modulus_allowed(modulus_bits as u32)
+            == crate::crypto::Decision::Deny
+        {
+            return Err(Error::Unsupported(format!(
+                "RSA signing key modulus is {modulus_bits} bits; the active crypto \
+                 SecurityPolicy requires at least {} (#230 Phase D)",
+                crate::crypto::active_policy().min_rsa_modulus_bits()
+            )));
+        }
+
         // ── Signed attributes ──────────────────────────────────────────
         // Attribute 1: id-contentType = id-data
         let attr_ct = {
@@ -200,10 +263,20 @@ impl PdfSigner {
             c.extend(der_set(&der_octet_string(&message_digest)));
             der_sequence(&c)
         };
-        // SET OF order: attr_ct < attr_md (shorter encodes first in canonical SET)
+        // Canonical SET-OF order (X.690 §11.6 / RFC 5652 §5.4): compare
+        // element encodings as octet strings. All three are `30 LL 06
+        // <oidlen> …`; content-type/message-digest OIDs are 9 bytes
+        // (`06 09 … 09 03` / `… 09 04`) so ct < md; the ESS
+        // signing-certificate-v2 OID is 11 bytes (`06 0B …`) and `0B`
+        // > `09`, so ESS sorts strictly LAST. Appending it (only on the
+        // PAdES path) therefore keeps the legacy ct‖md bytes
+        // byte-identical (#235 plan Q3) while being canonically correct.
         let mut attrs_content = Vec::new();
         attrs_content.extend(&attr_ct);
         attrs_content.extend(&attr_md);
+        if let Some(ess) = ess_attr {
+            attrs_content.extend_from_slice(ess);
+        }
 
         // For hashing: SET tag (RFC 5652 §5.4)
         let attrs_for_hashing = der_set(&attrs_content);
@@ -225,6 +298,22 @@ impl PdfSigner {
         let sig_bytes = rsa_key
             .sign(Pkcs1v15Sign::new_unprefixed(), &digest_info_bytes)
             .map_err(|e| Error::InvalidPdf(format!("RSA signing failed: {e}")))?;
+
+        // ── B-T: unsigned signature-time-stamp attribute ────────────────
+        // RFC 3161 token over the signature value (SignerInfo.signature
+        // content). UNSIGNED — does not change the hashed signedAttrs,
+        // so the signature stays valid and the signed bytes are
+        // byte-identical to the B-B form (#235 plan §4 / I7).
+        // SignerInfo.unsignedAttrs ::= [1] IMPLICIT SET OF Attribute, so
+        // the [1] (0xA1) tag wraps the (single) attribute directly.
+        let unsigned_attrs: Option<Vec<u8>> = match timestamper {
+            Some(ts) => {
+                let token = ts(&sig_bytes)?;
+                let attr = crate::signatures::pades::build_signature_timestamp_attr(&token)?;
+                Some(der_tag(0xA1, &attr))
+            },
+            None => None,
+        };
 
         // ── Build SignerInfo ────────────────────────────────────────────
         let signer_info = {
@@ -252,6 +341,9 @@ impl PdfSigner {
             si.extend(attrs_for_storage);
             si.extend(sig_alg);
             si.extend(der_octet_string(&sig_bytes));
+            if let Some(ref ua) = unsigned_attrs {
+                si.extend_from_slice(ua);
+            }
             der_sequence(&si)
         };
 
@@ -320,47 +412,11 @@ impl PdfSigner {
     }
 }
 
-// ─── Minimal DER / ASN.1 encoding helpers ───────────────────────────────────
-//
-// These are used only by create_pkcs7_signature. They cover the small subset
-// of DER needed for RFC 5652 SignedData: SEQUENCE, SET, OCTET STRING, OID,
-// single-byte INTEGER, and arbitrary context-specific constructed tags.
-
-fn der_length(len: usize) -> Vec<u8> {
-    if len < 0x80 {
-        vec![len as u8]
-    } else if len <= 0xFF {
-        vec![0x81, len as u8]
-    } else if len <= 0xFFFF {
-        vec![0x82, (len >> 8) as u8, len as u8]
-    } else {
-        vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
-    }
-}
-
-fn der_tag(tag: u8, content: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 4 + content.len());
-    out.push(tag);
-    out.extend(der_length(content.len()));
-    out.extend_from_slice(content);
-    out
-}
-
-fn der_sequence(content: &[u8]) -> Vec<u8> {
-    der_tag(0x30, content)
-}
-fn der_set(content: &[u8]) -> Vec<u8> {
-    der_tag(0x31, content)
-}
-fn der_oid(oid_bytes: &[u8]) -> Vec<u8> {
-    der_tag(0x06, oid_bytes)
-}
-fn der_octet_string(data: &[u8]) -> Vec<u8> {
-    der_tag(0x04, data)
-}
-fn der_integer(n: u8) -> Vec<u8> {
-    vec![0x02, 0x01, n]
-}
+// Minimal DER/ASN.1 encoders for RFC 5652 SignedData construction now
+// live in `super::der_util` (#235 TODO #2 — single source of truth,
+// shared with the PAdES ESS/ts-attr/DSS writers).
+#[cfg(feature = "signatures")]
+use super::der_util::{der_integer, der_octet_string, der_oid, der_sequence, der_set, der_tag};
 
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -392,31 +448,14 @@ fn escape_pdf_string(s: &str) -> String {
     result
 }
 
-/// Format current time as a PDF date string.
+/// Current time as a PDF date string. Delegates to the single
+/// leap-year-correct implementation; the prior local copy hard-coded
+/// month/day to "0101" and approximated the year as 1970 + days/365,
+/// corrupting every signature /M date (README latent bug). WASM note:
+/// SystemTime::now() in the shared helper still needs cfg-gating if
+/// signatures are ever enabled for wasm32 (currently masked).
 fn format_pdf_date() -> String {
-    // WASM note: if signatures are ever enabled for wasm32, SystemTime::now()
-    // here will also need cfg-gating (currently masked because the `signatures`
-    // feature is not enabled in the wasm build).
-    use std::time::SystemTime;
-
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Convert to a simple date format: D:YYYYMMDDHHmmSS
-    // This is a simplified version - a real implementation would use chrono
-    let secs_per_day = 86400;
-    let days_since_1970 = now / secs_per_day;
-    let secs_today = now % secs_per_day;
-
-    // Very rough approximation for date calculation
-    let years = 1970 + (days_since_1970 / 365);
-    let hours = secs_today / 3600;
-    let mins = (secs_today % 3600) / 60;
-    let secs = secs_today % 60;
-
-    format!("D:{:04}0101{:02}{:02}{:02}Z", years, hours, mins, secs)
+    super::pdf_date::format_pdf_date_utc()
 }
 
 // SignOptions is re-exported from super::types
@@ -518,6 +557,125 @@ mod tests {
             SignerVerify::Valid,
             "signature must verify as Valid with the same content"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "signatures")]
+    fn test_sign_pades_adds_ess_and_still_verifies() {
+        use super::super::cms_verify::SignerVerify;
+        use super::super::types::SignOptions;
+        use super::super::{verify_signer_detached, SigningCredentials};
+
+        let cert_pem = std::fs::read_to_string("tests/fixtures/test_signing_cert.pem").unwrap();
+        let key_pem = std::fs::read_to_string("tests/fixtures/test_signing_key.pem").unwrap();
+        let creds = SigningCredentials::from_pem(&cert_pem, &key_pem).unwrap();
+        let content = b"PAdES-B-B content under signature";
+        let signer = PdfSigner::new(creds, SignOptions::default());
+
+        // id-aa-signingCertificateV2 OID content octets.
+        const ESS_OID: &[u8] = &[
+            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F,
+        ];
+
+        // Legacy path: still Valid, and carries NO ESS attribute
+        // (byte-compat for existing adbe.pkcs7.detached users — plan Q3).
+        let legacy = signer.sign(content).unwrap();
+        assert_eq!(verify_signer_detached(&legacy, content).unwrap(), SignerVerify::Valid);
+        assert!(
+            !legacy.windows(ESS_OID.len()).any(|w| w == ESS_OID),
+            "legacy sign() must not add the ESS attribute"
+        );
+
+        // PAdES path: the ESS signing-certificate-v2 attr is present AND
+        // the signature still verifies (the signed-attrs hash + RSA sign
+        // correctly account for the extra signed attribute — the core
+        // TODO #4 correctness check, short of the EU-DSS validator).
+        let pades = signer.sign_pades(content).unwrap();
+        assert!(
+            pades.windows(ESS_OID.len()).any(|w| w == ESS_OID),
+            "sign_pades() must embed the ESS signing-certificate-v2 attr"
+        );
+        assert_eq!(
+            verify_signer_detached(&pades, content).unwrap(),
+            SignerVerify::Valid,
+            "PAdES signature with ESS must still verify as Valid"
+        );
+        // Tampered content must fail for the PAdES blob too.
+        assert_ne!(
+            verify_signer_detached(&pades, b"different content").unwrap(),
+            SignerVerify::Valid
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "signatures")]
+    fn test_sign_pades_t_embeds_timestamp_and_classifies_bt() {
+        use super::super::cms_verify::SignerVerify;
+        use super::super::types::{SignOptions, SignatureInfo};
+        use super::super::{classify_pades_level, verify_signer_detached, SigningCredentials};
+        use crate::signatures::PadesLevel;
+
+        let cert_pem = std::fs::read_to_string("tests/fixtures/test_signing_cert.pem").unwrap();
+        let key_pem = std::fs::read_to_string("tests/fixtures/test_signing_key.pem").unwrap();
+        let creds = SigningCredentials::from_pem(&cert_pem, &key_pem).unwrap();
+        let content = b"PAdES-B-T content under signature";
+        let signer = PdfSigner::new(creds, SignOptions::default());
+
+        // Offline stub TSA: returns a minimal well-formed DER SEQUENCE
+        // standing in for an RFC 3161 TimeStampToken (no network in unit
+        // tests — feature plan §5.1). It must receive the signature
+        // value to timestamp.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let token: &dyn Fn(&[u8]) -> Result<Vec<u8>> = &|sig: &[u8]| {
+            *seen.borrow_mut() = sig.to_vec();
+            Ok(vec![0x30, 0x07, 0x02, 0x01, 0x01, 0x04, 0x02, b't', b's'])
+        };
+
+        let b_b = signer.sign_pades(content).unwrap();
+        let b_t = signer.sign_pades_t(content, token).unwrap();
+
+        // The timestamper was invoked over the (non-empty) signature value.
+        assert!(!seen.borrow().is_empty(), "timestamper must see the sig value");
+
+        // I7: B-T does not change the signed bytes — the RSA signature
+        // value is deterministic and identical to the B-B form (only an
+        // UNSIGNED attribute was added). The 256-byte sig appears in both.
+        let sig = &seen.borrow().clone();
+        assert!(b_b.windows(sig.len()).any(|w| w == sig.as_slice()));
+        assert!(b_t.windows(sig.len()).any(|w| w == sig.as_slice()));
+
+        // The B-T CMS still verifies (unsigned attr is outside the
+        // signed data).
+        assert_eq!(verify_signer_detached(&b_t, content).unwrap(), SignerVerify::Valid);
+
+        // id-aa-signatureTimeStampToken OID present, and the real cms
+        // decoder (via classify) sees it as an unsigned attr ⇒ B-T.
+        const TS_OID: &[u8] = &[
+            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0E,
+        ];
+        assert!(b_t.windows(TS_OID.len()).any(|w| w == TS_OID));
+        let info = SignatureInfo {
+            signer_name: None,
+            signing_time: None,
+            reason: None,
+            location: None,
+            contact_info: None,
+            sub_filter: None,
+            covers_whole_document: false,
+            byte_range: vec![],
+            certificate_cn: None,
+            certificate_issuer: None,
+            valid_from: None,
+            valid_to: None,
+            contents: Some(b_t.clone()),
+        };
+        assert_eq!(classify_pades_level(&info, None), PadesLevel::BT);
+        // The plain B-B blob (no ts attr) classifies as BB.
+        let info_bb = SignatureInfo {
+            contents: Some(b_b),
+            ..info
+        };
+        assert_eq!(classify_pades_level(&info_bb, None), PadesLevel::BB);
     }
 
     #[test]

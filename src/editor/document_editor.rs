@@ -480,6 +480,21 @@ pub struct DocumentEditor {
     flatten_annotations_pages: std::collections::HashSet<usize>,
     /// Pages where redactions should be applied
     apply_redactions_pages: std::collections::HashSet<usize>,
+    /// Programmatic redaction regions queued per source page index
+    /// (in addition to any `/Redact` annotations), used by destructive
+    /// redaction (#231).
+    redaction_regions: HashMap<usize, Vec<crate::redaction::RedactionRegion>>,
+    /// Destructively-redacted replacement content bytes per source page
+    /// index, produced by `apply_redactions_destructive` and written by
+    /// the save path as the page's single new `/Contents` stream so the
+    /// old content object is GC'd (no residual recoverable bytes, G6).
+    redacted_content: HashMap<usize, Vec<u8>>,
+    /// Object ids of the *original* `/Contents` streams of redacted
+    /// pages. These hold the pre-redaction (secret) bytes and must NEVER
+    /// be emitted, independent of GC reachability — the hard G6 guarantee
+    /// (#231; reachability alone is insufficient because the page is only
+    /// repointed transiently during the write).
+    redacted_orphan_ids: std::collections::HashSet<u32>,
     /// Image modifications per page: page_index -> (image_name -> modification)
     image_modifications: HashMap<usize, HashMap<String, ImageModification>>,
     /// Pages where form fields should be flattened
@@ -605,6 +620,9 @@ impl DocumentEditor {
             erase_regions: HashMap::new(),
             flatten_annotations_pages: std::collections::HashSet::new(),
             apply_redactions_pages: std::collections::HashSet::new(),
+            redaction_regions: HashMap::new(),
+            redacted_content: HashMap::new(),
+            redacted_orphan_ids: std::collections::HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -642,6 +660,9 @@ impl DocumentEditor {
             erase_regions: HashMap::new(),
             flatten_annotations_pages: std::collections::HashSet::new(),
             apply_redactions_pages: std::collections::HashSet::new(),
+            redaction_regions: HashMap::new(),
+            redacted_content: HashMap::new(),
+            redacted_orphan_ids: std::collections::HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -683,6 +704,9 @@ impl DocumentEditor {
             erase_regions: HashMap::new(),
             flatten_annotations_pages: std::collections::HashSet::new(),
             apply_redactions_pages: std::collections::HashSet::new(),
+            redaction_regions: HashMap::new(),
+            redacted_content: HashMap::new(),
+            redacted_orphan_ids: std::collections::HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -2301,8 +2325,23 @@ impl DocumentEditor {
                                 // Check if we need to apply redactions for this page
                                 let should_apply_redactions =
                                     self.apply_redactions_pages.contains(&source_page_index);
+                                // Destructive redaction (#231): pre-computed
+                                // replacement content for this page. Takes
+                                // precedence over the legacy cosmetic overlay
+                                // path; the bytes already include the opaque
+                                // overlay and the secret is physically gone.
+                                let destructive_redaction: Option<(Vec<u8>, u32)> = self
+                                    .redacted_content
+                                    .get(&source_page_index)
+                                    .cloned()
+                                    .map(|bytes| (bytes, self.allocate_object_id()));
+
                                 let redaction_data: Option<(Vec<RedactionData>, u32)> =
-                                    if should_apply_redactions {
+                                    if destructive_redaction.is_some() {
+                                        // Destructive path owns Contents/Annots; skip
+                                        // the cosmetic overlay entirely.
+                                        None
+                                    } else if should_apply_redactions {
                                         let redactions =
                                             self.get_redaction_data(source_page_index)?;
                                         if !redactions.is_empty() {
@@ -2526,6 +2565,26 @@ impl DocumentEditor {
                                     // A more sophisticated implementation would only remove Redact subtypes
                                     new_dict.remove("Annots");
 
+                                    final_page_obj = Object::Dictionary(new_dict);
+                                }
+
+                                // Destructive redaction (#231): REPLACE the
+                                // page /Contents with the single rewritten
+                                // stream (secret physically removed + opaque
+                                // overlay). The old content object becomes
+                                // unreferenced and is dropped by the
+                                // garbage-collected full rewrite (no residual
+                                // recoverable bytes, G6). /Redact annotations
+                                // are removed (ISO 32000-1 §12.5.6.23).
+                                if let (Some((_, redacted_id)), Some(page_dict)) =
+                                    (&destructive_redaction, final_page_obj.as_dict())
+                                {
+                                    let mut new_dict = page_dict.clone();
+                                    new_dict.insert(
+                                        "Contents".to_string(),
+                                        Object::Reference(ObjectRef::new(*redacted_id, 0)),
+                                    );
+                                    new_dict.remove("Annots");
                                     final_page_obj = Object::Dictionary(new_dict);
                                 }
 
@@ -2912,8 +2971,13 @@ impl DocumentEditor {
                                                     _ => {},
                                                 }
                                             }
-                                        } else {
-                                            // Use original contents
+                                        } else if destructive_redaction.is_none() {
+                                            // Use original contents — but NEVER when this
+                                            // page was destructively redacted (#231 G6):
+                                            // the redacted replacement is written below
+                                            // and the page /Contents now points to it;
+                                            // emitting the original here would re-introduce
+                                            // the secret bytes.
                                             if let Some(contents_ref) = page_dict
                                                 .get("Contents")
                                                 .and_then(|c| c.as_reference())
@@ -3423,6 +3487,29 @@ impl DocumentEditor {
                                     xref_entries.push((redact_overlay_id, offset, 0, true));
                                 }
 
+                                // Write the destructively-redacted replacement
+                                // content stream (#231). These bytes already
+                                // contain the pruned content + opaque overlay;
+                                // the page /Contents was repointed to this
+                                // object above, orphaning the original.
+                                if let Some((redacted_bytes, redacted_id)) = &destructive_redaction
+                                {
+                                    let redacted_stream = Object::Stream {
+                                        dict: HashMap::new(),
+                                        data: redacted_bytes.clone().into(),
+                                    };
+                                    let offset = writer.stream_position()?;
+                                    let bytes = serialize_obj(
+                                        &serializer,
+                                        *redacted_id,
+                                        0,
+                                        &redacted_stream,
+                                        &encryption_handler,
+                                    );
+                                    writer.write_all(&bytes)?;
+                                    xref_entries.push((*redacted_id, offset, 0, true));
+                                }
+
                                 // Write form flatten XObjects and overlay if present
                                 if let Some((
                                     ref form_appearances,
@@ -3645,6 +3732,12 @@ impl DocumentEditor {
         let all_source_ids = self.source.all_object_ids();
         for obj_id in all_source_ids {
             if obj_id == 0 || written_ids.contains(&obj_id) {
+                continue;
+            }
+            // #231 G6: never emit the original content stream of a
+            // destructively-redacted page (it holds the secret bytes),
+            // regardless of GC reachability.
+            if self.redacted_orphan_ids.contains(&obj_id) {
                 continue;
             }
             if let Some(ref reachable) = reachable_ids {
@@ -6058,6 +6151,372 @@ impl DocumentEditor {
     /// editor.apply_page_redactions(0)?;
     /// editor.save("output.pdf")?;
     /// ```
+    /// Queue an explicit rectangular redaction on `page` (zero-based,
+    /// output order) in page user-space points `[x0, y0, x1, y1]`.
+    ///
+    /// The region is applied by [`apply_redactions_destructive`], which
+    /// physically removes the underlying text — not a cosmetic overlay
+    /// (#231, ISO 32000-1:2008 §12.5.6.23). `fill` is the overlay colour
+    /// (DeviceRGB); `None` uses the configured default.
+    ///
+    /// [`apply_redactions_destructive`]: DocumentEditor::apply_redactions_destructive
+    ///
+    /// # Errors
+    /// [`Error::InvalidPdf`] if `page` is out of range.
+    pub fn add_redaction(
+        &mut self,
+        page: usize,
+        rect: [f32; 4],
+        fill: Option<[f32; 3]>,
+    ) -> Result<()> {
+        if page >= self.current_page_count() {
+            return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
+        }
+        let source_page = self.output_to_source_index(page);
+        self.redaction_regions.entry(source_page).or_default().push(
+            crate::redaction::RedactionRegion::from_rect(rect[0], rect[1], rect[2], rect[3], fill),
+        );
+        self.apply_redactions_pages.insert(source_page);
+        self.is_modified = true;
+        Ok(())
+    }
+
+    /// Number of redaction regions queued for `page` (zero-based, output
+    /// order): `/Redact` annotations in the source plus programmatic
+    /// [`add_redaction`] rectangles.
+    ///
+    /// [`add_redaction`]: DocumentEditor::add_redaction
+    ///
+    /// # Errors
+    /// [`Error::InvalidPdf`] if `page` is out of range.
+    pub fn redaction_count(&mut self, page: usize) -> Result<usize> {
+        if page >= self.current_page_count() {
+            return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
+        }
+        let source_page = self.output_to_source_index(page);
+        let annots = self.get_redaction_data(source_page)?.len();
+        let prog = self
+            .redaction_regions
+            .get(&source_page)
+            .map_or(0, |v| v.len());
+        Ok(annots + prog)
+    }
+
+    /// Decode a source page's `/Contents` to raw bytes (the `/Contents`
+    /// array, if any, is the logical concatenation of its streams,
+    /// ISO 32000-1:2008 §7.8.2). Empty if the page has no contents.
+    fn get_page_content_bytes(&mut self, source_page: usize) -> Result<Vec<u8>> {
+        let page_ref = self.source.get_page_ref(source_page)?;
+        let page_obj = self.source.load_object(page_ref)?;
+        let page_dict = page_obj
+            .as_dict()
+            .ok_or_else(|| Error::InvalidPdf("Page is not a dictionary".to_string()))?;
+        let contents = match page_dict.get("Contents") {
+            Some(c) => c.clone(),
+            None => return Ok(Vec::new()),
+        };
+        match contents {
+            Object::Reference(r) => Ok(self.source.load_object(r)?.decode_stream_data()?),
+            Object::Array(arr) => {
+                let mut data = Vec::new();
+                for item in arr {
+                    if let Object::Reference(r) = item {
+                        if let Ok(s) = self.source.load_object(r)?.decode_stream_data() {
+                            data.extend_from_slice(&s);
+                            data.push(b'\n');
+                        }
+                    }
+                }
+                Ok(data)
+            },
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Build the [`crate::redaction::FontInfoMetrics`] for a source page
+    /// from its (possibly inherited) `/Resources/Font`. A font that fails
+    /// to parse is simply omitted — the engine then reports it
+    /// non-simple and *refuses* rather than under-redacting.
+    fn build_page_font_metrics(
+        &mut self,
+        source_page: usize,
+    ) -> Result<crate::redaction::FontInfoMetrics> {
+        use std::collections::HashMap as Map;
+        let mut map: Map<String, std::sync::Arc<crate::fonts::FontInfo>> = Map::new();
+
+        // Resolve /Resources: the page's own, else inherited from the
+        // /Pages chain (ISO 32000-1:2008 §7.7.3.4 inheritable attributes).
+        // `rendering`-gated `get_page_resources` is unavailable in the
+        // default build, so resolve it here. No resources ⇒ empty map ⇒
+        // the engine reports unknown fonts non-simple and *refuses*
+        // (fail closed, never under-redact).
+        let page_ref = self.source.get_page_ref(source_page)?;
+        let mut node = self.source.load_object(page_ref).ok();
+        let mut resources = Object::Null;
+        let mut guard = 0;
+        while let Some(obj) = node {
+            guard += 1;
+            if guard > 64 {
+                break; // cyclic /Parent — bail (fail closed)
+            }
+            let Some(dict) = obj.as_dict() else { break };
+            if let Some(res) = dict.get("Resources") {
+                resources = match res.as_reference() {
+                    Some(r) => self.source.load_object(r).unwrap_or(Object::Null),
+                    None => res.clone(),
+                };
+                break;
+            }
+            node = dict
+                .get("Parent")
+                .and_then(|p| p.as_reference())
+                .and_then(|r| self.source.load_object(r).ok());
+        }
+
+        if let Some(res_dict) = resources.as_dict() {
+            if let Some(font_obj) = res_dict.get("Font") {
+                let font_dict_obj = match font_obj.as_reference() {
+                    Some(r) => self.source.load_object(r)?,
+                    None => font_obj.clone(),
+                };
+                if let Some(font_dict) = font_dict_obj.as_dict() {
+                    for (name, val) in font_dict {
+                        let resolved = match val.as_reference() {
+                            Some(r) => match self.source.load_object(r) {
+                                Ok(o) => o,
+                                Err(_) => continue,
+                            },
+                            None => val.clone(),
+                        };
+                        if let Ok(fi) = crate::fonts::FontInfo::from_dict(&resolved, &self.source) {
+                            map.insert(name.clone(), std::sync::Arc::new(fi));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(crate::redaction::FontInfoMetrics::new(map))
+    }
+
+    /// Destructively apply every queued redaction (programmatic
+    /// rectangles + source `/Redact` annotations): the underlying text
+    /// is physically removed from the content stream and an opaque
+    /// overlay drawn over the area (ISO 32000-1:2008 §12.5.6.23 — "remove
+    /// all traces"). The redacted pages' content is rewritten so that a
+    /// subsequent garbage-collected full-rewrite save (the default
+    /// [`save_to_bytes`]/[`save`]) leaves no residual recoverable bytes
+    /// (G6); the `/Redact` annotations are removed.
+    ///
+    /// Returns an aggregate [`crate::redaction::RedactionReport`].
+    ///
+    /// [`save_to_bytes`]: DocumentEditor::save_to_bytes
+    /// [`save`]: DocumentEditor::save
+    ///
+    /// # Errors
+    /// - [`Error::Unsupported`] if a redacted page shows text in a
+    ///   composite/Type0/unknown font (refused rather than risk a silent
+    ///   under-redaction — fail closed).
+    /// - [`Error::InvalidPdf`]/[`Error::ParseError`] on an unreadable
+    ///   page or content stream.
+    pub fn apply_redactions_destructive(
+        &mut self,
+        opts: crate::redaction::RedactionOptions,
+    ) -> Result<crate::redaction::RedactionReport> {
+        use crate::redaction::{redact_content_stream, RedactionRegion, RegionSet};
+        let mut pages: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        pages.extend(self.apply_redactions_pages.iter().copied());
+        pages.extend(self.redaction_regions.keys().copied());
+
+        let mut total = crate::redaction::RedactionReport::default();
+        for src in pages {
+            let mut rs = RegionSet::new(src);
+            for rd in self.get_redaction_data(src)? {
+                rs.push(RedactionRegion::from_rect(
+                    rd.rect[0],
+                    rd.rect[1],
+                    rd.rect[2],
+                    rd.rect[3],
+                    Some(rd.color),
+                ));
+            }
+            if let Some(progs) = self.redaction_regions.get(&src) {
+                for r in progs {
+                    rs.push(*r);
+                }
+            }
+            if rs.is_empty() {
+                continue;
+            }
+            let content = self.get_page_content_bytes(src)?;
+            if content.is_empty() {
+                continue;
+            }
+            let fonts = self.build_page_font_metrics(src)?;
+            let (bytes, rep) = redact_content_stream(&content, &rs, &opts, &fonts)?;
+            // Record the original /Contents object ids so the save path
+            // hard-drops them (G6) — the secret must not survive even as
+            // an orphaned, GC-missed object.
+            if let Ok(page_ref) = self.source.get_page_ref(src) {
+                if let Ok(page_obj) = self.source.load_object(page_ref) {
+                    if let Some(d) = page_obj.as_dict() {
+                        match d.get("Contents") {
+                            Some(Object::Reference(r)) => {
+                                self.redacted_orphan_ids.insert(r.id);
+                            },
+                            Some(Object::Array(arr)) => {
+                                for it in arr {
+                                    if let Object::Reference(r) = it {
+                                        self.redacted_orphan_ids.insert(r.id);
+                                    }
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                }
+            }
+            self.redacted_content.insert(src, bytes);
+            self.apply_redactions_pages.insert(src);
+            total.regions += rep.regions;
+            total.glyphs_removed += rep.glyphs_removed;
+            total.bytes_removed += rep.bytes_removed;
+        }
+        self.is_modified = true;
+        Ok(total)
+    }
+
+    /// Standalone document sanitization without geometric redaction
+    /// (#231 T10, feature plan §4.6 / §5.1).
+    ///
+    /// Strips document-level secrets that cosmetic redaction left behind:
+    /// the `/Info` dictionary, the catalog XMP `/Metadata` stream,
+    /// document JavaScript (`/OpenAction`, `/AA`, `/Names/JavaScript`)
+    /// and `/Names/EmbeddedFiles`, subject to the
+    /// [`crate::redaction::RedactionOptions`] toggles. The removed object
+    /// subtrees are hard-excluded from the
+    /// output (G6) so a secret cannot survive even as a GC-missed
+    /// orphan, and `/Info` is replaced with an empty dictionary.
+    ///
+    /// Returns a [`crate::redaction::RedactionReport`]; `bytes_removed`
+    /// is a best-effort total of the dropped objects' sizes so callers
+    /// can assert the scrub did real work.
+    ///
+    /// # Errors
+    /// [`Error::InvalidPdf`] if the document has no resolvable catalog.
+    pub fn sanitize_document(
+        &mut self,
+        opts: crate::redaction::RedactionOptions,
+    ) -> Result<crate::redaction::RedactionReport> {
+        use std::collections::{HashSet, VecDeque};
+
+        let catalog_ref = self
+            .source
+            .trailer()
+            .as_dict()
+            .and_then(|d| d.get("Root"))
+            .and_then(|r| r.as_reference())
+            .ok_or_else(|| Error::InvalidPdf("Missing catalog reference".to_string()))?;
+        let info_root = self
+            .source
+            .trailer()
+            .as_dict()
+            .and_then(|d| d.get("Info"))
+            .and_then(|r| r.as_reference())
+            .map(|r| r.id);
+
+        let catalog_dict = match self.modified_objects.get(&catalog_ref.id) {
+            Some(obj) => obj.clone(),
+            None => self.source.catalog()?,
+        };
+        let catalog_dict = catalog_dict
+            .as_dict()
+            .ok_or_else(|| Error::InvalidPdf("Catalog is not a dictionary".to_string()))?
+            .clone();
+
+        let scrub = crate::redaction::sanitize_catalog(&catalog_dict, &opts, |id| {
+            self.source.load_object(ObjectRef { id, gen: 0 }).ok()
+        });
+        let counts = scrub.counts;
+        let removed_roots = scrub.removed_roots.clone();
+
+        // Stage the scrubbed catalog and the cleared /Info first so the
+        // post-scrub reachability set reflects them.
+        self.modified_objects
+            .insert(catalog_ref.id, Object::Dictionary(scrub.catalog));
+        if opts.scrub_metadata {
+            self.modified_info = Some(DocumentInfo::default());
+        }
+
+        let reachable = self.collect_reachable_ids();
+
+        // Expand the catalog-derived roots → full subtree, excluding
+        // anything still reachable after the scrub (a genuinely shared
+        // object — e.g. a filespec also referenced by a file-attachment
+        // annotation — must not be dropped).
+        let mut to_drop: HashSet<u32> = HashSet::new();
+        let mut queue: VecDeque<u32> = removed_roots.into_iter().collect();
+        let mut bytes_removed: u64 = 0;
+        let account = |obj: &Object, b: &mut u64| {
+            *b += match obj {
+                Object::Stream { data, .. } => data.len() as u64 + 64,
+                _ => 48,
+            };
+        };
+        while let Some(id) = queue.pop_front() {
+            if id == 0 || reachable.contains(&id) || !to_drop.insert(id) {
+                continue;
+            }
+            if let Ok(obj) = self.source.load_object(ObjectRef { id, gen: 0 }) {
+                account(&obj, &mut bytes_removed);
+                fn walk(o: &Object, q: &mut VecDeque<u32>) {
+                    match o {
+                        Object::Reference(r) => q.push_back(r.id),
+                        Object::Array(a) => a.iter().for_each(|x| walk(x, q)),
+                        Object::Dictionary(d) => d.values().for_each(|x| walk(x, q)),
+                        Object::Stream { dict, .. } => dict.values().for_each(|x| walk(x, q)),
+                        _ => {},
+                    }
+                }
+                walk(&obj, &mut queue);
+            }
+        }
+
+        // The original /Info object is *replaced* by an empty dict, so it
+        // must be hard-excluded unconditionally — `collect_reachable_ids`
+        // always seeds the source trailer /Info, so the reachable-subtract
+        // guard above would wrongly protect the secret-bearing original
+        // (same defense-in-depth as redacted content streams, G6).
+        if opts.scrub_metadata {
+            if let Some(id) = info_root {
+                if to_drop.insert(id) {
+                    if let Ok(obj) = self.source.load_object(ObjectRef { id, gen: 0 }) {
+                        account(&obj, &mut bytes_removed);
+                    }
+                }
+            }
+        }
+
+        self.redacted_orphan_ids.extend(to_drop.iter().copied());
+        self.is_modified = true;
+
+        Ok(crate::redaction::RedactionReport {
+            annotations_removed: counts.total(),
+            bytes_removed,
+            ..crate::redaction::RedactionReport::default()
+        })
+    }
+
+    /// Mark a page for (legacy) redaction application.
+    ///
+    /// Historically this drew a cosmetic overlay only. Prefer
+    /// [`add_redaction`] + [`apply_redactions_destructive`] for true
+    /// content removal (#231).
+    ///
+    /// [`add_redaction`]: DocumentEditor::add_redaction
+    /// [`apply_redactions_destructive`]: DocumentEditor::apply_redactions_destructive
+    ///
+    /// # Errors
+    /// [`Error::InvalidPdf`] if `page` is out of range.
     pub fn apply_page_redactions(&mut self, page: usize) -> Result<()> {
         if page >= self.current_page_count() {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
@@ -6518,382 +6977,21 @@ impl DocumentEditor {
         Ok(output)
     }
 
-    /// Serialize an operator to bytes.
+    /// Serialize an operator to content-stream bytes.
+    ///
+    /// Delegates to [`crate::redaction::serialize`] — the single source
+    /// of truth (DRY, #231 T1). Binary strings are emitted as
+    /// hexadecimal per ISO 32000-1 §7.3.4.3 (binary-safe).
     fn serialize_operator(&self, output: &mut Vec<u8>, op: &crate::content::operators::Operator) {
-        use crate::content::operators::{Operator, TextElement};
-
-        match op {
-            // Graphics state
-            Operator::SaveState => output.extend_from_slice(b"q\n"),
-            Operator::RestoreState => output.extend_from_slice(b"Q\n"),
-            Operator::Cm { a, b, c, d, e, f } => {
-                output.extend_from_slice(
-                    format!("{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm\n", a, b, c, d, e, f)
-                        .as_bytes(),
-                );
-            },
-            Operator::SetLineWidth { width } => {
-                output.extend_from_slice(format!("{:.6} w\n", width).as_bytes());
-            },
-            Operator::SetLineCap { cap_style } => {
-                output.extend_from_slice(format!("{} J\n", cap_style).as_bytes());
-            },
-            Operator::SetLineJoin { join_style } => {
-                output.extend_from_slice(format!("{} j\n", join_style).as_bytes());
-            },
-            Operator::SetMiterLimit { limit } => {
-                output.extend_from_slice(format!("{:.6} M\n", limit).as_bytes());
-            },
-            Operator::SetDash { array, phase } => {
-                output.push(b'[');
-                for (i, v) in array.iter().enumerate() {
-                    if i > 0 {
-                        output.push(b' ');
-                    }
-                    output.extend_from_slice(format!("{:.6}", v).as_bytes());
-                }
-                output.extend_from_slice(format!("] {:.6} d\n", phase).as_bytes());
-            },
-            Operator::SetFlatness { tolerance } => {
-                output.extend_from_slice(format!("{:.6} i\n", tolerance).as_bytes());
-            },
-            Operator::SetRenderingIntent { intent } => {
-                output.extend_from_slice(format!("/{} ri\n", intent).as_bytes());
-            },
-            Operator::SetExtGState { dict_name } => {
-                output.extend_from_slice(format!("/{} gs\n", dict_name).as_bytes());
-            },
-
-            // Path construction
-            Operator::MoveTo { x, y } => {
-                output.extend_from_slice(format!("{:.6} {:.6} m\n", x, y).as_bytes());
-            },
-            Operator::LineTo { x, y } => {
-                output.extend_from_slice(format!("{:.6} {:.6} l\n", x, y).as_bytes());
-            },
-            Operator::CurveTo {
-                x1,
-                y1,
-                x2,
-                y2,
-                x3,
-                y3,
-            } => {
-                output.extend_from_slice(
-                    format!("{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} c\n", x1, y1, x2, y2, x3, y3)
-                        .as_bytes(),
-                );
-            },
-            Operator::CurveToV { x2, y2, x3, y3 } => {
-                output.extend_from_slice(
-                    format!("{:.6} {:.6} {:.6} {:.6} v\n", x2, y2, x3, y3).as_bytes(),
-                );
-            },
-            Operator::CurveToY { x1, y1, x3, y3 } => {
-                output.extend_from_slice(
-                    format!("{:.6} {:.6} {:.6} {:.6} y\n", x1, y1, x3, y3).as_bytes(),
-                );
-            },
-            Operator::ClosePath => output.extend_from_slice(b"h\n"),
-            Operator::Rectangle {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                output.extend_from_slice(
-                    format!("{:.6} {:.6} {:.6} {:.6} re\n", x, y, width, height).as_bytes(),
-                );
-            },
-
-            // Path painting
-            Operator::Stroke => output.extend_from_slice(b"S\n"),
-            Operator::Fill => output.extend_from_slice(b"f\n"),
-            Operator::FillEvenOdd => output.extend_from_slice(b"f*\n"),
-            Operator::CloseFillStroke => output.extend_from_slice(b"b\n"),
-            Operator::FillStroke => output.extend_from_slice(b"B\n"),
-            Operator::FillStrokeEvenOdd => output.extend_from_slice(b"B*\n"),
-            Operator::CloseFillStrokeEvenOdd => output.extend_from_slice(b"b*\n"),
-            Operator::EndPath => output.extend_from_slice(b"n\n"),
-
-            // Clipping
-            Operator::ClipNonZero => output.extend_from_slice(b"W\n"),
-            Operator::ClipEvenOdd => output.extend_from_slice(b"W*\n"),
-
-            // Text object
-            Operator::BeginText => output.extend_from_slice(b"BT\n"),
-            Operator::EndText => output.extend_from_slice(b"ET\n"),
-
-            // Text state
-            Operator::Tc { char_space } => {
-                output.extend_from_slice(format!("{:.6} Tc\n", char_space).as_bytes());
-            },
-            Operator::Tw { word_space } => {
-                output.extend_from_slice(format!("{:.6} Tw\n", word_space).as_bytes());
-            },
-            Operator::Tz { scale } => {
-                output.extend_from_slice(format!("{:.6} Tz\n", scale).as_bytes());
-            },
-            Operator::TL { leading } => {
-                output.extend_from_slice(format!("{:.6} TL\n", leading).as_bytes());
-            },
-            Operator::Tf { font, size } => {
-                output.extend_from_slice(format!("/{} {:.6} Tf\n", font, size).as_bytes());
-            },
-            Operator::Tr { render } => {
-                output.extend_from_slice(format!("{} Tr\n", render).as_bytes());
-            },
-            Operator::Ts { rise } => {
-                output.extend_from_slice(format!("{:.6} Ts\n", rise).as_bytes());
-            },
-
-            // Text positioning
-            Operator::Td { tx, ty } => {
-                output.extend_from_slice(format!("{:.6} {:.6} Td\n", tx, ty).as_bytes());
-            },
-            Operator::TD { tx, ty } => {
-                output.extend_from_slice(format!("{:.6} {:.6} TD\n", tx, ty).as_bytes());
-            },
-            Operator::Tm { a, b, c, d, e, f } => {
-                output.extend_from_slice(
-                    format!("{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} Tm\n", a, b, c, d, e, f)
-                        .as_bytes(),
-                );
-            },
-            Operator::TStar => output.extend_from_slice(b"T*\n"),
-
-            // Text showing
-            Operator::Tj { text } => {
-                output.push(b'(');
-                for byte in text {
-                    match *byte {
-                        b'(' | b')' | b'\\' => {
-                            output.push(b'\\');
-                            output.push(*byte);
-                        },
-                        _ => output.push(*byte),
-                    }
-                }
-                output.extend_from_slice(b") Tj\n");
-            },
-            Operator::TJ { array } => {
-                output.push(b'[');
-                for item in array {
-                    match item {
-                        TextElement::String(text) => {
-                            output.push(b'(');
-                            for byte in text {
-                                match *byte {
-                                    b'(' | b')' | b'\\' => {
-                                        output.push(b'\\');
-                                        output.push(*byte);
-                                    },
-                                    _ => output.push(*byte),
-                                }
-                            }
-                            output.push(b')');
-                        },
-                        TextElement::Offset(offset) => {
-                            output.extend_from_slice(format!("{:.6}", offset).as_bytes());
-                        },
-                    }
-                }
-                output.extend_from_slice(b"] TJ\n");
-            },
-            Operator::Quote { text } => {
-                output.push(b'(');
-                for byte in text {
-                    match *byte {
-                        b'(' | b')' | b'\\' => {
-                            output.push(b'\\');
-                            output.push(*byte);
-                        },
-                        _ => output.push(*byte),
-                    }
-                }
-                output.extend_from_slice(b") '\n");
-            },
-            Operator::DoubleQuote {
-                word_space,
-                char_space,
-                text,
-            } => {
-                output
-                    .extend_from_slice(format!("{:.6} {:.6} (", word_space, char_space).as_bytes());
-                for byte in text {
-                    match *byte {
-                        b'(' | b')' | b'\\' => {
-                            output.push(b'\\');
-                            output.push(*byte);
-                        },
-                        _ => output.push(*byte),
-                    }
-                }
-                output.extend_from_slice(b") \"\n");
-            },
-
-            // Color space
-            Operator::SetStrokeColorSpace { name } => {
-                output.extend_from_slice(format!("/{} CS\n", name).as_bytes());
-            },
-            Operator::SetFillColorSpace { name } => {
-                output.extend_from_slice(format!("/{} cs\n", name).as_bytes());
-            },
-            Operator::SetStrokeColor { components } => {
-                for c in components {
-                    output.extend_from_slice(format!("{:.6} ", c).as_bytes());
-                }
-                output.extend_from_slice(b"SC\n");
-            },
-            Operator::SetFillColor { components } => {
-                for c in components {
-                    output.extend_from_slice(format!("{:.6} ", c).as_bytes());
-                }
-                output.extend_from_slice(b"sc\n");
-            },
-            Operator::SetStrokeColorN { components, name } => {
-                for c in components {
-                    output.extend_from_slice(format!("{:.6} ", c).as_bytes());
-                }
-                if let Some(p) = name {
-                    output.extend_from_slice(format!("/{} ", p).as_bytes());
-                }
-                output.extend_from_slice(b"SCN\n");
-            },
-            Operator::SetFillColorN { components, name } => {
-                for c in components {
-                    output.extend_from_slice(format!("{:.6} ", c).as_bytes());
-                }
-                if let Some(p) = name {
-                    output.extend_from_slice(format!("/{} ", p).as_bytes());
-                }
-                output.extend_from_slice(b"scn\n");
-            },
-            Operator::SetStrokeGray { gray } => {
-                output.extend_from_slice(format!("{:.6} G\n", gray).as_bytes());
-            },
-            Operator::SetFillGray { gray } => {
-                output.extend_from_slice(format!("{:.6} g\n", gray).as_bytes());
-            },
-            Operator::SetStrokeRgb { r, g, b } => {
-                output.extend_from_slice(format!("{:.6} {:.6} {:.6} RG\n", r, g, b).as_bytes());
-            },
-            Operator::SetFillRgb { r, g, b } => {
-                output.extend_from_slice(format!("{:.6} {:.6} {:.6} rg\n", r, g, b).as_bytes());
-            },
-            Operator::SetStrokeCmyk { c, m, y, k } => {
-                output.extend_from_slice(
-                    format!("{:.6} {:.6} {:.6} {:.6} K\n", c, m, y, k).as_bytes(),
-                );
-            },
-            Operator::SetFillCmyk { c, m, y, k } => {
-                output.extend_from_slice(
-                    format!("{:.6} {:.6} {:.6} {:.6} k\n", c, m, y, k).as_bytes(),
-                );
-            },
-
-            // XObject
-            Operator::Do { name } => {
-                output.extend_from_slice(format!("/{} Do\n", name).as_bytes());
-            },
-
-            // Marked content
-            Operator::BeginMarkedContent { tag } => {
-                output.extend_from_slice(format!("/{} BMC\n", tag).as_bytes());
-            },
-            Operator::BeginMarkedContentDict { tag, properties } => {
-                output.extend_from_slice(format!("/{} ", tag).as_bytes());
-                self.serialize_object(output, properties);
-                output.extend_from_slice(b" BDC\n");
-            },
-            Operator::EndMarkedContent => output.extend_from_slice(b"EMC\n"),
-
-            // Shading
-            Operator::PaintShading { name } => {
-                output.extend_from_slice(format!("/{} sh\n", name).as_bytes());
-            },
-
-            // Inline image (complex - serialize full BI...ID...EI sequence)
-            Operator::InlineImage { dict, data } => {
-                output.extend_from_slice(b"BI\n");
-                for (key, value) in dict.iter() {
-                    output.extend_from_slice(format!("/{} ", key).as_bytes());
-                    self.serialize_object(output, value);
-                    output.push(b'\n');
-                }
-                output.extend_from_slice(b"ID ");
-                output.extend_from_slice(data);
-                output.extend_from_slice(b"\nEI\n");
-            },
-
-            // Other operators (fallback for unrecognized operators)
-            Operator::Other { name, operands } => {
-                for operand in operands.iter() {
-                    self.serialize_object(output, operand);
-                    output.push(b' ');
-                }
-                output.extend_from_slice(name.as_bytes());
-                output.push(b'\n');
-            },
-        }
+        crate::redaction::serialize::serialize_operator(output, op);
     }
 
-    /// Serialize a PDF Object to bytes.
-    #[allow(clippy::only_used_in_recursion)]
+    /// Serialize a PDF object to bytes.
+    ///
+    /// Delegates to [`crate::redaction::serialize`] (single source of
+    /// truth, #231 T1).
     fn serialize_object(&self, output: &mut Vec<u8>, obj: &crate::object::Object) {
-        use crate::object::Object;
-        match obj {
-            Object::Null => output.extend_from_slice(b"null"),
-            Object::Boolean(b) => {
-                if *b {
-                    output.extend_from_slice(b"true");
-                } else {
-                    output.extend_from_slice(b"false");
-                }
-            },
-            Object::Integer(i) => output.extend_from_slice(format!("{}", i).as_bytes()),
-            Object::Real(r) => output.extend_from_slice(format!("{:.6}", r).as_bytes()),
-            Object::Name(n) => output.extend_from_slice(format!("/{}", n).as_bytes()),
-            Object::String(s) => {
-                output.push(b'(');
-                for byte in s {
-                    match *byte {
-                        b'(' | b')' | b'\\' => {
-                            output.push(b'\\');
-                            output.push(*byte);
-                        },
-                        _ => output.push(*byte),
-                    }
-                }
-                output.push(b')');
-            },
-            // Note: PDF HexStrings are stored as Object::String and serialized as literal strings
-            Object::Array(arr) => {
-                output.push(b'[');
-                for (i, item) in arr.iter().enumerate() {
-                    if i > 0 {
-                        output.push(b' ');
-                    }
-                    self.serialize_object(output, item);
-                }
-                output.push(b']');
-            },
-            Object::Dictionary(dict) => {
-                output.extend_from_slice(b"<<");
-                for (key, value) in dict {
-                    output.extend_from_slice(format!("/{} ", key).as_bytes());
-                    self.serialize_object(output, value);
-                }
-                output.extend_from_slice(b">>");
-            },
-            Object::Stream { .. } => {
-                // Streams are complex; for inline serialization just output placeholder
-                output.extend_from_slice(b"(stream)");
-            },
-            Object::Reference(obj_ref) => {
-                output.extend_from_slice(format!("{} {} R", obj_ref.id, obj_ref.gen).as_bytes());
-            },
-        }
+        crate::redaction::serialize::serialize_object(output, obj);
     }
 }
 

@@ -20,15 +20,25 @@
 mod active;
 #[cfg(feature = "fips")]
 mod aws_lc_provider;
+mod cbom;
 mod error;
+mod policy;
 mod provider;
 mod rust_provider;
 mod types;
 
-pub use active::{active, is_set, set_provider, SetProviderError};
+pub use active::{
+    active, active_policy, inventory, is_policy_set, is_set, record_algorithm_use, set_policy,
+    set_provider, SetPolicyError, SetProviderError,
+};
 #[cfg(feature = "fips")]
 pub use aws_lc_provider::AwsLcProvider;
+pub use cbom::cbom_json;
 pub use error::{not_permitted, AlgorithmKind, Error, Result};
+pub use policy::{
+    AlgorithmId, AlgorithmUse, AuditEvent, AuditSink, Decision, LogAuditSink, NoopAuditSink,
+    PolicyMode, PolicyParseError, SecurityPolicy, SecurityPolicyBuilder,
+};
 pub use provider::{
     CryptoProvider, Hasher, SignatureVerifier, Signer, SigningKeyMaterial, SymmetricCipher,
 };

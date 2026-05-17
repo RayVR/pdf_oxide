@@ -17,8 +17,10 @@
 //! [`active`]: self::active
 //! [`RustCryptoProvider`]: super::RustCryptoProvider
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use super::policy::{AlgorithmId, SecurityPolicy};
 use super::provider::CryptoProvider;
 use super::rust_provider::RustCryptoProvider;
 
@@ -77,6 +79,87 @@ pub fn active() -> &'static Arc<dyn CryptoProvider> {
 /// via [`set_provider`] or lazily by a previous [`active`] call).
 pub fn is_set() -> bool {
     ACTIVE.get().is_some()
+}
+
+/// Errors from [`set_policy`].
+#[derive(Debug)]
+pub enum SetPolicyError {
+    /// A policy has already been installed (by a prior [`set_policy`]
+    /// call or lazily by a previous [`active_policy`] call). Like the
+    /// provider, a mid-flight policy downgrade is a soundness/attack
+    /// hazard, so the policy is set at most once.
+    AlreadySet,
+}
+
+impl std::fmt::Display for SetPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetPolicyError::AlreadySet => f.write_str(
+                "crypto policy already set — set_policy() must be called once at \
+                 process startup, before any PDF crypto operation",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SetPolicyError {}
+
+static ACTIVE_POLICY: OnceLock<SecurityPolicy> = OnceLock::new();
+
+/// Install `policy` as the process-wide active [`SecurityPolicy`].
+///
+/// Set-once, exactly like [`set_provider`] (a runtime policy downgrade
+/// would be an attack vector). Returns [`SetPolicyError::AlreadySet`]
+/// if a policy is already installed — treat that as fatal. The policy
+/// is orthogonal to the provider: it never widens behaviour, only
+/// narrows it.
+///
+/// The same test-isolation rule as [`set_provider`] applies — registry
+/// tests must run in their own integration-test binary.
+pub fn set_policy(policy: SecurityPolicy) -> Result<(), SetPolicyError> {
+    ACTIVE_POLICY
+        .set(policy)
+        .map_err(|_| SetPolicyError::AlreadySet)
+}
+
+/// Returns the active [`SecurityPolicy`], lazily initialising
+/// [`SecurityPolicy::compat`] (behaviour-preserving) on first call if
+/// none was registered.
+pub fn active_policy() -> &'static SecurityPolicy {
+    ACTIVE_POLICY.get_or_init(SecurityPolicy::compat)
+}
+
+/// Reports whether a policy has been installed (explicitly via
+/// [`set_policy`] or lazily by a previous [`active_policy`] call).
+pub fn is_policy_set() -> bool {
+    ACTIVE_POLICY.get().is_some()
+}
+
+/// Process-wide crypto inventory: bit `AlgorithmId::index()` is set
+/// the first time that algorithm is exercised at an enforcement
+/// boundary. This is the minimal "what crypto did this run use?"
+/// report regulated buyers ask for (CBOM-adjacent — see #230 plan
+/// §3.7).
+///
+/// It is a **content-keyed** atomic bitset, *not* a pointer-keyed
+/// global cache — explicitly the allowed shape per the shared
+/// foundation §6.2 (no #505-class data race). 17 ids fit in 64 bits
+/// with head-room.
+static INVENTORY: AtomicU64 = AtomicU64::new(0);
+
+/// Record that `alg` was exercised this process (idempotent, lock-free).
+pub fn record_algorithm_use(alg: AlgorithmId) {
+    INVENTORY.fetch_or(1u64 << alg.index(), Ordering::Relaxed);
+}
+
+/// The set of [`AlgorithmId`]s exercised so far this process, in
+/// declaration order. Cheap; no allocation beyond the result `Vec`.
+pub fn inventory() -> Vec<AlgorithmId> {
+    let bits = INVENTORY.load(Ordering::Relaxed);
+    AlgorithmId::ALL
+        .into_iter()
+        .filter(|a| bits & (1u64 << a.index()) != 0)
+        .collect()
 }
 
 #[cfg(test)]

@@ -310,6 +310,89 @@ namespace PdfOxide.Core
         }
 
         /// <summary>
+        /// Reads the document's Document Security Store (<c>/DSS</c>,
+        /// ISO 32000-2:2020 §12.8.4.3), or <c>null</c> when the PDF has
+        /// no DSS (not an error). Mirrors Rust <c>signatures::read_dss</c>.
+        /// </summary>
+        public unsafe DocumentSecurityStore? GetDss()
+        {
+            _lock.EnterReadLock();
+            try
+            {
+                ThrowIfDisposed();
+                IntPtr dss = NativeMethods.pdf_document_get_dss(_handle, out int err);
+                ExceptionMapper.ThrowIfError(err);
+                if (dss == IntPtr.Zero)
+                    return null; // no /DSS present
+                try
+                {
+                    var certs = ReadDssArray(
+                        dss, NativeMethods.pdf_dss_cert_count, NativeMethods.pdf_dss_get_cert);
+                    var crls = ReadDssArray(
+                        dss, NativeMethods.pdf_dss_crl_count, NativeMethods.pdf_dss_get_crl);
+                    var ocsps = ReadDssArray(
+                        dss, NativeMethods.pdf_dss_ocsp_count, NativeMethods.pdf_dss_get_ocsp);
+                    int vri = NativeMethods.pdf_dss_vri_count(dss);
+                    return new DocumentSecurityStore(certs, crls, ocsps, vri < 0 ? 0 : vri);
+                }
+                finally
+                {
+                    NativeMethods.pdf_dss_free(dss);
+                }
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
+        /// <summary>
+        /// Whether the document carries a document-scoped RFC 3161
+        /// <c>/DocTimeStamp</c> archival timestamp (PAdES-B-LTA,
+        /// ISO 32000-2:2020 §12.8.5). This is the document-level reader
+        /// signal; <see cref="Signature.PadesLevel"/> is signature-scoped
+        /// and tops out at B-LT by design.
+        /// </summary>
+        public bool HasDocumentTimestamp()
+        {
+            _lock.EnterReadLock();
+            try
+            {
+                ThrowIfDisposed();
+                int r = NativeMethods.pdf_document_has_timestamp(_handle, out int err);
+                ExceptionMapper.ThrowIfError(err);
+                return r == 1;
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
+        private unsafe delegate byte* DssGetter(IntPtr dss, int index, out nuint outLen, out int errorCode);
+
+        private static unsafe System.Collections.Generic.IReadOnlyList<byte[]> ReadDssArray(
+            IntPtr dss, Func<IntPtr, int> count, DssGetter get)
+        {
+            int n = count(dss);
+            if (n <= 0)
+                return Array.Empty<byte[]>();
+            var list = new System.Collections.Generic.List<byte[]>(n);
+            for (int i = 0; i < n; i++)
+            {
+                byte* p = get(dss, i, out nuint len, out int ec);
+                ExceptionMapper.ThrowIfError(ec);
+                if (p == null)
+                    continue;
+                try
+                {
+                    var blob = new byte[(int)len];
+                    Marshal.Copy((IntPtr)p, blob, 0, (int)len);
+                    list.Add(blob);
+                }
+                finally
+                {
+                    NativeMethods.FreeBytes((IntPtr)p);
+                }
+            }
+            return list;
+        }
+
+        /// <summary>
         /// Gets a value indicating whether the document has a structure tree (Tagged PDF).
         /// </summary>
         /// <value>True if the document has a structure tree, false otherwise.</value>
@@ -899,6 +982,46 @@ namespace PdfOxide.Core
             finally { _lock.ExitReadLock(); }
         }
 
+        /// <summary>
+        /// Plans a split of the document at outline/bookmark boundaries
+        /// (issue #482). Returns a JSON array of segment objects
+        /// (index, start_page, end_page, title, file_stem, page_label) —
+        /// the same raw-JSON convention as <see cref="GetOutline"/>.
+        /// Throws if the document has no outline or nothing resolves.
+        /// </summary>
+        /// <param name="titlePrefix">Only split at bookmarks whose title starts with this.</param>
+        /// <param name="ignoreCase">Case-insensitive prefix match.</param>
+        /// <param name="level">0 = all depths, 1 = top-level (default), n = up to depth n.</param>
+        /// <param name="includeFrontMatter">Emit a leading front-matter segment when non-empty.</param>
+        public string PlanSplitByBookmarks(
+            string? titlePrefix = null,
+            bool ignoreCase = false,
+            int level = 1,
+            bool includeFrontMatter = true)
+        {
+            _lock.EnterReadLock();
+            try
+            {
+                ThrowIfDisposed();
+                // Hand-built (AOT/trim-safe — no reflection-based
+                // JsonSerializer); only titlePrefix is user-controlled
+                // and is escaped via JsonEncodedText.
+                var prefixJson = titlePrefix is null
+                    ? "null"
+                    : $"\"{System.Text.Json.JsonEncodedText.Encode(titlePrefix)}\"";
+                var optionsJson =
+                    $"{{\"title_prefix\":{prefixJson}," +
+                    $"\"ignore_case\":{(ignoreCase ? "true" : "false")}," +
+                    $"\"level\":{level}," +
+                    $"\"include_front_matter\":{(includeFrontMatter ? "true" : "false")}}}";
+                var ptr = NativeMethods.pdf_document_plan_split_by_bookmarks(
+                    _handle.Ptr, optionsJson, out var errorCode);
+                ExceptionMapper.ThrowIfError(errorCode);
+                return StringMarshaler.PtrToStringAndFree(ptr);
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
         /// <summary>Extracts individual characters from a page.</summary>
         public (char Char, float X, float Y, float W, float H)[] ExtractChars(int pageIndex)
         {
@@ -1451,6 +1574,77 @@ namespace PdfOxide.Core
                     throw new InvalidOperationException(
                         $"pdf_oxide_crypto_use_fips returned unknown error code {code}.");
             }
+        }
+
+        /// <summary>
+        /// Installs the process-wide runtime crypto-governance policy
+        /// (issue #230) from its grammar string, e.g. <c>"strict"</c>,
+        /// <c>"fips-strict"</c>, or <c>"compat;deny:rc4@write"</c>.
+        /// Set-once; treat any exception as fatal (the policy is not
+        /// installed on failure — fail-closed).
+        /// </summary>
+        /// <exception cref="ArgumentException">Spec is null/non-UTF-8 or rejected.</exception>
+        /// <exception cref="InvalidOperationException">A policy is already set.</exception>
+        public static void SetCryptoPolicy(string spec)
+        {
+            var code = NativeMethods.PdfOxideCryptoSetPolicy(spec);
+            switch (code)
+            {
+                case 0: return;
+                case 1:
+                    throw new ArgumentException(
+                        "Invalid crypto policy spec (not valid UTF-8).", nameof(spec));
+                case 2:
+                    throw new ArgumentException(
+                        $"Crypto policy spec rejected (parse error): '{spec}'.", nameof(spec));
+                case 3:
+                    throw new InvalidOperationException(
+                        "Crypto policy already set — SetCryptoPolicy must be called once " +
+                        "before any PDF crypto operation.");
+                default:
+                    throw new InvalidOperationException(
+                        $"pdf_oxide_crypto_set_policy returned unknown error code {code}.");
+            }
+        }
+
+        /// <summary>The active crypto policy as its canonical grammar string.</summary>
+        public static string CryptoPolicy()
+        {
+            var ptr = NativeMethods.PdfOxideCryptoPolicy();
+            if (ptr == IntPtr.Zero) return "compat";
+            try { return Marshal.PtrToStringUTF8(ptr) ?? "compat"; }
+            finally { NativeMethods.FreeString(ptr); }
+        }
+
+        /// <summary>
+        /// The cryptographic algorithm tokens exercised so far this
+        /// process (governance report); empty when nothing exercised.
+        /// </summary>
+        public static string[] CryptoInventory()
+        {
+            var ptr = NativeMethods.PdfOxideCryptoInventory();
+            if (ptr == IntPtr.Zero) return Array.Empty<string>();
+            try
+            {
+                var s = Marshal.PtrToStringUTF8(ptr) ?? "";
+                return s.Length == 0 ? Array.Empty<string>() : s.Split(',');
+            }
+            finally { NativeMethods.FreeString(ptr); }
+        }
+
+        /// <summary>
+        /// A CycloneDX 1.6 Cryptographic Bill of Materials (JSON string)
+        /// of the algorithms exercised so far this process (#230 Phase F).
+        /// </summary>
+        public static string CryptoCbom()
+        {
+            var ptr = NativeMethods.PdfOxideCryptoCbom();
+            if (ptr == IntPtr.Zero) return "{}";
+            try
+            {
+                return Marshal.PtrToStringUTF8(ptr) ?? "{}";
+            }
+            finally { NativeMethods.FreeString(ptr); }
         }
     }
 
