@@ -2,6 +2,45 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [0.3.55] - 2026-05-25
+
+> Ruby + PHP language bindings + multi-line heading reading-order fix
+
+### Added
+- **Ruby binding (9th language)** — full PDF toolkit for Ruby. Install
+  with `gem install pdf_oxide`. Prebuilt native gems for linux-x86_64,
+  linux-aarch64, darwin-x86_64, darwin-arm64, windows-x64 plus a
+  source gem. API mirrors the Java binding's 9-class shape
+  (`PdfDocument`, `Pdf`, `PdfPage`, `PdfPolicy`, `PdfSigner`,
+  `PdfValidator`, `DocumentEditor`, `AutoExtractor`,
+  `MarkdownConverter`) so docs and examples are uniform across
+  languages. Full feature parity with Python / Java including
+  auto-extraction, PAdES B/T/LT signing, destructive redaction,
+  office round-trip, and split-by-bookmarks. (#545)
+- **PHP binding (10th language)** — full PDF toolkit for PHP. Install
+  with `composer require oxide/pdf-oxide`. PHP 8.2 / 8.3 / 8.4 / 8.5
+  on Linux / macOS / Windows. Same 9-class API shape as Ruby and
+  Java. Composer post-install hook fetches the matching prebuilt
+  `libpdf_oxide` per platform with SHA-256 verification. Full feature
+  parity with Python / Java. Requires `ext-ffi`. (#546)
+
+### Fixed
+- **#543** — Long subsection titles in multi-column academic papers
+  no longer split when they wrap across column boundaries.
+  Discovered while regression-testing v0.3.54 on a 75-PDF corpus.
+- **#537** *(follow-up)* — Markdown output now emits Unicode
+  bidi-isolation markers around RTL runs detected by the v0.3.54
+  Hebrew / RTL detector, so extracted Hebrew / Arabic text renders
+  correctly inside mixed-direction paragraphs. Original report by
+  **alexagr**; this completes the markdown emission half deferred
+  from v0.3.54.
+- **#535** *(follow-up)* — Type 1 built-in encodings, CFF charset,
+  and `/Differences`-array glyph lookups now go through the same
+  Adobe Glyph List fallback chain as v0.3.54's main extractor, with
+  variant-suffix stripping (`A.sc` → `A`, `bullet.alt` → `•`,
+  `fi.001` → `ﬁ`). Resolves replacement-character (`�`) leakage on
+  PDFs using simple-font encodings without a ToUnicode CMap.
+
 ## [0.3.54] - 2026-05-23
 
 > Text-extraction fidelity pass. Hebrew / RTL reads in correct
