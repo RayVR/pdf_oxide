@@ -12620,6 +12620,165 @@ impl PdfDocument {
         self.extract_images_filtered(page_index, &ImageExtractFilter::default())
     }
 
+    /// Enumerate images on a page without decompressing any stream (Phase 1).
+    ///
+    /// Walks the page content stream once and reads image metadata (dimensions,
+    /// colour space, filter chain, compressed size) directly from each Image
+    /// XObject dictionary. No pixel data is decoded. Returns a handle per image
+    /// in content-stream paint order.
+    ///
+    /// Call [`PdfImageHandle::decode`] on individual handles to materialise only
+    /// the images you need, or [`PdfImageHandle::raw_compressed_bytes`] to forward
+    /// compressed data (e.g. JPEG bytes) without recompression.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use pdf_oxide::PdfDocument;
+    /// # let bytes = std::fs::read("page.pdf").unwrap();
+    /// let doc = PdfDocument::from_bytes(bytes).unwrap();
+    ///
+    /// // Decode only images larger than a thumbnail threshold
+    /// let images: Vec<_> = doc.page_image_handles(0)?
+    ///     .into_iter()
+    ///     .filter(|h| h.width >= 200 && h.height >= 200)
+    ///     .map(|h| h.decode())
+    ///     .collect::<Result<_, _>>()?;
+    /// # Ok::<(), pdf_oxide::error::Error>(())
+    /// ```
+    pub fn page_image_handles(
+        &self,
+        page_index: usize,
+    ) -> Result<Vec<crate::extractors::images::PdfImageHandle<'_>>> {
+        use crate::content::parse_content_stream_images_only;
+        use crate::content::Operator;
+        use crate::extractors::images::image_handle_from_inline;
+
+        self.require_authenticated()?;
+
+        let page = self.get_page(page_index)?;
+        let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
+            offset: 0,
+            reason: "Page is not a dictionary".to_string(),
+        })?;
+
+        let content_data = self.get_page_content_data(page_index)?;
+
+        let resources = match page_dict.get("Resources") {
+            Some(res) => {
+                if let Some(ref_obj) = res.as_reference() {
+                    Some(self.load_object(ref_obj)?)
+                } else {
+                    Some(res.clone())
+                }
+            },
+            None => None,
+        };
+
+        let operators = match parse_content_stream_images_only(&content_data) {
+            Ok(ops) => ops,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        // Pre-resolve the XObject dictionary once
+        let xobject_dict = if let Some(ref res) = resources {
+            if let Some(res_dict) = res.as_dict() {
+                if let Some(xobj_entry) = res_dict.get("XObject") {
+                    let resolved = if let Some(ref_obj) = xobj_entry.as_reference() {
+                        self.load_object(ref_obj)?
+                    } else {
+                        xobj_entry.clone()
+                    };
+                    resolved.as_dict().cloned()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut handles = Vec::new();
+        let mut ctm_stack = vec![crate::content::Matrix::identity()];
+        let mut paint_order: usize = 0;
+
+        for op in operators {
+            match op {
+                Operator::SaveState => {
+                    if let Some(current) = ctm_stack.last() {
+                        ctm_stack.push(*current);
+                    }
+                },
+                Operator::RestoreState => {
+                    if ctm_stack.len() > 1 {
+                        ctm_stack.pop();
+                    }
+                },
+                Operator::Cm { a, b, c, d, e, f } => {
+                    if let Some(current) = ctm_stack.last_mut() {
+                        let m = crate::content::Matrix { a, b, c, d, e, f };
+                        *current = m.multiply(current);
+                    }
+                },
+                Operator::Do { name } => {
+                    if let Some(ref xobj_dict_map) = xobject_dict {
+                        let ctm = ctm_stack.last().copied().unwrap_or_else(crate::content::Matrix::identity);
+                        if let Some(handle) = self.image_handle_from_do(
+                            &name,
+                            xobj_dict_map,
+                            ctm,
+                            paint_order,
+                        ) {
+                            handles.push(handle);
+                            paint_order += 1;
+                        }
+                    }
+                },
+                Operator::InlineImage { dict, data } => {
+                    let ctm = ctm_stack.last().copied().unwrap_or_else(crate::content::Matrix::identity);
+                    if let Some(handle) =
+                        image_handle_from_inline(self, &dict, data, ctm, paint_order)
+                    {
+                        handles.push(handle);
+                        paint_order += 1;
+                    }
+                },
+                _ => {},
+            }
+        }
+
+        Ok(handles)
+    }
+
+    /// Build a `PdfImageHandle` for a single `Do` operator pointing at an Image XObject.
+    ///
+    /// Returns `None` for non-Image XObjects (e.g. Form XObjects) or when the
+    /// XObject cannot be resolved.
+    fn image_handle_from_do<'s>(
+        &'s self,
+        name: &str,
+        xobject_dict: &std::collections::HashMap<String, Object>,
+        ctm: crate::content::Matrix,
+        paint_order: usize,
+    ) -> Option<crate::extractors::images::PdfImageHandle<'s>> {
+        use crate::extractors::images::image_handle_from_xobject;
+
+        let xobject_ref_obj = xobject_dict.get(name)?;
+        let xobject_ref = xobject_ref_obj.as_reference()?;
+
+        let xobject = self.load_object(xobject_ref).ok()?;
+        let xobj_dict = xobject.as_dict()?;
+
+        let subtype = xobj_dict.get("Subtype").and_then(|s| s.as_name()).unwrap_or("");
+        if subtype != "Image" {
+            return None;
+        }
+
+        image_handle_from_xobject(self, xobject_ref, xobj_dict, ctm, paint_order)
+    }
+
     /// Extract images with pre-decompression filtering.
     ///
     /// Applies dimension and pixel-count checks using XObject dictionary metadata
@@ -13139,7 +13298,7 @@ impl PdfDocument {
     }
 
     /// Helper to derive rotation angle from transformation matrix.
-    fn matrix_to_rotation(m: crate::content::Matrix) -> i32 {
+    pub(crate) fn matrix_to_rotation(m: crate::content::Matrix) -> i32 {
         // Compute angle from CTM components (atan2(b, a))
         let angle_rad = m.b.atan2(m.a);
         let angle_deg = (angle_rad.to_degrees().round() as i32) % 360;
@@ -13154,7 +13313,7 @@ impl PdfDocument {
     ///
     /// Transforms all four corners and computes the axis-aligned bounding box,
     /// which correctly handles rotation, shear, and negative scaling.
-    fn transform_bbox_with_ctm(
+    pub(crate) fn transform_bbox_with_ctm(
         &self,
         rect: &crate::geometry::Rect,
         ctm: crate::content::Matrix,
