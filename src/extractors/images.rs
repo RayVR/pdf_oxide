@@ -2236,7 +2236,10 @@ enum PdfImageSource {
         /// ready to pass directly to `extract_image_from_xobject`.
         stream_object: crate::object::Object,
         /// Raw compressed bytes as they appeared between `ID` and `EI`.
-        compressed_data: Vec<u8>,
+        /// Stored as `bytes::Bytes` (cheaply cloneable, refcounted) so that
+        /// the same allocation can be shared with the Stream data field
+        /// without duplicating a potentially large JPEG/JBIG2/etc payload.
+        compressed_bytes: bytes::Bytes,
     },
 }
 
@@ -2265,6 +2268,7 @@ enum PdfImageSource {
 ///     .collect::<Result<_, _>>()
 ///     .unwrap();
 /// ```
+#[non_exhaustive]
 pub struct PdfImageHandle<'doc> {
     /// Image width in pixels (from XObject `/Width`).
     pub width: u32,
@@ -2354,7 +2358,7 @@ impl<'doc> PdfImageHandle<'doc> {
                     )),
                 }
             },
-            PdfImageSource::Inline { compressed_data, .. } => Ok(compressed_data),
+            PdfImageSource::Inline { compressed_bytes, .. } => Ok(compressed_bytes.to_vec()),
         }
     }
 }
@@ -2547,11 +2551,15 @@ pub(crate) fn image_handle_from_inline<'doc>(
     let rotation_degrees = matrix_to_rotation(ctm);
 
     // Build a synthetic Object::Stream so decode() can call extract_image_from_xobject.
+    // Share a single Bytes allocation between the Stream (for decode) and the
+    // handle (for raw_compressed_bytes). Bytes is refcounted, so this avoids
+    // duplicating potentially large image payloads (e.g. 10 MB JPEG → 20 MB RSS).
     let mut stream_dict = expanded;
     stream_dict.insert("Subtype".to_string(), Object::Name("Image".to_string()));
+    let compressed_bytes = bytes::Bytes::from(data);
     let stream_object = Object::Stream {
         dict: stream_dict,
-        data: bytes::Bytes::copy_from_slice(&data),
+        data: compressed_bytes.clone(),
     };
 
     Some(PdfImageHandle {
@@ -2567,6 +2575,6 @@ pub(crate) fn image_handle_from_inline<'doc>(
         rotation_degrees,
         ctm,
         doc,
-        source: PdfImageSource::Inline { stream_object, compressed_data: data },
+        source: PdfImageSource::Inline { stream_object, compressed_bytes },
     })
 }
