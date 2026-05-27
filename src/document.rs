@@ -10689,15 +10689,30 @@ impl PdfDocument {
     /// uniquely identify fonts within a document. For reference-only fields (ToUnicode,
     /// FontDescriptor, DescendantFonts), hashes their presence to avoid false positives
     /// between fonts with vs without these features.
-    fn font_identity_hash_cheap(font_obj: &Object) -> u64 {
+    /// Returns `(hash, is_subset)`.
+    ///
+    /// Subset fonts (e.g. `AAAAAA+ArialUnicodeMS`) have document-specific
+    /// glyph subsets and ToUnicode mappings that are NOT safe to share across
+    /// documents even when the BaseFont name matches. The caller must skip
+    /// the global cross-document cache for subset fonts.
+    fn font_identity_hash_cheap(font_obj: &Object) -> (u64, bool) {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut is_subset = false;
 
         if let Some(d) = font_obj.as_dict() {
             // BaseFont: primary identity — unique per font within a document
             if let Some(Object::Name(n)) = d.get("BaseFont") {
                 1u8.hash(&mut hasher);
                 n.hash(&mut hasher);
+                // Detect subset prefix: 6 uppercase ASCII letters followed by '+'
+                let name_bytes = n.as_bytes();
+                if name_bytes.len() > 7
+                    && name_bytes[6] == b'+'
+                    && name_bytes[..6].iter().all(|b| b.is_ascii_uppercase())
+                {
+                    is_subset = true;
+                }
             }
             // Subtype: Type1, TrueType, Type0, CIDFontType0, CIDFontType2
             if let Some(Object::Name(n)) = d.get("Subtype") {
@@ -10709,12 +10724,16 @@ impl PdfDocument {
                 3u8.hash(&mut hasher);
                 match enc {
                     Object::Name(n) => n.hash(&mut hasher),
-                    Object::Reference(_) => b"enc_ref".hash(&mut hasher),
+                    Object::Reference(r) => {
+                        b"enc_ref".hash(&mut hasher);
+                        r.id.hash(&mut hasher);
+                        r.gen.hash(&mut hasher);
+                    },
                     Object::Dictionary(_) => b"enc_dict".hash(&mut hasher),
                     _ => {},
                 }
             }
-            // ToUnicode: hash content via reference or inline presence
+            // ToUnicode: hash reference ID (unique within a document)
             if let Some(to_unicode) = d.get("ToUnicode") {
                 4u8.hash(&mut hasher);
                 if let Some(r) = to_unicode.as_reference() {
@@ -10737,7 +10756,7 @@ impl PdfDocument {
                 }
             }
         }
-        hasher.finish()
+        (hasher.finish(), is_subset)
     }
 
     /// Load fonts from a Resources dictionary into the extractor.
@@ -10913,10 +10932,11 @@ impl PdfDocument {
                         let font = self.load_object(font_ref)?;
 
                         // Compute identity hash (cheap: 3-6 dict lookups, ~200ns)
-                        let id_hash = Self::font_identity_hash_cheap(&font);
+                        let (id_hash, is_subset) = Self::font_identity_hash_cheap(&font);
 
                         // Layer 5: Per-font identity cache — skip from_dict when a
-                        // structurally identical font was already parsed elsewhere.
+                        // structurally identical font was already parsed elsewhere
+                        // in the SAME document.
                         let cached_identity_opt = self
                             .font_identity_cache
                             .lock_or_recover()
@@ -10932,27 +10952,34 @@ impl PdfDocument {
 
                         // Layer 6: Global cross-document font cache — reuse fonts
                         // parsed by previous PdfDocument instances in this process.
-                        if let Some(cached) =
-                            crate::fonts::global_cache::global_font_cache_get(id_hash)
-                        {
-                            self.font_identity_cache
-                                .lock_or_recover()
-                                .insert(id_hash, Arc::clone(&cached));
-                            self.font_cache
-                                .lock_or_recover()
-                                .insert(font_ref, Arc::clone(&cached));
-                            extractor.add_font_shared((*name).clone(), cached);
-                            continue;
+                        // Skip for subset fonts: their ToUnicode mappings are
+                        // document-specific and unsafe to share across documents.
+                        if !is_subset {
+                            if let Some(cached) =
+                                crate::fonts::global_cache::global_font_cache_get(id_hash)
+                            {
+                                self.font_identity_cache
+                                    .lock_or_recover()
+                                    .insert(id_hash, Arc::clone(&cached));
+                                self.font_cache
+                                    .lock_or_recover()
+                                    .insert(font_ref, Arc::clone(&cached));
+                                extractor.add_font_shared((*name).clone(), cached);
+                                continue;
+                            }
                         }
 
                         match FontInfo::from_dict(&font, self) {
                             Ok(font_info) => {
                                 let arc = Arc::new(font_info);
-                                // Populate both document-level and global caches
-                                crate::fonts::global_cache::global_font_cache_insert(
-                                    id_hash,
-                                    Arc::clone(&arc),
-                                );
+                                // Global cache: only for non-subset fonts
+                                if !is_subset {
+                                    crate::fonts::global_cache::global_font_cache_insert(
+                                        id_hash,
+                                        Arc::clone(&arc),
+                                    );
+                                }
+                                // Document-level caches: always populate
                                 self.font_identity_cache
                                     .lock_or_recover()
                                     .insert(id_hash, Arc::clone(&arc));
@@ -17103,7 +17130,10 @@ mod tests {
         let mut enc = std::collections::HashMap::new();
         enc.insert("Type".to_string(), Object::Name("Encoding".to_string()));
         font_dict.insert("Encoding".to_string(), Object::Dictionary(enc));
-        assert_ne!(PdfDocument::font_identity_hash_cheap(&Object::Dictionary(font_dict)), 0);
+        let (hash, is_subset) =
+            PdfDocument::font_identity_hash_cheap(&Object::Dictionary(font_dict));
+        assert_ne!(hash, 0);
+        assert!(!is_subset);
     }
 
     #[test]
@@ -17111,7 +17141,10 @@ mod tests {
         let mut font_dict = std::collections::HashMap::new();
         font_dict.insert("BaseFont".to_string(), Object::Name("Helvetica".to_string()));
         font_dict.insert("Encoding".to_string(), Object::Reference(ObjectRef::new(99, 0)));
-        assert_ne!(PdfDocument::font_identity_hash_cheap(&Object::Dictionary(font_dict)), 0);
+        let (hash, is_subset) =
+            PdfDocument::font_identity_hash_cheap(&Object::Dictionary(font_dict));
+        assert_ne!(hash, 0);
+        assert!(!is_subset);
     }
 
     #[test]
@@ -17119,11 +17152,11 @@ mod tests {
         let mut d1 = std::collections::HashMap::new();
         d1.insert("BaseFont".to_string(), Object::Name("Arial".to_string()));
         d1.insert("ToUnicode".to_string(), Object::Reference(ObjectRef::new(50, 0)));
-        let h1 = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d1));
+        let (h1, _) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d1));
 
         let mut d2 = std::collections::HashMap::new();
         d2.insert("BaseFont".to_string(), Object::Name("Arial".to_string()));
-        let h2 = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d2));
+        let (h2, _) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d2));
         assert_ne!(h1, h2);
     }
 
@@ -17136,7 +17169,23 @@ mod tests {
             "DescendantFonts".to_string(),
             Object::Array(vec![Object::Reference(ObjectRef::new(20, 0))]),
         );
-        assert_ne!(PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d)), 0);
+        let (hash, is_subset) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d));
+        assert_ne!(hash, 0);
+        assert!(!is_subset);
+    }
+
+    #[test]
+    fn test_font_identity_hash_detects_subset_prefix() {
+        let mut d = std::collections::HashMap::new();
+        d.insert("BaseFont".to_string(), Object::Name("AAAAAA+ArialUnicodeMS".to_string()));
+        d.insert("Subtype".to_string(), Object::Name("Type0".to_string()));
+        let (_, is_subset) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d));
+        assert!(is_subset, "Should detect AAAAAA+ as subset prefix");
+
+        let mut d2 = std::collections::HashMap::new();
+        d2.insert("BaseFont".to_string(), Object::Name("ArialUnicodeMS".to_string()));
+        let (_, is_subset2) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d2));
+        assert!(!is_subset2, "No prefix should not be detected as subset");
     }
 
     // ========================================================================
