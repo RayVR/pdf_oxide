@@ -10687,8 +10687,9 @@ impl PdfDocument {
     /// Uses only inline fields (no reference resolution / load_object calls) to keep
     /// the cost at ~200ns. Relies on BaseFont + Subtype + Encoding (when inline) to
     /// uniquely identify fonts within a document. For reference-only fields (ToUnicode,
-    /// FontDescriptor, DescendantFonts), hashes their presence to avoid false positives
-    /// between fonts with vs without these features.
+    /// FontDescriptor, DescendantFonts), hashes their values to avoid false positives
+    /// between fonts with vs without these features. Indirect references (Encoding,
+    /// ToUnicode, DescendantFonts) are hashed by object ID, not just presence.
     /// Returns `(hash, is_subset)`.
     ///
     /// Subset fonts (e.g. `AAAAAA+ArialUnicodeMS`) have document-specific
@@ -10698,7 +10699,7 @@ impl PdfDocument {
     fn font_identity_hash_cheap(font_obj: &Object) -> (u64, bool) {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let mut is_subset = false;
+        let mut is_subset = true;
 
         if let Some(d) = font_obj.as_dict() {
             // BaseFont: primary identity — unique per font within a document
@@ -10707,12 +10708,9 @@ impl PdfDocument {
                 n.hash(&mut hasher);
                 // Detect subset prefix: 6 uppercase ASCII letters followed by '+'
                 let name_bytes = n.as_bytes();
-                if name_bytes.len() > 7
+                is_subset = name_bytes.len() > 7
                     && name_bytes[6] == b'+'
-                    && name_bytes[..6].iter().all(|b| b.is_ascii_uppercase())
-                {
-                    is_subset = true;
-                }
+                    && name_bytes[..6].iter().all(|b| b.is_ascii_uppercase());
             }
             // Subtype: Type1, TrueType, Type0, CIDFontType0, CIDFontType2
             if let Some(Object::Name(n)) = d.get("Subtype") {
@@ -10891,7 +10889,8 @@ impl PdfDocument {
                             if let Some(font_ref) = font_obj.as_reference() {
                                 if let Ok(font) = self.load_object(font_ref) {
                                     name.as_str().hash(&mut h);
-                                    Self::font_identity_hash_cheap(&font).hash(&mut h);
+                                    let (id_hash, _) = Self::font_identity_hash_cheap(&font);
+                                    id_hash.hash(&mut h);
                                 }
                             }
                         }
@@ -11051,7 +11050,8 @@ impl PdfDocument {
                             if let Some(font_ref) = font_obj.as_reference() {
                                 if let Ok(font) = self.load_object(font_ref) {
                                     name.as_str().hash(&mut h);
-                                    Self::font_identity_hash_cheap(&font).hash(&mut h);
+                                    let (id_hash, _) = Self::font_identity_hash_cheap(&font);
+                                    id_hash.hash(&mut h);
                                 }
                             }
                         }
@@ -15845,8 +15845,8 @@ mod tests {
         dict2.insert("BaseFont".to_string(), Object::Name("Helvetica".to_string()));
         dict2.insert("Subtype".to_string(), Object::Name("Type1".to_string()));
 
-        let hash1 = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(dict1));
-        let hash2 = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(dict2));
+        let (hash1, _) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(dict1));
+        let (hash2, _) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(dict2));
         assert_eq!(hash1, hash2);
     }
 
@@ -15858,16 +15858,16 @@ mod tests {
         let mut dict2 = std::collections::HashMap::new();
         dict2.insert("BaseFont".to_string(), Object::Name("Times-Roman".to_string()));
 
-        let hash1 = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(dict1));
-        let hash2 = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(dict2));
+        let (hash1, _) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(dict1));
+        let (hash2, _) = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(dict2));
         assert_ne!(hash1, hash2);
     }
 
     #[test]
     fn test_font_identity_hash_null_object() {
-        let hash = PdfDocument::font_identity_hash_cheap(&Object::Null);
-        // Should not panic, returns some hash
-        let _ = hash;
+        let (_, is_subset) = PdfDocument::font_identity_hash_cheap(&Object::Null);
+        // No BaseFont key → is_subset defaults to true (fail-safe)
+        assert!(is_subset);
     }
 
     // ========================================================================

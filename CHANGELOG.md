@@ -2,6 +2,14 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **#595** — Cross-document font cache poisoning when subset fonts
+  (e.g. `AAAAAA+Arial`) from different PDFs collide on BaseFont name.
+  The global cache now skips subset fonts entirely, and fonts without
+  a `BaseFont` entry default to `is_subset = true` as a fail-safe.
+
 ## [0.3.55] - 2026-05-25
 
 > Ruby + PHP language bindings + multi-line heading reading-order fix

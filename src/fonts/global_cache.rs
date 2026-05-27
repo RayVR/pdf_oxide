@@ -358,6 +358,7 @@ mod tests {
 
     #[test]
     fn test_global_api_insert_get_clear_stats() {
+        // Relies on process-global state — may interact with parallel tests
         // Use very high unique keys to avoid collisions with other tests
         let key_base = 9_000_000u64;
 
