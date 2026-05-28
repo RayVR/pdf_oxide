@@ -222,14 +222,25 @@ fn render_raw(doc: &PdfDocument, excluded: HashSet<String>) -> (Vec<u8>, u32, u3
 }
 
 /// Sample the average color in a rectangular pixel region.
-/// Returns (r, g, b, a) as floats in 0..255.
-fn sample_region(data: &[u8], width: u32, x: u32, y: u32, w: u32, h: u32) -> (f32, f32, f32, f32) {
+/// Returns (r, g, b, a) as straight-alpha floats in 0..255.
+///
+/// Panics on an empty region (caller bug) so out-of-frame coordinates are
+/// detected rather than silently returning black.
+fn sample_region(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> (f32, f32, f32, f32) {
     let mut r_sum = 0u64;
     let mut g_sum = 0u64;
     let mut b_sum = 0u64;
     let mut a_sum = 0u64;
     let mut count = 0u64;
-    for py in y..(y + h).min(width) {
+    for py in y..(y + h).min(height) {
         for px in x..(x + w).min(width) {
             let idx = ((py * width + px) * 4) as usize;
             if idx + 3 < data.len() {
@@ -250,9 +261,10 @@ fn sample_region(data: &[u8], width: u32, x: u32, y: u32, w: u32, h: u32) -> (f3
             }
         }
     }
-    if count == 0 {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
+    assert!(
+        count > 0,
+        "sample_region({x},{y},{w},{h}) selected zero pixels in a {width}x{height} image"
+    );
     (
         r_sum as f32 / count as f32,
         g_sum as f32 / count as f32,
@@ -270,11 +282,11 @@ fn test_render_ocg_rect_visible_without_filter() {
     let pdf_bytes = build_pdf_with_ocg_rect_and_text();
     let doc = PdfDocument::from_bytes(pdf_bytes).expect("parse PDF");
 
-    let (data, width, _height) = render_raw(&doc, HashSet::new());
+    let (data, width, height) = render_raw(&doc, HashSet::new());
 
     // The red rectangle region (PDF coords 50,550 to 250,750 mapped to 72 DPI pixels)
     // At 72 DPI, 1pt = 1px. PDF y=550..750 → pixel y = 792-750..792-550 = 42..242
-    let (r, g, b, a) = sample_region(&data, width, 100, 80, 50, 50);
+    let (r, g, b, a) = sample_region(&data, width, height, 100, 80, 50, 50);
     assert!(r > 200.0, "Red channel should be high in rect region, got {r}");
     assert!(g < 50.0, "Green should be low, got {g}");
     assert!(b < 50.0, "Blue should be low, got {b}");
@@ -287,10 +299,10 @@ fn test_render_ocg_rect_hidden_with_filter() {
     let doc = PdfDocument::from_bytes(pdf_bytes).expect("parse PDF");
 
     let excluded = HashSet::from(["Background".to_string()]);
-    let (data, width, _height) = render_raw(&doc, excluded);
+    let (data, width, height) = render_raw(&doc, excluded);
 
     // The red rectangle region should now be white (background)
-    let (r, g, b, a) = sample_region(&data, width, 100, 80, 50, 50);
+    let (r, g, b, a) = sample_region(&data, width, height, 100, 80, 50, 50);
     assert!(
         r > 250.0 && g > 250.0 && b > 250.0,
         "Rect region should be white background when layer excluded, got ({r}, {g}, {b})"
@@ -321,28 +333,28 @@ fn test_render_ocmd_rect_hidden_with_filter() {
     let doc = PdfDocument::from_bytes(pdf_bytes).expect("parse PDF");
 
     // Without filter: blue rect at (50,550) should be visible
-    let (data_unfiltered, width, _) = render_raw(&doc, HashSet::new());
-    let (r, g, b, _a) = sample_region(&data_unfiltered, width, 100, 80, 50, 50);
+    let (data_unfiltered, width, height) = render_raw(&doc, HashSet::new());
+    let (r, g, b, _a) = sample_region(&data_unfiltered, width, height, 100, 80, 50, 50);
     assert!(b > 200.0, "Blue rect should be visible without filter, got b={b}");
     assert!(r < 50.0 && g < 50.0, "Should be blue, got r={r} g={g}");
 
     // Green rect at (300,550) should be visible
-    let (_r, g, _b, _a) = sample_region(&data_unfiltered, width, 350, 80, 50, 50);
+    let (_r, g, _b, _a) = sample_region(&data_unfiltered, width, height, 350, 80, 50, 50);
     assert!(g > 200.0, "Green rect should be visible, got g={g}");
 
     // With filter: exclude "Watermark" → blue rect gone, green rect remains
     let excluded = HashSet::from(["Watermark".to_string()]);
-    let (data_filtered, width, _) = render_raw(&doc, excluded);
+    let (data_filtered, width, height) = render_raw(&doc, excluded);
 
     // Blue rect region should now be white
-    let (r, g, b, _) = sample_region(&data_filtered, width, 100, 80, 50, 50);
+    let (r, g, b, _) = sample_region(&data_filtered, width, height, 100, 80, 50, 50);
     assert!(
         r > 250.0 && g > 250.0 && b > 250.0,
         "Blue rect should be hidden, got ({r}, {g}, {b})"
     );
 
     // Green rect should still be visible
-    let (_r, g, _b, _) = sample_region(&data_filtered, width, 350, 80, 50, 50);
+    let (_r, g, _b, _) = sample_region(&data_filtered, width, height, 350, 80, 50, 50);
     assert!(g > 200.0, "Green rect should survive filter, got g={g}");
 }
 
@@ -352,23 +364,23 @@ fn test_render_ocg_in_form_xobject_filtered() {
     let doc = PdfDocument::from_bytes(pdf_bytes).expect("parse PDF");
 
     // Without filter: red rect from Form XObject should be visible
-    let (data_unfiltered, width, _) = render_raw(&doc, HashSet::new());
-    let (r, _g, _b, _a) = sample_region(&data_unfiltered, width, 100, 80, 50, 50);
+    let (data_unfiltered, width, height) = render_raw(&doc, HashSet::new());
+    let (r, _g, _b, _a) = sample_region(&data_unfiltered, width, height, 100, 80, 50, 50);
     assert!(r > 200.0, "Red rect from XObject should be visible, got r={r}");
 
     // With filter: exclude "Background" → red rect gone, green rect remains
     let excluded = HashSet::from(["Background".to_string()]);
-    let (data_filtered, width, _) = render_raw(&doc, excluded);
+    let (data_filtered, width, height) = render_raw(&doc, excluded);
 
     // Red rect region should now be white
-    let (r, g, b, _) = sample_region(&data_filtered, width, 100, 80, 50, 50);
+    let (r, g, b, _) = sample_region(&data_filtered, width, height, 100, 80, 50, 50);
     assert!(
         r > 250.0 && g > 250.0 && b > 250.0,
         "Red rect from XObject should be hidden, got ({r}, {g}, {b})"
     );
 
     // Green rect at (300,550) should still be visible
-    let (_r, g, _b, _) = sample_region(&data_filtered, width, 350, 80, 50, 50);
+    let (_r, g, _b, _) = sample_region(&data_filtered, width, height, 350, 80, 50, 50);
     assert!(g > 200.0, "Green rect should survive filter, got g={g}");
 }
 

@@ -145,6 +145,12 @@ pub struct PageRenderer {
     fonts: HashMap<String, Arc<FontInfo>>,
     /// Color space cache (name -> Object) for current context
     color_spaces: HashMap<String, Object>,
+    /// Snapshot of `options.excluded_layers` wrapped in an `Arc` so that every
+    /// recursive `execute_operators` call holds a cheap reference instead of
+    /// deep-cloning the set per nested Form XObject. Recomputed on the first
+    /// access per `render_page` invocation. Stays `None` (no allocation) when
+    /// the set is empty — the common case.
+    excluded_layers_snapshot: Option<Arc<HashSet<String>>>,
 }
 
 impl PageRenderer {
@@ -156,6 +162,7 @@ impl PageRenderer {
             text_rasterizer: TextRasterizer::new(),
             fonts: HashMap::new(),
             color_spaces: HashMap::new(),
+            excluded_layers_snapshot: None,
         }
     }
 
@@ -173,6 +180,15 @@ impl PageRenderer {
         // Clear caches for new page
         self.fonts.clear();
         self.color_spaces.clear();
+
+        // Refresh the excluded-layers snapshot once per page so that every
+        // recursive `execute_operators` / Form-XObject pass below can hold a
+        // cheap `Arc` reference instead of re-cloning the HashSet.
+        self.excluded_layers_snapshot = if self.options.excluded_layers.is_empty() {
+            None
+        } else {
+            Some(Arc::new(self.options.excluded_layers.clone()))
+        };
 
         // Get page info
         let page_info = doc.get_page_info(page_num)?;
@@ -377,10 +393,16 @@ impl PageRenderer {
         page_num: usize,
         resources: &Object,
     ) -> Result<()> {
-        // Snapshot excluded layers once so the operator loop below can use a
-        // borrow without conflicting with the `&mut self` calls inside it.
-        let excluded_layers = self.options.excluded_layers.clone();
-        let excluded_layers = &excluded_layers;
+        // Per-render snapshot lives on `self.excluded_layers_snapshot` (filled
+        // by `render_page_with_options`). Recursive calls into this function
+        // reuse the same `Arc` without any allocation. We snapshot it as a
+        // local `Arc::clone` (cheap pointer copy) so the operator loop below
+        // can hold a `&HashSet` reference while still calling `&mut self`
+        // methods through the inner match arms.
+        let snapshot: Option<Arc<HashSet<String>>> = self.excluded_layers_snapshot.clone();
+        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+        let empty_ref: &HashSet<String> = EMPTY.get_or_init(HashSet::new);
+        let excluded_layers: &HashSet<String> = snapshot.as_deref().unwrap_or(empty_ref);
         let mut gs_stack = GraphicsStateStack::new();
 
         // PDF default: DeviceGray, black
@@ -1115,15 +1137,23 @@ impl PageRenderer {
                     current_path = PathBuilder::new();
                 },
 
-                // Clipping
+                // Clipping — suppressed inside an excluded OCG scope. Per PDF
+                // spec the clip is a graphics-state side-effect; without
+                // gating it, a `W n` issued inside an excluded BDC scope that
+                // is not bracketed by `q/Q` would silently restrict subsequent
+                // visible content.
                 Operator::ClipNonZero => {
-                    if let Some(path) = current_path.clone().finish() {
-                        pending_clip = Some((path, tiny_skia::FillRule::Winding));
+                    if excluded_layer_depth == 0 {
+                        if let Some(path) = current_path.clone().finish() {
+                            pending_clip = Some((path, tiny_skia::FillRule::Winding));
+                        }
                     }
                 },
                 Operator::ClipEvenOdd => {
-                    if let Some(path) = current_path.clone().finish() {
-                        pending_clip = Some((path, tiny_skia::FillRule::EvenOdd));
+                    if excluded_layer_depth == 0 {
+                        if let Some(path) = current_path.clone().finish() {
+                            pending_clip = Some((path, tiny_skia::FillRule::EvenOdd));
+                        }
                     }
                 },
 
@@ -1159,22 +1189,28 @@ impl PageRenderer {
                     gs_stack.current_mut().render_mode = *render;
                 },
 
-                // Text showing — suppressed when inside an excluded OCG layer
+                // Text showing — glyphs suppressed inside an excluded OCG layer,
+                // but the text matrix still advances so that subsequent visible
+                // text inside the same BT/ET paints at the correct X position.
                 Operator::Tj { text } => {
-                    if in_text_object && excluded_layer_depth == 0 {
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                    if in_text_object {
                         let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        let advance = self.text_rasterizer.render_text(
-                            pixmap,
-                            text,
-                            transform,
-                            gs,
-                            resources,
-                            doc,
-                            clip,
-                            &self.fonts,
-                        )?;
+                        let advance = if excluded_layer_depth == 0 {
+                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            self.text_rasterizer.render_text(
+                                pixmap,
+                                text,
+                                transform,
+                                gs,
+                                resources,
+                                doc,
+                                clip,
+                                &self.fonts,
+                            )?
+                        } else {
+                            self.text_rasterizer.measure_text(text, gs, &self.fonts)
+                        };
 
                         let gs_mut = gs_stack.current_mut();
                         let advance_matrix = Matrix::translation(advance, 0.0);
@@ -1190,9 +1226,9 @@ impl PageRenderer {
                         gs_mut.text_line_matrix = translation.multiply(&gs_mut.text_line_matrix);
                         gs_mut.text_matrix = gs_mut.text_line_matrix;
 
-                        if excluded_layer_depth == 0 {
+                        let gs = gs_stack.current();
+                        let advance = if excluded_layer_depth == 0 {
                             let clip = clip_stack.last().and_then(|c| c.as_ref());
-                            let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "' (Quote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -1203,7 +1239,7 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
-                            let advance = self.text_rasterizer.render_text(
+                            self.text_rasterizer.render_text(
                                 pixmap,
                                 text,
                                 transform,
@@ -1212,38 +1248,44 @@ impl PageRenderer {
                                 doc,
                                 clip,
                                 &self.fonts,
-                            )?;
+                            )?
+                        } else {
+                            self.text_rasterizer.measure_text(text, gs, &self.fonts)
+                        };
 
-                            let gs_mut = gs_stack.current_mut();
-                            let advance_matrix = Matrix::translation(advance, 0.0);
-                            gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
-                        }
+                        let gs_mut = gs_stack.current_mut();
+                        let advance_matrix = Matrix::translation(advance, 0.0);
+                        gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
                     }
                 },
                 Operator::TJ { array } => {
-                    if in_text_object && excluded_layer_depth == 0 {
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                    if in_text_object {
                         let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        log::debug!(
-                            "TJ: rendering array at Tm=[{}, {}, {}, {}, {}, {}]",
-                            gs.text_matrix.a,
-                            gs.text_matrix.b,
-                            gs.text_matrix.c,
-                            gs.text_matrix.d,
-                            gs.text_matrix.e,
-                            gs.text_matrix.f
-                        );
-                        let advance = self.text_rasterizer.render_tj_array(
-                            pixmap,
-                            array,
-                            transform,
-                            gs,
-                            resources,
-                            doc,
-                            clip,
-                            &self.fonts,
-                        )?;
+                        let advance = if excluded_layer_depth == 0 {
+                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            log::debug!(
+                                "TJ: rendering array at Tm=[{}, {}, {}, {}, {}, {}]",
+                                gs.text_matrix.a,
+                                gs.text_matrix.b,
+                                gs.text_matrix.c,
+                                gs.text_matrix.d,
+                                gs.text_matrix.e,
+                                gs.text_matrix.f
+                            );
+                            self.text_rasterizer.render_tj_array(
+                                pixmap,
+                                array,
+                                transform,
+                                gs,
+                                resources,
+                                doc,
+                                clip,
+                                &self.fonts,
+                            )?
+                        } else {
+                            self.text_rasterizer.measure_tj_array(array, gs, &self.fonts)
+                        };
 
                         let gs_mut = gs_stack.current_mut();
                         let advance_matrix = Matrix::translation(advance, 0.0);
@@ -1266,9 +1308,9 @@ impl PageRenderer {
                         gs_mut.text_line_matrix = translation.multiply(&gs_mut.text_line_matrix);
                         gs_mut.text_matrix = gs_mut.text_line_matrix;
 
-                        if excluded_layer_depth == 0 {
+                        let gs = gs_stack.current();
+                        let advance = if excluded_layer_depth == 0 {
                             let clip = clip_stack.last().and_then(|c| c.as_ref());
-                            let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "\" (DoubleQuote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -1279,7 +1321,7 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
-                            let advance = self.text_rasterizer.render_text(
+                            self.text_rasterizer.render_text(
                                 pixmap,
                                 text,
                                 transform,
@@ -1288,12 +1330,14 @@ impl PageRenderer {
                                 doc,
                                 clip,
                                 &self.fonts,
-                            )?;
+                            )?
+                        } else {
+                            self.text_rasterizer.measure_text(text, gs, &self.fonts)
+                        };
 
-                            let gs_mut = gs_stack.current_mut();
-                            let advance_matrix = Matrix::translation(advance, 0.0);
-                            gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
-                        }
+                        let gs_mut = gs_stack.current_mut();
+                        let advance_matrix = Matrix::translation(advance, 0.0);
+                        gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
                     }
                 },
 
@@ -1392,14 +1436,21 @@ impl PageRenderer {
                 // EndPath (n operator): discard current path without painting,
                 // but apply any pending clip. Per PDF spec, W n is the standard
                 // way to set a clipping path without filling or stroking.
+                // Suppress the clip application inside an excluded OCG scope so
+                // the clip doesn't leak past EMC into visible content.
                 Operator::EndPath => {
-                    apply_pending_clip(
-                        &mut pending_clip,
-                        &mut clip_stack,
-                        pixmap,
-                        base_transform,
-                        &gs_stack,
-                    );
+                    if excluded_layer_depth == 0 {
+                        apply_pending_clip(
+                            &mut pending_clip,
+                            &mut clip_stack,
+                            pixmap,
+                            base_transform,
+                            &gs_stack,
+                        );
+                    } else {
+                        // Drop any pending clip without applying it.
+                        let _ = pending_clip.take();
+                    }
                     current_path = PathBuilder::new();
                 },
 
@@ -2295,7 +2346,24 @@ impl PageRenderer {
         page_num: usize,
     ) -> Result<()> {
         let annotations = doc.get_annotations(page_num)?;
+        // Reuse the per-render snapshot so we don't deep-clone the HashSet here.
+        let excluded_snapshot: Option<Arc<HashSet<String>>> =
+            self.excluded_layers_snapshot.clone();
         for annot in annotations {
+            // Per ISO 32000-1 §12.5.2, an annotation dict may carry an /OC
+            // entry referencing the OCG/OCMD the annotation belongs to. Skip
+            // the annotation entirely if its layer is excluded.
+            if let Some(ref excluded_layers) = excluded_snapshot {
+                if let Some(oc_obj) = annot.raw_dict.as_ref().and_then(|d| d.get("OC")) {
+                    if crate::optional_content::annotation_is_excluded(
+                        oc_obj,
+                        doc,
+                        excluded_layers,
+                    ) {
+                        continue;
+                    }
+                }
+            }
             // Check if annotation has an appearance stream (/AP)
             if let Some(ap_obj) = annot.raw_dict.as_ref().and_then(|d| d.get("AP")) {
                 let ap_stream_obj = doc.resolve_object(ap_obj)?;
