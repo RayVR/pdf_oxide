@@ -8575,62 +8575,27 @@ impl PdfDocument {
         page_index: usize,
         config: crate::extractors::TextExtractionConfig,
     ) -> Result<Vec<crate::layout::TextSpan>> {
-        self.require_authenticated()?;
-        use crate::extractors::TextExtractor;
-
-        // Get page object
-        let page = self.get_page(page_index)?;
-        let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
-            offset: 0,
-            reason: "Page is not a dictionary".to_string(),
-        })?;
-
-        // Fast pre-check: skip pages that cannot produce text based on resources alone.
-        if self.page_cannot_have_text(page_dict) {
-            return Ok(Vec::new());
-        }
-
-        // Get content stream data — skip page on decode failure (Annex I)
-        let content_data = match self.get_page_content_data(page_index) {
-            Ok(data) => data,
-            Err(e) => {
-                log::warn!(
-                    "Failed to decode content stream for page {}: {}, returning empty",
-                    page_index,
-                    e
-                );
-                return Ok(Vec::new());
-            },
-        };
-
-        if !Self::may_contain_text(&content_data) {
-            return Ok(Vec::new());
-        }
-
-        // Single-pass extraction with the provided config
-        let mut extractor = TextExtractor::with_config(config);
-        if let Some(resources) = page_dict.get("Resources") {
-            extractor.set_resources(resources.clone());
-            extractor.set_document(self);
-            if let Err(e) = self.load_fonts(resources, &mut extractor) {
-                log::warn!(
-                    "Failed to load fonts for page {}: {}, continuing with defaults",
-                    page_index,
-                    e
-                );
-            }
-        }
-
-        extractor.extract_text_spans(&content_data)
+        self.extract_spans_impl(page_index, config, HashSet::new(), HashSet::new())
     }
 
-    /// Extract raw text spans with layer and ink exclusion filtering.
-    ///
-    /// Same as [`extract_spans_raw`] but configures the extractor to suppress
-    /// content from specified OCG layers and Separation/DeviceN ink color spaces.
     fn extract_spans_raw_filtered(
         &self,
         page_index: usize,
+        excluded_layers: HashSet<String>,
+        excluded_inks: HashSet<String>,
+    ) -> Result<Vec<crate::layout::TextSpan>> {
+        self.extract_spans_impl(
+            page_index,
+            crate::extractors::TextExtractionConfig::default(),
+            excluded_layers,
+            excluded_inks,
+        )
+    }
+
+    fn extract_spans_impl(
+        &self,
+        page_index: usize,
+        config: crate::extractors::TextExtractionConfig,
         excluded_layers: HashSet<String>,
         excluded_inks: HashSet<String>,
     ) -> Result<Vec<crate::layout::TextSpan>> {
@@ -8663,10 +8628,13 @@ impl PdfDocument {
             return Ok(Vec::new());
         }
 
-        let mut extractor =
-            TextExtractor::with_config(crate::extractors::TextExtractionConfig::default());
-        extractor.set_excluded_layers(excluded_layers);
-        extractor.set_excluded_inks(excluded_inks);
+        let mut extractor = TextExtractor::with_config(config);
+        if !excluded_layers.is_empty() {
+            extractor.set_excluded_layers(excluded_layers);
+        }
+        if !excluded_inks.is_empty() {
+            extractor.set_excluded_inks(excluded_inks);
+        }
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
             extractor.set_document(self);
@@ -9172,67 +9140,7 @@ impl PdfDocument {
     /// Character extraction is typically 30-50% faster than span extraction
     /// because it skips the text grouping and merging logic.
     pub fn extract_chars(&self, page_index: usize) -> Result<Vec<crate::layout::TextChar>> {
-        use crate::extractors::TextExtractor;
-
-        // Get page object
-        let page = self.get_page(page_index)?;
-        let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
-            offset: 0,
-            reason: "Page is not a dictionary".to_string(),
-        })?;
-
-        // Get content stream data — skip page on decode failure (Annex I)
-        let content_data = match self.get_page_content_data(page_index) {
-            Ok(data) => data,
-            Err(e) => {
-                log::warn!(
-                    "Failed to decode content stream for page {}: {}, returning empty",
-                    page_index,
-                    e
-                );
-                return Ok(Vec::new());
-            },
-        };
-
-        // Early-out for pages with no text content (§9.4.3)
-        if !Self::may_contain_text(&content_data) {
-            return Ok(Vec::new());
-        }
-
-        // Create text extractor for character-level extraction
-        let mut extractor = TextExtractor::new();
-
-        // Load fonts from page resources and set resources for XObject access
-        if let Some(resources) = page_dict.get("Resources") {
-            extractor.set_resources(resources.clone());
-            extractor.set_document(self);
-
-            // Load fonts
-            if let Err(e) = self.load_fonts(resources, &mut extractor) {
-                log::warn!(
-                    "Failed to load fonts for page {}: {}, continuing with defaults",
-                    page_index,
-                    e
-                );
-            }
-        }
-
-        // Extract characters directly (single-pass, no document classification)
-        let mut chars = extractor.extract(&content_data)?;
-
-        // Sort characters by reading order (Y-descending, then X-ascending)
-        // This ensures extract_words and extract_text_lines process them in logical order.
-        chars.sort_by(|a, b| {
-            // Y-descending (top-to-bottom)
-            let y_cmp = crate::utils::safe_float_cmp(b.bbox.y, a.bbox.y);
-            if y_cmp != std::cmp::Ordering::Equal {
-                return y_cmp;
-            }
-            // X-ascending (left-to-right)
-            crate::utils::safe_float_cmp(a.bbox.x, b.bbox.x)
-        });
-
-        Ok(chars)
+        self.extract_chars_impl(page_index, HashSet::new(), HashSet::new())
     }
 
     /// Extract characters from a page, excluding content from specified layers and inks.
@@ -9243,6 +9151,15 @@ impl PdfDocument {
     /// * `excluded_layers` - OCG layer names to suppress (empty = no layer filtering)
     /// * `excluded_inks` - Separation/DeviceN ink names to suppress (empty = no ink filtering)
     pub fn extract_chars_filtered(
+        &self,
+        page_index: usize,
+        excluded_layers: HashSet<String>,
+        excluded_inks: HashSet<String>,
+    ) -> Result<Vec<crate::layout::TextChar>> {
+        self.extract_chars_impl(page_index, excluded_layers, excluded_inks)
+    }
+
+    fn extract_chars_impl(
         &self,
         page_index: usize,
         excluded_layers: HashSet<String>,
@@ -9273,13 +9190,16 @@ impl PdfDocument {
         }
 
         let mut extractor = TextExtractor::new();
-        extractor.set_excluded_layers(excluded_layers);
-        extractor.set_excluded_inks(excluded_inks);
+        if !excluded_layers.is_empty() {
+            extractor.set_excluded_layers(excluded_layers);
+        }
+        if !excluded_inks.is_empty() {
+            extractor.set_excluded_inks(excluded_inks);
+        }
 
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
             extractor.set_document(self);
-
             if let Err(e) = self.load_fonts(resources, &mut extractor) {
                 log::warn!(
                     "Failed to load fonts for page {}: {}, continuing with defaults",
