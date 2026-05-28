@@ -826,3 +826,88 @@ fn test_devicen_excludes_entire_colorspace_if_any_ink_matches() {
         text
     );
 }
+
+// ============================================================================
+// Pipeline parity: filtering non-matching layers must not alter output
+// ============================================================================
+
+/// Build a PDF with a table-like layout and an OCG layer that doesn't
+/// overlap with any content. Filtering this layer should produce output
+/// identical to unfiltered extraction.
+fn build_pdf_with_table_and_unrelated_layer() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    let mut offsets: Vec<usize> = Vec::new();
+
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R\n\
+           /OCProperties << /OCGs [6 0 R] /D << /ON [6 0 R] >> >> >>\nendobj\n\n",
+    );
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\n");
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]\n\
+           /Contents 4 0 R\n\
+           /Resources << /Font << /F1 5 0 R >> /Properties << /MC0 6 0 R >> >> >>\nendobj\n\n",
+    );
+
+    // Content: multiple text lines (simulating rows), plus an empty OCG layer
+    let content = b"BT /F1 12 Tf 50 700 Td (Name) Tj 200 0 Td (Age) Tj ET \
+                    BT /F1 12 Tf 50 680 Td (Alice) Tj 200 0 Td (30) Tj ET \
+                    BT /F1 12 Tf 50 660 Td (Bob) Tj 200 0 Td (25) Tj ET \
+                    /OC /MC0 BDC EMC";
+    offsets.push(pdf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    pdf.extend_from_slice(hdr.as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica\n\
+           /Encoding /WinAnsiEncoding >>\nendobj\n\n",
+    );
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"6 0 obj\n<< /Type /OCG /Name /Dieline >>\nendobj\n\n");
+
+    let xref_offset = pdf.len();
+    let n_obj = offsets.len() + 1;
+    let mut xref = format!("xref\n0 {}\n", n_obj);
+    xref.push_str("0000000000 65535 f \n");
+    for off in &offsets {
+        xref.push_str(&format!("{:010} 00000 n \n", off));
+    }
+    pdf.extend_from_slice(xref.as_bytes());
+    let trailer = format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        n_obj, xref_offset
+    );
+    pdf.extend_from_slice(trailer.as_bytes());
+    pdf
+}
+
+#[test]
+fn test_filtering_unrelated_layer_produces_identical_output() {
+    let pdf_bytes = build_pdf_with_table_and_unrelated_layer();
+    let doc = PdfDocument::from_bytes(pdf_bytes).expect("parse PDF");
+
+    let text_normal = doc.extract_text(0).expect("unfiltered");
+    let text_filtered = doc
+        .extract_text_filtered(
+            0,
+            HashSet::from(["Dieline".to_string()]),
+            HashSet::new(),
+        )
+        .expect("filtered with non-matching layer");
+
+    assert_eq!(
+        text_normal, text_filtered,
+        "Excluding a layer with no content must produce identical output.\n\
+         Unfiltered: {:?}\n\
+         Filtered:   {:?}",
+        text_normal, text_filtered
+    );
+}
