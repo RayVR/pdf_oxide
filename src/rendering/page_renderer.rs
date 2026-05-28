@@ -181,13 +181,20 @@ impl PageRenderer {
         self.fonts.clear();
         self.color_spaces.clear();
 
-        // Refresh the excluded-layers snapshot once per page so that every
-        // recursive `execute_operators` / Form-XObject pass below can hold a
-        // cheap `Arc` reference instead of re-cloning the HashSet.
-        self.excluded_layers_snapshot = if self.options.excluded_layers.is_empty() {
+        // Refresh the excluded-layers snapshot once per page. The effective
+        // set combines (a) the PDF's default-off OCGs per /OCProperties/D
+        // (BaseState, /ON, /OFF) — ISO 32000-1 §8.11.4 — with (b) the caller's
+        // explicit excluded_layers. This makes the renderer respect the PDF's
+        // default visibility configuration, matching a viewer's initial state.
+        let default_off = crate::optional_content::compute_default_off_ocgs(doc);
+        let effective: HashSet<String> = default_off
+            .into_iter()
+            .chain(self.options.excluded_layers.iter().cloned())
+            .collect();
+        self.excluded_layers_snapshot = if effective.is_empty() {
             None
         } else {
-            Some(Arc::new(self.options.excluded_layers.clone()))
+            Some(Arc::new(effective))
         };
 
         // Get page info

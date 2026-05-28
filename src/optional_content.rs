@@ -17,6 +17,111 @@ use std::collections::{HashMap, HashSet};
 use crate::document::PdfDocument;
 use crate::object::Object;
 
+/// Compute the document's default-off OCG names per ISO 32000-1 §8.11.4.
+///
+/// Reads `/OCProperties/D` (the default configuration) and returns the set of
+/// OCG `/Name` strings that are off in the default state. Logic:
+///
+///  - `/D/BaseState` = `/ON` (or absent): OCGs default to on. `/D/OFF` lists
+///     names that are explicitly turned off.
+///  - `/D/BaseState` = `/OFF`: OCGs default to off. All OCGs in `/OCProperties
+///    /OCGs` that are NOT in `/D/ON` are off.
+///  - `/D/BaseState` = `/Unchanged`: treat as `/ON` (libraries have no prior
+///    viewer state to preserve).
+///  - `/OCProperties` or `/D` absent: returns empty set (all OCGs on).
+///
+/// Callers typically combine this with caller-supplied `excluded_layers` via
+/// `default_off | excluded_layers` to get the effective "off" set for filtering.
+pub fn compute_default_off_ocgs(doc: &PdfDocument) -> HashSet<String> {
+    let mut off = HashSet::new();
+    let catalog = match doc.catalog() {
+        Ok(c) => c,
+        Err(_) => return off,
+    };
+    let catalog_dict = match catalog.as_dict() {
+        Some(d) => d,
+        None => return off,
+    };
+    let oc_props = match resolve_indirect(catalog_dict.get("OCProperties"), doc) {
+        Some(o) => o,
+        None => return off,
+    };
+    let oc_dict = match oc_props.as_dict() {
+        Some(d) => d,
+        None => return off,
+    };
+    let d_obj = match resolve_indirect(oc_dict.get("D"), doc) {
+        Some(o) => o,
+        None => return off,
+    };
+    let d_dict = match d_obj.as_dict() {
+        Some(d) => d,
+        None => return off,
+    };
+
+    let base_state = d_dict
+        .get("BaseState")
+        .and_then(|o| o.as_name())
+        .unwrap_or("ON");
+    let on_set = collect_ocg_name_set(d_dict.get("ON"), doc);
+    let off_set = collect_ocg_name_set(d_dict.get("OFF"), doc);
+
+    if base_state == "OFF" {
+        // All OCGs default off; explicit /ON entries are on.
+        // Walk /OCProperties/OCGs and mark anything not in on_set as off.
+        let all_ocgs = collect_ocg_name_set(oc_dict.get("OCGs"), doc);
+        for name in all_ocgs {
+            if !on_set.contains(&name) {
+                off.insert(name);
+            }
+        }
+    } else {
+        // BaseState is /ON or /Unchanged: only explicit /D/OFF entries are off.
+        off.extend(off_set);
+    }
+
+    off
+}
+
+fn resolve_indirect(obj: Option<&Object>, doc: &PdfDocument) -> Option<Object> {
+    let obj = obj?;
+    match obj.as_reference() {
+        Some(r) => doc.load_object(r).ok(),
+        None => Some(obj.clone()),
+    }
+}
+
+fn collect_ocg_name_set(arr_obj: Option<&Object>, doc: &PdfDocument) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let resolved = match resolve_indirect(arr_obj, doc) {
+        Some(o) => o,
+        None => return names,
+    };
+    let arr = match resolved.as_array() {
+        Some(a) => a,
+        None => return names,
+    };
+    for item in arr {
+        let resolved = match item.as_reference() {
+            Some(r) => match doc.load_object(r) {
+                Ok(o) => o,
+                Err(_) => continue,
+            },
+            None => item.clone(),
+        };
+        if let Some(d) = resolved.as_dict() {
+            if let Some(Object::Name(n)) = d.get("Name") {
+                names.insert(n.clone());
+            } else if let Some(name_obj) = d.get("Name") {
+                if let Some(b) = name_obj.as_string() {
+                    names.insert(decode_pdf_text_string(b));
+                }
+            }
+        }
+    }
+    names
+}
+
 /// OCMD visibility policy (`/P` entry). Per ISO 32000-1 §8.11.2.2 Table 102.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OcmdPolicy {

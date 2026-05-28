@@ -1243,6 +1243,81 @@ fn test_ve_or_operator() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// /D default-off respect — ISO 32000-1 §8.11.4
+// ---------------------------------------------------------------------------
+
+/// PDF whose /OCProperties/D entry marks an OCG as off by default.
+fn build_pdf_with_default_off_layer() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    let mut offsets: Vec<usize> = Vec::new();
+
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R\n\
+           /OCProperties << /OCGs [6 0 R] /D << /BaseState /ON /OFF [6 0 R] >> >> >>\nendobj\n\n",
+    );
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\n");
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]\n\
+           /Contents 4 0 R\n\
+           /Resources << /Font << /F1 5 0 R >> /Properties << /MC0 6 0 R >> >> >>\nendobj\n\n",
+    );
+
+    let content = b"/OC /MC0 BDC 0 0 1 rg 50 550 200 200 re f EMC \
+                    0 1 0 rg 300 550 200 200 re f";
+    offsets.push(pdf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    pdf.extend_from_slice(hdr.as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica\n\
+           /Encoding /WinAnsiEncoding >>\nendobj\n\n",
+    );
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"6 0 obj\n<< /Type /OCG /Name /Watermark >>\nendobj\n\n");
+
+    let xref_offset = pdf.len();
+    let n_obj = offsets.len() + 1;
+    let mut xref = format!("xref\n0 {}\n", n_obj);
+    xref.push_str("0000000000 65535 f \n");
+    for off in &offsets {
+        xref.push_str(&format!("{:010} 00000 n \n", off));
+    }
+    pdf.extend_from_slice(xref.as_bytes());
+    let trailer = format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        n_obj, xref_offset
+    );
+    pdf.extend_from_slice(trailer.as_bytes());
+    pdf
+}
+
+#[test]
+fn test_default_off_layer_hidden_with_empty_exclusions() {
+    // /D/OFF marks Watermark off — content should be hidden even when the
+    // caller passes no excluded_layers.
+    let doc = PdfDocument::from_bytes(build_pdf_with_default_off_layer()).unwrap();
+    let (data, w, h) = render_raw(&doc, HashSet::new());
+    let (r, g, b, _) = sample_region(&data, w, h, 100, 100, 30, 30);
+    assert!(
+        r > 240.0 && g > 240.0 && b > 240.0,
+        "Default-off OCG content should be hidden: ({r}, {g}, {b})"
+    );
+    let (r2, g2, b2, _) = sample_region(&data, w, h, 350, 100, 30, 30);
+    assert!(
+        r2 < 80.0 && g2 > 200.0 && b2 < 80.0,
+        "Unrelated content should remain: ({r2}, {g2}, {b2})"
+    );
+}
+
 #[test]
 fn test_ve_nested_expression() {
     // /VE = [/And 7 0 R [/Not 8 0 R]]   — A on AND B off
