@@ -95,15 +95,10 @@ impl Value {
     fn as_int(self) -> Result<i64> {
         match self {
             Value::Int(i) => Ok(i),
-            // PLRM allows reals only if they are exact integers; otherwise typecheck.
-            Value::Real(r) => {
-                if r.is_finite() && r.fract() == 0.0 && r >= i64::MIN as f64 && r <= i64::MAX as f64
-                {
-                    Ok(r as i64)
-                } else {
-                    Err(typecheck("expected integer, got non-integral real"))
-                }
-            },
+            // PLRM §8.2: idiv, mod, bitshift, and other integer ops require
+            // typed integer values. A real literal like `2.0` is a typed real
+            // even if its value is integral and is rejected.
+            Value::Real(_) => Err(typecheck("expected integer, got real")),
             Value::Bool(_) => Err(typecheck("expected integer, got boolean")),
         }
     }
@@ -333,7 +328,20 @@ fn resolve_conditionals(instructions: &mut Vec<Instruction>) -> Result<()> {
 /// After execution the remaining stack values are returned as the output.
 pub fn evaluate_type4(program: &[u8], inputs: &[f64]) -> Result<Vec<f64>> {
     let instructions = parse(program)?;
-    let mut stack: Vec<Value> = inputs.iter().map(|&v| Value::Real(v)).collect();
+    // The public API takes f64s. Caller intent (typed int vs typed real) is
+    // ambiguous, so promote exact integer-valued inputs to typed integers.
+    // This lets integer ops (idiv, mod, bitshift) accept caller-supplied
+    // integer inputs while still rejecting parser literals like `2.0`.
+    let mut stack: Vec<Value> = inputs
+        .iter()
+        .map(|&v| {
+            if v.is_finite() && v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
+                Value::Int(v as i64)
+            } else {
+                Value::Real(v)
+            }
+        })
+        .collect();
     execute(&instructions, &mut stack)?;
     Ok(stack.into_iter().map(Value::to_output).collect())
 }
@@ -939,6 +947,28 @@ mod tests {
         // Mixed -> typecheck error
         assert!(evaluate_type4(b"{ true 1 and }", &[]).is_err());
         assert!(evaluate_type4(b"{ 1 true or }", &[]).is_err());
+    }
+
+    #[test]
+    fn integer_only_ops_reject_real_literals() {
+        // PLRM §8.2: idiv, mod, bitshift require typed integer operands.
+        // A real literal like `2.0` is a typed real and must be rejected.
+        assert!(evaluate_type4(b"{ 5.5 2 idiv }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 5 2.5 idiv }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 5 2.0 mod }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 5.0 2 mod }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 1.0 not }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 3.0 1 bitshift }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 3 1.0 bitshift }", &[]).is_err());
+    }
+
+    #[test]
+    fn integer_valued_inputs_accepted_by_integer_ops() {
+        // Caller-supplied f64 inputs are an ambiguous typed-int/typed-real
+        // boundary; integer-valued f64s are accepted by integer ops.
+        assert_eq!(evaluate_type4(b"{ idiv }", &[10.0, 3.0]).unwrap(), vec![3.0]);
+        assert_eq!(evaluate_type4(b"{ mod }", &[10.0, 3.0]).unwrap(), vec![1.0]);
+        assert_eq!(evaluate_type4(b"{ bitshift }", &[1.0, 4.0]).unwrap(), vec![16.0]);
     }
 
     #[test]
