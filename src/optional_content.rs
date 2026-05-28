@@ -167,10 +167,10 @@ fn collect_ocmd_ocg_names(ocgs_obj: &Object, doc: &PdfDocument) -> Vec<Object> {
 ///
 /// Semantics:
 ///  - **OCG** (dict has `/Name`): excluded iff the name is in `excluded`.
-///  - **OCMD** (dict has `/Type /OCMD` and `/OCGs`): excluded iff the OCMD
-///    visibility policy applied to the membership states (`on = !excluded`)
-///    evaluates to "hidden". `/P` defaults to `AnyOn` per spec. `/VE` is
-///    not yet supported — see [`OcmdPolicy`].
+///  - **OCMD** (dict has `/Type /OCMD`): if `/VE` is present, evaluate the
+///    visibility expression tree (`/And`, `/Or`, `/Not`); otherwise apply
+///    the `/P` policy (`AnyOn` default) over the `/OCGs` membership where
+///    `on = !excluded`. Content is excluded iff the result is "hidden".
 pub fn check_ocg_excluded(
     props_dict: &HashMap<String, Object>,
     doc: &PdfDocument,
