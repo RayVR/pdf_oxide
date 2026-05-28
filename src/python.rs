@@ -244,19 +244,18 @@ impl PyPdfDocument {
 
         if let Some((x, y, w, h)) = region {
             if has_filters {
-                // Filtered extraction with region: extract filtered text, then
-                // filter chars by rect from the result. For region + filter combos
-                // we do filtered span extraction and then apply the region filter.
-                let text = self
+                let chars = self
                     .inner
-                    .extract_text_filtered(page, layers, inks)
+                    .extract_chars_filtered(page, layers, inks)
                     .map_err(|e| {
                         PyRuntimeError::new_err(format!("Failed to extract filtered text: {}", e))
                     })?;
-                // When both region and filters are specified, the region filter
-                // is best-effort since extract_text_filtered returns a string.
-                // For precise region + filter, use extract_chars with both params.
-                Ok(text)
+                use crate::layout::SpatialCollectionFiltering;
+                let filtered = chars.filter_by_rect(
+                    &crate::geometry::Rect::new(x, y, w, h),
+                    crate::layout::RectFilterMode::Intersects,
+                );
+                Ok(filtered.iter().map(|c| c.char.to_string()).collect::<Vec<_>>().join(""))
             } else {
                 self.inner
                     .extract_text_in_rect(

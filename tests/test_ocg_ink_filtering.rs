@@ -416,6 +416,98 @@ fn test_ink_filtering_blocked_by_text_only_parser() {
 // ============================================================================
 // Basic OCG filtering (no XObject cache involvement)
 // ============================================================================
+// Task 1: region + filter combo
+// ============================================================================
+
+fn build_pdf_for_region_and_filter() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    let mut offsets: Vec<usize> = Vec::new();
+
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R\n\
+           /OCProperties << /OCGs [6 0 R] /D << /ON [6 0 R] >> >> >>\nendobj\n\n",
+    );
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\n");
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]\n\
+           /Contents 4 0 R\n\
+           /Resources << /Font << /F1 5 0 R >> /Properties << /MC0 6 0 R >> >> >>\nendobj\n\n",
+    );
+
+    let content = b"BT /F1 12 Tf 50 700 Td (TOP_VISIBLE) Tj ET \
+                    /OC /MC0 BDC BT /F1 12 Tf 50 650 Td (TOP_HIDDEN) Tj ET EMC \
+                    BT /F1 12 Tf 50 100 Td (BOT_VISIBLE) Tj ET";
+    offsets.push(pdf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    pdf.extend_from_slice(hdr.as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica\n\
+           /Encoding /WinAnsiEncoding >>\nendobj\n\n",
+    );
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"6 0 obj\n<< /Type /OCG /Name /Overlay >>\nendobj\n\n");
+
+    let xref_offset = pdf.len();
+    let n_obj = offsets.len() + 1;
+    let mut xref = format!("xref\n0 {}\n", n_obj);
+    xref.push_str("0000000000 65535 f \n");
+    for off in &offsets {
+        xref.push_str(&format!("{:010} 00000 n \n", off));
+    }
+    pdf.extend_from_slice(xref.as_bytes());
+    let trailer = format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        n_obj, xref_offset
+    );
+    pdf.extend_from_slice(trailer.as_bytes());
+    pdf
+}
+
+#[test]
+fn test_extract_text_filtered_respects_region() {
+    let pdf_bytes = build_pdf_for_region_and_filter();
+    let doc = PdfDocument::from_bytes(pdf_bytes).expect("parse PDF");
+
+    let excluded = HashSet::from(["Overlay".to_string()]);
+    let chars = doc
+        .extract_chars_filtered(0, excluded, HashSet::new())
+        .expect("filtered chars");
+
+    use pdf_oxide::geometry::Rect;
+    use pdf_oxide::layout::{RectFilterMode, SpatialCollectionFiltering};
+    let region = Rect::new(0.0, 600.0, 612.0, 200.0);
+    let filtered: Vec<_> = chars.filter_by_rect(&region, RectFilterMode::Intersects);
+    let text: String = filtered.iter().map(|c| c.char).collect();
+
+    assert!(
+        text.contains("TOP_VISIBLE"),
+        "TOP_VISIBLE should survive both filters, got: {:?}",
+        text
+    );
+    assert!(
+        !text.contains("TOP_HIDDEN"),
+        "TOP_HIDDEN should be excluded by layer filter, got: {:?}",
+        text
+    );
+    assert!(
+        !text.contains("BOT_VISIBLE"),
+        "BOT_VISIBLE should be excluded by region filter, got: {:?}",
+        text
+    );
+}
+
+// ============================================================================
+// Basic OCG filtering (no XObject cache involvement)
+// ============================================================================
 
 /// Build a minimal PDF with inline OCG-tagged text (no XObjects).
 fn build_pdf_with_inline_ocg() -> Vec<u8> {
