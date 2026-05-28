@@ -4,7 +4,11 @@
 //!
 //! PDF Type 4 functions are small stack-based programs used as tint transforms
 //! in Separation and DeviceN color spaces. This module parses and evaluates
-//! them per PDF spec Table 42.
+//! them per ISO 32000-1:2008 §7.10.5 and Table 42, which together define a
+//! restricted subset of the PostScript Language Reference Manual (PLRM, 3rd
+//! ed.) §8.2 operator semantics. Where Rust's default numeric behaviour
+//! diverges from PLRM (e.g. `f64::round` ties, `atan2` range, panicking on
+//! `i64::MIN / -1`), the PLRM rule is honoured and cited inline.
 //!
 //! # Integration
 //!
@@ -21,7 +25,8 @@ use crate::error::{Error, Result};
 /// A parsed instruction in a Type 4 PostScript calculator program.
 #[derive(Debug, Clone, PartialEq)]
 enum Instruction {
-    Operand(f64),
+    NumberLiteral(f64),
+    IntLiteral(i64),
     BoolLiteral(bool),
     // Arithmetic
     Add,
@@ -66,6 +71,63 @@ enum Instruction {
     // Conditional
     If(Vec<Instruction>),
     IfElse(Vec<Instruction>, Vec<Instruction>),
+}
+
+/// A runtime stack value. PLRM §8.2 distinguishes integer, real, and boolean
+/// types; the same surface syntax (`1`, `1.0`, `true`) can produce values that
+/// behave differently under `not`, `and`, `or`, `xor`, `idiv`, and `mod`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Value {
+    Int(i64),
+    Real(f64),
+    Bool(bool),
+}
+
+impl Value {
+    fn as_real(self) -> Result<f64> {
+        match self {
+            Value::Int(i) => Ok(i as f64),
+            Value::Real(r) => Ok(r),
+            Value::Bool(_) => Err(typecheck("expected numeric, got boolean")),
+        }
+    }
+
+    fn as_int(self) -> Result<i64> {
+        match self {
+            Value::Int(i) => Ok(i),
+            // PLRM allows reals only if they are exact integers; otherwise typecheck.
+            Value::Real(r) => {
+                if r.is_finite() && r.fract() == 0.0 && r >= i64::MIN as f64 && r <= i64::MAX as f64
+                {
+                    Ok(r as i64)
+                } else {
+                    Err(typecheck("expected integer, got non-integral real"))
+                }
+            },
+            Value::Bool(_) => Err(typecheck("expected integer, got boolean")),
+        }
+    }
+
+    fn as_bool(self) -> Result<bool> {
+        match self {
+            Value::Bool(b) => Ok(b),
+            _ => Err(typecheck("expected boolean")),
+        }
+    }
+
+    fn to_output(self) -> f64 {
+        match self {
+            Value::Int(i) => i as f64,
+            Value::Real(r) => r,
+            Value::Bool(b) => {
+                if b {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+        }
+    }
 }
 
 /// Parse a Type 4 PostScript calculator program from raw bytes.
@@ -187,13 +249,28 @@ fn parse_token(token: &str) -> Result<Instruction> {
         } else {
             Instruction::IfElse(vec![], vec![])
         }),
-        _ => {
-            let val: f64 = token
-                .parse()
-                .map_err(|_| Error::InvalidPdf(format!("Unknown Type 4 token: {token}")))?;
-            Ok(Instruction::Operand(val))
-        },
+        _ => parse_numeric_literal(token),
     }
+}
+
+/// Parse a numeric literal. PLRM §3.3.2 specifies decimal/real syntax only;
+/// `inf`, `NaN`, hex, and radix forms are not part of the Type 4 subset
+/// (ISO 32000-1 Table 42). Reject anything that round-trips to a non-finite
+/// f64 so malformed streams cannot smuggle in poisoned values.
+fn parse_numeric_literal(token: &str) -> Result<Instruction> {
+    // Prefer an integer parse so `52 not` and similar stay typed as integers.
+    if let Ok(i) = token.parse::<i64>() {
+        return Ok(Instruction::IntLiteral(i));
+    }
+    let val: f64 = token
+        .parse()
+        .map_err(|_| Error::InvalidPdf(format!("Unknown Type 4 token: {token}")))?;
+    if !val.is_finite() {
+        return Err(Error::InvalidPdf(format!(
+            "Type 4 numeric literal must be finite, got: {token}"
+        )));
+    }
+    Ok(Instruction::NumberLiteral(val))
 }
 
 /// Post-process: attach preceding procedure bodies to `if`/`ifelse` instructions.
@@ -256,16 +333,18 @@ fn resolve_conditionals(instructions: &mut Vec<Instruction>) -> Result<()> {
 /// After execution the remaining stack values are returned as the output.
 pub fn evaluate_type4(program: &[u8], inputs: &[f64]) -> Result<Vec<f64>> {
     let instructions = parse(program)?;
-    let mut stack: Vec<f64> = inputs.to_vec();
+    let mut stack: Vec<Value> = inputs.iter().map(|&v| Value::Real(v)).collect();
     execute(&instructions, &mut stack)?;
-    Ok(stack)
+    Ok(stack.into_iter().map(Value::to_output).collect())
 }
 
 /// Evaluate with Domain/Range clamping per the PDF function dictionary.
 ///
 /// `domain` is a list of `[min, max]` pairs (one per input). Each input is
 /// clamped to its domain before execution. `range` is a list of `[min, max]`
-/// pairs (one per output). Each output is clamped to its range after execution.
+/// pairs (one per output). Each output is clamped to its range after
+/// execution. Malformed bounds (`min > max`) are swapped; NaN bounds are
+/// treated as no-op, since `f64::clamp` would otherwise panic.
 pub fn evaluate_type4_clamped(
     program: &[u8],
     inputs: &[f64],
@@ -277,7 +356,7 @@ pub fn evaluate_type4_clamped(
         .enumerate()
         .map(|(i, &v)| {
             if let Some(&[lo, hi]) = domain.get(i) {
-                v.clamp(lo, hi)
+                safe_clamp(v, lo, hi)
             } else {
                 v
             }
@@ -286,98 +365,178 @@ pub fn evaluate_type4_clamped(
     let mut result = evaluate_type4(program, &clamped_inputs)?;
     for (i, val) in result.iter_mut().enumerate() {
         if let Some(&[lo, hi]) = range.get(i) {
-            *val = val.clamp(lo, hi);
+            *val = safe_clamp(*val, lo, hi);
         }
     }
     Ok(result)
 }
 
-fn execute(instructions: &[Instruction], stack: &mut Vec<f64>) -> Result<()> {
+/// Clamp without panicking on malformed bounds. PDF spec allows arrays we do
+/// not trust; `f64::clamp` panics on NaN bounds or `min > max`.
+fn safe_clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if lo.is_nan() || hi.is_nan() {
+        return v;
+    }
+    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+    v.clamp(lo, hi)
+}
+
+fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
     for instr in instructions {
         match instr {
-            Instruction::Operand(v) => stack.push(*v),
-            Instruction::BoolLiteral(b) => stack.push(if *b { 1.0 } else { 0.0 }),
-            Instruction::Add => binary_op(stack, |a, b| Ok(a + b))?,
-            Instruction::Sub => binary_op(stack, |a, b| Ok(a - b))?,
-            Instruction::Mul => binary_op(stack, |a, b| Ok(a * b))?,
-            Instruction::Div => binary_op(stack, |a, b| {
+            Instruction::NumberLiteral(v) => stack.push(Value::Real(*v)),
+            Instruction::IntLiteral(i) => stack.push(Value::Int(*i)),
+            Instruction::BoolLiteral(b) => stack.push(Value::Bool(*b)),
+            Instruction::Add => numeric_binary(stack, |a, b| Ok(a + b))?,
+            Instruction::Sub => numeric_binary(stack, |a, b| Ok(a - b))?,
+            Instruction::Mul => numeric_binary(stack, |a, b| Ok(a * b))?,
+            Instruction::Div => numeric_binary(stack, |a, b| {
                 if b == 0.0 {
                     Err(Error::InvalidPdf("Type 4 division by zero".into()))
                 } else {
                     Ok(a / b)
                 }
             })?,
-            Instruction::Idiv => binary_op(stack, |a, b| {
-                let ib = b as i64;
-                if ib == 0 {
-                    Err(Error::InvalidPdf("Type 4 idiv by zero".into()))
+            Instruction::Idiv => {
+                // PLRM §8.2: idiv requires integer operands, returns integer.
+                // i64::MIN / -1 overflows; use checked_div to fail safely.
+                let b = pop(stack)?.as_int()?;
+                let a = pop(stack)?.as_int()?;
+                if b == 0 {
+                    return Err(Error::InvalidPdf("Type 4 idiv by zero".into()));
+                }
+                let q = a
+                    .checked_div(b)
+                    .ok_or_else(|| Error::InvalidPdf("Type 4 idiv integer overflow".into()))?;
+                stack.push(Value::Int(q));
+            },
+            Instruction::Mod => {
+                let b = pop(stack)?.as_int()?;
+                let a = pop(stack)?.as_int()?;
+                if b == 0 {
+                    return Err(Error::InvalidPdf("Type 4 mod by zero".into()));
+                }
+                let r = a
+                    .checked_rem(b)
+                    .ok_or_else(|| Error::InvalidPdf("Type 4 mod integer overflow".into()))?;
+                stack.push(Value::Int(r));
+            },
+            Instruction::Neg => {
+                let v = pop(stack)?;
+                match v {
+                    Value::Int(i) => stack.push(Value::Int(i.wrapping_neg())),
+                    Value::Real(r) => stack.push(Value::Real(-r)),
+                    Value::Bool(_) => return Err(typecheck("neg expects a number")),
+                }
+            },
+            Instruction::Abs => {
+                let v = pop(stack)?;
+                match v {
+                    Value::Int(i) => stack.push(Value::Int(i.wrapping_abs())),
+                    Value::Real(r) => stack.push(Value::Real(r.abs())),
+                    Value::Bool(_) => return Err(typecheck("abs expects a number")),
+                }
+            },
+            Instruction::Ceiling => real_unary_preserve(stack, |a| Ok(a.ceil()))?,
+            Instruction::Floor => real_unary_preserve(stack, |a| Ok(a.floor()))?,
+            // PLRM §8.2: round goes to the greater of the two surrounding
+            // integers (i.e. round-half-toward-+inf). Rust's `f64::round`
+            // ties away from zero, so -6.5 would become -7.0 instead of -6.0.
+            Instruction::Round => real_unary_preserve(stack, |a| Ok((a + 0.5).floor()))?,
+            Instruction::Truncate => real_unary_preserve(stack, |a| Ok(a.trunc()))?,
+            // PLRM §8.2: sqrt requires num >= 0; ln/log require num > 0.
+            // Invalid inputs raise rangecheck/undefinedresult; we propagate as
+            // InvalidPdf rather than letting NaN/-inf reach the renderer.
+            Instruction::Sqrt => real_unary(stack, |a| {
+                if a < 0.0 || a.is_nan() {
+                    Err(Error::InvalidPdf("Type 4 sqrt of negative".into()))
                 } else {
-                    Ok(((a as i64) / ib) as f64)
+                    Ok(a.sqrt())
                 }
             })?,
-            Instruction::Mod => binary_op(stack, |a, b| {
-                let ib = b as i64;
-                if ib == 0 {
-                    Err(Error::InvalidPdf("Type 4 mod by zero".into()))
+            Instruction::Exp => numeric_binary(stack, |base, exp| Ok(base.powf(exp)))?,
+            Instruction::Ln => real_unary(stack, |a| {
+                if a <= 0.0 || a.is_nan() {
+                    Err(Error::InvalidPdf("Type 4 ln of non-positive".into()))
                 } else {
-                    Ok(((a as i64) % ib) as f64)
+                    Ok(a.ln())
                 }
             })?,
-            Instruction::Neg => unary_op(stack, |a| Ok(-a))?,
-            Instruction::Abs => unary_op(stack, |a| Ok(a.abs()))?,
-            Instruction::Ceiling => unary_op(stack, |a| Ok(a.ceil()))?,
-            Instruction::Floor => unary_op(stack, |a| Ok(a.floor()))?,
-            Instruction::Round => unary_op(stack, |a| Ok(a.round()))?,
-            Instruction::Truncate => unary_op(stack, |a| Ok(a.trunc()))?,
-            Instruction::Sqrt => unary_op(stack, |a| Ok(a.sqrt()))?,
-            Instruction::Exp => binary_op(stack, |base, exp| Ok(base.powf(exp)))?,
-            Instruction::Ln => unary_op(stack, |a| Ok(a.ln()))?,
-            Instruction::Log => unary_op(stack, |a| Ok(a.log10()))?,
-            Instruction::Sin => unary_op(stack, |a| Ok(a.to_radians().sin()))?,
-            Instruction::Cos => unary_op(stack, |a| Ok(a.to_radians().cos()))?,
-            Instruction::Atan => binary_op(stack, |num, den| Ok(num.atan2(den).to_degrees()))?,
-            Instruction::Eq => binary_op(stack, |a, b| Ok(bool_val(a == b)))?,
-            Instruction::Ne => binary_op(stack, |a, b| Ok(bool_val(a != b)))?,
-            Instruction::Gt => binary_op(stack, |a, b| Ok(bool_val(a > b)))?,
-            Instruction::Ge => binary_op(stack, |a, b| Ok(bool_val(a >= b)))?,
-            Instruction::Lt => binary_op(stack, |a, b| Ok(bool_val(a < b)))?,
-            Instruction::Le => binary_op(stack, |a, b| Ok(bool_val(a <= b)))?,
-            Instruction::And => binary_op(stack, |a, b| {
-                Ok(if is_bool(a) && is_bool(b) {
-                    bool_val(as_bool(a) && as_bool(b))
+            Instruction::Log => real_unary(stack, |a| {
+                if a <= 0.0 || a.is_nan() {
+                    Err(Error::InvalidPdf("Type 4 log of non-positive".into()))
                 } else {
-                    ((a as i64) & (b as i64)) as f64
-                })
+                    Ok(a.log10())
+                }
             })?,
-            Instruction::Or => binary_op(stack, |a, b| {
-                Ok(if is_bool(a) && is_bool(b) {
-                    bool_val(as_bool(a) || as_bool(b))
-                } else {
-                    ((a as i64) | (b as i64)) as f64
-                })
-            })?,
-            Instruction::Xor => binary_op(stack, |a, b| {
-                Ok(if is_bool(a) && is_bool(b) {
-                    bool_val(as_bool(a) ^ as_bool(b))
-                } else {
-                    ((a as i64) ^ (b as i64)) as f64
-                })
-            })?,
-            Instruction::Not => unary_op(stack, |a| {
-                Ok(if is_bool(a) {
-                    bool_val(!as_bool(a))
-                } else {
-                    (!(a as i64)) as f64
-                })
-            })?,
-            Instruction::Bitshift => binary_op(stack, |val, shift| {
-                let iv = val as i64;
-                let is = shift as i64;
-                Ok(if is >= 0 { iv << is } else { iv >> (-is) } as f64)
-            })?,
-            Instruction::Dup => {
+            Instruction::Sin => real_unary(stack, |a| Ok(a.to_radians().sin()))?,
+            Instruction::Cos => real_unary(stack, |a| Ok(a.to_radians().cos()))?,
+            // PLRM §8.2: atan returns the angle in degrees in [0, 360). Rust's
+            // atan2().to_degrees() returns (-180, 180]; map negative results
+            // back into the spec range.
+            Instruction::Atan => {
+                let den = pop(stack)?.as_real()?;
+                let num = pop(stack)?.as_real()?;
+                if num == 0.0 && den == 0.0 {
+                    return Err(Error::InvalidPdf("Type 4 atan undefined for (0, 0)".into()));
+                }
+                let mut deg = num.atan2(den).to_degrees();
+                if deg < 0.0 {
+                    deg += 360.0;
+                }
+                // Guard against atan2 returning exactly 360.0 due to rounding.
+                if deg >= 360.0 {
+                    deg -= 360.0;
+                }
+                stack.push(Value::Real(deg));
+            },
+            Instruction::Eq => {
+                let b = pop(stack)?;
                 let a = pop(stack)?;
-                stack.push(a);
+                stack.push(Value::Bool(values_equal(a, b)));
+            },
+            Instruction::Ne => {
+                let b = pop(stack)?;
+                let a = pop(stack)?;
+                stack.push(Value::Bool(!values_equal(a, b)));
+            },
+            Instruction::Gt => comparison(stack, |o| o == std::cmp::Ordering::Greater)?,
+            Instruction::Ge => comparison(stack, |o| o != std::cmp::Ordering::Less)?,
+            Instruction::Lt => comparison(stack, |o| o == std::cmp::Ordering::Less)?,
+            Instruction::Le => comparison(stack, |o| o != std::cmp::Ordering::Greater)?,
+            Instruction::And => bool_or_bitwise(stack, |a, b| a && b, |a, b| a & b)?,
+            Instruction::Or => bool_or_bitwise(stack, |a, b| a || b, |a, b| a | b)?,
+            Instruction::Xor => bool_or_bitwise(stack, |a, b| a != b, |a, b| a ^ b)?,
+            Instruction::Not => {
+                let v = pop(stack)?;
+                match v {
+                    Value::Bool(b) => stack.push(Value::Bool(!b)),
+                    Value::Int(i) => stack.push(Value::Int(!i)),
+                    Value::Real(_) => {
+                        return Err(typecheck("not expects boolean or integer"));
+                    },
+                }
+            },
+            // PLRM §8.2: bitshift takes two integers. Magnitudes >= 64 would
+            // panic with Rust's `<<`/`>>`; PLRM treats out-of-range shifts as
+            // shifting all bits out, i.e. zero.
+            Instruction::Bitshift => {
+                let shift = pop(stack)?.as_int()?;
+                let val = pop(stack)?.as_int()?;
+                let result = if shift >= 64 || shift <= -64 {
+                    0
+                } else if shift >= 0 {
+                    val.wrapping_shl(shift as u32)
+                } else {
+                    // Logical right shift on the unsigned bit pattern, per
+                    // PLRM's "bits shifted out are discarded; zeros are
+                    // supplied for vacated bits".
+                    ((val as u64) >> (-shift) as u32) as i64
+                };
+                stack.push(Value::Int(result));
+            },
+            Instruction::Dup => {
+                let a = *stack.last().ok_or_else(underflow)?;
                 stack.push(a);
             },
             Instruction::Exch => {
@@ -390,16 +549,16 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<f64>) -> Result<()> {
                 pop(stack)?;
             },
             Instruction::Copy => {
-                let n = pop(stack)? as usize;
+                let n = pop_count(stack, "copy")?;
                 if n > stack.len() {
                     return Err(underflow());
                 }
                 let start = stack.len() - n;
-                let copied: Vec<f64> = stack[start..].to_vec();
+                let copied: Vec<Value> = stack[start..].to_vec();
                 stack.extend_from_slice(&copied);
             },
             Instruction::Index => {
-                let n = pop(stack)? as usize;
+                let n = pop_count(stack, "index")?;
                 if n >= stack.len() {
                     return Err(underflow());
                 }
@@ -407,28 +566,28 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<f64>) -> Result<()> {
                 stack.push(val);
             },
             Instruction::Roll => {
-                let j = pop(stack)? as i64;
-                let n = pop(stack)? as usize;
+                let j = pop(stack)?.as_int()?;
+                let n = pop_count(stack, "roll")?;
                 if n > stack.len() {
                     return Err(underflow());
                 }
                 if n > 0 {
                     let start = stack.len() - n;
                     let slice = &mut stack[start..];
-                    let len = slice.len();
-                    let shift = ((j % len as i64) + len as i64) as usize % len;
+                    let len = slice.len() as i64;
+                    let shift = j.rem_euclid(len) as usize;
                     slice.rotate_right(shift);
                 }
             },
             Instruction::If(body) => {
-                let cond = pop(stack)?;
-                if as_bool(cond) {
+                let cond = pop(stack)?.as_bool()?;
+                if cond {
                     execute(body, stack)?;
                 }
             },
             Instruction::IfElse(true_branch, false_branch) => {
-                let cond = pop(stack)?;
-                if as_bool(cond) {
+                let cond = pop(stack)?.as_bool()?;
+                if cond {
                     execute(true_branch, stack)?;
                 } else {
                     execute(false_branch, stack)?;
@@ -439,41 +598,106 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<f64>) -> Result<()> {
     Ok(())
 }
 
-fn pop(stack: &mut Vec<f64>) -> Result<f64> {
+fn pop(stack: &mut Vec<Value>) -> Result<Value> {
     stack.pop().ok_or_else(underflow)
+}
+
+/// Pop a non-negative count for `copy`/`index`/`roll`. PLRM rejects negative
+/// or non-integer counts with `rangecheck`/`typecheck`; `as usize` on negative
+/// or NaN floats would silently wrap.
+fn pop_count(stack: &mut Vec<Value>, op: &str) -> Result<usize> {
+    let v = pop(stack)?.as_int()?;
+    if v < 0 {
+        return Err(Error::InvalidPdf(format!("Type 4 {op}: negative count {v}")));
+    }
+    Ok(v as usize)
 }
 
 fn underflow() -> Error {
     Error::InvalidPdf("Type 4 stack underflow".into())
 }
 
-fn unary_op(stack: &mut Vec<f64>, f: impl FnOnce(f64) -> Result<f64>) -> Result<()> {
-    let a = pop(stack)?;
-    stack.push(f(a)?);
+fn typecheck(msg: &str) -> Error {
+    Error::InvalidPdf(format!("Type 4 typecheck: {msg}"))
+}
+
+fn real_unary(stack: &mut Vec<Value>, f: impl FnOnce(f64) -> Result<f64>) -> Result<()> {
+    let a = pop(stack)?.as_real()?;
+    stack.push(Value::Real(f(a)?));
     Ok(())
 }
 
-fn binary_op(stack: &mut Vec<f64>, f: impl FnOnce(f64, f64) -> Result<f64>) -> Result<()> {
+/// Unary operator that preserves integer-ness if the input was an integer
+/// (e.g. `ceiling`, `floor`, `round`, `truncate` per PLRM §8.2).
+fn real_unary_preserve(stack: &mut Vec<Value>, f: impl FnOnce(f64) -> Result<f64>) -> Result<()> {
+    let v = pop(stack)?;
+    match v {
+        Value::Int(i) => stack.push(Value::Int(i)),
+        Value::Real(r) => stack.push(Value::Real(f(r)?)),
+        Value::Bool(_) => return Err(typecheck("expected number, got boolean")),
+    }
+    Ok(())
+}
+
+/// Arithmetic with PLRM type promotion: integer op integer -> integer (if no
+/// overflow on add/sub/mul; we fall back to real on overflow), otherwise real.
+fn numeric_binary(stack: &mut Vec<Value>, f: impl FnOnce(f64, f64) -> Result<f64>) -> Result<()> {
     let b = pop(stack)?;
     let a = pop(stack)?;
-    stack.push(f(a, b)?);
+    let af = a.as_real()?;
+    let bf = b.as_real()?;
+    let result = f(af, bf)?;
+    // Promote back to Int when both operands were integers and the result is
+    // exactly representable. This keeps `52 not` working when authors wrap
+    // bitwise ops around arithmetic chains.
+    if matches!(a, Value::Int(_))
+        && matches!(b, Value::Int(_))
+        && result.is_finite()
+        && result.fract() == 0.0
+        && result >= i64::MIN as f64
+        && result <= i64::MAX as f64
+    {
+        stack.push(Value::Int(result as i64));
+    } else {
+        stack.push(Value::Real(result));
+    }
     Ok(())
 }
 
-fn bool_val(b: bool) -> f64 {
-    if b {
-        1.0
-    } else {
-        0.0
+fn comparison(stack: &mut Vec<Value>, pred: impl FnOnce(std::cmp::Ordering) -> bool) -> Result<()> {
+    let b = pop(stack)?.as_real()?;
+    let a = pop(stack)?.as_real()?;
+    let ord = a
+        .partial_cmp(&b)
+        .ok_or_else(|| Error::InvalidPdf("Type 4 comparison with NaN".into()))?;
+    stack.push(Value::Bool(pred(ord)));
+    Ok(())
+}
+
+fn values_equal(a: Value, b: Value) -> bool {
+    match (a, b) {
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Bool(_), _) | (_, Value::Bool(_)) => false,
+        // PLRM treats `1` and `1.0` as equal, so compare numerically.
+        _ => a.as_real().ok() == b.as_real().ok(),
     }
 }
 
-fn as_bool(v: f64) -> bool {
-    v != 0.0
-}
-
-fn is_bool(v: f64) -> bool {
-    v == 0.0 || v == 1.0
+/// `and`/`or`/`xor`: PLRM §8.2 dispatches on operand type — both boolean uses
+/// logical op, both integer uses bitwise. Mixed types are a typecheck error.
+fn bool_or_bitwise(
+    stack: &mut Vec<Value>,
+    boolean: impl FnOnce(bool, bool) -> bool,
+    bitwise: impl FnOnce(i64, i64) -> i64,
+) -> Result<()> {
+    let b = pop(stack)?;
+    let a = pop(stack)?;
+    match (a, b) {
+        (Value::Bool(x), Value::Bool(y)) => stack.push(Value::Bool(boolean(x, y))),
+        (Value::Int(x), Value::Int(y)) => stack.push(Value::Int(bitwise(x, y))),
+        _ => return Err(typecheck("and/or/xor require matching boolean or integer operands")),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -591,19 +815,20 @@ mod tests {
 
     #[test]
     fn boolean_operators() {
-        assert_eq!(evaluate_type4(b"{ and }", &[1.0, 0.0]).unwrap(), vec![0.0]);
-        assert_eq!(evaluate_type4(b"{ or }", &[1.0, 0.0]).unwrap(), vec![1.0]);
-        assert_eq!(evaluate_type4(b"{ xor }", &[1.0, 1.0]).unwrap(), vec![0.0]);
-        assert_eq!(evaluate_type4(b"{ not }", &[1.0]).unwrap(), vec![0.0]);
-        assert_eq!(evaluate_type4(b"{ not }", &[0.0]).unwrap(), vec![1.0]);
+        // True/false literals exercise the boolean dispatch in and/or/xor/not.
+        assert_eq!(evaluate_type4(b"{ true false and }", &[]).unwrap(), vec![0.0]);
+        assert_eq!(evaluate_type4(b"{ true false or }", &[]).unwrap(), vec![1.0]);
+        assert_eq!(evaluate_type4(b"{ true true xor }", &[]).unwrap(), vec![0.0]);
+        assert_eq!(evaluate_type4(b"{ true not }", &[]).unwrap(), vec![0.0]);
+        assert_eq!(evaluate_type4(b"{ false not }", &[]).unwrap(), vec![1.0]);
     }
 
     #[test]
     fn bitwise_operators() {
-        assert_eq!(evaluate_type4(b"{ and }", &[12.0, 10.0]).unwrap(), vec![8.0]);
-        assert_eq!(evaluate_type4(b"{ or }", &[12.0, 10.0]).unwrap(), vec![14.0]);
-        assert_eq!(evaluate_type4(b"{ bitshift }", &[8.0, 2.0]).unwrap(), vec![32.0]);
-        assert_eq!(evaluate_type4(b"{ bitshift }", &[32.0, -2.0]).unwrap(), vec![8.0]);
+        assert_eq!(evaluate_type4(b"{ 12 10 and }", &[]).unwrap(), vec![8.0]);
+        assert_eq!(evaluate_type4(b"{ 12 10 or }", &[]).unwrap(), vec![14.0]);
+        assert_eq!(evaluate_type4(b"{ 8 2 bitshift }", &[]).unwrap(), vec![32.0]);
+        assert_eq!(evaluate_type4(b"{ 32 -2 bitshift }", &[]).unwrap(), vec![8.0]);
     }
 
     #[test]
@@ -667,5 +892,117 @@ mod tests {
     fn negative_number_literal() {
         let result = evaluate_type4(b"{ -3.5 add }", &[10.0]).unwrap();
         assert!(approx_eq(&result, &[6.5], 1e-9), "got {result:?}");
+    }
+
+    // --- Regression tests for PLRM §8.2 corner cases ---
+
+    #[test]
+    fn plrm_examples() {
+        // (program_bytes, inputs, expected_outputs, description)
+        let cases: &[(&[u8], &[f64], &[f64], &str)] = &[
+            (b"{ atan }", &[-100.0, 0.0], &[270.0], "atan negative-num zero-den"),
+            (b"{ atan }", &[-1.0, -1.0], &[225.0], "atan third quadrant"),
+            (b"{ atan }", &[0.0, 1.0], &[0.0], "atan first axis"),
+            (b"{ atan }", &[1.0, 1.0], &[45.0], "atan first quadrant"),
+            (b"{ atan }", &[0.0, -1.0], &[180.0], "atan negative-x axis"),
+            (b"{ round }", &[-6.5], &[-6.0], "round negative half toward +inf"),
+            (b"{ round }", &[6.5], &[7.0], "round positive half toward +inf"),
+            (b"{ round }", &[-0.5], &[0.0], "round -0.5"),
+            (b"{ round }", &[0.5], &[1.0], "round 0.5"),
+            (b"{ idiv }", &[-7.0, 2.0], &[-3.0], "idiv negative"),
+            (b"{ mod }", &[-7.0, 2.0], &[-1.0], "mod negative dividend"),
+            (b"{ truncate }", &[-6.5], &[-6.0], "truncate negative"),
+        ];
+        for (prog, inp, want, desc) in cases {
+            let got = evaluate_type4(prog, inp).unwrap_or_else(|e| panic!("{desc}: {e}"));
+            assert!(approx_eq(&got, want, 1e-9), "case: {desc}\n  got:  {got:?}\n  want: {want:?}");
+        }
+    }
+
+    #[test]
+    fn not_distinguishes_bool_from_int() {
+        // PLRM §8.2: `true not -> false` (logical), `52 not -> -53` (bitwise),
+        // `1 not -> -2` (bitwise on the integer literal 1, NOT boolean true).
+        assert_eq!(evaluate_type4(b"{ true not }", &[]).unwrap(), vec![0.0]);
+        assert_eq!(evaluate_type4(b"{ false not }", &[]).unwrap(), vec![1.0]);
+        assert_eq!(evaluate_type4(b"{ 52 not }", &[]).unwrap(), vec![-53.0]);
+        assert_eq!(evaluate_type4(b"{ 1 not }", &[]).unwrap(), vec![-2.0]);
+        assert_eq!(evaluate_type4(b"{ 0 not }", &[]).unwrap(), vec![-1.0]);
+    }
+
+    #[test]
+    fn and_or_xor_dispatch_on_type() {
+        // Both-boolean -> logical
+        assert_eq!(evaluate_type4(b"{ true true and }", &[]).unwrap(), vec![1.0]);
+        // Both-integer -> bitwise
+        assert_eq!(evaluate_type4(b"{ 12 10 and }", &[]).unwrap(), vec![8.0]);
+        // Mixed -> typecheck error
+        assert!(evaluate_type4(b"{ true 1 and }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 1 true or }", &[]).is_err());
+    }
+
+    #[test]
+    fn errors_not_panics() {
+        // sqrt of negative, ln/log of non-positive -> error, not NaN/-inf.
+        assert!(evaluate_type4(b"{ sqrt }", &[-1.0]).is_err());
+        assert!(evaluate_type4(b"{ ln }", &[0.0]).is_err());
+        assert!(evaluate_type4(b"{ ln }", &[-1.0]).is_err());
+        assert!(evaluate_type4(b"{ log }", &[0.0]).is_err());
+        assert!(evaluate_type4(b"{ log }", &[-1.0]).is_err());
+
+        // Malformed Domain (min > max) used to panic in f64::clamp.
+        let r = evaluate_type4_clamped(b"{ }", &[0.5], &[[1.0, 0.0]], &[]).unwrap();
+        // Bounds are swapped, so 0.5 stays in [0, 1].
+        assert_eq!(r, vec![0.5]);
+
+        // NaN bounds must not panic — treat as no clamp.
+        let r =
+            evaluate_type4_clamped(b"{ }", &[0.5], &[[f64::NAN, 1.0]], &[[0.0, f64::NAN]]).unwrap();
+        assert_eq!(r, vec![0.5]);
+
+        // bitshift by >= 64 must not shift-overflow.
+        assert_eq!(evaluate_type4(b"{ 1 64 bitshift }", &[]).unwrap(), vec![0.0]);
+        assert_eq!(evaluate_type4(b"{ 1 100 bitshift }", &[]).unwrap(), vec![0.0]);
+        assert_eq!(evaluate_type4(b"{ 1 -64 bitshift }", &[]).unwrap(), vec![0.0]);
+
+        // idiv overflow path: i64::MIN / -1
+        let prog = format!("{{ {} -1 idiv }}", i64::MIN);
+        assert!(evaluate_type4(prog.as_bytes(), &[]).is_err());
+
+        // Non-finite numeric literals must be rejected at parse time.
+        assert!(evaluate_type4(b"{ inf }", &[]).is_err());
+        assert!(evaluate_type4(b"{ NaN }", &[]).is_err());
+
+        // idiv/mod on non-integral reals -> typecheck.
+        assert!(evaluate_type4(b"{ 7.5 2 idiv }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 7 2.5 mod }", &[]).is_err());
+
+        // Negative count for copy/index/roll -> error, not garbage.
+        assert!(evaluate_type4(b"{ -1 copy }", &[1.0]).is_err());
+        assert!(evaluate_type4(b"{ -1 index }", &[1.0]).is_err());
+        assert!(evaluate_type4(b"{ -1 1 roll }", &[1.0, 2.0]).is_err());
+
+        // atan undefined at (0, 0).
+        assert!(evaluate_type4(b"{ atan }", &[0.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn atan_full_range() {
+        // PLRM §8.2: atan returns angle in [0, 360).
+        for &(num, den, want) in &[
+            (0.0, 1.0, 0.0),
+            (1.0, 1.0, 45.0),
+            (1.0, 0.0, 90.0),
+            (1.0, -1.0, 135.0),
+            (0.0, -1.0, 180.0),
+            (-1.0, -1.0, 225.0),
+            (-1.0, 0.0, 270.0),
+            (-1.0, 1.0, 315.0),
+            (-100.0, 0.0, 270.0),
+        ] {
+            let got = evaluate_type4(b"{ atan }", &[num, den]).unwrap();
+            assert!((got[0] - want).abs() < 1e-9, "atan({num}, {den}) = {got:?}, want {want}");
+            assert!(got[0] >= 0.0 && got[0] < 360.0, "atan out of [0, 360): {got:?}");
+        }
     }
 }
