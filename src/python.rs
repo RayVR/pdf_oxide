@@ -609,14 +609,16 @@ impl PyPdfDocument {
 
     /// Render all ink separation plates for a page.
     ///
-    /// Each plate is a grayscale image where pixel intensity (0-255) represents
-    /// the tint percentage of one ink at each point. Process inks (Cyan, Magenta,
+    /// Each plate is a grayscale image where pixel intensity (0-255) = ink
+    /// coverage (0 = no ink, 255 = full tint). Process inks (Cyan, Magenta,
     /// Yellow, Black) are included if the page uses DeviceCMYK content; spot
-    /// colors are taken from Separation and DeviceN color spaces.
+    /// colors are taken from Separation and DeviceN color spaces. To display
+    /// a plate as black ink on white paper, invert: ``display = 255 - value``.
     ///
     /// Args:
     ///     page (int): Zero-based page index.
-    ///     dpi (int, optional): Resolution in DPI (default 150).
+    ///     dpi (int, optional): Resolution in DPI (default 150 — the Rust API
+    ///         has no default; Python defaults to 150 for convenience).
     ///
     /// Returns:
     ///     list[SeparationPlate]: One plate per ink. Each has ``ink_name``,
@@ -664,14 +666,16 @@ impl PyPdfDocument {
 
     /// Render a single ink separation plate for a page.
     ///
-    /// Returns a grayscale image where pixel intensity (0-255) = tint
-    /// percentage of the named ink. If the ink is not present on the
-    /// page, the plate is all zeros.
+    /// Returns a grayscale image where pixel intensity (0-255) = ink coverage
+    /// of the named ink (0 = no ink, 255 = full tint). If the ink is not
+    /// present on the page, the plate is all zeros. To display the plate as
+    /// black ink on white paper, invert: ``display = 255 - value``.
     ///
     /// Args:
     ///     page (int): Zero-based page index.
     ///     ink_name (str): Ink name (e.g., "Cyan", "PANTONE 185 C", "Dieline").
-    ///     dpi (int, optional): Resolution in DPI (default 150).
+    ///     dpi (int, optional): Resolution in DPI (default 150 — the Rust API
+    ///         has no default; Python defaults to 150 for convenience).
     ///
     /// Returns:
     ///     SeparationPlate: The plate with ``ink_name``, ``data``, ``width``, ``height``.

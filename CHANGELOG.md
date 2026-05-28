@@ -2,6 +2,17 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [Unreleased]
+
+### Added
+- **Separation plate rendering** — new `render_separations(page, dpi)` and
+  `render_separation(page, ink_name, dpi)` APIs (Rust + Python) that emit
+  one grayscale image per ink. Pixel value equals ink coverage (0 = no ink,
+  255 = full tint). Routes DeviceCMYK, Separation, and DeviceN content
+  per ISO 32000-1 §8.6; handles the reserved colorant names `/All` and
+  `/None` per §8.6.6.4 (registration / crop marks correctly appear on
+  every plate). New `SeparationPlate` namedtuple in Python.
+
 ## [0.3.55] - 2026-05-25
 
 > Ruby + PHP language bindings + multi-line heading reading-order fix

@@ -41,6 +41,15 @@
 //! vector-based prepress artwork (dielines, varnish layers, spot-PMS
 //! text and shapes). PDFs that rely on raster spot-channel data will
 //! produce incomplete plates and should be flagged at the caller.
+//!
+//! # Transparency
+//!
+//! Plate output is opaque: the renderer treats `fill_alpha` / `stroke_alpha`
+//! from ExtGState (`/CA`, `/ca`) and the blend mode (`/BM`) as if both were
+//! `1.0` / `Normal`. This is intentional — a separation plate represents ink
+//! coverage on the press, not transparent compositing. Callers who need the
+//! transparent intent (e.g. a 50%-alpha spot text overlay) should evaluate it
+//! against the underlying content with [`super::page_renderer`] first.
 #![allow(
     clippy::field_reassign_with_default,
     clippy::ptr_arg,
@@ -64,6 +73,11 @@ use super::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState};
 use super::text_rasterizer::TextRasterizer;
 
 /// A rendered separation plate for a single ink.
+///
+/// The pixel convention is **ML/QC-friendly**: `value == ink coverage`.
+/// 0 means no ink on paper at that pixel, 255 means full tint coverage.
+/// To display the plate as black ink on white paper (prepress viewer
+/// convention) invert before showing: `display = 255 - value`.
 #[derive(Debug, Clone)]
 pub struct SeparationPlate {
     /// Ink name (e.g., "Cyan", "PANTONE 185 C", "Dieline").
@@ -517,9 +531,10 @@ fn classify_resolved(
             }
         },
         "ICCBased" => {
-            // ICCBased: try to read /N from the stream dict to pick the
-            // right component-count interpretation. Falls back to the
-            // 4-comp = CMYK heuristic when the stream isn't reachable.
+            // ICCBased: read /N from the stream dict to pick the component-count
+            // interpretation. Unknown / unreachable / unsupported N → Unknown,
+            // since fabricating CMYK plate values from an N=2 or N=5 profile
+            // would silently corrupt output. tint_for_ink skips Unknown spaces.
             if let Some(stream_obj) = arr.get(1) {
                 if let Ok(resolved) = doc.resolve_object(stream_obj) {
                     if let Object::Stream { ref dict, .. } = resolved {
@@ -534,8 +549,7 @@ fn classify_resolved(
                     }
                 }
             }
-            // Unknown component count — caller decides via component vector length.
-            ResolvedSpace::IccCmyk
+            ResolvedSpace::Unknown
         },
         _ => ResolvedSpace::Unknown,
     }

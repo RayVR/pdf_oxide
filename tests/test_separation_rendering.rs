@@ -975,27 +975,74 @@ mod tests {
     #[test]
     #[ignore = "spec gap: overprint (/OP, /op, /OPM) — §11.7 not yet implemented"]
     fn test_overprint_preserves_underlying_ink() {
-        // Paint 50% K rect, then paint a Separation rect on top with OP=true.
-        // Expected: Black plate retains 50% under the spot rect; Spot plate
-        // shows the spot ink. Current behavior: spot rect knocks out K.
-        let content = b"0 0 0 0.5 k 20 20 60 60 re f \
-                        /GS1 gs /CS1 cs 1.0 scn 30 30 40 40 re f";
-        let _pdf = build_pdf_with_extgstate_overprint(content);
-        unimplemented!("foundation test — overprint not yet supported");
-    }
+        // K rect 50% under, Separation rect on top with OP=true via /GS1.
+        // Spec: spot paint with overprint preserves underlying K plate.
+        // Current: spot paint knocks out K (last-writer-wins per pixel).
+        let content = "0 0 0 0.5 k\n20 20 60 60 re f\n\
+                       /GS1 gs /CS1 cs 1.0 scn\n30 30 40 40 re f\n";
+        let content_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /ColorSpace << /CS1 5 0 R >> /ExtGState << /GS1 7 0 R >> >> >>"
+                .into(),
+            content_obj,
+            "[/Separation /SpotInk /DeviceGray 6 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>".into(),
+            "<< /Type /ExtGState /OP true /op true /OPM 1 >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let plates = render_separations(&doc, 0, 144).unwrap();
 
-    fn build_pdf_with_extgstate_overprint(_content: &[u8]) -> Vec<u8> {
-        Vec::new()
+        // Sample center of the overlap region (where the spot rect sits on top of K).
+        let black = plates.iter().find(|p| p.ink_name == "Black").unwrap();
+        let bw = black.width as usize;
+        let center = black.data[(50 * bw) + 50];
+        assert!(
+            center >= 100 && center <= 140,
+            "Black plate at overlap should retain ~50% tint under overprinted spot, got {}",
+            center
+        );
+
+        let spot = plates.iter().find(|p| p.ink_name == "SpotInk").unwrap();
+        let sw = spot.width as usize;
+        assert!(spot.data[(50 * sw) + 50] > 200, "SpotInk plate should show the overprinted ink");
     }
 
     /// §9.3.6 — Text rendering mode 3 = "neither fill nor stroke (invisible)".
-    /// Should advance the text matrix but contribute no pixels to any plate.
+    /// Advances the text matrix but contributes no pixels to any plate.
     /// Common in tagged/searchable PDFs where invisible text underlies an
-    /// image of scanned content.
+    /// image of scanned content. Regression test for already-working behavior.
     #[test]
-    #[ignore = "spec gap: render mode 3 (invisible text) may leak onto plates"]
     fn test_render_mode_3_invisible_text_no_plate_pixels() {
-        unimplemented!("foundation test — render mode 3 not yet verified");
+        // Tr 3 = invisible: glyphs advance the text matrix but contribute
+        // no pixels. A separation plate must show zero ink for a Tr 3 run
+        // even when the active fill is a Separation at full tint.
+        let content = "/CS1 cs 1.0 scn\n\
+                       BT /F1 24 Tf 3 Tr 20 50 Td (HIDDEN) Tj ET\n";
+        let content_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R \
+              /Resources << /ColorSpace << /CS1 5 0 R >> \
+                           /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>"
+                .into(),
+            content_obj,
+            "[/Separation /Watermark /DeviceGray 6 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let watermark = render_separation(&doc, 0, "Watermark", 144).unwrap();
+        let inked = watermark.data.iter().filter(|&&v| v > 50).count();
+        assert_eq!(
+            inked, 0,
+            "Tr 3 (invisible) text must not contribute pixels to the Watermark plate, got {} inked",
+            inked
+        );
     }
 
     /// §9.3.6 — Text rendering modes 1, 2, 5, 6 stroke the glyphs. Stroke
@@ -1004,23 +1051,99 @@ mod tests {
     #[test]
     #[ignore = "spec gap: stroke-mode text routes to fill color, not stroke"]
     fn test_stroke_mode_text_uses_stroke_color() {
-        unimplemented!("foundation test — stroke-mode text color routing");
+        // Tr 1 (stroke text) uses the STROKE color space + components. Fill
+        // is /CS1 (FillInk), stroke is /CS2 (StrokeInk). Glyph outlines must
+        // appear on StrokeInk's plate, not FillInk's.
+        let content = "/CS1 cs 1.0 scn\n/CS2 CS 1.0 SCN\n\
+                       BT /F1 24 Tf 1 Tr 20 50 Td (X) Tj ET\n";
+        let content_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /ColorSpace << /CS1 5 0 R /CS2 6 0 R >> \
+                           /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>"
+                .into(),
+            content_obj,
+            "[/Separation /FillInk /DeviceGray 7 0 R]".into(),
+            "[/Separation /StrokeInk /DeviceGray 7 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let stroke_plate = render_separation(&doc, 0, "StrokeInk", 144).unwrap();
+        let stroke_inked = stroke_plate.data.iter().filter(|&&v| v > 50).count();
+        assert!(
+            stroke_inked > 100,
+            "StrokeInk plate should receive the Tr 1 stroked glyph, got {} inked",
+            stroke_inked
+        );
+        let fill_plate = render_separation(&doc, 0, "FillInk", 144).unwrap();
+        let fill_inked = fill_plate.data.iter().filter(|&&v| v > 50).count();
+        assert_eq!(
+            fill_inked, 0,
+            "FillInk plate should NOT receive Tr 1 text, got {} inked",
+            fill_inked
+        );
     }
 
-    /// §8.6.5.6 — DefaultRGB remap. References to DeviceRGB should resolve
-    /// through /Resources/ColorSpace/DefaultRGB when present. Currently only
-    /// DefaultCMYK is honored.
+    /// §8.6.5.6 — DefaultRGB remap. References to DeviceRGB resolve through
+    /// /Resources/ColorSpace/DefaultRGB when present.
     #[test]
-    #[ignore = "spec gap: §8.6.5.6 /DefaultRGB and /DefaultGray remap"]
     fn test_default_rgb_remap() {
-        unimplemented!("foundation test — DefaultRGB resolution");
+        // /Resources/ColorSpace/DefaultRGB -> Separation /SpotInk. A page that
+        // paints with `rg` should route content to SpotInk's plate, not
+        // be skipped as a display color.
+        let content = "1.0 0.0 0.0 rg\n25 25 50 50 re f\n";
+        let content_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /ColorSpace << /DefaultRGB 5 0 R >> >> >>"
+                .into(),
+            content_obj,
+            "[/DeviceN [/SpotR /SpotG /SpotB] /DeviceRGB 6 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 3 /C0 [0 0 0] /C1 [1 0 0] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let plate = render_separation(&doc, 0, "SpotR", 144).unwrap();
+        let center = plate.data
+            [(plate.height as usize / 2) * plate.width as usize + (plate.width as usize / 2)];
+        assert!(
+            center > 200,
+            "DefaultRGB should remap `rg` -> Separation; SpotR plate center got {}",
+            center
+        );
     }
 
-    /// §8.6.5.6 — DefaultGray remap (same as above).
+    /// §8.6.5.6 — DefaultGray remap. References to DeviceGray resolve through
+    /// /Resources/ColorSpace/DefaultGray when present.
     #[test]
-    #[ignore = "spec gap: §8.6.5.6 /DefaultGray remap"]
     fn test_default_gray_remap() {
-        unimplemented!("foundation test — DefaultGray resolution");
+        let content = "0.5 g\n25 25 50 50 re f\n";
+        let content_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /ColorSpace << /DefaultGray 5 0 R >> >> >>"
+                .into(),
+            content_obj,
+            "[/Separation /GraySpot /DeviceGray 6 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let plate = render_separation(&doc, 0, "GraySpot", 144).unwrap();
+        let center = plate.data
+            [(plate.height as usize / 2) * plate.width as usize + (plate.width as usize / 2)];
+        assert!(
+            center > 100 && center < 160,
+            "DefaultGray should remap `g 0.5` -> Separation; GraySpot center got {}",
+            center
+        );
     }
 
     /// §8.10.1 — Form XObject inherits the COMPLETE graphics state at the
@@ -1030,7 +1153,46 @@ mod tests {
     #[test]
     #[ignore = "spec gap: Form XObject inherits only color, not full GS (line width, etc.)"]
     fn test_form_xobject_inherits_line_width() {
-        unimplemented!("foundation test — Form XObject non-color GS inheritance");
+        // Caller sets line width to 10pt and a Separation color, then invokes
+        // a Form XObject that strokes a line WITHOUT setting line width.
+        // Per §8.10.1, the form should inherit width=10. Currently inherits
+        // only color, so the stroke renders at default 1pt (much thinner).
+        let form_content = "50 30 m 50 70 l S\n";
+        let form_obj = format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length {} >>\n\
+             stream\n{}\nendstream",
+            form_content.len(),
+            form_content
+        );
+        let page_content = "/CS1 cs 1.0 scn /CS1 CS 1.0 SCN 10 w\n/Fm1 Do\n";
+        let page_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", page_content.len(), page_content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /XObject << /Fm1 5 0 R >> \
+                           /ColorSpace << /CS1 6 0 R >> >> >>"
+                .into(),
+            page_obj,
+            form_obj,
+            "[/Separation /InheritInk /DeviceGray 7 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let plate = render_separation(&doc, 0, "InheritInk", 144).unwrap();
+        // Count inked pixels in a horizontal slice through the stroke.
+        let row = plate.height as usize / 2;
+        let start = row * plate.width as usize;
+        let stroke_width: usize = (start..start + plate.width as usize)
+            .filter(|&i| plate.data[i] > 50)
+            .count();
+        // 10pt stroke at 144 DPI = 20 px wide. 1pt default would be 2 px.
+        assert!(
+            stroke_width >= 15,
+            "Stroke should inherit 10pt line width (≈20 px at 144 DPI); got {} inked px",
+            stroke_width
+        );
     }
 
     /// §8.6.6.5 — DeviceN can declare /Subtype /NChannel with /Process and
@@ -1040,7 +1202,45 @@ mod tests {
     #[test]
     #[ignore = "spec gap: §8.6.6.5 NChannel /Process and /Colorants routing"]
     fn test_nchannel_process_attributes() {
-        unimplemented!("foundation test — NChannel sub-type per-process routing");
+        // NChannel DeviceN with /Subtype /NChannel and /Process declaring a
+        // per-process-component contribution into CMYK. Painting with the
+        // NChannel space should ALSO add tint to the named process plates.
+        // Currently the renderer routes only to the named components.
+        let content = "/CS1 cs 1.0 scn\n25 25 50 50 re f\n";
+        let content_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /ColorSpace << /CS1 5 0 R >> >> >>"
+                .into(),
+            content_obj,
+            // NChannel with /Process pointing to DeviceCMYK with a tint
+            // transform that pushes 50% Cyan when the spot is at full tint.
+            "[/DeviceN [/SpotNC] /DeviceCMYK 6 0 R \
+              << /Subtype /NChannel \
+                 /Process << /ColorSpace /DeviceCMYK /Components [/Cyan] >> >>]"
+                .into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 4 /C0 [0 0 0 0] /C1 [0.5 0 0 0] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        // Spot plate should receive the named ink.
+        let spot = render_separation(&doc, 0, "SpotNC", 144).unwrap();
+        let sw = spot.width as usize;
+        assert!(
+            spot.data[(spot.height as usize / 2) * sw + sw / 2] > 200,
+            "SpotNC plate should receive tint"
+        );
+        // Cyan plate should ALSO have content per the /Process declaration.
+        let cyan = render_separation(&doc, 0, "Cyan", 144).unwrap();
+        let cw = cyan.width as usize;
+        let cyan_center = cyan.data[(cyan.height as usize / 2) * cw + cw / 2];
+        assert!(
+            cyan_center > 100,
+            "NChannel /Process should route additional tint to Cyan, got {}",
+            cyan_center
+        );
     }
 
     /// §8.6.6 — Negative and >1.0 tint values. Spec permits them; some
@@ -1049,7 +1249,35 @@ mod tests {
     #[test]
     #[ignore = "spec gap: §8.6.6 tint values outside [0,1] silently clamped"]
     fn test_out_of_range_tint_values_documented() {
-        unimplemented!("foundation test — tint clamp behavior documentation");
+        // PDF allows tint values outside [0,1] (e.g. for "150% ink" effects).
+        // Current renderer clamps to [0,1] silently. The right behavior is
+        // either to (a) clamp and emit a diagnostic, or (b) preserve the
+        // out-of-range data via a wider pixel format. This test pins the
+        // expectation: 1.5 tint produces > 1.0 ink coverage — currently
+        // capped at 255, indistinguishable from 1.0.
+        let content = "/CS1 cs 1.5 scn\n25 25 50 50 re f\n";
+        let content_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /ColorSpace << /CS1 5 0 R >> >> >>"
+                .into(),
+            content_obj,
+            "[/Separation /OverInk /DeviceGray 6 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let plate = render_separation(&doc, 0, "OverInk", 144).unwrap();
+        let center = plate.data
+            [(plate.height as usize / 2) * plate.width as usize + (plate.width as usize / 2)];
+        // Future behavior: the diagnostic / wider-format should make
+        // out-of-range detectable. For now this is documented as a gap.
+        assert_ne!(
+            center, 255,
+            "tint value 1.5 should be detectable as out-of-range (currently clamped to 255)"
+        );
     }
 
     /// §12.5.4 — Annotations rendered via /AP appearance streams may contain
@@ -1059,7 +1287,38 @@ mod tests {
     #[test]
     #[ignore = "spec gap: §12.5.4 annotations not rendered to plates"]
     fn test_annotation_appearance_streams_contribute_to_plates() {
-        unimplemented!("foundation test — annotation appearance stream rendering");
+        // A stamp annotation with a /N (normal) appearance stream that paints
+        // a Separation rect. The composite renderer paints annotations; the
+        // separation renderer currently skips them, so spot-colored stamps
+        // are dropped from plates.
+        let appearance = "/CS1 cs 1.0 scn\n0 0 50 50 re f\n";
+        let appearance_obj = format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 50 50] \
+              /Resources << /ColorSpace << /CS1 7 0 R >> >> /Length {} >>\n\
+             stream\n{}\nendstream",
+            appearance.len(),
+            appearance
+        );
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Annots [5 0 R] >>"
+                .into(),
+            "<< /Length 0 >>\nstream\n\nendstream".into(),
+            "<< /Type /Annot /Subtype /Stamp /Rect [25 25 75 75] /AP << /N 6 0 R >> >>".into(),
+            appearance_obj,
+            "[/Separation /StampInk /DeviceGray 8 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let plate = render_separation(&doc, 0, "StampInk", 144).unwrap();
+        let inked = plate.data.iter().filter(|&&v| v > 50).count();
+        assert!(
+            inked > 1000,
+            "StampInk plate should receive annotation appearance content, got {} inked",
+            inked
+        );
     }
 
     /// §8.7 — Tiling and shading patterns. Patterns can use Separation/DeviceN
@@ -1068,7 +1327,41 @@ mod tests {
     #[test]
     #[ignore = "spec gap: §8.7 Pattern color spaces and `sh` operator not supported"]
     fn test_pattern_color_space() {
-        unimplemented!("foundation test — Pattern color space support");
+        // Tiling pattern in a Separation ink. Spec says the pattern's
+        // contents are painted (tiled) to cover the filled area; that
+        // tiled content should contribute to the Separation plate.
+        let pattern = "/CS1 cs 1.0 scn\n0 0 10 10 re f\n";
+        let pattern_obj = format!(
+            "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+              /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+              /Resources << /ColorSpace << /CS1 7 0 R >> >> /Length {} >>\n\
+             stream\n{}\nendstream",
+            pattern.len(),
+            pattern
+        );
+        let page_content = "/Pattern cs /P1 scn\n25 25 50 50 re f\n";
+        let page_obj =
+            format!("<< /Length {} >>\nstream\n{}\nendstream", page_content.len(), page_content);
+        let pdf = assemble_pdf(vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /Pattern << /P1 5 0 R >> /ColorSpace << /CS1 7 0 R >> >> >>"
+                .into(),
+            page_obj,
+            pattern_obj,
+            "<< >>".into(), // Filler obj 6
+            "[/Separation /PatternInk /DeviceGray 8 0 R]".into(),
+            "<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>".into(),
+        ]);
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let plate = render_separation(&doc, 0, "PatternInk", 144).unwrap();
+        let inked = plate.data.iter().filter(|&&v| v > 50).count();
+        assert!(
+            inked > 1000,
+            "Pattern fill in Separation ink should populate the plate, got {} inked",
+            inked
+        );
     }
 
     /// §8.9 — Inline images (BI/ID/EI) can carry DeviceN samples. Currently
@@ -1076,6 +1369,57 @@ mod tests {
     #[test]
     #[ignore = "spec gap: §8.9 inline images dropped"]
     fn test_inline_image_devicen() {
-        unimplemented!("foundation test — inline image with DeviceN data");
+        // Inline image with single-component DeviceN-encoded data.
+        // Currently the operator walker drops BI/ID/EI entirely.
+        // Real DeviceN inline images carry one sample per ink-name per pixel.
+        let mut content: Vec<u8> = Vec::new();
+        content.extend_from_slice(b"/CS1 cs\nBI /W 10 /H 10 /BPC 8 /CS /DeviceGray ID\n");
+        content.extend(std::iter::repeat(0xFFu8).take(100));
+        content.extend_from_slice(b"\nEI\n");
+
+        // Assemble PDF bytes directly to keep the binary inline image intact.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets.push(buf.len());
+        buf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+              /Resources << /ColorSpace << /CS1 5 0 R >> >> >>\nendobj\n",
+        );
+        offsets.push(buf.len());
+        let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+        buf.extend_from_slice(stream_hdr.as_bytes());
+        buf.extend_from_slice(&content);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"5 0 obj\n[/Separation /InlineInk /DeviceGray 6 0 R]\nendobj\n");
+        offsets.push(buf.len());
+        buf.extend_from_slice(
+            b"6 0 obj\n<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >>\nendobj\n",
+        );
+
+        let xref = buf.len();
+        let n = offsets.len() + 1;
+        buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", n).as_bytes());
+        for off in &offsets {
+            buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", n, xref)
+                .as_bytes(),
+        );
+
+        let doc = PdfDocument::from_bytes(buf).unwrap();
+        let plate = render_separation(&doc, 0, "InlineInk", 144).unwrap();
+        let inked = plate.data.iter().filter(|&&v| v > 50).count();
+        assert!(
+            inked > 0,
+            "Inline image in Separation should contribute to plate, got {} inked",
+            inked
+        );
     }
 }

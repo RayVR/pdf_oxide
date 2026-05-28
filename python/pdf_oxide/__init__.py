@@ -117,6 +117,11 @@ class SeparationPlate(NamedTuple):
     each point. Used in prepress workflows, ink coverage analysis, and ML
     pipelines that process packaging/label PDFs.
 
+    The pixel convention is ML/QC-friendly: ``value == ink coverage``.
+    0 means no ink, 255 means full tint coverage. To display the plate as
+    black ink on white paper (prepress viewer convention), invert before
+    showing: ``display = 255 - value``.
+
     Attributes:
         ink_name (str): Ink name (e.g., "Cyan", "PANTONE 185 C", "Dieline").
         data (bytes): Grayscale pixels, row-major, top-left origin.
