@@ -9102,8 +9102,12 @@ impl PdfDocument {
                         match cs_type.as_str() {
                             "Separation" => {
                                 // [/Separation /InkName /AlternateCS /TintTransform]
+                                // §8.6.6.4: /All and /None are reserved colorant names
+                                // (paint to all / paint to none) and never name a plate.
                                 if let Some(Object::Name(ink)) = arr.get(1) {
-                                    ink_names.push(ink.clone());
+                                    if ink != "All" && ink != "None" {
+                                        ink_names.push(ink.clone());
+                                    }
                                 }
                             },
                             "DeviceN" => {
@@ -9111,7 +9115,9 @@ impl PdfDocument {
                                 if let Some(Object::Array(inks)) = arr.get(1) {
                                     for ink_obj in inks {
                                         if let Object::Name(ink) = ink_obj {
-                                            ink_names.push(ink.clone());
+                                            if ink != "All" && ink != "None" {
+                                                ink_names.push(ink.clone());
+                                            }
                                         }
                                     }
                                 }

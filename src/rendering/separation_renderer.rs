@@ -287,13 +287,28 @@ fn inks_from_space(
             }
         },
         ResolvedSpace::Separation(name) => {
-            if !out.iter().any(|s| s == &name) {
+            // §8.6.6.4: /All marks every output separation — list CMYK so the
+            // per-plate short-circuit in render_separations doesn't skip them.
+            // /None paints nothing and never names a plate.
+            if name == "All" {
+                for ink in ["Cyan", "Magenta", "Yellow", "Black"] {
+                    if !out.iter().any(|s| s == ink) {
+                        out.push(ink.to_string());
+                    }
+                }
+            } else if name != "None" && !out.iter().any(|s| s == &name) {
                 out.push(name);
             }
         },
         ResolvedSpace::DeviceN(names) => {
             for n in names {
-                if !out.iter().any(|s| s == &n) {
+                if n == "All" {
+                    for ink in ["Cyan", "Magenta", "Yellow", "Black"] {
+                        if !out.iter().any(|s| s == ink) {
+                            out.push(ink.to_string());
+                        }
+                    }
+                } else if n != "None" && !out.iter().any(|s| s == &n) {
                     out.push(n);
                 }
             }
@@ -624,7 +639,11 @@ fn tint_for_ink(
             None
         },
         ResolvedSpace::Separation(ink) => {
-            if ink == target_ink && !components.is_empty() {
+            // §8.6.6.4: /All paints to every output separation; /None paints
+            // nothing. Treat the rest as a regular per-ink match.
+            if ink == "None" || components.is_empty() {
+                None
+            } else if ink == "All" || ink == target_ink {
                 Some(components[0])
             } else {
                 None
@@ -632,7 +651,10 @@ fn tint_for_ink(
         },
         ResolvedSpace::DeviceN(names) => {
             for (i, n) in names.iter().enumerate() {
-                if n == target_ink && i < components.len() {
+                if n == "None" {
+                    continue;
+                }
+                if (n == "All" || n == target_ink) && i < components.len() {
                     return Some(components[i]);
                 }
             }
