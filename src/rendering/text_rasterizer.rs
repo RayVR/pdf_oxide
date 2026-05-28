@@ -595,7 +595,10 @@ impl TextRasterizer {
         gs: &GraphicsState,
         font_cache: &HashMap<String, Arc<crate::fonts::FontInfo>>,
     ) -> f32 {
-        let font_info = gs.font_name.as_ref().and_then(|n| font_cache.get(n).cloned());
+        let font_info = gs
+            .font_name
+            .as_ref()
+            .and_then(|n| font_cache.get(n).cloned());
         measure_text_bytes(text, gs, font_info.as_deref())
     }
 
@@ -607,7 +610,10 @@ impl TextRasterizer {
         gs: &GraphicsState,
         font_cache: &HashMap<String, Arc<crate::fonts::FontInfo>>,
     ) -> f32 {
-        let font_info = gs.font_name.as_ref().and_then(|n| font_cache.get(n).cloned());
+        let font_info = gs
+            .font_name
+            .as_ref()
+            .and_then(|n| font_cache.get(n).cloned());
         let mut total: f32 = 0.0;
         for element in array {
             match element {

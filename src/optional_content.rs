@@ -95,10 +95,12 @@ pub fn ocg_name_is_excluded(name_obj: &Object, excluded: &HashSet<String>) -> bo
 ///
 /// Handles indirect references at every level (the resources dict, the
 /// Properties sub-dict, and the property entry itself can all be `Reference`s).
+/// `doc` may be `None` — in that case only the inline-dict fast path resolves;
+/// the name-reference path requires indirect-object resolution.
 pub fn resolve_bdc_properties(
     properties: &Object,
     resources: Option<&Object>,
-    doc: &PdfDocument,
+    doc: Option<&PdfDocument>,
 ) -> Option<HashMap<String, Object>> {
     if let Some(dict) = properties.as_dict() {
         return Some(dict.clone());
@@ -106,6 +108,7 @@ pub fn resolve_bdc_properties(
 
     let prop_name = properties.as_name()?;
     let resources = resources?;
+    let doc = doc?;
     let res_dict = if let Some(res_ref) = resources.as_reference() {
         doc.load_object(res_ref).ok()?
     } else {
@@ -210,14 +213,27 @@ pub fn check_ocg_excluded(
 pub fn resolve_and_check_ocg_excluded(
     properties: &Object,
     resources: Option<&Object>,
-    doc: &PdfDocument,
+    doc: Option<&PdfDocument>,
     excluded: &HashSet<String>,
 ) -> bool {
     let props_dict = match resolve_bdc_properties(properties, resources, doc) {
         Some(d) => d,
         None => return false,
     };
-    check_ocg_excluded(&props_dict, doc, excluded)
+    // OCMD evaluation needs the document to resolve referenced OCG /Name fields,
+    // but the inline-OCG case (Name in the props dict) does not. If we have no
+    // doc, only the OCG-Name short-circuit inside check_ocg_excluded can fire.
+    match doc {
+        Some(d) => check_ocg_excluded(&props_dict, d, excluded),
+        None => {
+            // Without a doc, only direct OCG checks (Name in props dict) are
+            // possible — the OCMD path needs to resolve /OCGs refs.
+            if let Some(ocg_name) = props_dict.get("Name") {
+                return ocg_name_is_excluded(ocg_name, excluded);
+            }
+            false
+        },
+    }
 }
 
 /// Resolve an annotation `/OC` entry (an OCG or OCMD dict, possibly indirect)
@@ -260,11 +276,7 @@ pub fn annotation_is_excluded(
 ///  - `AllOn`  — visible iff all referenced OCGs are on → hide iff any is off.
 ///  - `AnyOff` — visible iff any referenced OCG is off → hide iff all are on.
 ///  - `AllOff` — visible iff all referenced OCGs are off → hide iff any is on.
-fn ocmd_is_hidden(
-    ocg_names: &[Object],
-    policy: OcmdPolicy,
-    excluded: &HashSet<String>,
-) -> bool {
+fn ocmd_is_hidden(ocg_names: &[Object], policy: OcmdPolicy, excluded: &HashSet<String>) -> bool {
     if ocg_names.is_empty() {
         return false;
     }
@@ -286,10 +298,10 @@ fn ocmd_is_hidden(
     }
 
     match policy {
-        OcmdPolicy::AnyOn => !any_on,    // hide when none are on
-        OcmdPolicy::AllOn => !all_on,    // hide when any is off
-        OcmdPolicy::AnyOff => !any_off,  // hide when none are off
-        OcmdPolicy::AllOff => !all_off,  // hide when any is on
+        OcmdPolicy::AnyOn => !any_on,   // hide when none are on
+        OcmdPolicy::AllOn => !all_on,   // hide when any is off
+        OcmdPolicy::AnyOff => !any_off, // hide when none are off
+        OcmdPolicy::AllOff => !all_off, // hide when any is on
     }
 }
 
@@ -326,14 +338,8 @@ mod tests {
     fn ocg_name_is_excluded_matches_name_token() {
         let mut excluded = HashSet::new();
         excluded.insert("Watermark".to_string());
-        assert!(ocg_name_is_excluded(
-            &Object::Name("Watermark".into()),
-            &excluded
-        ));
-        assert!(!ocg_name_is_excluded(
-            &Object::Name("Other".into()),
-            &excluded
-        ));
+        assert!(ocg_name_is_excluded(&Object::Name("Watermark".into()), &excluded));
+        assert!(!ocg_name_is_excluded(&Object::Name("Other".into()), &excluded));
     }
 
     #[test]

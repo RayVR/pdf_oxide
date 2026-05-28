@@ -1284,7 +1284,8 @@ impl PageRenderer {
                                 &self.fonts,
                             )?
                         } else {
-                            self.text_rasterizer.measure_tj_array(array, gs, &self.fonts)
+                            self.text_rasterizer
+                                .measure_tj_array(array, gs, &self.fonts)
                         };
 
                         let gs_mut = gs_stack.current_mut();
@@ -1474,7 +1475,7 @@ impl PageRenderer {
                         is_excluded = crate::optional_content::resolve_and_check_ocg_excluded(
                             properties,
                             Some(resources),
-                            doc,
+                            Some(doc),
                             excluded_layers,
                         );
                     }
@@ -2347,19 +2348,15 @@ impl PageRenderer {
     ) -> Result<()> {
         let annotations = doc.get_annotations(page_num)?;
         // Reuse the per-render snapshot so we don't deep-clone the HashSet here.
-        let excluded_snapshot: Option<Arc<HashSet<String>>> =
-            self.excluded_layers_snapshot.clone();
+        let excluded_snapshot: Option<Arc<HashSet<String>>> = self.excluded_layers_snapshot.clone();
         for annot in annotations {
             // Per ISO 32000-1 §12.5.2, an annotation dict may carry an /OC
             // entry referencing the OCG/OCMD the annotation belongs to. Skip
             // the annotation entirely if its layer is excluded.
             if let Some(ref excluded_layers) = excluded_snapshot {
                 if let Some(oc_obj) = annot.raw_dict.as_ref().and_then(|d| d.get("OC")) {
-                    if crate::optional_content::annotation_is_excluded(
-                        oc_obj,
-                        doc,
-                        excluded_layers,
-                    ) {
+                    if crate::optional_content::annotation_is_excluded(oc_obj, doc, excluded_layers)
+                    {
                         continue;
                     }
                 }

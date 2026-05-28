@@ -2543,12 +2543,18 @@ impl<'doc> TextExtractor<'doc> {
     /// Resolve BDC properties: can be an inline dictionary or a name referencing /Properties resource.
     ///
     /// Thin delegate to [`crate::optional_content::resolve_bdc_properties`].
+    /// Passing `self.document` as `Option` lets the inline-dict fast path work
+    /// even on a freshly-constructed extractor with no document attached (used
+    /// by unit tests).
     fn resolve_bdc_properties(
         &self,
         properties: &Object,
     ) -> Option<std::collections::HashMap<String, Object>> {
-        let doc = self.document?;
-        crate::optional_content::resolve_bdc_properties(properties, self.resources.as_ref(), doc)
+        crate::optional_content::resolve_bdc_properties(
+            properties,
+            self.resources.as_ref(),
+            self.document,
+        )
     }
 
     /// Resolve a named color space from the /Resources /ColorSpace dictionary.
@@ -2640,7 +2646,6 @@ impl<'doc> TextExtractor<'doc> {
         };
         crate::optional_content::check_ocg_excluded(props_dict, doc, &self.excluded_layers)
     }
-
 
     /// Get current ActualText from marked content stack (PDF Spec Section 14.9.4).
     ///
