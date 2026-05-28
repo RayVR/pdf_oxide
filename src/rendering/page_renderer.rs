@@ -1471,7 +1471,12 @@ impl PageRenderer {
                 },
                 Operator::BeginMarkedContentDict { tag, properties } => {
                     let mut is_excluded = false;
-                    if tag == "OC" && !excluded_layers.is_empty() {
+                    // Tag "OC" scopes can hide content even with empty excluded_layers
+                    // when the OCMD uses /VE /Not or /P /AllOff/AnyOff (the
+                    // expression evaluates with all OCGs on by default). We can
+                    // only short-circuit cheaply for simple OCG refs, which the
+                    // optional_content module handles internally.
+                    if tag == "OC" {
                         is_excluded = crate::optional_content::resolve_and_check_ocg_excluded(
                             properties,
                             Some(resources),

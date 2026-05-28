@@ -182,10 +182,11 @@ pub fn check_ocg_excluded(
 
     if let Some(Object::Name(t)) = props_dict.get("Type") {
         if t == "OCMD" {
-            // /VE — visibility expression. Not implemented; if present, fall
-            // through to /P / /OCGs evaluation. A future implementation would
-            // walk the operator tree and short-circuit return here.
-            //
+            // /VE takes precedence over /P per ISO 32000-1 §8.11.2.4.
+            if let Some(ve) = props_dict.get("VE") {
+                return !evaluate_visibility_expression(ve, doc, excluded);
+            }
+
             // /P — visibility policy. Defaults to /AnyOn.
             let policy = props_dict
                 .get("P")
@@ -203,6 +204,65 @@ pub fn check_ocg_excluded(
     }
 
     false
+}
+
+/// Evaluate an OCMD `/VE` visibility expression to a boolean visibility state.
+///
+/// Per ISO 32000-1 §8.11.2.4 a visibility expression is an array whose first
+/// element is the operator (`/And`, `/Or`, or `/Not`) and remaining elements
+/// are operands. Each operand is either:
+///  - An indirect reference to an OCG dict (evaluates to that OCG's on-state)
+///  - A nested visibility expression array (evaluates recursively)
+///
+/// Returns `true` if the expression resolves to "visible", `false` to "hidden".
+/// For our exclusion model an OCG is on iff its `/Name` is NOT in `excluded`.
+/// Bounded recursion depth prevents stack overflow on hostile/malformed input.
+fn evaluate_visibility_expression(
+    expr: &Object,
+    doc: &PdfDocument,
+    excluded: &HashSet<String>,
+) -> bool {
+    fn eval(expr: &Object, doc: &PdfDocument, excluded: &HashSet<String>, depth: u8) -> bool {
+        if depth > 16 {
+            return true; // permissive: don't suppress on malformed/circular input
+        }
+
+        // Resolve indirect references — operands may be direct OCG refs.
+        let resolved = match expr.as_reference() {
+            Some(r) => doc.load_object(r).unwrap_or_else(|_| expr.clone()),
+            None => expr.clone(),
+        };
+
+        // Leaf: an OCG dictionary. On iff its name is not excluded.
+        if let Some(d) = resolved.as_dict() {
+            if let Some(name) = d.get("Name") {
+                return !ocg_name_is_excluded(name, excluded);
+            }
+            return true;
+        }
+
+        // Expression: array starting with operator name.
+        let arr = match resolved.as_array() {
+            Some(a) => a,
+            None => return true,
+        };
+        let op = match arr.first().and_then(|o| o.as_name()) {
+            Some(n) => n,
+            None => return true,
+        };
+
+        match op {
+            "Not" => !arr
+                .get(1)
+                .map(|o| eval(o, doc, excluded, depth + 1))
+                .unwrap_or(true),
+            "And" => arr[1..].iter().all(|o| eval(o, doc, excluded, depth + 1)),
+            "Or" => arr[1..].iter().any(|o| eval(o, doc, excluded, depth + 1)),
+            _ => true,
+        }
+    }
+
+    eval(expr, doc, excluded, 0)
 }
 
 /// Resolve BDC properties and decide if the resulting scope is excluded.
