@@ -196,6 +196,7 @@ pub mod layout;
 pub mod content;
 pub mod extractors;
 pub mod fonts;
+pub mod optional_content;
 pub mod text;
 
 // Document structure

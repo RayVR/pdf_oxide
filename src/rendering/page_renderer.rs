@@ -1420,9 +1420,9 @@ impl PageRenderer {
                 Operator::BeginMarkedContentDict { tag, properties } => {
                     let mut is_excluded = false;
                     if tag == "OC" && !excluded_layers.is_empty() {
-                        is_excluded = resolve_and_check_ocg_excluded(
+                        is_excluded = crate::optional_content::resolve_and_check_ocg_excluded(
                             properties,
-                            resources,
+                            Some(resources),
                             doc,
                             excluded_layers,
                         );
@@ -2532,127 +2532,6 @@ fn encode_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
 /// Combine two transformations.
 fn combine_transforms(base: Transform, ctm: &Matrix) -> Transform {
     base.pre_concat(Transform::from_row(ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f))
-}
-
-/// Resolve BDC properties and check whether the referenced OCG/OCMD is excluded.
-///
-/// Mirrors the logic from `TextExtractor::check_ocg_excluded` but operates as
-/// a standalone function for the renderer (which doesn't hold a TextExtractor).
-fn resolve_and_check_ocg_excluded(
-    properties: &Object,
-    resources: &Object,
-    doc: &PdfDocument,
-    excluded_layers: &HashSet<String>,
-) -> bool {
-    let props_dict = match resolve_bdc_properties_for_render(properties, resources, doc) {
-        Some(d) => d,
-        None => return false,
-    };
-    check_ocg_excluded_render(&props_dict, doc, excluded_layers)
-}
-
-/// Resolve BDC properties: inline dict or name reference into /Properties resource.
-fn resolve_bdc_properties_for_render(
-    properties: &Object,
-    resources: &Object,
-    doc: &PdfDocument,
-) -> Option<HashMap<String, Object>> {
-    if let Some(dict) = properties.as_dict() {
-        return Some(dict.clone());
-    }
-
-    let prop_name = properties.as_name()?;
-    let res_dict = resources.as_dict()?;
-    let properties_dict_obj = res_dict.get("Properties")?;
-    let properties_dict = match properties_dict_obj.as_reference() {
-        Some(r) => doc.load_object(r).ok()?,
-        None => properties_dict_obj.clone(),
-    };
-    let properties_dict = properties_dict.as_dict()?;
-    let prop_obj = properties_dict.get(prop_name)?;
-    let resolved = match prop_obj.as_reference() {
-        Some(r) => doc.load_object(r).ok()?,
-        None => prop_obj.clone(),
-    };
-    resolved.as_dict().cloned()
-}
-
-/// Check whether a resolved BDC properties dict represents an excluded OCG or OCMD.
-fn check_ocg_excluded_render(
-    props_dict: &HashMap<String, Object>,
-    doc: &PdfDocument,
-    excluded_layers: &HashSet<String>,
-) -> bool {
-    if let Some(ocg_name) = props_dict.get("Name") {
-        return ocg_name_is_excluded_render(ocg_name, excluded_layers);
-    }
-
-    if let Some(Object::Name(t)) = props_dict.get("Type") {
-        if t == "OCMD" {
-            if let Some(ocgs_obj) = props_dict.get("OCGs") {
-                return ocmd_ocgs_excluded_render(ocgs_obj, doc, excluded_layers);
-            }
-        }
-    }
-
-    false
-}
-
-fn ocg_name_is_excluded_render(name_obj: &Object, excluded_layers: &HashSet<String>) -> bool {
-    if let Some(name_str) = name_obj.as_name() {
-        return excluded_layers.contains(name_str);
-    }
-    if let Some(name_bytes) = name_obj.as_string() {
-        let name_str = decode_pdf_text_string_simple(name_bytes);
-        return excluded_layers.contains(&name_str);
-    }
-    false
-}
-
-fn ocmd_ocgs_excluded_render(
-    ocgs_obj: &Object,
-    doc: &PdfDocument,
-    excluded_layers: &HashSet<String>,
-) -> bool {
-    let refs: Vec<&Object> = if let Some(arr) = ocgs_obj.as_array() {
-        arr.iter().collect()
-    } else {
-        vec![ocgs_obj]
-    };
-
-    for obj in refs {
-        let resolved = if let Some(r) = obj.as_reference() {
-            match doc.load_object(r) {
-                Ok(o) => o,
-                Err(_) => continue,
-            }
-        } else {
-            obj.clone()
-        };
-        if let Some(d) = resolved.as_dict() {
-            if let Some(name_obj) = d.get("Name") {
-                if ocg_name_is_excluded_render(name_obj, excluded_layers) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Minimal PDF text string decoder (UTF-16BE BOM or latin-1 fallback).
-fn decode_pdf_text_string_simple(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-        let utf16_pairs: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-            .collect();
-        String::from_utf16(&utf16_pairs)
-            .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string())
-    } else {
-        String::from_utf8(bytes.to_vec())
-            .unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect())
-    }
 }
 
 /// Convert DeviceCMYK (0.0–1.0) to DeviceRGB (0.0–1.0) per ISO 32000-1:2008
