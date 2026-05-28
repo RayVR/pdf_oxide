@@ -23,7 +23,7 @@ use crate::rendering::path_rasterizer::PathRasterizer;
 use crate::rendering::text_rasterizer::TextRasterizer;
 
 use crate::fonts::FontInfo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tiny_skia::{Color, PathBuilder, Pixmap, PixmapPaint, Transform};
 
@@ -53,6 +53,12 @@ pub struct RenderOptions {
     pub render_annotations: bool,
     /// JPEG quality (1-100, default: 85)
     pub jpeg_quality: u8,
+    /// Optional Content Group (layer) names to exclude from rendering.
+    ///
+    /// When a BDC operator with tag "OC" references an OCG whose /Name matches
+    /// one of these entries, all graphical content within that marked content
+    /// scope is suppressed (not painted). Empty means render everything.
+    pub excluded_layers: HashSet<String>,
     /// Explicit float scale factor set by `render_page_fit`.
     /// When `Some`, bypasses integer-DPI quantization so fit dimensions are
     /// exact (issue #480). Not part of the public API; set via
@@ -68,6 +74,7 @@ impl Default for RenderOptions {
             background: Some([1.0, 1.0, 1.0, 1.0]), // White background
             render_annotations: true,
             jpeg_quality: 85,
+            excluded_layers: HashSet::new(),
             scale_override: None,
         }
     }
@@ -357,6 +364,10 @@ impl PageRenderer {
     }
 
     /// Execute PDF operators to render content.
+    ///
+    /// OCG layer exclusion is sourced from `self.options.excluded_layers`;
+    /// BDC/EMC operators referencing matching layers cause graphical operators
+    /// inside that scope to be silently dropped.
     fn execute_operators(
         &mut self,
         pixmap: &mut Pixmap,
@@ -366,6 +377,10 @@ impl PageRenderer {
         page_num: usize,
         resources: &Object,
     ) -> Result<()> {
+        // Snapshot excluded layers once so the operator loop below can use a
+        // borrow without conflicting with the `&mut self` calls inside it.
+        let excluded_layers = self.options.excluded_layers.clone();
+        let excluded_layers = &excluded_layers;
         let mut gs_stack = GraphicsStateStack::new();
 
         // PDF default: DeviceGray, black
@@ -381,6 +396,14 @@ impl PageRenderer {
         let mut current_path = PathBuilder::new();
         let mut pending_clip: Option<(tiny_skia::Path, tiny_skia::FillRule)> = None;
         let mut clip_stack: Vec<Option<tiny_skia::Mask>> = vec![None]; // Start with no clip at depth 0
+
+        // OCG layer exclusion tracking.
+        // `excluded_layer_depth` counts how many nested BDC/OC scopes we are
+        // inside that match an excluded layer. >0 means content is suppressed.
+        // `marked_content_depth` tracks total BDC/BMC nesting so EMC correctly
+        // decrements only when it pops an excluded-layer entry.
+        let mut excluded_layer_depth: u32 = 0;
+        let mut marked_content_is_excluded: Vec<bool> = Vec::new();
 
         // Per-`execute_operators` resolved ExtGState resource dictionary. PDF
         // content streams often invoke `gs<N>` thousands of times per page
@@ -981,99 +1004,113 @@ impl PageRenderer {
                     current_path.close();
                 },
 
-                // Path painting
+                // Path painting — suppressed when inside an excluded OCG layer
                 Operator::Stroke => {
-                    apply_pending_clip(
-                        &mut pending_clip,
-                        &mut clip_stack,
-                        pixmap,
-                        base_transform,
-                        &gs_stack,
-                    );
-                    let clip = clip_stack.last().and_then(|c| c.as_ref());
-                    if let Some(path) = current_path.finish() {
-                        let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        self.path_rasterizer
-                            .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                    if excluded_layer_depth == 0 {
+                        apply_pending_clip(
+                            &mut pending_clip,
+                            &mut clip_stack,
+                            pixmap,
+                            base_transform,
+                            &gs_stack,
+                        );
+                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        if let Some(path) = current_path.finish() {
+                            let gs = gs_stack.current();
+                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            self.path_rasterizer
+                                .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                        }
+                    } else {
+                        let _ = current_path.finish();
                     }
                     current_path = PathBuilder::new();
                 },
                 Operator::Fill => {
-                    apply_pending_clip(
-                        &mut pending_clip,
-                        &mut clip_stack,
-                        pixmap,
-                        base_transform,
-                        &gs_stack,
-                    );
-                    let clip = clip_stack.last().and_then(|c| c.as_ref());
-                    if let Some(path) = current_path.finish() {
-                        let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        self.path_rasterizer.fill_path_clipped(
+                    if excluded_layer_depth == 0 {
+                        apply_pending_clip(
+                            &mut pending_clip,
+                            &mut clip_stack,
                             pixmap,
-                            &path,
-                            transform,
-                            gs,
-                            tiny_skia::FillRule::Winding,
-                            clip,
+                            base_transform,
+                            &gs_stack,
                         );
+                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        if let Some(path) = current_path.finish() {
+                            let gs = gs_stack.current();
+                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            self.path_rasterizer.fill_path_clipped(
+                                pixmap,
+                                &path,
+                                transform,
+                                gs,
+                                tiny_skia::FillRule::Winding,
+                                clip,
+                            );
+                        }
+                    } else {
+                        let _ = current_path.finish();
                     }
                     current_path = PathBuilder::new();
                 },
                 Operator::FillStroke
                 | Operator::CloseFillStroke
                 | Operator::CloseFillStrokeEvenOdd => {
-                    apply_pending_clip(
-                        &mut pending_clip,
-                        &mut clip_stack,
-                        pixmap,
-                        base_transform,
-                        &gs_stack,
-                    );
-                    let clip = clip_stack.last().and_then(|c| c.as_ref());
-                    if let Some(path) = current_path.finish() {
-                        let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        // Fill first, then stroke on top
-                        let fill_rule = if matches!(op, Operator::CloseFillStrokeEvenOdd) {
-                            tiny_skia::FillRule::EvenOdd
-                        } else {
-                            tiny_skia::FillRule::Winding
-                        };
-                        self.path_rasterizer
-                            .fill_path_clipped(pixmap, &path, transform, gs, fill_rule, clip);
-                        self.path_rasterizer
-                            .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                    if excluded_layer_depth == 0 {
+                        apply_pending_clip(
+                            &mut pending_clip,
+                            &mut clip_stack,
+                            pixmap,
+                            base_transform,
+                            &gs_stack,
+                        );
+                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        if let Some(path) = current_path.finish() {
+                            let gs = gs_stack.current();
+                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            let fill_rule = if matches!(op, Operator::CloseFillStrokeEvenOdd) {
+                                tiny_skia::FillRule::EvenOdd
+                            } else {
+                                tiny_skia::FillRule::Winding
+                            };
+                            self.path_rasterizer
+                                .fill_path_clipped(pixmap, &path, transform, gs, fill_rule, clip);
+                            self.path_rasterizer
+                                .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                        }
+                    } else {
+                        let _ = current_path.finish();
                     }
                     current_path = PathBuilder::new();
                 },
                 Operator::FillEvenOdd | Operator::FillStrokeEvenOdd => {
-                    apply_pending_clip(
-                        &mut pending_clip,
-                        &mut clip_stack,
-                        pixmap,
-                        base_transform,
-                        &gs_stack,
-                    );
-                    let clip = clip_stack.last().and_then(|c| c.as_ref());
-                    if let Some(path) = current_path.finish() {
-                        let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        self.path_rasterizer.fill_path_clipped(
+                    if excluded_layer_depth == 0 {
+                        apply_pending_clip(
+                            &mut pending_clip,
+                            &mut clip_stack,
                             pixmap,
-                            &path,
-                            transform,
-                            gs,
-                            tiny_skia::FillRule::EvenOdd,
-                            clip,
+                            base_transform,
+                            &gs_stack,
                         );
-                        // Add stroke for B* operator
-                        if matches!(op, Operator::FillStrokeEvenOdd) {
-                            self.path_rasterizer
-                                .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        if let Some(path) = current_path.finish() {
+                            let gs = gs_stack.current();
+                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            self.path_rasterizer.fill_path_clipped(
+                                pixmap,
+                                &path,
+                                transform,
+                                gs,
+                                tiny_skia::FillRule::EvenOdd,
+                                clip,
+                            );
+                            if matches!(op, Operator::FillStrokeEvenOdd) {
+                                self.path_rasterizer
+                                    .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                            }
                         }
+                    } else {
+                        let _ = current_path.finish();
                     }
                     current_path = PathBuilder::new();
                 },
@@ -1122,9 +1159,9 @@ impl PageRenderer {
                     gs_stack.current_mut().render_mode = *render;
                 },
 
-                // Text showing
+                // Text showing — suppressed when inside an excluded OCG layer
                 Operator::Tj { text } => {
-                    if in_text_object {
+                    if in_text_object && excluded_layer_depth == 0 {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         let gs = gs_stack.current();
                         let transform = combine_transforms(base_transform, &gs.ctm);
@@ -1139,7 +1176,6 @@ impl PageRenderer {
                             &self.fonts,
                         )?;
 
-                        // Advance text position: Tm = T(advance, 0) * Tm
                         let gs_mut = gs_stack.current_mut();
                         let advance_matrix = Matrix::translation(advance, 0.0);
                         gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
@@ -1147,44 +1183,45 @@ impl PageRenderer {
                 },
                 Operator::Quote { text } => {
                     if in_text_object {
-                        // Quote (') is T* followed by Tj
+                        // Quote (') is T* followed by Tj — always advance line
                         let gs_mut = gs_stack.current_mut();
                         let leading = gs_mut.leading;
                         let translation = Matrix::translation(0.0, -leading);
                         gs_mut.text_line_matrix = translation.multiply(&gs_mut.text_line_matrix);
                         gs_mut.text_matrix = gs_mut.text_line_matrix;
 
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        log::debug!(
-                            "' (Quote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
-                            gs.text_matrix.a,
-                            gs.text_matrix.b,
-                            gs.text_matrix.c,
-                            gs.text_matrix.d,
-                            gs.text_matrix.e,
-                            gs.text_matrix.f
-                        );
-                        let advance = self.text_rasterizer.render_text(
-                            pixmap,
-                            text,
-                            transform,
-                            gs,
-                            resources,
-                            doc,
-                            clip,
-                            &self.fonts,
-                        )?;
+                        if excluded_layer_depth == 0 {
+                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let gs = gs_stack.current();
+                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            log::debug!(
+                                "' (Quote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
+                                gs.text_matrix.a,
+                                gs.text_matrix.b,
+                                gs.text_matrix.c,
+                                gs.text_matrix.d,
+                                gs.text_matrix.e,
+                                gs.text_matrix.f
+                            );
+                            let advance = self.text_rasterizer.render_text(
+                                pixmap,
+                                text,
+                                transform,
+                                gs,
+                                resources,
+                                doc,
+                                clip,
+                                &self.fonts,
+                            )?;
 
-                        // Advance text position
-                        let gs_mut = gs_stack.current_mut();
-                        let advance_matrix = Matrix::translation(advance, 0.0);
-                        gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
+                            let gs_mut = gs_stack.current_mut();
+                            let advance_matrix = Matrix::translation(advance, 0.0);
+                            gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
+                        }
                     }
                 },
                 Operator::TJ { array } => {
-                    if in_text_object {
+                    if in_text_object && excluded_layer_depth == 0 {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         let gs = gs_stack.current();
                         let transform = combine_transforms(base_transform, &gs.ctm);
@@ -1208,7 +1245,6 @@ impl PageRenderer {
                             &self.fonts,
                         )?;
 
-                        // Advance text position: Tm = T(advance, 0) * Tm
                         let gs_mut = gs_stack.current_mut();
                         let advance_matrix = Matrix::translation(advance, 0.0);
                         gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
@@ -1220,7 +1256,7 @@ impl PageRenderer {
                     text,
                 } => {
                     if in_text_object {
-                        // Double Quote (") is Tw, Tc followed by ' (which is T*, Tj)
+                        // Double Quote (") always updates state
                         let gs_mut = gs_stack.current_mut();
                         gs_mut.word_space = *word_space;
                         gs_mut.char_space = *char_space;
@@ -1230,45 +1266,48 @@ impl PageRenderer {
                         gs_mut.text_line_matrix = translation.multiply(&gs_mut.text_line_matrix);
                         gs_mut.text_matrix = gs_mut.text_line_matrix;
 
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        log::debug!(
-                            "\" (DoubleQuote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
-                            gs.text_matrix.a,
-                            gs.text_matrix.b,
-                            gs.text_matrix.c,
-                            gs.text_matrix.d,
-                            gs.text_matrix.e,
-                            gs.text_matrix.f
-                        );
-                        let advance = self.text_rasterizer.render_text(
-                            pixmap,
-                            text,
-                            transform,
-                            gs,
-                            resources,
-                            doc,
-                            clip,
-                            &self.fonts,
-                        )?;
+                        if excluded_layer_depth == 0 {
+                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let gs = gs_stack.current();
+                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            log::debug!(
+                                "\" (DoubleQuote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
+                                gs.text_matrix.a,
+                                gs.text_matrix.b,
+                                gs.text_matrix.c,
+                                gs.text_matrix.d,
+                                gs.text_matrix.e,
+                                gs.text_matrix.f
+                            );
+                            let advance = self.text_rasterizer.render_text(
+                                pixmap,
+                                text,
+                                transform,
+                                gs,
+                                resources,
+                                doc,
+                                clip,
+                                &self.fonts,
+                            )?;
 
-                        // Advance text position
-                        let gs_mut = gs_stack.current_mut();
-                        let advance_matrix = Matrix::translation(advance, 0.0);
-                        gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
+                            let gs_mut = gs_stack.current_mut();
+                            let advance_matrix = Matrix::translation(advance, 0.0);
+                            gs_mut.text_matrix = advance_matrix.multiply(&gs_mut.text_matrix);
+                        }
                     }
                 },
 
-                // XObject (images)
+                // XObject (images) — suppressed when inside an excluded OCG layer
                 Operator::Do { name } => {
-                    let gs = gs_stack.current();
-                    let transform = combine_transforms(base_transform, &gs.ctm);
-                    let clip = clip_stack.last().and_then(|c| c.as_ref());
-                    log::debug!("Do: rendering XObject '{}'", name);
-                    self.render_xobject(
-                        pixmap, name, transform, gs, resources, doc, page_num, clip,
-                    )?;
+                    if excluded_layer_depth == 0 {
+                        let gs = gs_stack.current();
+                        let transform = combine_transforms(base_transform, &gs.ctm);
+                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        log::debug!("Do: rendering XObject '{}'", name);
+                        self.render_xobject(
+                            pixmap, name, transform, gs, resources, doc, page_num, clip,
+                        )?;
+                    }
                 },
 
                 // Text positioning
@@ -1364,12 +1403,41 @@ impl PageRenderer {
                     current_path = PathBuilder::new();
                 },
 
-                // Shading (gradient) operator
+                // Shading (gradient) operator — suppressed when inside excluded layer
                 Operator::PaintShading { name } => {
-                    let gs = gs_stack.current();
-                    let transform = combine_transforms(base_transform, &gs.ctm);
-                    let clip = clip_stack.last().and_then(|c| c.as_ref());
-                    self.render_shading(pixmap, name, transform, gs, resources, doc, clip)?;
+                    if excluded_layer_depth == 0 {
+                        let gs = gs_stack.current();
+                        let transform = combine_transforms(base_transform, &gs.ctm);
+                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        self.render_shading(pixmap, name, transform, gs, resources, doc, clip)?;
+                    }
+                },
+
+                // Marked content operators — track OCG layer exclusion
+                Operator::BeginMarkedContent { .. } => {
+                    marked_content_is_excluded.push(false);
+                },
+                Operator::BeginMarkedContentDict { tag, properties } => {
+                    let mut is_excluded = false;
+                    if tag == "OC" && !excluded_layers.is_empty() {
+                        is_excluded = resolve_and_check_ocg_excluded(
+                            properties,
+                            resources,
+                            doc,
+                            excluded_layers,
+                        );
+                    }
+                    if is_excluded {
+                        excluded_layer_depth += 1;
+                    }
+                    marked_content_is_excluded.push(is_excluded);
+                },
+                Operator::EndMarkedContent => {
+                    if let Some(was_excluded) = marked_content_is_excluded.pop() {
+                        if was_excluded && excluded_layer_depth > 0 {
+                            excluded_layer_depth -= 1;
+                        }
+                    }
                 },
 
                 _ => {},
@@ -2464,6 +2532,127 @@ fn encode_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
 /// Combine two transformations.
 fn combine_transforms(base: Transform, ctm: &Matrix) -> Transform {
     base.pre_concat(Transform::from_row(ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f))
+}
+
+/// Resolve BDC properties and check whether the referenced OCG/OCMD is excluded.
+///
+/// Mirrors the logic from `TextExtractor::check_ocg_excluded` but operates as
+/// a standalone function for the renderer (which doesn't hold a TextExtractor).
+fn resolve_and_check_ocg_excluded(
+    properties: &Object,
+    resources: &Object,
+    doc: &PdfDocument,
+    excluded_layers: &HashSet<String>,
+) -> bool {
+    let props_dict = match resolve_bdc_properties_for_render(properties, resources, doc) {
+        Some(d) => d,
+        None => return false,
+    };
+    check_ocg_excluded_render(&props_dict, doc, excluded_layers)
+}
+
+/// Resolve BDC properties: inline dict or name reference into /Properties resource.
+fn resolve_bdc_properties_for_render(
+    properties: &Object,
+    resources: &Object,
+    doc: &PdfDocument,
+) -> Option<HashMap<String, Object>> {
+    if let Some(dict) = properties.as_dict() {
+        return Some(dict.clone());
+    }
+
+    let prop_name = properties.as_name()?;
+    let res_dict = resources.as_dict()?;
+    let properties_dict_obj = res_dict.get("Properties")?;
+    let properties_dict = match properties_dict_obj.as_reference() {
+        Some(r) => doc.load_object(r).ok()?,
+        None => properties_dict_obj.clone(),
+    };
+    let properties_dict = properties_dict.as_dict()?;
+    let prop_obj = properties_dict.get(prop_name)?;
+    let resolved = match prop_obj.as_reference() {
+        Some(r) => doc.load_object(r).ok()?,
+        None => prop_obj.clone(),
+    };
+    resolved.as_dict().cloned()
+}
+
+/// Check whether a resolved BDC properties dict represents an excluded OCG or OCMD.
+fn check_ocg_excluded_render(
+    props_dict: &HashMap<String, Object>,
+    doc: &PdfDocument,
+    excluded_layers: &HashSet<String>,
+) -> bool {
+    if let Some(ocg_name) = props_dict.get("Name") {
+        return ocg_name_is_excluded_render(ocg_name, excluded_layers);
+    }
+
+    if let Some(Object::Name(t)) = props_dict.get("Type") {
+        if t == "OCMD" {
+            if let Some(ocgs_obj) = props_dict.get("OCGs") {
+                return ocmd_ocgs_excluded_render(ocgs_obj, doc, excluded_layers);
+            }
+        }
+    }
+
+    false
+}
+
+fn ocg_name_is_excluded_render(name_obj: &Object, excluded_layers: &HashSet<String>) -> bool {
+    if let Some(name_str) = name_obj.as_name() {
+        return excluded_layers.contains(name_str);
+    }
+    if let Some(name_bytes) = name_obj.as_string() {
+        let name_str = decode_pdf_text_string_simple(name_bytes);
+        return excluded_layers.contains(&name_str);
+    }
+    false
+}
+
+fn ocmd_ocgs_excluded_render(
+    ocgs_obj: &Object,
+    doc: &PdfDocument,
+    excluded_layers: &HashSet<String>,
+) -> bool {
+    let refs: Vec<&Object> = if let Some(arr) = ocgs_obj.as_array() {
+        arr.iter().collect()
+    } else {
+        vec![ocgs_obj]
+    };
+
+    for obj in refs {
+        let resolved = if let Some(r) = obj.as_reference() {
+            match doc.load_object(r) {
+                Ok(o) => o,
+                Err(_) => continue,
+            }
+        } else {
+            obj.clone()
+        };
+        if let Some(d) = resolved.as_dict() {
+            if let Some(name_obj) = d.get("Name") {
+                if ocg_name_is_excluded_render(name_obj, excluded_layers) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Minimal PDF text string decoder (UTF-16BE BOM or latin-1 fallback).
+fn decode_pdf_text_string_simple(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let utf16_pairs: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+        String::from_utf16(&utf16_pairs)
+            .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string())
+    } else {
+        String::from_utf8(bytes.to_vec())
+            .unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect())
+    }
 }
 
 /// Convert DeviceCMYK (0.0–1.0) to DeviceRGB (0.0–1.0) per ISO 32000-1:2008

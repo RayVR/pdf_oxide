@@ -4692,6 +4692,7 @@ pub extern "C" fn pdf_render_page_with_options(
             background,
             render_annotations: render_annotations != 0,
             jpeg_quality: jpeg_quality as u8,
+            excluded_layers: std::collections::HashSet::new(),
             scale_override: None,
         };
         match rendering::render_page(d, page_index as usize, &opts) {

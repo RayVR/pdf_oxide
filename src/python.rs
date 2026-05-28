@@ -401,6 +401,7 @@ impl PyPdfDocument {
     ///   (wins over `background`).
     /// - `render_annotations`: toggle for annotation rendering.
     /// - `jpeg_quality`: 1..=100, only applied when `format="jpeg"`.
+    /// - `excluded_layers`: list of OCG layer names to hide during rendering.
     #[pyo3(signature = (
         page,
         dpi=None,
@@ -409,6 +410,7 @@ impl PyPdfDocument {
         transparent=false,
         render_annotations=None,
         jpeg_quality=None,
+        excluded_layers=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn render_page(
@@ -420,6 +422,7 @@ impl PyPdfDocument {
         transparent: bool,
         render_annotations: Option<bool>,
         jpeg_quality: Option<u8>,
+        excluded_layers: Option<Vec<String>>,
     ) -> PyResult<Vec<u8>> {
         #[cfg(feature = "rendering")]
         {
@@ -458,6 +461,9 @@ impl PyPdfDocument {
             if let Some(flag) = render_annotations {
                 options.render_annotations = flag;
             }
+            if let Some(layers) = excluded_layers {
+                options.excluded_layers = layers.into_iter().collect();
+            }
 
             crate::rendering::render_page(&self.inner, page, &options)
                 .map(|img| img.data)
@@ -465,7 +471,16 @@ impl PyPdfDocument {
         }
         #[cfg(not(feature = "rendering"))]
         {
-            let _ = (page, dpi, format, background, transparent, render_annotations, jpeg_quality);
+            let _ = (
+                page,
+                dpi,
+                format,
+                background,
+                transparent,
+                render_annotations,
+                jpeg_quality,
+                excluded_layers,
+            );
             Err(PyRuntimeError::new_err("Rendering feature not enabled."))
         }
     }
@@ -485,12 +500,14 @@ impl PyPdfDocument {
     ///     transparent (bool, optional): If True, no background fill.
     ///     render_annotations (bool, optional): default True.
     ///     jpeg_quality (int, optional): 1-100, default 85.
+    ///     excluded_layers (list[str], optional): OCG layer names to hide.
     ///
     /// Returns: bytes of the rendered image. Issue #441 / #448.
     #[pyo3(signature = (
         page, width, height, *,
         format=None, background=None, transparent=false,
         render_annotations=None, jpeg_quality=None,
+        excluded_layers=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn render_page_fit(
@@ -503,6 +520,7 @@ impl PyPdfDocument {
         transparent: bool,
         render_annotations: Option<bool>,
         jpeg_quality: Option<u8>,
+        excluded_layers: Option<Vec<String>>,
     ) -> PyResult<Vec<u8>> {
         #[cfg(feature = "rendering")]
         {
@@ -544,6 +562,9 @@ impl PyPdfDocument {
             if let Some(flag) = render_annotations {
                 options.render_annotations = flag;
             }
+            if let Some(layers) = excluded_layers {
+                options.excluded_layers = layers.into_iter().collect();
+            }
 
             crate::rendering::render_page_fit(&self.inner, page, width, height, &options)
                 .map(|img| img.data)
@@ -560,6 +581,7 @@ impl PyPdfDocument {
                 transparent,
                 render_annotations,
                 jpeg_quality,
+                excluded_layers,
             );
             Err(PyRuntimeError::new_err("Rendering feature not enabled."))
         }
@@ -2902,6 +2924,7 @@ impl PyDocPage {
         transparent=false,
         render_annotations=None,
         jpeg_quality=None,
+        excluded_layers=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn render(
@@ -2913,6 +2936,7 @@ impl PyDocPage {
         transparent: bool,
         render_annotations: Option<bool>,
         jpeg_quality: Option<u8>,
+        excluded_layers: Option<Vec<String>>,
     ) -> PyResult<Vec<u8>> {
         self.doc.borrow_mut(py).render_page(
             self.page_index,
@@ -2922,6 +2946,7 @@ impl PyDocPage {
             transparent,
             render_annotations,
             jpeg_quality,
+            excluded_layers,
         )
     }
 
