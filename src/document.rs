@@ -6737,6 +6737,39 @@ impl PdfDocument {
         }
     }
 
+    /// #557a: append a span's text to the structure-tree assembly, reversing a
+    /// PURE-RTL run (every non-space char is an Arabic/Hebrew letter, no Latin)
+    /// from visual to logical order. The tagged/struct-tree path collapses each
+    /// run to a single span and never reaches `reverse_rtl_visual_order_runs`,
+    /// so visually-stored RTL (e.g. issue10301 Hebrew "גבא") otherwise leaked
+    /// out reversed. A single-direction run's logical order is just its reverse,
+    /// so no glyph geometry is needed for the pure-RTL case.
+    fn push_span_text_bidi(out: &mut String, span: &TextSpan) {
+        use crate::text::rtl_detector::is_rtl_text;
+        let mut rtl = 0usize;
+        let mut has_latin = false;
+        for c in span.text.chars() {
+            if c.is_whitespace() {
+                continue;
+            }
+            if c.is_ascii_alphabetic() {
+                has_latin = true;
+                break;
+            }
+            if is_rtl_text(c as u32) {
+                rtl += 1;
+            }
+        }
+        if rtl >= 2 && !has_latin {
+            let reversed: String = span.text.chars().rev().collect();
+            let mut tmp = span.clone();
+            tmp.text = reversed;
+            Self::push_span_text(out, &tmp);
+        } else {
+            Self::push_span_text(out, span);
+        }
+    }
+
     /// Parse font size from a /DA (Default Appearance) string.
     ///
     /// DA strings follow the format: `"/FontName size Tf ..."` (e.g., `"/Helv 12 Tf 0 g"`).
@@ -8154,7 +8187,7 @@ impl PdfDocument {
                         }
                     }
 
-                    Self::push_span_text(&mut text, span);
+                    Self::push_span_text_bidi(&mut text, span);
                     prev_span = Some(span);
                 }
             } else {
@@ -8192,7 +8225,7 @@ impl PdfDocument {
                             text.push(' ');
                         }
                     }
-                    Self::push_span_text(&mut text, span);
+                    Self::push_span_text_bidi(&mut text, span);
                     prev_span = Some(span);
                 }
             }
@@ -8213,7 +8246,7 @@ impl PdfDocument {
                         text.push(' ');
                     }
                 }
-                Self::push_span_text(&mut text, span);
+                Self::push_span_text_bidi(&mut text, span);
                 prev_span = Some(span);
             }
         }
@@ -8318,7 +8351,7 @@ impl PdfDocument {
                         }
                     }
 
-                    Self::push_span_text(&mut text, span);
+                    Self::push_span_text_bidi(&mut text, span);
                     prev_span = Some(span);
                 }
             }
@@ -8345,7 +8378,7 @@ impl PdfDocument {
                             text.push(' ');
                         }
                     }
-                    Self::push_span_text(&mut text, span);
+                    Self::push_span_text_bidi(&mut text, span);
                     prev_span = Some(span);
                 }
             }
@@ -8371,7 +8404,7 @@ impl PdfDocument {
                         text.push(' ');
                     }
                 }
-                Self::push_span_text(&mut text, span);
+                Self::push_span_text_bidi(&mut text, span);
                 prev_span = Some(span);
             }
         }
