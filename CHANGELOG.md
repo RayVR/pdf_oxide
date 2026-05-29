@@ -9,10 +9,17 @@ All notable changes to PDFOxide are documented here.
 ### Added
 
 - **`TextChar::rendered_advance`** — per-glyph cursor advance to the next character's origin, including character spacing (Tc) and word spacing (Tw) per the PDF Tx formula, distinct from the shape-only `advance_width`. Enables accurate word-boundary detection and cursor reconstruction. Thanks @haberman. (#602)
+- **Separation plate rendering** — `render_separations(page, dpi)` / `render_separation(page, ink_name, dpi)` (Rust + Python) emit one grayscale image per ink, pixel value = ink coverage (0 = none, 255 = full tint). Routes DeviceCMYK / Separation / DeviceN content per ISO 32000-1 §8.6 and honours the reserved colorant names `/All` and `/None` per §8.6.6.4 so registration / crop marks land on every plate. New `SeparationPlate` namedtuple in Python. Thanks @RayVR. (#605)
+- **OCG (Optional Content Group) ink filtering for text extraction** — `extract_text_filtered(page, excluded_layers, excluded_inks)` and the Python equivalent route through the full text-assembly pipeline (structure-tree ordering, table detection) while filtering by PDF layer and DeviceN/Separation ink. Handles OCMD membership dictionaries and DeviceN all-or-nothing ink semantics. Thanks @RayVR. (#600)
+- **`page_image_handles()` two-phase image API** — enumerate image handles on a page first, then materialize pixels on demand, including images nested inside Form XObjects via recursion. Avoids decoding every image up front. Thanks @kh3rld. (#588)
 
 ### Changed
 
 - **`TextChar` gained a required `rendered_advance` field** — external callers constructing `TextChar { .. }` literals must add `rendered_advance` (set it equal to `advance_width` to preserve prior behaviour). (#602)
+
+### Fixed
+
+- **Form XObject image cache poisoning when fonts/XObjects collide on basename** — the OCG ink-filtering work also fixed three latent bugs in OCG/ink handling: a parser edge case, a Form XObject cache keyed too coarsely, and ink-state restore on graphics-state pop. Thanks @RayVR. (#600)
 
 ## [0.3.56] - 2026-05-28
 
