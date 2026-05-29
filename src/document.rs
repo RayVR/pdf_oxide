@@ -9224,7 +9224,146 @@ impl PdfDocument {
         const MIN_DOMINANT_FRACTION: f32 = 0.5;
         let left_frac = dominant_cluster_fraction(&|cx| cx < mid_x);
         let right_frac = dominant_cluster_fraction(&|cx| cx >= mid_x);
-        left_frac >= MIN_DOMINANT_FRACTION && right_frac >= MIN_DOMINANT_FRACTION
+        if left_frac >= MIN_DOMINANT_FRACTION && right_frac >= MIN_DOMINANT_FRACTION {
+            return true;
+        }
+
+        // Additive accept path (no change to the gate above): shared-baseline
+        // two-column bodies — academic references / bibliographies — read
+        // left+right on the SAME Y line, so the row-aware sort interleaves
+        // them. Their word-granular left edges scatter, so the dominant-
+        // cluster gate above misses them. But they exhibit ONE persistent
+        // vertical gutter corridor (the signal poppler/MuPDF use, independent
+        // of line length). Detect it via within-line gap projection, prose-
+        // guarded so numeric / short-cell tables — which also reach here —
+        // stay on the row-aware path. See #607.
+        Self::has_persistent_gutter_corridor(spans, median, MAX_EXTENT_FROM_MEDIAN)
+    }
+
+    /// Detect a single persistent vertical gutter corridor across the page —
+    /// the geometric fingerprint of a two-column prose body whose columns
+    /// share Y baselines (so `has_bimodal_line_starts` and the dominant-
+    /// cluster gate both miss it). Mirrors `detect_narrow_gutter_prose`
+    /// (`src/pipeline/reading_order/xycut.rs`) at the document-routing layer.
+    ///
+    /// Prose-guarded (`mean non-whitespace chars per line > 20`) so numeric /
+    /// short-cell tables — which a bare corridor signal would also match —
+    /// are not routed to XY-cut. This is the conservative, table-safe subset:
+    /// it captures long-line academic references but intentionally NOT short-
+    /// verse layouts (tracked separately under #607).
+    fn has_persistent_gutter_corridor(
+        spans: &[crate::layout::TextSpan],
+        median: f32,
+        max_extent: f32,
+    ) -> bool {
+        // Group spans into lines by rounded Y baseline; carry left/right
+        // extents for gap projection and char count for the prose guard.
+        let mut lines: std::collections::BTreeMap<i32, (Vec<(f32, f32)>, usize)> =
+            std::collections::BTreeMap::new();
+        let mut x_min = f32::MAX;
+        let mut x_max = f32::MIN;
+        for s in spans {
+            let cx = s.bbox.x + s.bbox.width * 0.5;
+            if (cx - median).abs() > max_extent {
+                continue; // degenerate-CTM guard, same as the caller
+            }
+            let y_key = (s.bbox.y + s.bbox.height).round() as i32;
+            let entry = lines.entry(y_key).or_default();
+            entry.0.push((s.bbox.x, s.bbox.x + s.bbox.width));
+            entry.1 += s.text.chars().filter(|c| !c.is_whitespace()).count();
+            x_min = x_min.min(s.bbox.x);
+            x_max = x_max.max(s.bbox.x + s.bbox.width);
+        }
+        let region_width = x_max - x_min;
+        if lines.len() < 12 || region_width < 200.0 {
+            return false;
+        }
+
+        // Prose guard: tables (numeric / short cells) score low mean chars
+        // per line; two-column prose scores high. Mirrors the `mean_chars`
+        // arm of `classify_region_kind`. > 20 is the table-safe floor.
+        let total_chars: usize = lines.values().map(|(_, c)| *c).sum();
+        let mean_chars = total_chars as f32 / lines.len() as f32;
+        if mean_chars <= 20.0 {
+            return false;
+        }
+
+        // Largest within-line gap per line (≥ 6 pt suppresses word spacing);
+        // record the gap midpoint X.
+        const MIN_GAP_PT: f32 = 6.0;
+        let mut gap_positions: Vec<f32> = Vec::new();
+        for (line_spans, _) in lines.values() {
+            if line_spans.len() < 2 {
+                continue;
+            }
+            let mut sorted = line_spans.clone();
+            sorted.sort_by(|a, b| crate::utils::safe_float_cmp(a.0, b.0));
+            let mut largest_gap = 0.0_f32;
+            let mut largest_mid = 0.0_f32;
+            for w in sorted.windows(2) {
+                let gap = w[1].0 - w[0].1;
+                if gap > largest_gap {
+                    largest_gap = gap;
+                    largest_mid = (w[0].1 + w[1].0) * 0.5;
+                }
+            }
+            if largest_gap >= MIN_GAP_PT {
+                gap_positions.push(largest_mid);
+            }
+        }
+        if gap_positions.len() < 12 {
+            return false;
+        }
+
+        // Cluster gap midpoints (10 pt radius); find the dominant corridor.
+        const CLUSTER_RADIUS_PT: f32 = 10.0;
+        gap_positions.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
+        let mut best_size = 0usize;
+        let mut best_center = 0.0_f32;
+        let mut left = 0usize;
+        let mut right = 0usize;
+        let mut prefix: Vec<f32> = Vec::with_capacity(gap_positions.len() + 1);
+        prefix.push(0.0);
+        for &x in &gap_positions {
+            prefix.push(prefix.last().unwrap() + x);
+        }
+        for &pivot in &gap_positions {
+            while left < gap_positions.len() && gap_positions[left] < pivot - CLUSTER_RADIUS_PT {
+                left += 1;
+            }
+            while right < gap_positions.len() && gap_positions[right] <= pivot + CLUSTER_RADIUS_PT {
+                right += 1;
+            }
+            let count = right - left;
+            if count > best_size {
+                best_size = count;
+                best_center = (prefix[right] - prefix[left]) / count as f32;
+            }
+        }
+
+        // Concentration ≥ 62 %: one persistent corridor (2-col prose) vs many
+        // weaker corridors (tables). 0.62 admits the measured academic
+        // fixtures (0.65 / 0.69) while staying above the table noise floor.
+        if best_size * 50 < gap_positions.len() * 31 {
+            return false;
+        }
+        // The corridor must be a genuine full-height two-column body: present
+        // on a MAJORITY (≥ 50 %) of all lines, with a solid absolute floor.
+        // Stricter than `detect_narrow_gutter_prose`'s 20 % because this is a
+        // page-routing decision — a mixed prose+table page whose table happens
+        // to share one cell-gap x must NOT be routed to XY-cut (that reorders
+        // the table). Bibliographies put the gutter on nearly every line.
+        if best_size < 16 || best_size * 2 < lines.len() {
+            return false;
+        }
+
+        // Gutter must sit near the page centre (0.30–0.70). A true two-column
+        // body splits down the middle; a table's dominant gap (label column vs
+        // data, or one of several cell boundaries) sits off-centre and is
+        // rejected here. This is the decisive prose-vs-table discriminator at
+        // the routing layer.
+        let gutter_offset = best_center - x_min;
+        gutter_offset >= region_width * 0.30 && gutter_offset <= region_width * 0.70
     }
 
     /// True if the spans cluster into lines whose leftmost X positions
@@ -20041,6 +20180,93 @@ mod tests {
             labels,
             vec!["L1", "L2", "L3", "R1", "R2", "R3"],
             "ColumnAware should read left column fully before right column"
+        );
+    }
+
+    // ========================================================================
+    // COLUMN-ORDER: persistent-gutter-corridor accept path (#607)
+    // ========================================================================
+
+    /// Build a span with explicit width and text (for corridor-geometry tests).
+    #[cfg(test)]
+    fn corridor_span(text: &str, x: f32, y: f32, w: f32) -> crate::layout::TextSpan {
+        use crate::geometry::Rect;
+        use crate::layout::{Color, FontWeight, TextSpan};
+        TextSpan {
+            artifact_type: None,
+            text: text.to_string(),
+            bbox: Rect::new(x, y, w, 10.0),
+            font_size: 10.0,
+            font_name: "Test".to_string(),
+            font_weight: FontWeight::Normal,
+            is_italic: false,
+            is_monospace: false,
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+            },
+            mcid: None,
+            sequence: 0,
+            split_boundary_before: false,
+            offset_semantic: false,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 100.0,
+            primary_detected: false,
+            char_widths: vec![],
+            heading_level: None,
+        }
+    }
+
+    /// A shared-baseline two-column prose body (academic references): each line
+    /// has scattered word-granular left edges in BOTH columns — so the
+    /// dominant-cluster-fraction gate misses it — but a single persistent
+    /// central gutter. The corridor accept path must route it as multi-column.
+    #[test]
+    fn test_corridor_accepts_scattered_two_column_prose() {
+        let mut spans = Vec::new();
+        // 20 lines; left column words at x≈50/95/140 (scattered), right column
+        // words at x≈300/345/390. Persistent central gutter at x≈230.
+        for i in 0..20 {
+            let y = 700.0 - i as f32 * 14.0;
+            spans.push(corridor_span("Lorem", 50.0, y, 35.0));
+            spans.push(corridor_span("ipsumdolor", 95.0, y, 40.0));
+            spans.push(corridor_span("sitametco", 140.0, y, 40.0));
+            spans.push(corridor_span("consectetur", 300.0, y, 40.0));
+            spans.push(corridor_span("adipiscing", 345.0, y, 40.0));
+            spans.push(corridor_span("elitsedo", 390.0, y, 40.0));
+        }
+        assert!(
+            PdfDocument::is_multi_column_page(&spans),
+            "scattered-edge two-column prose with a persistent central gutter \
+             must be detected as multi-column via the corridor accept path"
+        );
+    }
+
+    /// A short-cell numeric table shares one column gap but has tiny cells
+    /// (mean chars per line well below 20). The prose guard must reject it so
+    /// the table is NOT routed to XY-cut (which would reorder its cells).
+    #[test]
+    fn test_corridor_rejects_short_cell_table() {
+        let mut spans = Vec::new();
+        // Scattered left edges (so the bimodal-line-start detector does NOT
+        // fire and the dominant-cluster gate fails — i.e. control reaches the
+        // corridor path), but every cell is a short numeric token so the
+        // per-line mean char count stays well under the prose floor of 20.
+        for i in 0..20 {
+            let y = 700.0 - i as f32 * 14.0;
+            spans.push(corridor_span("12", 50.0, y, 12.0));
+            spans.push(corridor_span("34", 95.0, y, 12.0));
+            spans.push(corridor_span("56", 140.0, y, 12.0));
+            spans.push(corridor_span("78", 300.0, y, 12.0));
+            spans.push(corridor_span("90", 345.0, y, 12.0));
+            spans.push(corridor_span("12", 390.0, y, 12.0));
+        }
+        assert!(
+            !PdfDocument::is_multi_column_page(&spans),
+            "short-cell numeric table must NOT be routed as multi-column \
+             (prose guard rejects mean_chars <= 20)"
         );
     }
 
