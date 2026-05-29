@@ -427,10 +427,19 @@ impl Program {
         // integers. This lets integer ops (idiv, mod, bitshift) accept
         // caller-supplied integer inputs while still rejecting parser
         // literals like `2.0`.
+        // i64::MAX (2^63 - 1) is not exactly representable in f64 —
+        // `i64::MAX as f64` rounds up to exactly 2^63. So using
+        // `v <= i64::MAX as f64` lets v == 2^63 through, where the
+        // `v as i64` cast then saturates silently to i64::MAX. Use 2^63
+        // with a strict `<` to keep the boundary on the safe side.
+        const I64_MAX_PLUS_ONE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
         let mut stack: Vec<Value> = inputs
             .iter()
             .map(|&v| {
-                if v.is_finite() && v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64
+                if v.is_finite()
+                    && v.fract() == 0.0
+                    && v >= i64::MIN as f64
+                    && v < I64_MAX_PLUS_ONE_AS_F64
                 {
                     Value::Int(v as i64)
                 } else {
@@ -715,7 +724,14 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                             ));
                         }
                         let t = r.trunc();
-                        if t < i64::MIN as f64 || t > i64::MAX as f64 {
+                        // i64::MAX (2^63 - 1) is NOT exactly representable in
+                        // f64 — `i64::MAX as f64` rounds up to exactly 2^63,
+                        // which IS representable. So the upper bound has to
+                        // use 2^63 with a `>=` comparison; using `> i64::MAX
+                        // as f64` lets t == 2^63 slip through and saturate
+                        // silently to i64::MAX on the `as i64` cast below.
+                        const I64_MAX_PLUS_ONE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+                        if t < i64::MIN as f64 || t >= I64_MAX_PLUS_ONE_AS_F64 {
                             return Err(Error::Type4Runtime("Type 4 cvi: integer overflow".into()));
                         }
                         push_checked(stack, Value::Int(t as i64))?;
@@ -1417,12 +1433,43 @@ mod tests {
         bytes.extend(std::iter::repeat(b'{').take(50));
         bytes.extend(std::iter::repeat(b'}').take(50));
         match evaluate_type4(&bytes, &[]) {
-            Err(Error::InvalidPdf(_)) => {} // correct
-            Err(Error::Type4Runtime(s)) => panic!(
-                "parse depth should error as InvalidPdf, not Type4Runtime: {s}"
-            ),
+            Err(Error::InvalidPdf(_)) => {}, // correct
+            Err(Error::Type4Runtime(s)) => {
+                panic!("parse depth should error as InvalidPdf, not Type4Runtime: {s}")
+            },
             Err(other) => panic!("unexpected error: {other}"),
             Ok(out) => panic!("should have errored, got {out:?}"),
         }
+    }
+
+    #[test]
+    fn cvi_rejects_two_pow_63() {
+        // 2^63 is representable in f64 but not as i64. The upper-bound
+        // check must use >= (or its mathematical equivalent) so the
+        // boundary is rejected with an integer-overflow error rather
+        // than silently saturating to i64::MAX = 2^63 - 1.
+        let pow_63: f64 = 9_223_372_036_854_775_808.0; // exactly 2^63
+        assert_eq!(pow_63, i64::MAX as f64, "test setup: 2^63 == i64::MAX as f64");
+        let result = evaluate_type4(b"{ cvi }", &[pow_63]);
+        match result {
+            Err(Error::Type4Runtime(s)) if s.contains("cvi") => {}, // correct
+            Err(other) => panic!("expected Type4Runtime(cvi overflow), got: {other}"),
+            Ok(v) => panic!(
+                "2^63 cvi should overflow; got {v:?} (likely saturated to i64::MAX = {})",
+                i64::MAX
+            ),
+        }
+    }
+
+    #[test]
+    fn cvi_accepts_two_pow_63_minus_one() {
+        // i64::MAX itself cannot be exactly represented as f64, so the
+        // largest f64 that rounds to a valid i64 via truncation is
+        // the predecessor, ~9.223e18. Verify this passes.
+        let near_max: f64 = 9_223_372_036_854_774_784.0; // f64 right below 2^63
+        let result = evaluate_type4(b"{ cvi }", &[near_max]).unwrap();
+        assert_eq!(result.len(), 1);
+        // The result should be a valid i64 close to i64::MAX
+        assert!(result[0] > 0.0 && result[0] < i64::MAX as f64);
     }
 }
