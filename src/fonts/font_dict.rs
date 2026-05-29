@@ -69,6 +69,11 @@ pub struct FontInfo {
     pub cid_system_info: Option<CIDSystemInfo>,
     /// CIDFont subtype ("CIDFontType0" for CFF, "CIDFontType2" for TrueType)
     pub cid_font_type: Option<String>,
+    /// FontMatrix [a] element — scales glyph-space widths to text-space units.
+    /// Standard Type1/TrueType: 0.001 (widths in 1/1000 em).
+    /// Type3 with FontMatrix [1 0 0 1 0 0]: 1.0 (widths already in text-space units).
+    /// advance_in_text_space = width × font_matrix_a × font_size
+    pub font_matrix_a: f32,
     /// Character widths in 1000ths of em (PDF units)
     /// For simple fonts (Type1, TrueType): array indexed by (char_code - first_char)
     /// PDF Spec: ISO 32000-1:2008, Section 9.7.4
@@ -376,6 +381,25 @@ impl FontInfo {
                 },
             );
         }
+
+        // Parse FontMatrix [a] for Type 3 fonts.
+        // Standard Type 1 FontMatrix is [0.001 0 0 0.001 0 0], so widths are in 1/1000 em.
+        // Type 3 fonts can use an identity FontMatrix [1 0 0 1 0 0], meaning widths are
+        // in text-space units directly (no 1/1000 scaling needed).
+        let font_matrix_a = if subtype == "Type3" {
+            font_dict
+                .get("FontMatrix")
+                .and_then(|obj| obj.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| {
+                    v.as_real()
+                        .map(|r| r as f32)
+                        .or_else(|| v.as_integer().map(|i| i as f32))
+                })
+                .unwrap_or(0.001)
+        } else {
+            0.001
+        };
 
         // Parse FontDescriptor FIRST to get font flags (needed for encoding decision)
         // PDF Spec: ISO 32000-1:2008, Section 9.6.2 - Font Descriptor
@@ -763,6 +787,16 @@ impl FontInfo {
             550.0
         };
 
+        // The heuristic above is calibrated for standard fonts where font_matrix_a = 0.001
+        // (i.e. glyph-space units are 1/1000 em).  Type3 fonts can use an arbitrary
+        // FontMatrix; if font_matrix_a differs from 0.001, rescale so that callers
+        // multiplying by font_matrix_a still get the intended em-fraction result.
+        let default_width = if subtype == "Type3" && font_matrix_a != 0.001 {
+            default_width * 0.001 / font_matrix_a
+        } else {
+            default_width
+        };
+
         // Phase 3: Parse DescendantFonts for Type0 fonts
         let (
             cid_to_gid_map,
@@ -845,6 +879,7 @@ impl FontInfo {
             cid_to_gid_map,
             cid_system_info,
             cid_font_type,
+            font_matrix_a,
             widths,
             first_char,
             last_char,
@@ -4686,6 +4721,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -4715,6 +4751,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -4747,6 +4784,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -4776,6 +4814,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -4811,6 +4850,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -4847,6 +4887,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -4882,6 +4923,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -4915,6 +4957,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5046,6 +5089,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5167,6 +5211,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5206,6 +5251,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5238,6 +5284,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5274,6 +5321,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5306,6 +5354,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5338,6 +5387,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5374,6 +5424,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5406,6 +5457,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5438,6 +5490,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5474,6 +5527,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5505,6 +5559,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5536,6 +5591,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5567,6 +5623,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5598,6 +5655,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5629,6 +5687,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5660,6 +5719,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5691,6 +5751,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -5722,6 +5783,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -6001,6 +6063,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -6044,6 +6107,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 500.0, // Simple font default
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -6083,6 +6147,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 600.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -6128,6 +6193,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 500.0,
             cid_to_gid_map: None,
             cid_system_info: Some(CIDSystemInfo {
@@ -6178,6 +6244,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 500.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -7735,6 +7802,7 @@ mod tests {
             widths: None, // No widths → should use standard metrics
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 500.0,
             cid_widths: None,
             cid_default_width: 1000.0,
@@ -7775,6 +7843,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 500.0,
             cid_widths: None,
             cid_default_width: 1000.0,
@@ -7811,6 +7880,7 @@ mod tests {
             widths: Some(vec![999.0]), // Has explicit widths
             first_char: Some(65),      // Starting at 'A'
             last_char: Some(65),
+            font_matrix_a: 0.001,
             default_width: 500.0,
             cid_widths: None,
             cid_default_width: 1000.0,
@@ -7845,6 +7915,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 500.0,
             cid_widths: None,
             cid_default_width: 1000.0,
@@ -7882,6 +7953,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info: None,
@@ -8019,6 +8091,7 @@ mod tests {
             widths: None,
             first_char: None,
             last_char: None,
+            font_matrix_a: 0.001,
             default_width: 1000.0,
             cid_to_gid_map: None,
             cid_system_info,
