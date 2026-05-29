@@ -495,6 +495,47 @@ mod tests {
         assert!(clusters[1].contains(&9));
     }
 
+    // PDX-2 (liteparse report): char clustering was O(n²) (BFS scanning all
+    // unvisited chars per frontier member), making dense pages quadratic. The
+    // sort-then-group rewrite is O(n log n). This guard clusters a large input
+    // (50 words × 5 chars across 50 lines = 2500 chars); pre-fix this was
+    // millions of inner-loop iterations, post-fix it returns promptly and with
+    // the correct cluster count. A plain wall-clock assert would be flaky on a
+    // shared CI box, so we pin correctness on a large input — a quadratic
+    // regression would manifest as a hang well inside the test timeout.
+    #[test]
+    fn test_pdx2_clustering_scales_on_large_input() {
+        let mut chars = Vec::new();
+        let words = 50usize;
+        let lines = 50usize;
+        for line in 0..lines {
+            let y = line as f32 * 20.0;
+            for w in 0..words {
+                // Each word: 5 glyphs at ~11pt pitch, words separated by a big gap.
+                let word_x0 = w as f32 * 80.0;
+                for g in 0..5 {
+                    chars.push(mock_char('a', word_x0 + g as f32 * 11.0, y));
+                }
+            }
+        }
+        assert_eq!(chars.len(), words * lines * 5);
+
+        let clusters = cluster_chars_into_words(&chars, 20.0);
+
+        // Exactly one cluster per word per line — no cross-word or cross-line merges.
+        assert_eq!(
+            clusters.len(),
+            words * lines,
+            "PDX-2 regression: expected {} word clusters, got {}",
+            words * lines,
+            clusters.len()
+        );
+        assert!(
+            clusters.iter().all(|c| c.len() == 5),
+            "PDX-2 regression: every word cluster should contain its 5 glyphs"
+        );
+    }
+
     #[test]
     fn test_cluster_words_empty() {
         let words: Vec<TextBlock> = vec![];
