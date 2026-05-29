@@ -400,7 +400,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
             Instruction::Mul => numeric_binary(stack, |a, b| Ok(a * b))?,
             Instruction::Div => numeric_binary(stack, |a, b| {
                 if b == 0.0 {
-                    Err(Error::InvalidPdf("Type 4 division by zero".into()))
+                    Err(Error::Type4Runtime("Type 4 division by zero".into()))
                 } else {
                     Ok(a / b)
                 }
@@ -411,22 +411,22 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
                 let b = pop(stack)?.as_int()?;
                 let a = pop(stack)?.as_int()?;
                 if b == 0 {
-                    return Err(Error::InvalidPdf("Type 4 idiv by zero".into()));
+                    return Err(Error::Type4Runtime("Type 4 idiv by zero".into()));
                 }
                 let q = a
                     .checked_div(b)
-                    .ok_or_else(|| Error::InvalidPdf("Type 4 idiv integer overflow".into()))?;
+                    .ok_or_else(|| Error::Type4Runtime("Type 4 idiv integer overflow".into()))?;
                 stack.push(Value::Int(q));
             },
             Instruction::Mod => {
                 let b = pop(stack)?.as_int()?;
                 let a = pop(stack)?.as_int()?;
                 if b == 0 {
-                    return Err(Error::InvalidPdf("Type 4 mod by zero".into()));
+                    return Err(Error::Type4Runtime("Type 4 mod by zero".into()));
                 }
                 let r = a
                     .checked_rem(b)
-                    .ok_or_else(|| Error::InvalidPdf("Type 4 mod integer overflow".into()))?;
+                    .ok_or_else(|| Error::Type4Runtime("Type 4 mod integer overflow".into()))?;
                 stack.push(Value::Int(r));
             },
             Instruction::Neg => {
@@ -457,7 +457,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
             // InvalidPdf rather than letting NaN/-inf reach the renderer.
             Instruction::Sqrt => real_unary(stack, |a| {
                 if a < 0.0 || a.is_nan() {
-                    Err(Error::InvalidPdf("Type 4 sqrt of negative".into()))
+                    Err(Error::Type4Runtime("Type 4 sqrt of negative".into()))
                 } else {
                     Ok(a.sqrt())
                 }
@@ -465,14 +465,14 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
             Instruction::Exp => numeric_binary(stack, |base, exp| Ok(base.powf(exp)))?,
             Instruction::Ln => real_unary(stack, |a| {
                 if a <= 0.0 || a.is_nan() {
-                    Err(Error::InvalidPdf("Type 4 ln of non-positive".into()))
+                    Err(Error::Type4Runtime("Type 4 ln of non-positive".into()))
                 } else {
                     Ok(a.ln())
                 }
             })?,
             Instruction::Log => real_unary(stack, |a| {
                 if a <= 0.0 || a.is_nan() {
-                    Err(Error::InvalidPdf("Type 4 log of non-positive".into()))
+                    Err(Error::Type4Runtime("Type 4 log of non-positive".into()))
                 } else {
                     Ok(a.log10())
                 }
@@ -486,7 +486,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
                 let den = pop(stack)?.as_real()?;
                 let num = pop(stack)?.as_real()?;
                 if num == 0.0 && den == 0.0 {
-                    return Err(Error::InvalidPdf("Type 4 atan undefined for (0, 0)".into()));
+                    return Err(Error::Type4Runtime("Type 4 atan undefined for (0, 0)".into()));
                 }
                 let mut deg = num.atan2(den).to_degrees();
                 if deg < 0.0 {
@@ -616,17 +616,17 @@ fn pop(stack: &mut Vec<Value>) -> Result<Value> {
 fn pop_count(stack: &mut Vec<Value>, op: &str) -> Result<usize> {
     let v = pop(stack)?.as_int()?;
     if v < 0 {
-        return Err(Error::InvalidPdf(format!("Type 4 {op}: negative count {v}")));
+        return Err(Error::Type4Runtime(format!("Type 4 {op}: negative count {v}")));
     }
     Ok(v as usize)
 }
 
 fn underflow() -> Error {
-    Error::InvalidPdf("Type 4 stack underflow".into())
+    Error::Type4Runtime("Type 4 stack underflow".into())
 }
 
 fn typecheck(msg: &str) -> Error {
-    Error::InvalidPdf(format!("Type 4 typecheck: {msg}"))
+    Error::Type4Runtime(format!("Type 4 typecheck: {msg}"))
 }
 
 fn real_unary(stack: &mut Vec<Value>, f: impl FnOnce(f64) -> Result<f64>) -> Result<()> {
@@ -677,7 +677,7 @@ fn comparison(stack: &mut Vec<Value>, pred: impl FnOnce(std::cmp::Ordering) -> b
     let a = pop(stack)?.as_real()?;
     let ord = a
         .partial_cmp(&b)
-        .ok_or_else(|| Error::InvalidPdf("Type 4 comparison with NaN".into()))?;
+        .ok_or_else(|| Error::Type4Runtime("Type 4 comparison with NaN".into()))?;
     stack.push(Value::Bool(pred(ord)));
     Ok(())
 }
