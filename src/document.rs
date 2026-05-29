@@ -5921,10 +5921,67 @@ impl PdfDocument {
                     has_presentation_form = true;
                 }
             }
-            if has_presentation_form && total >= 4 && rtl_count * 2 > total {
+            // #557: Pass 0 only applies to a *whole-line* visual-order span —
+            // one span holding several words separated by internal whitespace,
+            // in the order the content stream drew them (rightmost first). When
+            // the extractor instead emits one span PER WORD (the common
+            // CID-TrueType case, e.g. ArabicCIDTrueType.pdf), each word's
+            // characters are already in logical order, so char-reversing them
+            // here corrupts them. Their right-to-left *word* order is fixed
+            // separately by the span-run reversal pass below. Gate on internal
+            // whitespace so per-word logical spans are left untouched.
+            let has_internal_whitespace = span.text.trim().chars().any(|c| c.is_whitespace());
+            if has_presentation_form && has_internal_whitespace && total >= 4 && rtl_count * 2 > total
+            {
                 let reversed: String = span.text.chars().rev().collect();
                 span.text = reversed;
             }
+        }
+
+        // #557 Pass 0.5: per-word RTL span ORDER. The row-aware sort placed
+        // spans left-to-right (x ascending), but a right-to-left script reads
+        // the words in the opposite direction. For each maximal run of
+        // consecutive same-line spans that is purely RTL (every non-space span
+        // holds RTL letters and no Latin letters), reverse the run's order so
+        // the words come out in logical reading order. Each word's characters
+        // are left as-is (they are already logical — see Pass 0's gate).
+        let is_space = |s: &TextSpan| s.text.trim().is_empty();
+        let is_rtl_word = |s: &TextSpan| {
+            let mut has_rtl = false;
+            for c in s.text.chars() {
+                if c.is_ascii_alphabetic() {
+                    return false; // Latin letter → not a pure-RTL word
+                }
+                if is_rtl_text(c as u32) {
+                    has_rtl = true;
+                }
+            }
+            has_rtl
+        };
+        let mut i = 0;
+        while i < spans.len() {
+            if !is_rtl_word(&spans[i]) {
+                i += 1;
+                continue;
+            }
+            let y = spans[i].bbox.y;
+            let start = i;
+            let mut end = i + 1;
+            while end < spans.len()
+                && (spans[end].bbox.y - y).abs() < 2.0
+                && (is_rtl_word(&spans[end]) || is_space(&spans[end]))
+            {
+                end += 1;
+            }
+            // Trim trailing space spans so separators stay between words.
+            let mut last = end;
+            while last > start + 1 && is_space(&spans[last - 1]) {
+                last -= 1;
+            }
+            if last - start >= 2 {
+                spans[start..last].reverse();
+            }
+            i = end;
         }
 
         if spans.len() < 4 {
@@ -16967,6 +17024,35 @@ mod tests {
         PdfDocument::reverse_rtl_visual_order_runs(&mut spans);
         let after: Vec<String> = spans.iter().map(|s| s.text.clone()).collect();
         assert_eq!(before, after, "Pure-Latin spans must not be reversed by the RTL pass");
+    }
+
+    // #557: the common CID-TrueType shape — one span PER WORD, each word's
+    // characters already in LOGICAL order (Presentation Forms), laid out
+    // right-to-left so the row-aware sort hands them to us left-to-right
+    // (x ascending: last logical word first). The pass must (A) NOT
+    // char-reverse the per-word spans — they're already logical — and
+    // (B) reverse the WORD order so they read right-to-left. Phrase:
+    // "اﻧﻮاع اﳋﻄﻮط اﻟﻌﺮﺑﻴﺔ" ("types of Arabic fonts").
+    #[test]
+    fn test_reverse_rtl_per_word_logical_spans_reorder_not_charflip() {
+        // Spans in x-ascending order (as emitted by the row-aware sort):
+        // العربية (leftmost) … انواع (rightmost / logically first).
+        let mut spans = vec![
+            make_rtl_test_span("اﻟﻌﺮﺑﻴﺔ", 160.0, 700.0),
+            make_rtl_test_span(" ", 277.0, 700.0),
+            make_rtl_test_span("اﳋﻄﻮط", 288.0, 700.0),
+            make_rtl_test_span(" ", 409.0, 700.0),
+            make_rtl_test_span("اﻧﻮاع", 420.0, 700.0),
+        ];
+        PdfDocument::reverse_rtl_visual_order_runs(&mut spans);
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        // (B) word order reversed to logical right-to-left:
+        assert_eq!(
+            texts,
+            vec!["اﻧﻮاع", " ", "اﳋﻄﻮط", " ", "اﻟﻌﺮﺑﻴﺔ"],
+            "#557: per-word RTL spans must be reordered into logical word order \
+             without char-flipping (got {texts:?})"
+        );
     }
 
     // ========================================================================
