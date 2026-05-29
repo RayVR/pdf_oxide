@@ -373,69 +373,127 @@ fn resolve_conditionals(instructions: &mut Vec<Instruction>) -> Result<()> {
     Ok(())
 }
 
+/// A compiled Type 4 PostScript calculator program.
+///
+/// Construct once via [`Program::compile`], then call [`Program::evaluate`]
+/// (or [`Program::evaluate_clamped`]) many times with different inputs. This
+/// is the recommended path for tint transforms in Separation and DeviceN
+/// colour spaces, which are evaluated per pixel — parsing each call would
+/// be wasteful.
+///
+/// `Program` is `Send + Sync`, so it can live inside a shared tint-transform
+/// cache without a `Mutex`.
+#[derive(Debug, Clone)]
+pub struct Program {
+    instructions: Vec<Instruction>,
+}
+
+impl Program {
+    /// Compile a Type 4 program from its raw bytes.
+    ///
+    /// Returns [`Error::InvalidPdf`] for syntax errors (missing braces,
+    /// unknown tokens, orphan procedure bodies, etc.) and
+    /// [`Error::Type4Runtime`] for resource-cap violations during parse
+    /// (e.g. nesting deeper than [`MAX_PARSE_DEPTH`]). The resulting
+    /// `Program` is reusable across many [`evaluate`](Self::evaluate) calls.
+    pub fn compile(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            instructions: parse(bytes)?,
+        })
+    }
+
+    /// Evaluate the compiled program against the given inputs.
+    ///
+    /// Each call starts with a fresh operand stack initialised from `inputs`;
+    /// the compiled `Program` itself carries no mutable evaluation state, so
+    /// concurrent calls (across threads or pixels) are safe and independent.
+    pub fn evaluate(&self, inputs: &[f64]) -> Result<Vec<f64>> {
+        if inputs.len() > MAX_STACK {
+            return Err(Error::Type4Runtime(format!(
+                "Type 4 stack overflow: {} inputs exceeds max {MAX_STACK}",
+                inputs.len()
+            )));
+        }
+        // The public API takes f64s. Caller intent (typed int vs typed real)
+        // is ambiguous, so promote exact integer-valued inputs to typed
+        // integers. This lets integer ops (idiv, mod, bitshift) accept
+        // caller-supplied integer inputs while still rejecting parser
+        // literals like `2.0`.
+        let mut stack: Vec<Value> = inputs
+            .iter()
+            .map(|&v| {
+                if v.is_finite() && v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64
+                {
+                    Value::Int(v as i64)
+                } else {
+                    Value::Real(v)
+                }
+            })
+            .collect();
+        let mut budget = MAX_INSTRUCTIONS;
+        execute(&self.instructions, &mut stack, &mut budget)?;
+        Ok(stack.into_iter().map(Value::to_output).collect())
+    }
+
+    /// Evaluate with Domain/Range clamping per the PDF function dictionary.
+    ///
+    /// `domain` is a list of `[min, max]` pairs (one per input). Each input is
+    /// clamped to its domain before execution. `range` is a list of
+    /// `[min, max]` pairs (one per output). Each output is clamped to its
+    /// range after execution. Malformed bounds (`min > max`) are swapped;
+    /// NaN bounds are treated as no-op, since `f64::clamp` would otherwise
+    /// panic.
+    pub fn evaluate_clamped(
+        &self,
+        inputs: &[f64],
+        domain: &[[f64; 2]],
+        range: &[[f64; 2]],
+    ) -> Result<Vec<f64>> {
+        let clamped_inputs: Vec<f64> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if let Some(&[lo, hi]) = domain.get(i) {
+                    safe_clamp(v, lo, hi)
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let mut result = self.evaluate(&clamped_inputs)?;
+        for (i, val) in result.iter_mut().enumerate() {
+            if let Some(&[lo, hi]) = range.get(i) {
+                *val = safe_clamp(*val, lo, hi);
+            }
+        }
+        Ok(result)
+    }
+}
+
 /// Evaluate a Type 4 PostScript calculator program.
 ///
 /// `program` is the raw stream content (e.g. `{ dup 0.84 mul ... }`).
 /// `inputs` are pushed onto the stack before execution.
 /// After execution the remaining stack values are returned as the output.
+///
+/// This compiles and evaluates the program in one shot. For per-pixel
+/// evaluation (e.g. a Separation tint transform applied to every sample),
+/// use [`Program::compile`] once and call [`Program::evaluate`] many times.
 pub fn evaluate_type4(program: &[u8], inputs: &[f64]) -> Result<Vec<f64>> {
-    let instructions = parse(program)?;
-    if inputs.len() > MAX_STACK {
-        return Err(Error::Type4Runtime(format!(
-            "Type 4 stack overflow: {} inputs exceeds max {MAX_STACK}",
-            inputs.len()
-        )));
-    }
-    // The public API takes f64s. Caller intent (typed int vs typed real) is
-    // ambiguous, so promote exact integer-valued inputs to typed integers.
-    // This lets integer ops (idiv, mod, bitshift) accept caller-supplied
-    // integer inputs while still rejecting parser literals like `2.0`.
-    let mut stack: Vec<Value> = inputs
-        .iter()
-        .map(|&v| {
-            if v.is_finite() && v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
-                Value::Int(v as i64)
-            } else {
-                Value::Real(v)
-            }
-        })
-        .collect();
-    let mut budget = MAX_INSTRUCTIONS;
-    execute(&instructions, &mut stack, &mut budget)?;
-    Ok(stack.into_iter().map(Value::to_output).collect())
+    Program::compile(program)?.evaluate(inputs)
 }
 
 /// Evaluate with Domain/Range clamping per the PDF function dictionary.
 ///
-/// `domain` is a list of `[min, max]` pairs (one per input). Each input is
-/// clamped to its domain before execution. `range` is a list of `[min, max]`
-/// pairs (one per output). Each output is clamped to its range after
-/// execution. Malformed bounds (`min > max`) are swapped; NaN bounds are
-/// treated as no-op, since `f64::clamp` would otherwise panic.
+/// Thin wrapper around [`Program::compile`] + [`Program::evaluate_clamped`].
+/// Same per-call-cost caveat as [`evaluate_type4`].
 pub fn evaluate_type4_clamped(
     program: &[u8],
     inputs: &[f64],
     domain: &[[f64; 2]],
     range: &[[f64; 2]],
 ) -> Result<Vec<f64>> {
-    let clamped_inputs: Vec<f64> = inputs
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| {
-            if let Some(&[lo, hi]) = domain.get(i) {
-                safe_clamp(v, lo, hi)
-            } else {
-                v
-            }
-        })
-        .collect();
-    let mut result = evaluate_type4(program, &clamped_inputs)?;
-    for (i, val) in result.iter_mut().enumerate() {
-        if let Some(&[lo, hi]) = range.get(i) {
-            *val = safe_clamp(*val, lo, hi);
-        }
-    }
-    Ok(result)
+    Program::compile(program)?.evaluate_clamped(inputs, domain, range)
 }
 
 /// Clamp without panicking on malformed bounds. PDF spec allows arrays we do
@@ -1211,6 +1269,43 @@ mod tests {
     fn cvi_rejects_bool_and_non_finite() {
         assert!(evaluate_type4(b"{ true cvi }", &[]).is_err());
         assert!(evaluate_type4(b"{ true cvr }", &[]).is_err());
+    }
+
+    #[test]
+    fn program_is_send_sync() {
+        // A compiled program is meant to live in a shared tint-transform
+        // cache; verify it satisfies the marker bounds.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Program>();
+    }
+
+    #[test]
+    fn program_compile_once_evaluate_many() {
+        // Same compiled program, 1000 independent evaluations. Sanity-check
+        // that there is no shared mutable state — outputs depend only on
+        // inputs.
+        let program = Program::compile(b"{ dup mul }").expect("compile");
+        for i in 0..1000 {
+            let x = (i as f64) * 0.001;
+            let out = program.evaluate(&[x]).expect("eval");
+            assert_eq!(out.len(), 1);
+            // x*x within fp tolerance
+            let want = x * x;
+            assert!((out[0] - want).abs() < 1e-12, "i={i}: got {out:?}, want {want}");
+        }
+    }
+
+    #[test]
+    fn program_evaluate_clamped_matches_wrapper() {
+        // The wrapper should produce the same result as calling the typed
+        // API directly.
+        let program = Program::compile(b"{ 2.0 mul }").expect("compile");
+        let direct = program
+            .evaluate_clamped(&[1.5], &[[0.0, 1.0]], &[[0.0, 1.0]])
+            .expect("direct");
+        let via_fn = evaluate_type4_clamped(b"{ 2.0 mul }", &[1.5], &[[0.0, 1.0]], &[[0.0, 1.0]])
+            .expect("via_fn");
+        assert_eq!(direct, via_fn);
     }
 
     #[test]
