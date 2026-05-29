@@ -122,7 +122,7 @@ impl Default for TextPipeline {
 /// order so md/html/plain-text emit logical word order — matching the
 /// `extract_text` path's `reverse_rtl_visual_order_runs`. Each word's
 /// characters are left untouched (they are already logical).
-fn reorder_rtl_word_runs(ordered: &mut Vec<OrderedTextSpan>) {
+fn reorder_rtl_word_runs(ordered: &mut [OrderedTextSpan]) {
     use crate::text::rtl_detector::is_rtl_text;
     ordered.sort_by_key(|o| o.reading_order);
 

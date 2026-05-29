@@ -64,7 +64,9 @@ fn pdx4_html_honors_extract_tables() {
 fn pdx5_multicolumn_table_detected() {
     let doc = PdfDocument::open(FIXTURE).expect("open multi_column_table fixture");
     let opts_on = ConversionOptions::default().with_default_table_detection();
-    let md = doc.to_markdown_all(&opts_on).expect("to_markdown_all with tables");
+    let md = doc
+        .to_markdown_all(&opts_on)
+        .expect("to_markdown_all with tables");
 
     // Collect markdown table rows (lines that are pipe-delimited cells).
     let table_rows: Vec<&str> = md

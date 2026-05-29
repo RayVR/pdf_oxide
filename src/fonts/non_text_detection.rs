@@ -445,7 +445,8 @@ mod tests {
         // "suspicious" Unicode blocks, so this isolates the non-ASCII gate.
         let cjk = span_with_text("日本語のテキスト処理");
         assert!(
-            NonTextDetector::default().mark_non_text_spans(&[cjk.clone()])[0].is_non_text,
+            NonTextDetector::default().mark_non_text_spans(std::slice::from_ref(&cjk))[0]
+                .is_non_text,
             "default: CJK dropped by the non-ASCII ratio gate"
         );
         let na_off = NonTextDetector {
@@ -468,7 +469,7 @@ mod tests {
             ..NonTextDetector::default()
         };
         assert!(
-            susp_on.mark_non_text_spans(&[ctrl.clone()])[0].is_non_text,
+            susp_on.mark_non_text_spans(std::slice::from_ref(&ctrl))[0].is_non_text,
             "suspicious-Unicode gate drops the span when enabled"
         );
         let susp_off = NonTextDetector {

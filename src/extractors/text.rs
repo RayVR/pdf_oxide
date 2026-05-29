@@ -3374,10 +3374,7 @@ impl<'doc> TextExtractor<'doc> {
         // invisible hOCR layer emits thousands of spans, #575) into roughly
         // O(n log n + n·window). The window is a strict superset of the
         // acceptable bases, so the result is identical to the full scan.
-        let max_fs = snapshot
-            .iter()
-            .map(|s| s.3)
-            .fold(0.0f32, f32::max);
+        let max_fs = snapshot.iter().map(|s| s.3).fold(0.0f32, f32::max);
         let max_half_em = max_fs * 0.5;
         let mut by_order: Vec<usize> = (0..n).collect();
         by_order.sort_by(|&a, &b| {

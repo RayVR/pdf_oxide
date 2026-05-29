@@ -801,8 +801,7 @@ impl PdfDocument {
                 xref.all_object_numbers()
                     .filter_map(|id| {
                         xref.get(id).and_then(|e| {
-                            (e.in_use
-                                && e.entry_type == crate::xref::XRefEntryType::Uncompressed)
+                            (e.in_use && e.entry_type == crate::xref::XRefEntryType::Uncompressed)
                                 .then_some((id, e.offset))
                         })
                     })
@@ -5949,7 +5948,10 @@ impl PdfDocument {
             // separately by the span-run reversal pass below. Gate on internal
             // whitespace so per-word logical spans are left untouched.
             let has_internal_whitespace = span.text.trim().chars().any(|c| c.is_whitespace());
-            if has_presentation_form && has_internal_whitespace && total >= 4 && rtl_count * 2 > total
+            if has_presentation_form
+                && has_internal_whitespace
+                && total >= 4
+                && rtl_count * 2 > total
             {
                 let reversed: String = span.text.chars().rev().collect();
                 span.text = reversed;
@@ -17128,7 +17130,9 @@ mod tests {
         for yes in ["1", "12", "999", "1000", "9999", " 7 ".trim()] {
             assert!(PdfDocument::is_bare_page_number_text(yes), "{yes:?} should be a page number");
         }
-        for no in ["", "0", "10000", "12345", "1a", "iv", "Page", "1.2", "-1", "1,2"] {
+        for no in [
+            "", "0", "10000", "12345", "1a", "iv", "Page", "1.2", "-1", "1,2",
+        ] {
             assert!(!PdfDocument::is_bare_page_number_text(no), "{no:?} must NOT be a page number");
         }
     }
@@ -17666,13 +17670,21 @@ mod tests {
         let mut a = base();
         a.insert(
             "Widths".to_string(),
-            Object::Array(vec![Object::Integer(600), Object::Integer(600), Object::Integer(600)]),
+            Object::Array(vec![
+                Object::Integer(600),
+                Object::Integer(600),
+                Object::Integer(600),
+            ]),
         );
         // PDF B: real Helvetica metrics — same name, different widths.
         let mut b = base();
         b.insert(
             "Widths".to_string(),
-            Object::Array(vec![Object::Integer(667), Object::Integer(667), Object::Integer(722)]),
+            Object::Array(vec![
+                Object::Integer(667),
+                Object::Integer(667),
+                Object::Integer(722),
+            ]),
         );
 
         let hash_a = PdfDocument::font_identity_hash_cheap(&Object::Dictionary(a));
@@ -17686,12 +17698,20 @@ mod tests {
         let mut c = base();
         c.insert(
             "Widths".to_string(),
-            Object::Array(vec![Object::Integer(600), Object::Integer(600), Object::Integer(600)]),
+            Object::Array(vec![
+                Object::Integer(600),
+                Object::Integer(600),
+                Object::Integer(600),
+            ]),
         );
         let mut a2 = base();
         a2.insert(
             "Widths".to_string(),
-            Object::Array(vec![Object::Integer(600), Object::Integer(600), Object::Integer(600)]),
+            Object::Array(vec![
+                Object::Integer(600),
+                Object::Integer(600),
+                Object::Integer(600),
+            ]),
         );
         assert_eq!(
             PdfDocument::font_identity_hash_cheap(&Object::Dictionary(c)),
