@@ -4476,6 +4476,32 @@ fn decode_cjk_raw_charcode(
         .map(|i| i.ordering.as_str())
         .unwrap_or("");
 
+    // CORPUS-3: the bare Adobe predefined CMaps "H"/"V" are (overwhelmingly)
+    // Adobe-Japan1-H/V and carry JIS X 0208 codes in GL form (both bytes
+    // 0x21–0x7E). encoding_rs decodes EUC-JP (high bit set), so lift GL→EUC by
+    // OR-ing 0x8080, then decode. Recovers non-embedded Japanese (noembed-jis7:
+    // "あいうえお" was emitted as garbage "CACCCECGCI").
+    if (enc_name == "H" || enc_name == "V") && (ordering == "Japan1" || ordering.is_empty()) {
+        let hi = (char_code >> 8) & 0xFF;
+        let lo = char_code & 0xFF;
+        if (0x21..=0x7E).contains(&hi) && (0x21..=0x7E).contains(&lo) {
+            let euc = [(hi | 0x80) as u8, (lo | 0x80) as u8];
+            let (decoded, _, errors) = encoding_rs::EUC_JP.decode(&euc);
+            if !errors {
+                let r = decoded.replace('\u{FFFD}', "");
+                if !r.is_empty() {
+                    return Some(r);
+                }
+            }
+        }
+        // ASCII range (single-byte-ish codes 0x20–0x7E) pass through as-is.
+        if char_code <= 0x7E {
+            if let Some(c) = char::from_u32(char_code) {
+                return Some(c.to_string());
+            }
+        }
+    }
+
     // Determine which legacy encoding applies based on the CMap name and ordering.
     // CMap names that imply raw legacy encoding (not CID-keyed identity):
     let enc: Option<&'static encoding_rs::Encoding> = if enc_name.contains("GBK")

@@ -1993,6 +1993,12 @@ fn get_byte_mode(font: Option<&FontInfo>) -> ByteMode {
                     if (name.contains("Identity") && !name.contains("OneByteIdentity"))
                         || name.contains("UCS2")
                         || name.contains("UTF16")
+                        // CORPUS-3: bare Adobe predefined horizontal/vertical CMaps
+                        // ("H"/"V", e.g. Adobe-Japan1-H) are 2-byte by definition;
+                        // without this they were read single-byte → CJK garbage
+                        // ("あいうえお" → "CACCCECGCI" on noembed-jis7).
+                        || name == "H"
+                        || name == "V"
                     {
                         ByteMode::TwoByte
                     } else if name.contains("RKSJ") {
