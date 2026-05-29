@@ -553,6 +553,17 @@ fn push_checked(stack: &mut Vec<Value>, v: Value) -> Result<()> {
     Ok(())
 }
 
+// Stack-growth convention used throughout `execute`:
+//
+// - [`push_checked`] is used by operators that genuinely *grow* the stack
+//   relative to its entry size — number/int/bool literals, `dup`, and `copy`.
+//   These need the [`MAX_STACK`] guard because they can drive the stack past
+//   the cap from a fully-saturated starting state.
+// - Net-shrink and net-neutral operators (arithmetic, comparison, boolean,
+//   `cvi`/`cvr`, `not`, `exch`, `index`, `atan`, etc.) call raw `stack.push`
+//   after their pops. Each such site has already popped at least as many
+//   values as it will push back, so there is provably room and the
+//   `push_checked` overhead is unnecessary.
 fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut usize) -> Result<()> {
     for instr in instructions {
         if *budget == 0 {
@@ -586,7 +597,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                 let q = a
                     .checked_div(b)
                     .ok_or_else(|| Error::Type4Runtime("Type 4 idiv integer overflow".into()))?;
-                push_checked(stack, Value::Int(q))?;
+                stack.push(Value::Int(q));
             },
             Instruction::Mod => {
                 let b = pop(stack)?.as_int()?;
@@ -597,7 +608,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                 let r = a
                     .checked_rem(b)
                     .ok_or_else(|| Error::Type4Runtime("Type 4 mod integer overflow".into()))?;
-                push_checked(stack, Value::Int(r))?;
+                stack.push(Value::Int(r));
             },
             // PLRM §8.2: `neg` on `i64::MIN` overflows. Use `checked_neg` so
             // the program fails cleanly instead of wrapping silently — matches
@@ -609,9 +620,9 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                         let n = i.checked_neg().ok_or_else(|| {
                             Error::Type4Runtime("Type 4 integer overflow in neg".into())
                         })?;
-                        push_checked(stack, Value::Int(n))?;
+                        stack.push(Value::Int(n));
                     },
-                    Value::Real(r) => push_checked(stack, Value::Real(-r))?,
+                    Value::Real(r) => stack.push(Value::Real(-r)),
                     Value::Bool(_) => return Err(typecheck("neg expects a number")),
                 }
             },
@@ -623,9 +634,9 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                         let n = i.checked_abs().ok_or_else(|| {
                             Error::Type4Runtime("Type 4 integer overflow in abs".into())
                         })?;
-                        push_checked(stack, Value::Int(n))?;
+                        stack.push(Value::Int(n));
                     },
-                    Value::Real(r) => push_checked(stack, Value::Real(r.abs()))?,
+                    Value::Real(r) => stack.push(Value::Real(r.abs())),
                     Value::Bool(_) => return Err(typecheck("abs expects a number")),
                 }
             },
@@ -680,17 +691,17 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                 if deg >= 360.0 {
                     deg -= 360.0;
                 }
-                push_checked(stack, Value::Real(deg))?;
+                stack.push(Value::Real(deg));
             },
             Instruction::Eq => {
                 let b = pop(stack)?;
                 let a = pop(stack)?;
-                push_checked(stack, Value::Bool(values_equal(a, b)))?;
+                stack.push(Value::Bool(values_equal(a, b)));
             },
             Instruction::Ne => {
                 let b = pop(stack)?;
                 let a = pop(stack)?;
-                push_checked(stack, Value::Bool(!values_equal(a, b)))?;
+                stack.push(Value::Bool(!values_equal(a, b)));
             },
             Instruction::Gt => comparison(stack, |o| o == std::cmp::Ordering::Greater)?,
             Instruction::Ge => comparison(stack, |o| o != std::cmp::Ordering::Less)?,
@@ -702,8 +713,8 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
             Instruction::Not => {
                 let v = pop(stack)?;
                 match v {
-                    Value::Bool(b) => push_checked(stack, Value::Bool(!b))?,
-                    Value::Int(i) => push_checked(stack, Value::Int(!i))?,
+                    Value::Bool(b) => stack.push(Value::Bool(!b)),
+                    Value::Int(i) => stack.push(Value::Int(!i)),
                     Value::Real(_) => {
                         return Err(typecheck("not expects boolean or integer"));
                     },
@@ -727,7 +738,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                     // supplied for vacated bits".
                     ((val as u64) >> (-shift) as u32) as i64
                 };
-                push_checked(stack, Value::Int(result))?;
+                stack.push(Value::Int(result));
             },
             // PLRM §8.2: `cvi` pops a number, truncates toward zero, and
             // pushes the result as a typed integer. Reals outside the i64
@@ -735,7 +746,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
             Instruction::Cvi => {
                 let v = pop(stack)?;
                 match v {
-                    Value::Int(i) => push_checked(stack, Value::Int(i))?,
+                    Value::Int(i) => stack.push(Value::Int(i)),
                     Value::Real(r) => {
                         if !r.is_finite() {
                             return Err(Error::Type4Runtime(
@@ -753,7 +764,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                         if t < i64::MIN as f64 || t >= I64_MAX_PLUS_ONE_AS_F64 {
                             return Err(Error::Type4Runtime("Type 4 cvi: integer overflow".into()));
                         }
-                        push_checked(stack, Value::Int(t as i64))?;
+                        stack.push(Value::Int(t as i64));
                     },
                     Value::Bool(_) => return Err(typecheck("cvi expects a number")),
                 }
@@ -763,8 +774,8 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
             Instruction::Cvr => {
                 let v = pop(stack)?;
                 match v {
-                    Value::Int(i) => push_checked(stack, Value::Real(i as f64))?,
-                    Value::Real(r) => push_checked(stack, Value::Real(r))?,
+                    Value::Int(i) => stack.push(Value::Real(i as f64)),
+                    Value::Real(r) => stack.push(Value::Real(r)),
                     Value::Bool(_) => return Err(typecheck("cvr expects a number")),
                 }
             },
@@ -775,8 +786,7 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
             Instruction::Exch => {
                 let b = pop(stack)?;
                 let a = pop(stack)?;
-                // exch is a permutation — it pops two and pushes two back, so
-                // the stack size doesn't change. Pre-checked pops imply room.
+                // Net-neutral: two pops, two pushes back.
                 stack.push(b);
                 stack.push(a);
             },
@@ -784,6 +794,10 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                 pop(stack)?;
             },
             Instruction::Copy => {
+                // Note: operand pops happen before the bounds check below.
+                // The mutation is visible only inside this scope; on error
+                // the evaluation aborts and the partially-popped stack is
+                // never observed by the caller.
                 let n = pop_count(stack, "copy")?;
                 if n > stack.len() {
                     return Err(underflow());
@@ -798,14 +812,22 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>, budget: &mut us
                 stack.extend_from_slice(&copied);
             },
             Instruction::Index => {
+                // Note: operand pops happen before the bounds check below.
+                // The mutation is visible only inside this scope; on error
+                // the evaluation aborts and the partially-popped stack is
+                // never observed by the caller.
                 let n = pop_count(stack, "index")?;
                 if n >= stack.len() {
                     return Err(underflow());
                 }
                 let val = stack[stack.len() - 1 - n];
-                push_checked(stack, val)?;
+                stack.push(val);
             },
             Instruction::Roll => {
+                // Note: operand pops happen before the bounds check below.
+                // The mutation is visible only inside this scope; on error
+                // the evaluation aborts and the partially-popped stack is
+                // never observed by the caller.
                 let j = pop(stack)?.as_int()?;
                 let n = pop_count(stack, "roll")?;
                 if n > stack.len() {
