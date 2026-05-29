@@ -13425,6 +13425,405 @@ impl PdfDocument {
         self.extract_images_filtered(page_index, &ImageExtractFilter::default())
     }
 
+    /// Enumerate images on a page without decompressing any stream (Phase 1).
+    ///
+    /// Walks the page content stream once and reads image metadata (dimensions,
+    /// colour space, filter chain, compressed size) directly from each Image
+    /// XObject dictionary. No pixel data is decoded. Returns a handle per image
+    /// in content-stream paint order.
+    ///
+    /// Call [`crate::PdfImageHandle::decode`] on individual handles to materialise only
+    /// the images you need, or [`crate::PdfImageHandle::raw_compressed_bytes`] to forward
+    /// compressed data (e.g. JPEG bytes) without recompression.
+    ///
+    /// Form XObjects (subtype `/Form`) are recursed into, matching the behaviour
+    /// of [`PdfDocument::extract_images`]. Cycle detection (depth limit 100) and
+    /// the document's Form stream cache are used. Images inside nested or shared
+    /// Forms receive the correct final CTM-composed `bbox` / `rotation_degrees`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use pdf_oxide::PdfDocument;
+    /// # let bytes = std::fs::read("page.pdf").unwrap();
+    /// let doc = PdfDocument::from_bytes(bytes).unwrap();
+    ///
+    /// // Decode only images larger than a thumbnail threshold
+    /// let images: Vec<_> = doc.page_image_handles(0)?
+    ///     .into_iter()
+    ///     .filter(|h| h.width >= 200 && h.height >= 200)
+    ///     .map(|h| h.decode())
+    ///     .collect::<Result<_, _>>()?;
+    /// # Ok::<(), pdf_oxide::error::Error>(())
+    /// ```
+    pub fn page_image_handles(
+        &self,
+        page_index: usize,
+    ) -> Result<Vec<crate::extractors::images::PdfImageHandle<'_>>> {
+        use crate::content::parse_content_stream_images_only;
+        use crate::content::Operator;
+        use crate::extractors::images::image_handle_from_inline;
+
+        self.require_authenticated()?;
+
+        let page = self.get_page(page_index)?;
+        let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
+            offset: 0,
+            reason: "Page is not a dictionary".to_string(),
+        })?;
+
+        let content_data = self.get_page_content_data(page_index)?;
+
+        let resources = match page_dict.get("Resources") {
+            Some(res) => {
+                if let Some(ref_obj) = res.as_reference() {
+                    Some(self.load_object(ref_obj)?)
+                } else {
+                    Some(res.clone())
+                }
+            },
+            None => None,
+        };
+
+        let operators = match parse_content_stream_images_only(&content_data) {
+            Ok(ops) => ops,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        // Pre-resolve the XObject dictionary once
+        let xobject_dict = if let Some(ref res) = resources {
+            if let Some(res_dict) = res.as_dict() {
+                if let Some(xobj_entry) = res_dict.get("XObject") {
+                    let resolved = if let Some(ref_obj) = xobj_entry.as_reference() {
+                        self.load_object(ref_obj)?
+                    } else {
+                        xobj_entry.clone()
+                    };
+                    resolved.as_dict().cloned()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut handles = Vec::new();
+        let mut ctm_stack = vec![crate::content::Matrix::identity()];
+        let mut paint_order: usize = 0;
+        let mut xobject_stack: Vec<crate::object::ObjectRef> = Vec::new();
+
+        for op in operators {
+            match op {
+                Operator::SaveState => {
+                    if let Some(current) = ctm_stack.last() {
+                        ctm_stack.push(*current);
+                    }
+                },
+                Operator::RestoreState => {
+                    if ctm_stack.len() > 1 {
+                        ctm_stack.pop();
+                    }
+                },
+                Operator::Cm { a, b, c, d, e, f } => {
+                    if let Some(current) = ctm_stack.last_mut() {
+                        let m = crate::content::Matrix { a, b, c, d, e, f };
+                        *current = m.multiply(current);
+                    }
+                },
+                Operator::Do { name } => {
+                    if let Some(ref xobj_dict_map) = xobject_dict {
+                        let ctm = ctm_stack
+                            .last()
+                            .copied()
+                            .unwrap_or_else(crate::content::Matrix::identity);
+                        if let Ok(mut more) = self.collect_handles_from_do(
+                            &name,
+                            xobj_dict_map,
+                            resources.as_ref(),
+                            ctm,
+                            &mut paint_order,
+                            &mut xobject_stack,
+                        ) {
+                            handles.append(&mut more);
+                        }
+                    }
+                },
+                Operator::InlineImage { dict, data } => {
+                    let ctm = ctm_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_else(crate::content::Matrix::identity);
+                    if let Some(handle) =
+                        image_handle_from_inline(self, &dict, data, ctm, paint_order)
+                    {
+                        handles.push(handle);
+                        paint_order += 1;
+                    }
+                },
+                _ => {},
+            }
+        }
+
+        Ok(handles)
+    }
+
+    /// Collect zero or more image handles for a `Do` operator.
+    ///
+    /// If the target is an Image XObject, returns a vec containing one handle
+    /// (paint_order is advanced). If it is a Form XObject, recurses and returns
+    /// all image handles found inside (including nested Forms), with correct
+    /// paint_order and CTM composition for every handle.
+    fn collect_handles_from_do<'s>(
+        &'s self,
+        name: &str,
+        xobject_dict: &std::collections::HashMap<String, Object>,
+        resources: Option<&Object>,
+        ctm: crate::content::Matrix,
+        paint_order: &mut usize,
+        xobject_stack: &mut Vec<crate::object::ObjectRef>,
+    ) -> Result<Vec<crate::extractors::images::PdfImageHandle<'s>>> {
+        use crate::extractors::images::image_handle_from_xobject;
+
+        let xobject_ref_obj = match xobject_dict.get(name) {
+            Some(o) => o,
+            None => return Ok(Vec::new()),
+        };
+
+        let xobject_ref_opt = xobject_ref_obj.as_reference();
+        let xobject = if let Some(ref_obj) = xobject_ref_opt {
+            self.load_object(ref_obj)?
+        } else {
+            xobject_ref_obj.clone()
+        };
+        let xobj_dict = match xobject.as_dict() {
+            Some(d) => d,
+            None => return Ok(Vec::new()),
+        };
+
+        let subtype = xobj_dict
+            .get("Subtype")
+            .and_then(|s| s.as_name())
+            .unwrap_or("");
+
+        match subtype {
+            "Image" => {
+                if let Some(ref_obj) = xobject_ref_opt {
+                    if let Some(h) =
+                        image_handle_from_xobject(self, ref_obj, xobj_dict, ctm, *paint_order)
+                    {
+                        *paint_order += 1;
+                        Ok(vec![h])
+                    } else {
+                        Ok(Vec::new())
+                    }
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            "Form" => {
+                if let (Some(ref_obj), Some(parent_res)) = (xobject_ref_opt, resources) {
+                    self.collect_image_handles_from_form_xobject(
+                        ref_obj,
+                        &xobject,
+                        parent_res,
+                        ctm,
+                        paint_order,
+                        xobject_stack,
+                    )
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Recursively collect image handles from a Form XObject.
+    ///
+    /// This is the handles-side equivalent of `extract_images_from_form_xobject`.
+    /// It uses the same cycle detection (ObjectRef stack + depth 100), the same
+    /// Form Resources fallback rules, the same Form /Matrix handling, and reuses
+    /// the document's xobject_stream_cache (50 MiB bound) for decompressed Form
+    /// content.
+    ///
+    /// Unlike the materialised path, we do not cache "raw" handles — we compose
+    /// the full CTM (`parent_ctm * form_matrix`) at entry and let every inner
+    /// handle (and nested Form) naturally receive the final geometry. This is
+    /// simpler for the two-phase API and produces correct `bbox`/`rotation_degrees`
+    /// / `ctm` fields on the returned handles.
+    fn collect_image_handles_from_form_xobject<'s>(
+        &'s self,
+        xobject_ref: crate::object::ObjectRef,
+        xobject: &Object,
+        parent_resources: &Object,
+        parent_ctm: crate::content::Matrix,
+        paint_order: &mut usize,
+        xobject_stack: &mut Vec<crate::object::ObjectRef>,
+    ) -> Result<Vec<crate::extractors::images::PdfImageHandle<'s>>> {
+        use crate::content::parse_content_stream_images_only;
+        use crate::content::Operator;
+        use crate::extractors::images::image_handle_from_inline;
+
+        // Cycle detection — identical policy to the materialised extraction path.
+        if xobject_stack.contains(&xobject_ref) || xobject_stack.len() >= 100 {
+            return Ok(Vec::new());
+        }
+
+        xobject_stack.push(xobject_ref);
+
+        let xobj_dict = match xobject.as_dict() {
+            Some(d) => d,
+            None => {
+                xobject_stack.pop();
+                return Ok(Vec::new());
+            },
+        };
+
+        // Form's own Resources (fallback to the parent's resources if absent).
+        let form_resources = if let Some(form_res) = xobj_dict.get("Resources") {
+            if let Some(ref_obj) = form_res.as_reference() {
+                self.load_object(ref_obj)?
+            } else {
+                form_res.clone()
+            }
+        } else {
+            parent_resources.clone()
+        };
+
+        // Pre-resolve the XObject dictionary for *this* Form's Resources.
+        let form_xobject_dict = if let Some(res_dict) = form_resources.as_dict() {
+            if let Some(xobj_entry) = res_dict.get("XObject") {
+                let resolved = if let Some(ref_obj) = xobj_entry.as_reference() {
+                    self.load_object(ref_obj)?
+                } else {
+                    xobj_entry.clone()
+                };
+                resolved.as_dict().cloned()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Form's own transformation matrix (default identity).
+        let form_matrix = if let Some(matrix_obj) = xobj_dict.get("Matrix") {
+            self.parse_matrix_from_object(matrix_obj)
+                .unwrap_or_else(crate::content::Matrix::identity)
+        } else {
+            crate::content::Matrix::identity()
+        };
+
+        // Decode the Form stream (respecting the 50 MiB document-level cache).
+        let cached_stream = self
+            .xobject_stream_cache
+            .lock_or_recover()
+            .get(&xobject_ref)
+            .cloned();
+        let stream_data = if let Some(cached) = cached_stream {
+            cached.as_ref().clone()
+        } else {
+            match self.decode_stream_with_encryption(xobject, xobject_ref) {
+                Ok(data) => {
+                    const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
+                    let current_bytes = self.xobject_stream_cache_bytes.load(Ordering::Relaxed);
+                    if current_bytes + data.len() <= MAX_STREAM_CACHE_BYTES {
+                        self.xobject_stream_cache_bytes
+                            .store(current_bytes + data.len(), Ordering::Relaxed);
+                        self.xobject_stream_cache
+                            .lock_or_recover()
+                            .insert(xobject_ref, std::sync::Arc::new(data.clone()));
+                    }
+                    data
+                },
+                Err(e) => {
+                    log::warn!("Failed to decode Form XObject stream: {}, skipping", e);
+                    xobject_stack.pop();
+                    return Ok(Vec::new());
+                },
+            }
+        };
+
+        // Parse with the fast images-only parser (same as the materialised path).
+        let operators = match parse_content_stream_images_only(&stream_data) {
+            Ok(ops) => ops,
+            Err(_) => {
+                xobject_stack.pop();
+                return Ok(Vec::new());
+            },
+        };
+
+        // Critical CTM composition:
+        // Start the form's internal graphics state with `parent_ctm * form_matrix`.
+        // Every image (and nested Form) discovered inside will then have its
+        // handle's bbox/rotation/ctm computed with the *final* transform that
+        // will be active when the image is painted on the page.
+        let start_ctm = parent_ctm.multiply(&form_matrix);
+        let mut ctm_stack = vec![start_ctm];
+        let mut handles = Vec::new();
+
+        for op in operators {
+            match op {
+                Operator::SaveState => {
+                    if let Some(current) = ctm_stack.last() {
+                        ctm_stack.push(*current);
+                    }
+                },
+                Operator::RestoreState => {
+                    if ctm_stack.len() > 1 {
+                        ctm_stack.pop();
+                    }
+                },
+                Operator::Cm { a, b, c, d, e, f } => {
+                    if let Some(current) = ctm_stack.last_mut() {
+                        let m = crate::content::Matrix { a, b, c, d, e, f };
+                        *current = m.multiply(current);
+                    }
+                },
+
+                Operator::Do { name } => {
+                    if let Some(ref xobj_d) = form_xobject_dict {
+                        let current_ctm = ctm_stack
+                            .last()
+                            .copied()
+                            .unwrap_or_else(crate::content::Matrix::identity);
+                        if let Ok(mut more) = self.collect_handles_from_do(
+                            &name,
+                            xobj_d,
+                            Some(&form_resources),
+                            current_ctm,
+                            paint_order,
+                            xobject_stack,
+                        ) {
+                            handles.append(&mut more);
+                        }
+                    }
+                },
+
+                Operator::InlineImage { dict, data } => {
+                    let current_ctm = ctm_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_else(crate::content::Matrix::identity);
+                    if let Some(h) =
+                        image_handle_from_inline(self, &dict, data, current_ctm, *paint_order)
+                    {
+                        handles.push(h);
+                        *paint_order += 1;
+                    }
+                },
+
+                _ => {},
+            }
+        }
+
+        xobject_stack.pop();
+        Ok(handles)
+    }
+
     /// Extract images with pre-decompression filtering.
     ///
     /// Applies dimension and pixel-count checks using XObject dictionary metadata
