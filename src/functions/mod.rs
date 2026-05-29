@@ -61,6 +61,9 @@ enum Instruction {
     Xor,
     Not,
     Bitshift,
+    // Type conversion (PLRM §8.2)
+    Cvi,
+    Cvr,
     // Stack manipulation
     Dup,
     Exch,
@@ -235,6 +238,8 @@ fn parse_token(token: &str) -> Result<Instruction> {
         "xor" => Ok(Instruction::Xor),
         "not" => Ok(Instruction::Not),
         "bitshift" => Ok(Instruction::Bitshift),
+        "cvi" => Ok(Instruction::Cvi),
+        "cvr" => Ok(Instruction::Cvr),
         "true" => Ok(Instruction::BoolLiteral(true)),
         "false" => Ok(Instruction::BoolLiteral(false)),
         "dup" => Ok(Instruction::Dup),
@@ -420,13 +425,13 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
             Instruction::Add => numeric_binary(stack, |a, b| Ok(a + b))?,
             Instruction::Sub => numeric_binary(stack, |a, b| Ok(a - b))?,
             Instruction::Mul => numeric_binary(stack, |a, b| Ok(a * b))?,
-            Instruction::Div => numeric_binary(stack, |a, b| {
-                if b == 0.0 {
-                    Err(Error::Type4Runtime("Type 4 division by zero".into()))
-                } else {
-                    Ok(a / b)
-                }
-            })?,
+            // PLRM §8.2 raises `undefinedresult` on `div` by zero, but Acrobat
+            // and Poppler instead let IEEE 754 produce the result (±inf for
+            // n/0, NaN for 0/0). Match that behaviour so a tint transform
+            // that overruns its domain doesn't blow up an otherwise valid
+            // page. `idiv` / `mod` stay as runtime errors — integer math has
+            // no inf/NaN to fall back to.
+            Instruction::Div => numeric_binary(stack, |a, b| Ok(a / b))?,
             Instruction::Idiv => {
                 // PLRM §8.2: idiv requires integer operands, returns integer.
                 // i64::MIN / -1 overflows; use checked_div to fail safely.
@@ -451,18 +456,32 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
                     .ok_or_else(|| Error::Type4Runtime("Type 4 mod integer overflow".into()))?;
                 stack.push(Value::Int(r));
             },
+            // PLRM §8.2: `neg` on `i64::MIN` overflows. Use `checked_neg` so
+            // the program fails cleanly instead of wrapping silently — matches
+            // the explicit overflow path already in use for `idiv`/`mod`.
             Instruction::Neg => {
                 let v = pop(stack)?;
                 match v {
-                    Value::Int(i) => stack.push(Value::Int(i.wrapping_neg())),
+                    Value::Int(i) => {
+                        let n = i.checked_neg().ok_or_else(|| {
+                            Error::Type4Runtime("Type 4 integer overflow in neg".into())
+                        })?;
+                        stack.push(Value::Int(n));
+                    },
                     Value::Real(r) => stack.push(Value::Real(-r)),
                     Value::Bool(_) => return Err(typecheck("neg expects a number")),
                 }
             },
+            // PLRM §8.2: `abs` on `i64::MIN` overflows. Same treatment as `neg`.
             Instruction::Abs => {
                 let v = pop(stack)?;
                 match v {
-                    Value::Int(i) => stack.push(Value::Int(i.wrapping_abs())),
+                    Value::Int(i) => {
+                        let n = i.checked_abs().ok_or_else(|| {
+                            Error::Type4Runtime("Type 4 integer overflow in abs".into())
+                        })?;
+                        stack.push(Value::Int(n));
+                    },
                     Value::Real(r) => stack.push(Value::Real(r.abs())),
                     Value::Bool(_) => return Err(typecheck("abs expects a number")),
                 }
@@ -548,8 +567,10 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
                 }
             },
             // PLRM §8.2: bitshift takes two integers. Magnitudes >= 64 would
-            // panic with Rust's `<<`/`>>`; PLRM treats out-of-range shifts as
-            // shifting all bits out, i.e. zero.
+            // panic with Rust's `<<`/`>>`; PLRM specifies "bits shifted out
+            // are discarded; zeros are supplied for vacated bits", which for
+            // |shift| >= 64 produces 0. We saturate to zero rather than
+            // raising a runtime error because the spec gives a defined value.
             Instruction::Bitshift => {
                 let shift = pop(stack)?.as_int()?;
                 let val = pop(stack)?.as_int()?;
@@ -564,6 +585,38 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
                     ((val as u64) >> (-shift) as u32) as i64
                 };
                 stack.push(Value::Int(result));
+            },
+            // PLRM §8.2: `cvi` pops a number, truncates toward zero, and
+            // pushes the result as a typed integer. Reals outside the i64
+            // range overflow as a runtime error rather than wrapping.
+            Instruction::Cvi => {
+                let v = pop(stack)?;
+                match v {
+                    Value::Int(i) => stack.push(Value::Int(i)),
+                    Value::Real(r) => {
+                        if !r.is_finite() {
+                            return Err(Error::Type4Runtime(
+                                "Type 4 cvi: input is not finite".into(),
+                            ));
+                        }
+                        let t = r.trunc();
+                        if t < i64::MIN as f64 || t > i64::MAX as f64 {
+                            return Err(Error::Type4Runtime("Type 4 cvi: integer overflow".into()));
+                        }
+                        stack.push(Value::Int(t as i64));
+                    },
+                    Value::Bool(_) => return Err(typecheck("cvi expects a number")),
+                }
+            },
+            // PLRM §8.2: `cvr` pops a number and pushes it as a typed real.
+            // An integer becomes a typed real (no longer satisfies `as_int`).
+            Instruction::Cvr => {
+                let v = pop(stack)?;
+                match v {
+                    Value::Int(i) => stack.push(Value::Real(i as f64)),
+                    Value::Real(r) => stack.push(Value::Real(r)),
+                    Value::Bool(_) => return Err(typecheck("cvr expects a number")),
+                }
             },
             Instruction::Dup => {
                 let a = *stack.last().ok_or_else(underflow)?;
@@ -898,9 +951,38 @@ mod tests {
     }
 
     #[test]
-    fn division_by_zero() {
-        let err = evaluate_type4(b"{ div }", &[1.0, 0.0]).unwrap_err();
-        assert!(err.to_string().contains("division by zero"), "got: {err}");
+    fn division_by_zero_follows_ieee_754() {
+        // Acrobat/Poppler hand back IEEE 754 specials for `div` by zero
+        // rather than failing the whole program. We follow that behaviour;
+        // `idiv` and `mod` (integer ops with no inf/NaN) stay as errors.
+        let pos = evaluate_type4(b"{ div }", &[1.0, 0.0]).unwrap();
+        assert_eq!(pos.len(), 1);
+        assert!(pos[0].is_infinite() && pos[0] > 0.0, "expected +inf, got {pos:?}");
+
+        let neg = evaluate_type4(b"{ div }", &[-1.0, 0.0]).unwrap();
+        assert_eq!(neg.len(), 1);
+        assert!(neg[0].is_infinite() && neg[0] < 0.0, "expected -inf, got {neg:?}");
+
+        let nan = evaluate_type4(b"{ div }", &[0.0, 0.0]).unwrap();
+        assert_eq!(nan.len(), 1);
+        assert!(nan[0].is_nan(), "expected NaN, got {nan:?}");
+
+        // idiv / mod by zero still error.
+        assert!(evaluate_type4(b"{ idiv }", &[1.0, 0.0]).is_err());
+        assert!(evaluate_type4(b"{ mod }", &[1.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn int_min_neg_and_abs_error() {
+        // i64::MIN cannot be negated or abs'd without overflow. PLRM raises
+        // a runtime error; we map that to Error::Type4Runtime.
+        let neg = format!("{{ {} neg }}", i64::MIN);
+        let err = evaluate_type4(neg.as_bytes(), &[]).unwrap_err();
+        assert!(matches!(err, Error::Type4Runtime(_)), "got: {err}");
+
+        let abs = format!("{{ {} abs }}", i64::MIN);
+        let err = evaluate_type4(abs.as_bytes(), &[]).unwrap_err();
+        assert!(matches!(err, Error::Type4Runtime(_)), "got: {err}");
     }
 
     #[test]
@@ -1044,6 +1126,35 @@ mod tests {
 
         // atan undefined at (0, 0).
         assert!(evaluate_type4(b"{ atan }", &[0.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn cvi_truncates_toward_zero() {
+        // PLRM §8.2 examples
+        assert_eq!(evaluate_type4(b"{ cvi }", &[3.2]).unwrap(), vec![3.0]);
+        assert_eq!(evaluate_type4(b"{ cvi }", &[-3.2]).unwrap(), vec![-3.0]);
+        assert_eq!(evaluate_type4(b"{ cvi }", &[3.0]).unwrap(), vec![3.0]);
+        // 3.5 cvi -> 3 (truncate toward zero, not round)
+        assert_eq!(evaluate_type4(b"{ 3.5 cvi }", &[]).unwrap(), vec![3.0]);
+        assert_eq!(evaluate_type4(b"{ -3.5 cvi }", &[]).unwrap(), vec![-3.0]);
+    }
+
+    #[test]
+    fn cvr_makes_typed_real() {
+        // 3 cvr -> 3.0 as a typed real. Should not satisfy `idiv` (which
+        // wants typed integers) — verifies the type tag really changed.
+        let err = evaluate_type4(b"{ 3 cvr 2 idiv }", &[]).unwrap_err();
+        assert!(matches!(err, Error::Type4Runtime(_)), "got: {err}");
+        // 3.5 cvr -> 3.5 (stays real)
+        assert_eq!(evaluate_type4(b"{ 3.5 cvr }", &[]).unwrap(), vec![3.5]);
+        // Combined with `cvi`: `3.5 cvi 2 idiv` succeeds
+        assert_eq!(evaluate_type4(b"{ 3.5 cvi 2 idiv }", &[]).unwrap(), vec![1.0]);
+    }
+
+    #[test]
+    fn cvi_rejects_bool_and_non_finite() {
+        assert!(evaluate_type4(b"{ true cvi }", &[]).is_err());
+        assert!(evaluate_type4(b"{ true cvr }", &[]).is_err());
     }
 
     #[test]
