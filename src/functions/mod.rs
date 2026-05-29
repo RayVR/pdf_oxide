@@ -10,6 +10,23 @@
 //! diverges from PLRM (e.g. `f64::round` ties, `atan2` range, panicking on
 //! `i64::MIN / -1`), the PLRM rule is honoured and cited inline.
 //!
+//! # Supported operators
+//!
+//! Per PDF spec ISO 32000-1 §7.10.5 / Table 42:
+//!
+//! - **Arithmetic**: `add` `sub` `mul` `div` `idiv` `mod` `neg` `abs`
+//!   `ceiling` `floor` `round` `truncate` `sqrt` `exp` `ln` `log`
+//!   `sin` `cos` `atan` `cvi` `cvr`
+//! - **Comparison**: `eq` `ne` `gt` `ge` `lt` `le`
+//! - **Boolean / bitwise**: `and` `or` `xor` `not` `bitshift`
+//! - **Stack**: `dup` `exch` `pop` `copy` `index` `roll`
+//! - **Conditional**: `if` `ifelse` (each consuming one or two preceding
+//!   `{ ... }` procedure bodies)
+//! - **Literals**: integer (`5`, `-3`, `+1`), real (`1.5`, `-.5`, `1e-3`),
+//!   boolean (`true`, `false`)
+//!
+//! Non-finite numeric literals (`inf`, `NaN`) are rejected at parse time.
+//!
 //! # Integration
 //!
 //! The renderer at `src/rendering/page_renderer.rs` (lines 566-642) currently
@@ -136,21 +153,23 @@ impl Value {
 /// Maximum nested `{ ... }` depth permitted by the parser. PLRM has no formal
 /// cap, but real-world Type 4 streams are shallow; bounding it prevents a
 /// maliciously deep stream from blowing the Rust call stack since `parse_body`
-/// recurses for each brace level.
-const MAX_PARSE_DEPTH: u32 = 32;
+/// recurses for each brace level. Programs nested deeper return
+/// [`Error::InvalidPdf`].
+pub const MAX_PARSE_DEPTH: u32 = 32;
 
 /// Maximum operand stack size during execution. PLRM §7.10.5.2 requires a
-/// "stack overflow" diagnostic; we surface it as `Error::Type4Runtime`. The
+/// "stack overflow" diagnostic; we surface it as [`Error::Type4Runtime`]. The
 /// cap matches what Adobe accepts in practice — Acrobat's interpreter allows
 /// up to a few hundred operands.
-const MAX_STACK: usize = 256;
+pub const MAX_STACK: usize = 256;
 
 /// Maximum number of instructions the evaluator will execute. Type 4 has no
 /// loops in the language proper, but nested `if`/`ifelse` plus large generated
 /// bodies (or pathological streams crafted to consume CPU) can still produce
 /// arbitrarily many steps. 100 000 is generous for any realistic tint
-/// transform while still being a hard upper bound.
-const MAX_INSTRUCTIONS: usize = 100_000;
+/// transform while still being a hard upper bound. Programs that exceed this
+/// budget return [`Error::Type4Runtime`].
+pub const MAX_INSTRUCTIONS: usize = 100_000;
 
 /// Parse a Type 4 PostScript calculator program from raw bytes.
 ///
@@ -394,9 +413,9 @@ impl Program {
     /// Returns [`Error::InvalidPdf`] for any parse-time failure — syntax
     /// errors (missing braces, unknown tokens, orphan procedure bodies),
     /// non-finite numeric literals, and resource caps that fire during
-    /// parsing such as nesting deeper than `MAX_PARSE_DEPTH` (32). All of
-    /// these are deterministic properties of the program text, so callers
-    /// must not retry the same bytes on the next sample.
+    /// parsing such as nesting deeper than [`MAX_PARSE_DEPTH`]. All of these
+    /// are deterministic properties of the program text, so callers must
+    /// not retry the same bytes on the next sample.
     ///
     /// [`Error::Type4Runtime`] is reserved for execution-time failures
     /// (stack overflow/underflow, integer overflow in arithmetic, hitting
@@ -1293,6 +1312,14 @@ mod tests {
     fn cvi_rejects_bool_and_non_finite() {
         assert!(evaluate_type4(b"{ true cvi }", &[]).is_err());
         assert!(evaluate_type4(b"{ true cvr }", &[]).is_err());
+        // Runtime-produced inf/NaN: cvi rejects non-finite reals. Parser
+        // refuses `inf`/`NaN` literals, so route through `1 0 div` (+inf)
+        // and `0 0 div` (NaN) to hit the runtime-side check.
+        assert!(evaluate_type4(b"{ 1 0 div cvi }", &[]).is_err());
+        assert!(evaluate_type4(b"{ 0 0 div cvi }", &[]).is_err());
+        // cvr accepts any real, including non-finite values — no integer
+        // overflow concern. Verify the +inf round-trip survives.
+        assert_eq!(evaluate_type4(b"{ 1 0 div cvr }", &[]).unwrap()[0], f64::INFINITY);
     }
 
     #[test]
