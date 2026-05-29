@@ -170,7 +170,7 @@ fn parse(program: &[u8]) -> Result<Vec<Instruction>> {
 
 fn parse_body(s: &str, depth: u32) -> Result<Vec<Instruction>> {
     if depth > MAX_PARSE_DEPTH {
-        return Err(Error::Type4Runtime(format!(
+        return Err(Error::InvalidPdf(format!(
             "Type 4 parse depth limit exceeded (max {MAX_PARSE_DEPTH})"
         )));
     }
@@ -391,11 +391,19 @@ pub struct Program {
 impl Program {
     /// Compile a Type 4 program from its raw bytes.
     ///
-    /// Returns [`Error::InvalidPdf`] for syntax errors (missing braces,
-    /// unknown tokens, orphan procedure bodies, etc.) and
-    /// [`Error::Type4Runtime`] for resource-cap violations during parse
-    /// (e.g. nesting deeper than [`MAX_PARSE_DEPTH`]). The resulting
-    /// `Program` is reusable across many [`evaluate`](Self::evaluate) calls.
+    /// Returns [`Error::InvalidPdf`] for any parse-time failure — syntax
+    /// errors (missing braces, unknown tokens, orphan procedure bodies),
+    /// non-finite numeric literals, and resource caps that fire during
+    /// parsing such as nesting deeper than `MAX_PARSE_DEPTH` (32). All of
+    /// these are deterministic properties of the program text, so callers
+    /// must not retry the same bytes on the next sample.
+    ///
+    /// [`Error::Type4Runtime`] is reserved for execution-time failures
+    /// (stack overflow/underflow, integer overflow in arithmetic, hitting
+    /// the per-call instruction budget); those are raised by
+    /// [`evaluate`](Self::evaluate) and [`evaluate_clamped`](Self::evaluate_clamped),
+    /// never by `compile`. The resulting `Program` is reusable across many
+    /// `evaluate` calls.
     pub fn compile(bytes: &[u8]) -> Result<Self> {
         Ok(Self {
             instructions: parse(bytes)?,
@@ -1316,7 +1324,7 @@ mod tests {
         // it blows.
         let deep = format!("{{{}}}", "{".repeat(50)) + &"}".repeat(50);
         let err = evaluate_type4(deep.as_bytes(), &[]).unwrap_err();
-        assert!(matches!(err, Error::Type4Runtime(_)), "got: {err}");
+        assert!(matches!(err, Error::InvalidPdf(_)), "got: {err}");
         assert!(err.to_string().contains("depth"), "got: {err}");
 
         // Up to the depth cap itself: a deeply nested-but-bounded program
@@ -1397,6 +1405,24 @@ mod tests {
             let got = evaluate_type4(b"{ atan }", &[num, den]).unwrap();
             assert!((got[0] - want).abs() < 1e-9, "atan({num}, {den}) = {got:?}, want {want}");
             assert!(got[0] >= 0.0 && got[0] < 360.0, "atan out of [0, 360): {got:?}");
+        }
+    }
+
+    #[test]
+    fn parse_depth_limit_returns_invalid_pdf() {
+        // A pathologically nested program is malformed at parse time —
+        // it must surface as InvalidPdf so callers don't classify it as a
+        // runtime resource failure and retry forever.
+        let mut bytes = Vec::new();
+        bytes.extend(std::iter::repeat(b'{').take(50));
+        bytes.extend(std::iter::repeat(b'}').take(50));
+        match evaluate_type4(&bytes, &[]) {
+            Err(Error::InvalidPdf(_)) => {} // correct
+            Err(Error::Type4Runtime(s)) => panic!(
+                "parse depth should error as InvalidPdf, not Type4Runtime: {s}"
+            ),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(out) => panic!("should have errored, got {out:?}"),
         }
     }
 }
