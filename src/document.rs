@@ -11849,6 +11849,30 @@ impl PdfDocument {
         hasher.finish()
     }
 
+    /// Whether a font dictionary describes a font that is *document-local* and
+    /// therefore must never be served from / inserted into the cross-document
+    /// global font cache (Layer 6), even if its cheap identity hash collides
+    /// with a font in another document.
+    ///
+    /// Type 3 fonts (PDF 32000-1 §9.6.5) define their glyphs as streams of PDF
+    /// graphics operators in a `/CharProcs` dictionary whose procedures
+    /// reference the *owning document's* resources (XObjects, ColorSpaces,
+    /// ExtGState, …). Two Type 3 fonts from different documents that happen to
+    /// share `/Name` + `/Encoding` shape are NOT interchangeable: serving one
+    /// document's parsed `FontInfo` for the other yields wrong glyphs. Such
+    /// fonts carry no subset prefix, so the cheap hash cannot distinguish them
+    /// — this predicate gates them out of the global cache instead (#597).
+    fn font_is_document_local(font_obj: &Object) -> bool {
+        font_obj
+            .as_dict()
+            .and_then(|d| d.get("Subtype"))
+            .and_then(|s| match s {
+                Object::Name(n) => Some(n.as_str()),
+                _ => None,
+            })
+            == Some("Type3")
+    }
+
     /// Load fonts from a Resources dictionary into the extractor.
     pub(crate) fn load_fonts(
         &self,
@@ -12024,6 +12048,13 @@ impl PdfDocument {
                         // Compute identity hash (cheap: 3-6 dict lookups, ~200ns)
                         let id_hash = Self::font_identity_hash_cheap(&font);
 
+                        // #597: Type 3 (and other document-local) fonts must
+                        // not cross PdfDocument boundaries via the global
+                        // cache — their glyph procs reference this document's
+                        // resources. The per-document Layer 4/5 caches below
+                        // stay safe to use.
+                        let is_document_local = Self::font_is_document_local(&font);
+
                         // Layer 5: Per-font identity cache — skip from_dict when a
                         // structurally identical font was already parsed elsewhere.
                         let cached_identity_opt = self
@@ -12041,27 +12072,34 @@ impl PdfDocument {
 
                         // Layer 6: Global cross-document font cache — reuse fonts
                         // parsed by previous PdfDocument instances in this process.
-                        if let Some(cached) =
-                            crate::fonts::global_cache::global_font_cache_get(id_hash)
-                        {
-                            self.font_identity_cache
-                                .lock_or_recover()
-                                .insert(id_hash, Arc::clone(&cached));
-                            self.font_cache
-                                .lock_or_recover()
-                                .insert(font_ref, Arc::clone(&cached));
-                            extractor.add_font_shared((*name).clone(), cached);
-                            continue;
+                        // Skipped entirely for document-local fonts (#597).
+                        if !is_document_local {
+                            if let Some(cached) =
+                                crate::fonts::global_cache::global_font_cache_get(id_hash)
+                            {
+                                self.font_identity_cache
+                                    .lock_or_recover()
+                                    .insert(id_hash, Arc::clone(&cached));
+                                self.font_cache
+                                    .lock_or_recover()
+                                    .insert(font_ref, Arc::clone(&cached));
+                                extractor.add_font_shared((*name).clone(), cached);
+                                continue;
+                            }
                         }
 
                         match FontInfo::from_dict(&font, self) {
                             Ok(font_info) => {
                                 let arc = Arc::new(font_info);
-                                // Populate both document-level and global caches
-                                crate::fonts::global_cache::global_font_cache_insert(
-                                    id_hash,
-                                    Arc::clone(&arc),
-                                );
+                                // Populate the document-level caches always; the
+                                // global cross-document cache only for fonts that
+                                // are safe to share across documents (#597).
+                                if !is_document_local {
+                                    crate::fonts::global_cache::global_font_cache_insert(
+                                        id_hash,
+                                        Arc::clone(&arc),
+                                    );
+                                }
                                 self.font_identity_cache
                                     .lock_or_recover()
                                     .insert(id_hash, Arc::clone(&arc));
@@ -17349,6 +17387,33 @@ mod tests {
         let hash = PdfDocument::font_identity_hash_cheap(&Object::Null);
         // Should not panic, returns some hash
         let _ = hash;
+    }
+
+    // #597: Type 3 fonts are document-local and must be kept out of the
+    // cross-document global font cache (Layer 6). The gate uses
+    // font_is_document_local; pin its classification here.
+    #[test]
+    fn test_type3_font_is_document_local() {
+        let mut type3 = std::collections::HashMap::new();
+        type3.insert("Subtype".to_string(), Object::Name("Type3".to_string()));
+        type3.insert("Name".to_string(), Object::Name("F1".to_string()));
+        assert!(
+            PdfDocument::font_is_document_local(&Object::Dictionary(type3)),
+            "#597: Type3 fonts must be treated as document-local (uncacheable cross-document)"
+        );
+
+        // Non-Type3 fonts remain cacheable across documents.
+        for subtype in ["Type1", "TrueType", "Type0", "CIDFontType2"] {
+            let mut d = std::collections::HashMap::new();
+            d.insert("Subtype".to_string(), Object::Name(subtype.to_string()));
+            d.insert("BaseFont".to_string(), Object::Name("Helvetica".to_string()));
+            assert!(
+                !PdfDocument::font_is_document_local(&Object::Dictionary(d)),
+                "#597: {subtype} must remain cacheable across documents"
+            );
+        }
+        // A dict with no Subtype is not document-local.
+        assert!(!PdfDocument::font_is_document_local(&Object::Null));
     }
 
     // ========================================================================
