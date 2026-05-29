@@ -68,7 +68,12 @@ enum Instruction {
     Copy,
     Index,
     Roll,
-    // Conditional
+    // Parser-emitted procedure body. A `{ ... }` block starts as one of these
+    // and is consumed by the immediately following `if` or `ifelse` during
+    // `resolve_conditionals`. Any `ProcedureBody` that survives the resolve
+    // pass is an orphan and rejected at parse time.
+    ProcedureBody(Vec<Instruction>),
+    // Conditional (post-resolve form)
     If(Vec<Instruction>),
     IfElse(Vec<Instruction>, Vec<Instruction>),
 }
@@ -173,7 +178,7 @@ fn parse_body(s: &str) -> Result<Vec<Instruction>> {
                 return Err(Error::InvalidPdf("Unclosed brace in Type 4 function".into()));
             }
             let body = parse_body(&s[start..end])?;
-            instructions.push(Instruction::If(body));
+            instructions.push(Instruction::ProcedureBody(body));
             continue;
         }
         // Collect a token
@@ -268,7 +273,8 @@ fn parse_numeric_literal(token: &str) -> Result<Instruction> {
     Ok(Instruction::NumberLiteral(val))
 }
 
-/// Post-process: attach preceding procedure bodies to `if`/`ifelse` instructions.
+/// Post-process: attach preceding procedure bodies to `if`/`ifelse` and reject
+/// orphan procedure bodies that aren't consumed by a conditional.
 fn resolve_conditionals(instructions: &mut Vec<Instruction>) -> Result<()> {
     let mut i = 0;
     while i < instructions.len() {
@@ -280,14 +286,19 @@ fn resolve_conditionals(instructions: &mut Vec<Instruction>) -> Result<()> {
                         "Type 4 `if` without preceding procedure body".into(),
                     ));
                 }
-                if let Instruction::If(body) = instructions.remove(i - 1) {
-                    instructions[i - 1] = Instruction::If(body);
-                    // Don't increment i; we removed an element before
-                } else {
-                    return Err(Error::InvalidPdf("Type 4 `if` requires a procedure body".into()));
+                match instructions.remove(i - 1) {
+                    Instruction::ProcedureBody(body) => {
+                        instructions[i - 1] = Instruction::If(body);
+                        // Don't increment i; we removed an element before
+                    },
+                    _ => {
+                        return Err(Error::InvalidPdf(
+                            "Type 4 `if` requires a procedure body".into(),
+                        ));
+                    },
                 }
             },
-            Instruction::IfElse(_, _) => {
+            Instruction::IfElse(true_b, false_b) if true_b.is_empty() && false_b.is_empty() => {
                 // `ifelse`: two preceding procedure bodies
                 if i < 2 {
                     return Err(Error::InvalidPdf(
@@ -295,7 +306,7 @@ fn resolve_conditionals(instructions: &mut Vec<Instruction>) -> Result<()> {
                     ));
                 }
                 let false_branch = match instructions.remove(i - 1) {
-                    Instruction::If(body) => body,
+                    Instruction::ProcedureBody(body) => body,
                     _ => {
                         return Err(Error::InvalidPdf(
                             "Type 4 `ifelse` requires two procedure bodies".into(),
@@ -303,7 +314,7 @@ fn resolve_conditionals(instructions: &mut Vec<Instruction>) -> Result<()> {
                     },
                 };
                 let true_branch = match instructions.remove(i - 2) {
-                    Instruction::If(body) => body,
+                    Instruction::ProcedureBody(body) => body,
                     _ => {
                         return Err(Error::InvalidPdf(
                             "Type 4 `ifelse` requires two procedure bodies".into(),
@@ -317,6 +328,17 @@ fn resolve_conditionals(instructions: &mut Vec<Instruction>) -> Result<()> {
                 i += 1;
             },
         }
+    }
+    // Any procedure body that survives the resolve pass is an orphan — a
+    // `{ ... }` block not followed by `if`/`ifelse`. PLRM has no concept of
+    // executing a procedure object directly from this subset; reject it.
+    if instructions
+        .iter()
+        .any(|ins| matches!(ins, Instruction::ProcedureBody(_)))
+    {
+        return Err(Error::InvalidPdf(
+            "Type 4 orphan procedure body: { ... } not consumed by if/ifelse".into(),
+        ));
     }
     Ok(())
 }
@@ -600,6 +622,14 @@ fn execute(instructions: &[Instruction], stack: &mut Vec<Value>) -> Result<()> {
                 } else {
                     execute(false_branch, stack)?;
                 }
+            },
+            Instruction::ProcedureBody(_) => {
+                // Unreachable: `resolve_conditionals` rejects orphan procedure
+                // bodies at parse time. If one reaches `execute` we treat it
+                // as an internal invariant violation rather than panicking.
+                return Err(Error::Type4Runtime(
+                    "Type 4 internal error: ProcedureBody reached execute".into(),
+                ));
             },
         }
     }
@@ -1014,6 +1044,24 @@ mod tests {
 
         // atan undefined at (0, 0).
         assert!(evaluate_type4(b"{ atan }", &[0.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn orphan_procedure_body_rejected_at_parse() {
+        // `{ 1 { 2 } 3 }` has an inner `{ 2 }` that no `if`/`ifelse` consumes.
+        // Previous behavior silently turned the inner body into an `If` and
+        // mis-executed it (popping a bool that wasn't there). Now: parse error.
+        let err = evaluate_type4(b"{ 1 { 2 } 3 }", &[]).unwrap_err();
+        assert!(matches!(err, Error::InvalidPdf(_)), "got: {err}");
+        assert!(err.to_string().contains("orphan"), "got: {err}");
+    }
+
+    #[test]
+    fn orphan_procedure_body_alone_rejected() {
+        // A program that is only a procedure body with nothing else also has
+        // no `if`/`ifelse` to consume it.
+        let err = evaluate_type4(b"{ { 1 2 add } }", &[]).unwrap_err();
+        assert!(matches!(err, Error::InvalidPdf(_)), "got: {err}");
     }
 
     #[test]
