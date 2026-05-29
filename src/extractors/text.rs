@@ -1,7 +1,7 @@
 //! Text extraction from PDF content streams.
 //!
 //! This module executes content stream operators to extract positioned
-//! text characters with their Unicode mappings, font information, and
+//! text characters with their Unicode mappings, font information,
 //! bounding boxes.
 
 #![forbid(unsafe_code)]
@@ -20,7 +20,48 @@ use crate::object::{Object, ObjectRef};
 use crate::pipeline::config::WordBoundaryMode;
 use crate::text::{BoundaryContext, CharacterInfo, DocumentScript, WordBoundaryDetector};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Global flag controlling whether glyph-decode sites emit `U+FFFD`
+/// (REPLACEMENT CHARACTER) into `extract_text` / `extract_words` /
+/// `extract_spans` output.
+///
+/// The historical default is to silently drop `U+FFFD` chars, which
+/// is preserved here for back-compat. Setting `true` makes the
+/// high-level accessors consistent with `extract_chars` (which
+/// always preserves FFFD) so callers can detect unmapped-glyph
+/// pages without diffing the two accessors' outputs.
+///
+/// `Ordering::Relaxed` is sufficient because every read is gated on
+/// `Acquire`-style writes from the setter, and the flag is a single
+/// boolean with no other state dependencies.
+static PRESERVE_UNMAPPED_GLYPHS: AtomicBool = AtomicBool::new(false);
+
+/// Set the global U+FFFD preservation flag. When `true`, the high-level
+/// text accessors (`extract_text` / `extract_words` / `extract_spans`)
+/// emit U+FFFD chars for glyphs that map to the REPLACEMENT
+/// CHARACTER, matching the behaviour of `extract_chars` which has
+/// always preserved them. Returns the previous flag value.
+///
+/// Resolves the filter divergence where the high-level accessors
+/// silently drop FFFD while `extract_chars` keeps them, producing
+/// empty `extract_text` output on pages whose visible glyphs all
+/// map to FFFD (e.g. the MSAM10 math-symbol font).
+///
+/// The default is `false` to preserve historical fixture output
+/// byte-identical for the no-FFFD-glyph case; downstream callers
+/// that want to surface unmapped glyphs to the user opt in by
+/// setting `true`.
+pub fn set_preserve_unmapped_glyphs(preserve: bool) -> bool {
+    PRESERVE_UNMAPPED_GLYPHS.swap(preserve, Ordering::SeqCst)
+}
+
+/// True if the high-level accessors should preserve `U+FFFD` glyphs.
+#[inline]
+pub(crate) fn preserve_unmapped_glyphs() -> bool {
+    PRESERVE_UNMAPPED_GLYPHS.load(Ordering::Relaxed)
+}
 
 /// Source of a space decision in the unified pipeline.
 ///
@@ -201,6 +242,21 @@ impl Default for TextExtractionConfig {
     fn default() -> Self {
         Self {
             profile: None,
+            // Default -120.0 (conservative; matches existing
+            // ExtractionProfile::CONSERVATIVE for byte-identical
+            // back-compat). Callers handling TJ-heavy PDFs that
+            // produce `Loremipsumdolorsitamet`-style merged
+            // paragraphs can override via
+            // `TextExtractionConfig::with_space_threshold(-100.0)` or
+            // via the `TJ_HEAVY` extraction profile (see
+            // config/extraction_profiles.rs). The default stays at
+            // -120 to preserve byte-identical fixture output for the
+            // 75-PDF regression sweep.
+            //
+            // Per-document calibration via gap_statistics is the
+            // ideal root-cause fix; it requires a calibration corpus
+            // to validate the threshold against without regressing
+            // other inputs.
             space_insertion_threshold: -120.0,
             word_margin_ratio: 0.1,
             use_adaptive_tj_threshold: false,
@@ -793,7 +849,7 @@ impl SpanMergingConfig {
 /// Unified space decision function - SINGLE SOURCE OF TRUTH for space insertion.
 ///
 /// This function consolidates all space insertion logic into one place per the
-/// design principle in the comprehensive plan. It evaluates multiple signals and
+/// design principle in the comprehensive plan. It evaluates multiple signals
 /// returns a definitive decision about whether to insert a space between spans.
 ///
 /// # Rules (in priority order)
@@ -854,12 +910,12 @@ impl SpanMergingConfig {
 /// systematically OVER-reports proportional Latin glyphs. That inflates
 /// `bbox.width`, pushing `prev.right_edge` past the real glyph end so it can
 /// swallow a true word gap and drive `raw_gap` NEGATIVE — glyphs that do not
-/// actually overlap appear to (issue #328). Only in that overlap case do we
+/// actually overlap appear to. Only in that overlap case do we
 /// divide out the fallback inflation (0.55 em ÷ 0.45 em ≈ 1.22) to restore a
 /// believable gap.
 ///
 /// Crucially, the correction is applied ONLY when `raw_gap < 0`. When the
-/// glyphs do not overlap (`raw_gap ≥ 0`) the layout is already honest and
+/// glyphs do not overlap (`raw_gap ≥ 0`) the layout is already honest
 /// must not be second-guessed: inflating a non-overlapping gap manufactures
 /// a phantom word space and splits single words that were positioned
 /// edge-to-edge — e.g. a CamelCase brand "SalesForce" emitted as
@@ -877,6 +933,76 @@ fn corrected_space_gap(
     } else {
         raw_gap
     }
+}
+
+/// detect whether a glyph's mapped text
+/// represents an AGL Latin ligature (`/ff` / `/fi` / `/fl` / `/ffi` /
+/// `/ffl`). When the upstream space-emission heuristic processes a
+/// glyph adjacent to a ligature, the small intra-word kerning that
+/// surrounds the ligature glyph can trigger spurious space
+/// insertion (producing `di ff cult` for `difficult`). The detection
+/// here lets the heuristic suppress space insertion at ligature
+/// boundaries.
+///
+/// Returns true when the text *is* a bare AGL ligature glyph — a
+/// single codepoint in the Latin Ligatures block (U+FB00..U+FB06) or
+/// the multi-char ASCII fallback ("ff"/"fi"/"fl"/"ffi"/"ffl"). The
+/// suppression at the call site targets the pdfTeX-style emission
+/// pattern where the ligature is its own cluster between two
+/// intra-word fragments (e.g. "di"→"ﬃ"→"cult" or "di"→"ffi"→"cult").
+/// A multi-char cluster that merely starts with a ligature
+/// (e.g. "ﬂuid" or "ffective") is a full word whose boundary with the
+/// previous span is a legitimate space, so we return false in that
+/// case.
+#[inline]
+pub(crate) fn starts_with_agl_ligature(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    // Bare single-codepoint ligature glyph from the Latin Ligatures
+    // block.
+    if ('\u{FB00}'..='\u{FB06}').contains(&first) && chars.next().is_none() {
+        return true;
+    }
+    // Multi-character AGL outputs from non-PUA fallbacks — match only
+    // when the cluster IS the ligature, never when it just begins
+    // with one.
+    matches!(text, "ff" | "fi" | "fl" | "ffi" | "ffl")
+}
+
+/// detect monospace fonts by name.
+/// Monospace fonts emit one show-text op per glyph with one-em
+/// advance positioning, which triggers the proportional-font space-
+/// emission heuristic to fire inside ordinary tokens. Bumping the
+/// threshold for these fonts closes the `function add (a , b )` repro
+/// from `code_and_formula.pdf` (issue ). Used by
+/// [`should_insert_space`] to switch its `word_margin_ratio` to
+/// `1.2` for monospace.
+///
+/// Names matched case-insensitively. Covers the major monospace
+/// families on macOS / Linux / Windows + the pdfTeX-emitted
+/// Computer Modern Typewriter (CMTT*) and Latin Modern Mono
+/// (LMMono*) families that frequently appear in academic PDFs.
+pub(crate) fn is_monospace_font(font_name: &str) -> bool {
+    let lower = font_name.to_lowercase();
+    const MONO_MARKERS: &[&str] = &[
+        "mono",
+        "courier",
+        "consolas",
+        "menlo",
+        "fira code",
+        "fira mono",
+        "source code",
+        "inconsolata",
+        "cmtt",   // pdfTeX Computer Modern Typewriter
+        "lmmono", // Latin Modern Mono (pdfTeX)
+        "letter gothic",
+        "ocr ", // OCR-A, OCR-B
+        "fixedsys",
+        "terminal",
+    ];
+    MONO_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 fn should_insert_space(
@@ -1031,15 +1157,41 @@ fn should_insert_space(
         // Font found: use space glyph width for calculation
         let space_width_units = font_info.get_space_glyph_width(); // in 1000ths of em
         let space_width_pt = (space_width_units / 1000.0) * font_size;
-        let word_margin_ratio = 0.5; // 50% of space width
+        // monospace fonts emit one show-text
+        // op per glyph at one-em-advance positioning, so the gap
+        // between glyphs in normal tokens briefly exceeds the
+        // proportional-font threshold. Use a 1.2× ratio for monospace
+        // so spurious spaces around punctuation in code listings
+        // (`function add (a , b )` → `function add(a, b)`) don't fire.
+        let mut word_margin_ratio = if is_monospace_font(font_name) {
+            1.2
+        } else {
+            0.5 // 50% of space width (proportional default)
+        };
+        // when prev_font_size
+        // next_font_size differ significantly, we're at a font-run
+        // boundary (italic → roman, bold → regular, or a font-family
+        // switch). PdfTeX-typeset titles like
+        // `Astronomy & Astrophysicsmanuscript no.` exhibit this when
+        // the writer doesn't emit an explicit space-glyph at the font
+        // switch. Reduce the threshold by 30% at boundaries so a
+        // smaller gap suffices to trigger space insertion. The full
+        // fix (font-name plumbing for italic→roman within same size)
+        // is tracked in — many italic transitions
+        // share font_size, so this only catches the size-changing
+        // subset.
+        if (prev_font_size - next_font_size).abs() > 0.5 {
+            word_margin_ratio *= 0.7;
+        }
         let threshold = space_width_pt * word_margin_ratio;
 
         log::debug!(
-            "Font-aware spacing for '{}' @ {:.1}pt: space_width={:.1}pt, threshold={:.1}pt",
+            "Font-aware spacing for '{}' @ {:.1}pt: space_width={:.1}pt, threshold={:.1}pt (mono={})",
             font_name,
             font_size,
             space_width_pt,
-            threshold
+            threshold,
+            is_monospace_font(font_name),
         );
 
         threshold
@@ -1051,6 +1203,26 @@ fn should_insert_space(
             font_size
         );
         font_size * 0.25
+    };
+
+    // suppress space insertion at AGL-
+    // ligature boundaries. When the preceding or following text
+    // starts with one of the Latin ligature codepoints (U+FB00..U+FB04)
+    // or matches the multi-char AGL ligature names, the small kerning
+    // gap that surrounds the ligature glyph is NOT a word boundary —
+    // it's an intra-word position artefact from pdfTeX-style ligature
+    // emission. Inflating the threshold by 1.5× at these positions
+    // catches the `di ff cult` → `difficult` repro from issue .
+    let ligature_boundary = starts_with_agl_ligature(following_text)
+        || preceding_text
+            .chars()
+            .last()
+            .map(|c| ('\u{FB00}'..='\u{FB06}').contains(&c))
+            .unwrap_or(false);
+    let geometric_threshold = if ligature_boundary {
+        geometric_threshold * 1.5
+    } else {
+        geometric_threshold
     };
 
     let geometric_suggests_space = gap_pt > geometric_threshold;
@@ -1172,7 +1344,7 @@ fn should_insert_space(
     // `geometric_threshold` is already `space_width_pt * 0.5`. A gap that
     // clears this threshold is >= 50 % of the font's own space-glyph
     // advance, which is what pdfium (Chrome/pypdfium2) uses as the
-    // word-break heuristic in its default text-extraction path — and
+    // word-break heuristic in its default text-extraction path —
     // the reason pdf_oxide was glueing adjacent words like
     // "atBirmingham", "LIFESCIENCESRESEARCH", "STATIONFREEDOM",
     // "proteincrystals" before this change. The previous 2× multiplier
@@ -1597,7 +1769,7 @@ impl TjBuffer {
                     } else {
                         // Rare: multi-char mapping or unmapped byte
                         if let Some(s) = font.char_to_unicode(byte as u32) {
-                            if s != "\u{FFFD}" {
+                            if s != "\u{FFFD}" || preserve_unmapped_glyphs() {
                                 for ch in s.chars() {
                                     if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
                                         self.unicode.push(ch);
@@ -1606,7 +1778,7 @@ impl TjBuffer {
                             }
                         } else {
                             let fb = fallback_char_to_unicode(byte as u32);
-                            if fb != "\u{FFFD}" {
+                            if fb != "\u{FFFD}" || preserve_unmapped_glyphs() {
                                 for ch in fb.chars() {
                                     if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
                                         self.unicode.push(ch);
@@ -1804,7 +1976,7 @@ fn get_byte_mode(font: Option<&FontInfo>) -> ByteMode {
     if let Some(font) = font {
         if font.subtype == "Type0" {
             // If the ToUnicode CMap declares a 2-byte codespace range, always use
-            // TwoByte mode regardless of the encoding name.  This handles CJK fonts
+            // TwoByte mode regardless of the encoding name. This handles CJK fonts
             // whose /Encoding name is a custom CMap stream that doesn't match the
             // well-known keyword patterns below (e.g. "H", "V", "UniCNS-H", …).
             // See PDF Spec §9.7.5 — `begincodespacerange` is authoritative.
@@ -1909,7 +2081,7 @@ fn decode_text_to_unicode(bytes: &[u8], font: Option<&FontInfo>) -> String {
                     let char_str = font
                         .char_to_unicode(byte as u32)
                         .unwrap_or_else(|| fallback_char_to_unicode(byte as u32));
-                    if char_str != "\u{FFFD}" {
+                    if char_str != "\u{FFFD}" || preserve_unmapped_glyphs() {
                         result.push_str(&char_str);
                     }
                 }
@@ -1921,7 +2093,7 @@ fn decode_text_to_unicode(bytes: &[u8], font: Option<&FontInfo>) -> String {
                     .char_to_unicode(char_code as u32)
                     .unwrap_or_else(|| fallback_char_to_unicode(char_code as u32));
 
-                if char_str != "\u{FFFD}" {
+                if char_str != "\u{FFFD}" || preserve_unmapped_glyphs() {
                     result.push_str(&char_str);
                 }
             }
@@ -2463,7 +2635,7 @@ impl<'doc> TextExtractor<'doc> {
     /// Per ISO 32000 §7.9.2, strings without a UTF-16 BOM are PDFDocEncoding.
     /// We try UTF-8 first as a lenient path for non-spec-compliant PDFs that
     /// embed raw UTF-8 without a BOM; if that fails we fall back to the correct
-    /// PDFDocEncoding lookup (which handles the 0x80–0x9E special-char zone and
+    /// PDFDocEncoding lookup (which handles the 0x80–0x9E special-char zone
     /// maps 0xA0–0xFF as ISO Latin-1, unlike from_utf8_lossy which substitutes
     /// U+FFFD for any byte that is not valid UTF-8).
     fn decode_pdf_text_string(bytes: &[u8]) -> String {
@@ -2791,6 +2963,17 @@ impl<'doc> TextExtractor<'doc> {
             );
         }
 
+        // Snap super/subscript glyph spans onto the baseline of an
+        // adjacent base span BEFORE row-aware sorting. PDFs raise
+        // or lower the text matrix via the `Ts` (text-rise) operator
+        // for super/subscripts (§9.3.7); the rendered glyphs end up
+        // at a Y offset of typically 0.3–0.5 × font_size from the
+        // baseline. Without the snap, sorting groups all raised
+        // glyphs into a separate Y-band above the body, producing
+        // output like `"1,2 ★ 3,4 5 / Chibueze, …"` instead of
+        // `"Chibueze,1,2★ Caleb,3,4† …"`.
+        self.snap_superscript_baselines();
+
         self.sort_spans_by_reading_order();
 
         // Deduplicate overlapping spans
@@ -2921,6 +3104,98 @@ impl<'doc> TextExtractor<'doc> {
         );
 
         self.chars = deduplicated;
+    }
+
+    /// Snap super/subscript glyph spans onto the baseline of an
+    /// adjacent base span so downstream row-aware sorting keeps
+    /// them inline.
+    ///
+    /// PDF §9.3.7 defines text rise (`Ts`) as a per-text-state
+    /// vertical offset added to the rendering position; the
+    /// resulting glyphs sit above (super) or below (sub) the
+    /// surrounding baseline. The raw extracted bbox preserves
+    /// that offset, so sorting by Y descending interprets a
+    /// superscript line of affiliation markers (`1,2 ★ 3,4 …`)
+    /// as a row that precedes the author names that they actually
+    /// annotate. Snapping each candidate's Y to the matched base
+    /// puts them back in the same Y-band.
+    ///
+    /// A span is a snap candidate when:
+    /// - its font_size is < 85 % of a nearby larger-font span,
+    /// - its Y is above that base by ≤ 50 % of the base's font_size
+    ///   (or below it by the same — covers subscript too), and
+    /// - its X falls between the base's right edge and one base
+    ///   font_size beyond (the position a superscript would
+    ///   appear when typeset directly after the base).
+    fn snap_superscript_baselines(&mut self) {
+        let n = self.spans.len();
+        if n < 2 {
+            return;
+        }
+
+        // Snapshot the read-side fields we need so the borrow checker
+        // lets us mutate `self.spans[i].bbox.y` inside the loop.
+        let snapshot: Vec<(f32, f32, f32, f32)> = self
+            .spans
+            .iter()
+            .map(|s| (s.bbox.x, s.bbox.y, s.bbox.width, s.font_size))
+            .collect();
+
+        for i in 0..n {
+            let (sx, sy, _sw, sfs) = snapshot[i];
+            if sfs <= 0.0 {
+                continue;
+            }
+            // Find the closest base candidate (in Y) that satisfies
+            // the super/subscript geometry. Pick the smallest |y_offset|
+            // tie-breaker so a candidate sandwiched between two body
+            // lines snaps onto the nearer one.
+            let mut best_base_y: Option<f32> = None;
+            let mut best_abs_offset = f32::MAX;
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let (bx, by, bw, bfs) = snapshot[j];
+                if bfs <= sfs * 1.15 {
+                    continue;
+                }
+                let y_offset = sy - by;
+                let half_em = bfs * 0.5;
+                if y_offset.abs() > half_em {
+                    continue;
+                }
+                // Skip subscripts (lowered glyphs). The document-level
+                // pass `apply_super_sub_script_substitutions` needs to
+                // see them at their original lowered baseline so it can
+                // substitute ASCII digits with U+2080..U+2089 (e.g.
+                // H2O -> H\u{2082}O). Snapping them onto the base
+                // baseline would defeat that substitution.
+                if y_offset < 0.0 {
+                    continue;
+                }
+                // X adjacency: the candidate's left edge must sit
+                // near the base's right edge — within one base
+                // font_size to the right and a small slack to the
+                // left for kerning. Combining diacritics are
+                // excluded by the size-ratio gate above (they
+                // typically share font_size with their base
+                // letter, failing `bfs > sfs * 1.15`).
+                let base_right = bx + bw;
+                let dx = sx - base_right;
+                if dx < -bfs * 0.25 || dx > bfs {
+                    continue;
+                }
+                let abs_off = y_offset.abs();
+                if abs_off < best_abs_offset {
+                    best_abs_offset = abs_off;
+                    best_base_y = Some(by);
+                }
+            }
+            if let Some(by) = best_base_y {
+                self.spans[i].bbox.y = by;
+            }
+        }
     }
 
     /// Sort extracted text spans by reading order (top-to-bottom, left-to-right).
@@ -3320,7 +3595,7 @@ impl<'doc> TextExtractor<'doc> {
             // Gap between end of current span and start of next span
             let current_end_x = current.bbox.x + current.bbox.width;
             let gap = span.bbox.x - current_end_x;
-            // Fallback-width correction (issue #328): When the previous
+            // Fallback-width correction: When the previous
             // span's font has no explicit `/Widths` array, every glyph in
             // that span reports the 500/550/600-thousandths-of-em fallback
             // from `FontInfo::new`. For proportional Latin fonts whose
@@ -3329,7 +3604,7 @@ impl<'doc> TextExtractor<'doc> {
             // `bbox.width` is systematically inflated and `current_end_x`
             // overshoots the actual end of the rendered text — often by
             // enough to swallow the real inter-word gap entirely, turning
-            // the visible word boundary into a negative `gap` value and
+            // the visible word boundary into a negative `gap` value
             // tripping merge logic that then glues the words without a
             // space.
             //
@@ -3389,16 +3664,16 @@ impl<'doc> TextExtractor<'doc> {
             // transition between adjacent characters in different fonts —
             // the standard mixed-script PDF layout pattern — was triggering
             // cross-font glue and concatenating "神鹰集团" + "Z" into
-            // "神鹰集团Z" with no separator.  Word-F1 against pdftotext
+            // "神鹰集团Z" with no separator. Word-F1 against pdftotext
             // ground truth (which inserts a space at every CJK↔non-CJK
             // boundary) then loses both the trailing CJK token and the
-            // leading Latin/digit token.  Skip cross-font glue when the
+            // leading Latin/digit token. Skip cross-font glue when the
             // boundary crosses CJK / non-CJK scripts.
             //
-            // EXCLUDES fullwidth ASCII (U+FF01..FF5E) and CJK Symbols and
+            // EXCLUDES fullwidth ASCII (U+FF01..FF5E) and CJK Symbols
             // Punctuation (U+3000..303F) — those operator-style glyphs sit
             // inline with adjacent Latin/digit in CJK technical writing
-            // (e.g. "60000≤Q＜80000" in issue-336).  Treating them as a CJK
+            // (e.g. "60000≤Q＜80000" in issue-336). Treating them as a CJK
             // boundary would split the compound token.
             let is_cjk_char = |c: char| {
                 matches!(
@@ -3429,6 +3704,33 @@ impl<'doc> TextExtractor<'doc> {
                 && curr_head_char.is_some_and(|c| c.is_alphabetic())
                 && (current.text.chars().count() == 1 || span.text.chars().count() == 1);
 
+            // Small-caps / drop-cap glue: same base font and same
+            // weight/italic flags but different font_size, adjacent
+            // on the same baseline, both alphabetic. PDFs simulate
+            // small-caps by rendering the capital initial at body
+            // font size and the remaining letters at a reduced
+            // size in the same font, emitted as separate Tj runs
+            // with zero gap between them. The strict `is_same_font`
+            // gate rejects the merge because of the size mismatch,
+            // and the single-character drop-cap glue above doesn't
+            // help when both runs are multi-character (an initial
+            // run of several full-size capitals followed by a
+            // reduced-size remainder). Spec basis: PDF §9.3.1
+            // treats font_size as a graphics-state parameter that
+            // may change between Tj operators; nothing in §9.4
+            // makes such a change a word boundary.
+            let small_caps_glue = !is_same_font
+                && current.font_name == span.font_name
+                && current.font_weight == span.font_weight
+                && current.is_italic == span.is_italic
+                && same_line
+                && gap.abs() < 1.0
+                && !current.text.is_empty()
+                && !span.text.is_empty()
+                && !crosses_cjk_boundary
+                && prev_tail_char.is_some_and(|c| c.is_alphabetic())
+                && curr_head_char.is_some_and(|c| c.is_alphabetic());
+
             // Merge threshold: Use configured values
             // Negative gaps: use severe_overlap_threshold_pt (default -0.5pt)
             // Positive gaps: use a threshold that allows for justified text but
@@ -3448,7 +3750,8 @@ impl<'doc> TextExtractor<'doc> {
                     .contains(&gap)
                 && !large_gap_indicates_column
                 || (same_line && has_split_boundary)
-                || cross_font_word_glue;
+                || cross_font_word_glue
+                || small_caps_glue;
 
             // DECIMAL VALUE MERGE: Some forms place integer and decimal parts
             // of dollar amounts in separate fixed-width boxes.
@@ -3462,7 +3765,7 @@ impl<'doc> TextExtractor<'doc> {
             // documents that emit each glyph as its own Tj — e.g. the year
             // "2013" rendered as four separate TjL operators with sub-pixel
             // gaps was being mangled into "201.3", losing the year token from
-            // word-F1 scoring.  Real "$123 _ 45" split-box layouts always have
+            // word-F1 scoring. Real "$123 _ 45" split-box layouts always have
             // a gap > ~half the font size; tight letter spacing is < 0.1 em.
             let min_decimal_gap = current.font_size * 0.4;
             let decimal_merge = same_line
@@ -3856,7 +4159,7 @@ impl<'doc> TextExtractor<'doc> {
                 // line's own height is the SAME visual line — only a
                 // delta on the order of the font size is a real line
                 // break (body leading ≳ 1.0× font size). The previous
-                // `f.round() as i32 ==` check tolerated only ±0.5pt and
+                // `f.round() as i32 ==` check tolerated only ±0.5pt
                 // split jittered glyphs into separate Y-banded spans that
                 // the reading-order sort then scrambled. Tolerance is
                 // scale-relative (0.5× the text-space glyph height, ≥0.5pt
@@ -4069,7 +4372,7 @@ impl<'doc> TextExtractor<'doc> {
                                     //
                                     // In PDFs, spaces are often represented as negative positioning offsets in TJ arrays,
                                     // not as explicit space characters. For example:
-                                    // [(Text1) -200 (Text2)] TJ  <- the -200 creates visual spacing
+                                    // [(Text1) -200 (Text2)] TJ <- the -200 creates visual spacing
                                     //
                                     // Geometry-based adaptive threshold (based on font metrics)
                                     // Formula: adaptive_threshold = -(average_glyph_width * word_margin_ratio)
@@ -4245,9 +4548,17 @@ impl<'doc> TextExtractor<'doc> {
 
             // Graphics state operators
             Operator::SaveState => {
+                // Flush the Tj span buffer before pushing graphics state.
+                // q/Q wraps a graphics-state block; restoring after Q can
+                // re-set the CTM to an earlier value, leaving the
+                // captured user_pos inside the buffer out of sync with
+                // the active CTM. Flush so each q/Q block emits its
+                // own clean cluster.
+                self.flush_tj_span_buffer()?;
                 self.state_stack.save();
             },
             Operator::RestoreState => {
+                self.flush_tj_span_buffer()?;
                 self.state_stack.restore();
                 // Sync cached font with restored state
                 self.cached_current_font = self
@@ -4259,6 +4570,24 @@ impl<'doc> TextExtractor<'doc> {
                     .cloned();
             },
             Operator::Cm { a, b, c, d, e, f } => {
+                // Flush the Tj span buffer before changing the CTM.
+                // The buffer captured `user_pos_x`/`user_pos_y` and
+                // `user_h_scale` from the CTM in effect when it was
+                // created (TjBuffer::new at the first Tj after BT).
+                // Non-conforming PDFs can issue cm operators inside
+                // a text object — typically when figure / chart text
+                // runs alternate `cm` for position with text
+                // operators in the same BT/ET block. Without a
+                // flush, subsequent Tj chars get a position derived
+                // from the new CTM while the buffer still reports
+                // the stale `user_pos`, dropping the cluster off
+                // the page in the worst case. Flushing here emits
+                // the current cluster at its captured position and
+                // the next Tj creates a fresh buffer under the new
+                // CTM. Spec basis: §9.4 lists cm as general
+                // graphics state, not formally allowed inside
+                // BT/ET, but conforming readers must process it.
+                self.flush_tj_span_buffer()?;
                 let state = self.state_stack.current_mut();
                 let new_ctm = Matrix { a, b, c, d, e, f };
                 // PDF spec ISO 32000-1:2008 §8.3.4: cm concatenates as M_cm × CTM
@@ -4945,6 +5274,15 @@ impl<'doc> TextExtractor<'doc> {
 
             // XObject operator - Process Form XObjects for text extraction
             Operator::Do { name } => {
+                // Flush the Tj span buffer before invoking a Form XObject.
+                // `process_xobject` applies the form's /Matrix to the CTM
+                // (§8.10.1) and may execute cm/Tm operators inside the
+                // form's content stream. The buffer's captured user_pos
+                // would no longer correspond to the CTM in effect when
+                // the form's text is emitted, so subsequent Tj chars
+                // would be stitched into the wrong cluster.
+                self.flush_tj_span_buffer()?;
+
                 // Process Form XObjects to extract text from reusable content.
                 // Form XObjects can contain text that is not duplicated in the main stream.
                 // We track processed XObjects to avoid infinite loops and duplicates.
@@ -5058,7 +5396,7 @@ impl<'doc> TextExtractor<'doc> {
         let current_ctm = self.state_stack.current().ctm;
         // Round to nearest millipoint instead of truncating with `as i64`,
         // so floating-point noise in the same logical CTM produces a
-        // stable hash key (truncation alone could send 0.99999... and
+        // stable hash key (truncation alone could send 0.99999...
         // 1.00001... to different buckets).
         let ctm_key = [
             (current_ctm.a * 1000.0).round() as i64,
@@ -5642,7 +5980,7 @@ impl<'doc> TextExtractor<'doc> {
 
                         // Check if the next element in the TJ array is a string
                         // that starts with whitespace. If so, DON'T insert a space to avoid doubling.
-                        // This prevents patterns like "word " + " next" = "word  next" (double space)
+                        // This prevents patterns like "word " + " next" = "word next" (double space)
                         let next_element_starts_with_space = if idx + 1 < array.len() {
                             if let TextElement::String(next_s) = &array[idx + 1] {
                                 next_s.first().is_some_and(|&byte| {
@@ -5661,16 +5999,26 @@ impl<'doc> TextExtractor<'doc> {
                             self.insert_space_as_span()?;
                         }
 
+                        // Apply the TJ offset to the text matrix BEFORE
+                        // creating the new buffer so its `user_pos_x`
+                        // captures the actual draw position of the next
+                        // string. Otherwise the buffer anchors at the
+                        // pre-offset position and every subsequent span
+                        // on the line inherits the missing tx.
+                        self.advance_position_for_offset(*offset)?;
+
                         // Start new buffer with current state
                         buffer = TjBuffer::new(
                             self.state_stack.current(),
                             self.current_mcid,
                             self.cached_current_font.clone(),
                         );
+                    } else {
+                        // Sub-threshold offset: matrix advances but the
+                        // current buffer keeps accumulating, so apply
+                        // the offset unconditionally here as well.
+                        self.advance_position_for_offset(*offset)?;
                     }
-
-                    // Advance position for offset (updates text matrix)
-                    self.advance_position_for_offset(*offset)?;
                 },
             }
         }
@@ -6135,7 +6483,7 @@ impl<'doc> TextExtractor<'doc> {
             } else {
                 // Type0/CID font: use TextCharIter so that the byte-width (1 or 2)
                 // is determined by the font's encoding / ToUnicode CMap codespace,
-                // not hardcoded to 2.  Per ISO 32000-1:2008 §9.7.6.2.
+                // not hardcoded to 2. Per ISO 32000-1:2008 §9.7.6.2.
                 let mut w_sum = 0.0f32;
                 for (cid, _) in TextCharIter::new(text, Some(font)) {
                     let mut w = font.get_glyph_width(cid) * fs_factor * hs_factor;
@@ -6256,7 +6604,7 @@ impl<'doc> TextExtractor<'doc> {
                     } else {
                         // Rare: multi-char mapping or unmapped byte
                         if let Some(s) = font.char_to_unicode(byte as u32) {
-                            if s != "\u{FFFD}" {
+                            if s != "\u{FFFD}" || preserve_unmapped_glyphs() {
                                 for ch in s.chars() {
                                     if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
                                         buffer.unicode.push(ch);
@@ -6265,7 +6613,7 @@ impl<'doc> TextExtractor<'doc> {
                             }
                         } else {
                             let fb = fallback_char_to_unicode(byte as u32);
-                            if fb != "\u{FFFD}" {
+                            if fb != "\u{FFFD}" || preserve_unmapped_glyphs() {
                                 for ch in fb.chars() {
                                     if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
                                         buffer.unicode.push(ch);
@@ -6436,7 +6784,7 @@ impl<'doc> TextExtractor<'doc> {
                     if c != '\0' {
                         buffer.unicode.push(c);
                     } else if let Some(s) = font.char_to_unicode(byte as u32) {
-                        if s != "\u{FFFD}" {
+                        if s != "\u{FFFD}" || preserve_unmapped_glyphs() {
                             for ch in s.chars() {
                                 if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
                                     buffer.unicode.push(ch);
@@ -6445,7 +6793,7 @@ impl<'doc> TextExtractor<'doc> {
                         }
                     } else {
                         let fb = fallback_char_to_unicode(byte as u32);
-                        if fb != "\u{FFFD}" {
+                        if fb != "\u{FFFD}" || preserve_unmapped_glyphs() {
                             for ch in fb.chars() {
                                 if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
                                     buffer.unicode.push(ch);
@@ -6473,7 +6821,7 @@ impl<'doc> TextExtractor<'doc> {
             } else {
                 buffer.append(text)?;
                 // Width calculation: use TextCharIter so byte-width respects the
-                // CMap codespace (1 or 2 bytes per character).  Fixes CJK fonts
+                // CMap codespace (1 or 2 bytes per character). Fixes CJK fonts
                 // whose encoding name doesn't match the well-known Identity-H/EUC/…
                 // keyword patterns but whose ToUnicode CMap declares a 2-byte
                 // codespace range (§9.7.5).
@@ -6584,10 +6932,13 @@ impl<'doc> TextExtractor<'doc> {
 
         self.spans.push(span);
 
-        // Advance position per ISO 32000-1:2008 §9.4.4
-        let state = self.state_stack.current_mut();
-        state.text_matrix.e += space_width * text_matrix.a;
-        state.text_matrix.f += space_width * text_matrix.b;
+        // Do NOT advance the text matrix here. The caller drives the
+        // matrix forward by the *actual* TJ offset via
+        // `advance_position_for_offset` immediately after; advancing
+        // by `space_width` on top of that would double-count the gap
+        // and capture the wrong `user_pos_x` when the next buffer is
+        // created, producing spans whose bbox.x sits ~one synthetic
+        // space-width to the right of the character actually drawn.
 
         Ok(())
     }
@@ -6634,12 +6985,12 @@ impl<'doc> TextExtractor<'doc> {
                     .take()
                     .unwrap_or_else(|| "Unknown".to_string());
 
-                // v0.3.54 #537: RTL visual-order detection for the Tj-span
+                // #537: RTL visual-order detection for the Tj-span
                 // path. This was the gap on the Magic Palace Eilat Hebrew
                 // PDF — the Tj-span buffer flush had no RTL correction at
                 // all, so Hebrew came out in content-stream (visual)
                 // order regardless of what the geometric signals said.
-                // Mirrors the existing logic in `flush_tj_buffer` and
+                // Mirrors the existing logic in `flush_tj_buffer`
                 // `cluster_to_span`: detect RTL content, use the geometric
                 // detector when `char_widths` give us per-char x; fall back
                 // to the `accumulated_width > 0` simple check (text drawn
@@ -11130,7 +11481,7 @@ mod tests {
     }
 
     // ========================================================================
-    // REGRESSION: named / unknown color space references (issue #444)
+    // REGRESSION: named / unknown color space references
     // ========================================================================
 
     /// Named color space reference like "Cs1" should fall back by component
@@ -12464,7 +12815,7 @@ mod tests {
 
         extractor.merge_adjacent_spans();
         assert_eq!(extractor.spans.len(), 1);
-        // Should not have "Hello   World" (triple space)
+        // Should not have "Hello World" (triple space)
         assert!(!extractor.spans[0].text.contains("   "), "Should prevent triple space");
     }
 
@@ -12835,7 +13186,7 @@ mod tests {
 
     #[test]
     fn test_decode_pdfdocencoding_latin_byte() {
-        // 0xE9 = PDFDocEncoding for é (U+00E9).  Not valid UTF-8 on its own.
+        // 0xE9 = PDFDocEncoding for é (U+00E9). Not valid UTF-8 on its own.
         let result = TextExtractor::decode_pdf_text_string(&[0xE9]);
         assert_eq!(result, "é", "0xE9 must decode as 'é' via PDFDocEncoding, not produce U+FFFD");
     }

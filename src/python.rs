@@ -141,17 +141,26 @@ impl PyPdfDocument {
     }
 
     /// Get number of pages.
-    fn page_count(&mut self) -> PyResult<usize> {
-        if let Some(ref mut editor) = self.editor {
+    ///
+    /// works as both an attribute (the v0.3.6 shape)
+    /// AND as a method call (the shape). Returns a `_PageCount`
+    /// wrapper that is callable (`doc.page_count()` returns the int),
+    /// indexable (`range(doc.page_count)` works via `__index__`),
+    /// comparable with ints (`doc.page_count == 5`). The method-call
+    /// form is deprecated; new code should use the attribute form.
+    #[getter(page_count)]
+    fn page_count(&mut self) -> PyResult<PyPageCount> {
+        let value = if let Some(ref mut editor) = self.editor {
             use crate::editor::EditableDocument;
             editor
                 .page_count()
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page count: {}", e)))
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page count: {}", e)))?
         } else {
             self.inner
                 .page_count()
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page count: {}", e)))
-        }
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page count: {}", e)))?
+        };
+        Ok(PyPageCount { value })
     }
 
     /// Enumerate existing PDF signatures. Returns a list of
@@ -399,8 +408,8 @@ impl PyPdfDocument {
     /// previews where the caller doesn't want to do DPI arithmetic.
     ///
     /// Args:
-    ///     page (int):   Zero-based page index.
-    ///     width (int):  Target box width in pixels (must be > 0).
+    ///     page (int): Zero-based page index.
+    ///     width (int): Target box width in pixels (must be > 0).
     ///     height (int): Target box height in pixels (must be > 0).
     ///     format (str, optional): "png" (default) or "jpeg".
     ///     background (tuple[float, float, float, float], optional):
@@ -2087,6 +2096,62 @@ impl PyPdfDocument {
         }
     }
 
+    /// Python wrapper: returns True if the page has a
+    /// text layer; False for image-only / genuinely-empty pages.
+    /// Callers route image-only pages to OCR.
+    fn has_text_layer(&self, page: usize) -> PyResult<bool> {
+        self.inner
+            .has_text_layer(page)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Python wrapper: returns the document's /P
+    /// permission flags as a dict (None for unencrypted PDFs). Keys
+    /// match the PdfPermissions struct fields. Per PDF spec §7.6.3.2
+    /// the flags are advisory; pdf_oxide does not enforce them.
+    fn permissions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self.inner.permissions() {
+            None => Ok(py.None()),
+            Some(p) => {
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("print_low_res", p.print_low_res)?;
+                dict.set_item("modify", p.modify)?;
+                dict.set_item("copy", p.copy)?;
+                dict.set_item("annotate", p.annotate)?;
+                dict.set_item("fill_forms", p.fill_forms)?;
+                dict.set_item("accessibility", p.accessibility)?;
+                dict.set_item("assemble", p.assemble)?;
+                dict.set_item("print_high_res", p.print_high_res)?;
+                dict.set_item("raw_p", p.raw_p)?;
+                Ok(dict.into_any().unbind())
+            },
+        }
+    }
+
+    /// Python wrapper: returns the
+    /// document's accumulated structured warnings as a list of dicts.
+    /// Each entry has `category`, `page`, `message`, `spec_section`.
+    /// Companion to the Python per-target log-level downgrade — gives
+    /// callers a structured opt-in surface instead of stderr text.
+    ///
+    /// Named `structured_warnings` (not `flatten_warnings`) to avoid
+    /// collision with the existing `DocumentEditor::flatten_warnings`
+    /// accessor for form-flattening warnings; the Rust side was
+    /// renamed in for the same reason.
+    fn structured_warnings(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let warnings = self.inner.structured_warnings();
+        let list = pyo3::types::PyList::empty(py);
+        for w in warnings {
+            let entry = pyo3::types::PyDict::new(py);
+            entry.set_item("category", w.category.as_str())?;
+            entry.set_item("page", w.page)?;
+            entry.set_item("message", &w.message)?;
+            entry.set_item("spec_section", w.spec_section)?;
+            list.append(entry)?;
+        }
+        Ok(list.into_any().unbind())
+    }
+
     /// Get form fields.
     fn get_form_fields(&mut self) -> PyResult<Vec<PyFormField>> {
         use crate::extractors::forms::FormExtractor;
@@ -2361,7 +2426,7 @@ impl PyPdfDocument {
         };
         let result = convert_to_pdf_a(&mut self.inner, pdf_level)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        // Sync raw_bytes so that to_bytes() sees the updated document, and
+        // Sync raw_bytes so that to_bytes() sees the updated document,
         // drop any stale editor that was opened from the original bytes.
         self.raw_bytes = Some(self.inner.source_bytes.to_vec());
         self.path = None;
@@ -2548,11 +2613,21 @@ impl PyPdfDocument {
     }
 
     fn __len__(&mut self) -> PyResult<usize> {
-        self.page_count()
+        // : `page_count` is now a #[getter] returning PyPageCount,
+        // so call the inner Rust method directly here for the unsigned
+        // int we need.
+        self.inner
+            .page_count()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page count: {}", e)))
     }
 
     fn __getitem__(slf: Py<Self>, py: Python<'_>, index: isize) -> PyResult<PyDocPage> {
-        let count = slf.borrow_mut(py).page_count()? as isize;
+        let count = slf
+            .borrow_mut(py)
+            .inner
+            .page_count()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page count: {}", e)))?
+            as isize;
         let idx = if index < 0 { count + index } else { index };
         if idx < 0 || idx >= count {
             return Err(pyo3::exceptions::PyIndexError::new_err("page index out of range"));
@@ -2564,7 +2639,11 @@ impl PyPdfDocument {
     }
 
     fn __iter__(slf: Py<Self>, py: Python<'_>) -> PyResult<PyDocPageIter> {
-        let count = slf.borrow_mut(py).page_count()?;
+        let count = slf
+            .borrow_mut(py)
+            .inner
+            .page_count()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page count: {}", e)))?;
         Ok(PyDocPageIter {
             doc: slf,
             index: 0,
@@ -2583,7 +2662,11 @@ impl PyPdfDocument {
     ///         print(page.text[:80])
     #[getter]
     fn pages(slf: Py<Self>, py: Python<'_>) -> PyResult<PyDocPageIter> {
-        let count = slf.borrow_mut(py).page_count()?;
+        let count = slf
+            .borrow_mut(py)
+            .inner
+            .page_count()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page count: {}", e)))?;
         Ok(PyDocPageIter {
             doc: slf,
             index: 0,
@@ -2593,6 +2676,96 @@ impl PyPdfDocument {
 
     fn __repr__(&self) -> String {
         format!("PdfDocument(version={}.{})", self.inner.version().0, self.inner.version().1)
+    }
+}
+
+/// Int-like callable wrapper returned by `PdfDocument.page_count` for
+/// backward-compatibility. Behaves as an int via `__int__` /
+/// `__index__` / comparison protocols. Also callable via `__call__` so
+/// the method-call shape (`doc.page_count()`) still works.
+///
+/// New code should use the attribute form (`doc.page_count`); the
+/// method-call form is deprecated and will be removed in v0.4.0.
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "_PageCount")]
+pub struct PyPageCount {
+    value: usize,
+}
+
+#[pymethods]
+impl PyPageCount {
+    /// Method-call form (v0.3.54 shape): `doc.page_count()` returns
+    /// the int. Deprecated; use the attribute form.
+    fn __call__(&self) -> usize {
+        self.value
+    }
+
+    /// `int(doc.page_count)` returns the int.
+    fn __int__(&self) -> usize {
+        self.value
+    }
+
+    /// `range(doc.page_count)` works via the index protocol. This is
+    /// the v0.3.6 shape that broke in.
+    fn __index__(&self) -> usize {
+        self.value
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{}", self.value)
+    }
+
+    fn __str__(&self) -> String {
+        format!("{}", self.value)
+    }
+
+    /// `doc.page_count == 5` works against `int`. Also compares with
+    /// another `_PageCount` instance.
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if let Ok(n) = other.extract::<usize>() {
+            return Ok(self.value == n);
+        }
+        if let Ok(n) = other.extract::<i64>() {
+            return Ok(n >= 0 && self.value == n as usize);
+        }
+        if let Ok(other_pc) = other.extract::<PyRef<PyPageCount>>() {
+            return Ok(self.value == other_pc.value);
+        }
+        Ok(false)
+    }
+
+    fn __ne__(&self, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(!self.__eq__(other)?)
+    }
+
+    fn __lt__(&self, other: usize) -> bool {
+        self.value < other
+    }
+    fn __le__(&self, other: usize) -> bool {
+        self.value <= other
+    }
+    fn __gt__(&self, other: usize) -> bool {
+        self.value > other
+    }
+    fn __ge__(&self, other: usize) -> bool {
+        self.value >= other
+    }
+
+    fn __hash__(&self) -> usize {
+        self.value
+    }
+
+    /// Arithmetic compatibility — callers may write
+    /// `doc.page_count - 1` to get the last page index.
+    fn __sub__(&self, other: usize) -> usize {
+        self.value.saturating_sub(other)
+    }
+
+    fn __add__(&self, other: usize) -> usize {
+        self.value + other
+    }
+
+    fn __bool__(&self) -> bool {
+        self.value != 0
     }
 }
 
@@ -4939,7 +5112,7 @@ impl PyAlign {
     }
 }
 
-/// Python-side column descriptor used by `Table` and
+/// Python-side column descriptor used by `Table`
 /// `FluentPageBuilder.streaming_table`. Constructor matches the research
 /// C shape: `Column(header, width=100.0, align=Align.LEFT)`.
 #[pyclass(module = "pdf_oxide.pdf_oxide", name = "Column", skip_from_py_object)]
@@ -5105,7 +5278,7 @@ impl PyEmbeddedFont {
 /// )
 /// ```
 ///
-/// `build()`, `save()`, `save_encrypted()`, `to_bytes_encrypted()`, and
+/// `build()`, `save()`, `save_encrypted()`, `to_bytes_encrypted()`,
 /// `save_with_encryption()` **consume** the builder — subsequent calls
 /// on the same instance raise `RuntimeError`.
 #[pyclass(module = "pdf_oxide.pdf_oxide", name = "DocumentBuilder")]
@@ -5899,7 +6072,7 @@ impl PyFluentPageBuilder {
         Ok(fm.text_width(text, &self.current_font, self.current_size))
     }
 
-    /// Best-effort vertical space between the last known cursor y and
+    /// Best-effort vertical space between the last known cursor y
     /// the bottom margin (72 pt). Because `PyFluentPageBuilder` buffers
     /// ops until `done()`, this is a client-side estimate: it returns
     /// `last_at_y - 72` when `at()` has been called, else `page_height
@@ -6555,7 +6728,7 @@ impl PyStreamingTable {
 // =============================================================================
 //
 // `Pdf.from_html_css[_with_fonts]` exposes the HTML+CSS → PDF pipeline
-// to Python. The Rust side is `crate::api::Pdf::from_html_css` and
+// to Python. The Rust side is `crate::api::Pdf::from_html_css`
 // `from_html_css_with_fonts`.
 
 #[pyclass(
@@ -6638,8 +6811,29 @@ fn reset_pyo3_log_cache() {
 /// ```python
 /// import logging
 /// logging.basicConfig(level=logging.WARNING)
-/// ```
+/// Python wrapper: set the global content-stream
+/// operator cap. `None` restores the default (1,000,000). Returns the
+/// previous override value or None if default was active.
 ///
+/// Use case: large technical PDFs (textbooks, ISO standards) with
+/// legitimate content streams exceeding 1,000,000 operators. Set to
+/// `None` (the default) for adversarial-input protection; set to a
+/// large value when the inputs are trusted.
+#[pyfunction]
+fn set_max_ops_per_stream(limit: Option<usize>) -> Option<usize> {
+    crate::content::parser::set_max_ops_per_stream(limit)
+}
+
+/// Python wrapper: toggle the global U+FFFD
+/// preservation flag. When `True`, `extract_text` / `extract_words` /
+/// `extract_spans` emit U+FFFD chars for unmapped glyphs (matching
+/// `extract_chars` behaviour). When `False` (the default),
+/// the high-level accessors filter them. Returns the previous value.
+#[pyfunction]
+fn set_preserve_unmapped_glyphs(preserve: bool) -> bool {
+    crate::extractors::text::set_preserve_unmapped_glyphs(preserve)
+}
+
 /// Generate a 1D barcode as an SVG string.
 ///
 /// `barcode_type`: 0=Code128, 1=Code39, 2=EAN13, 3=EAN8, 4=UPCA, 5=ITF, 6=Code93, 7=Codabar.
@@ -7230,7 +7424,7 @@ impl PyTimestamp {
 
     /// Cryptographically verify this TimeStampToken.
     ///
-    /// Parses the outer CMS SignedData and verifies the TSA's signature and
+    /// Parses the outer CMS SignedData and verifies the TSA's signature
     /// `messageDigest` attribute (RSA-PKCS#1 v1.5, RSA-PSS, ECDSA P-256/P-384).
     ///
     /// Returns `True` when the token is cryptographically valid, `False` when
@@ -7413,9 +7607,12 @@ fn pdf_oxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_pyo3_log_handle();
     m.add_function(wrap_pyfunction!(setup_logging, m)?)?;
     m.add_function(wrap_pyfunction!(set_log_level, m)?)?;
+    m.add_function(wrap_pyfunction!(set_max_ops_per_stream, m)?)?;
+    m.add_function(wrap_pyfunction!(set_preserve_unmapped_glyphs, m)?)?;
     m.add_function(wrap_pyfunction!(get_log_level, m)?)?;
     m.add_function(wrap_pyfunction!(disable_logging, m)?)?;
     m.add_class::<PyPdfDocument>()?;
+    m.add_class::<PyPageCount>()?;
     m.add_class::<PyPdf>()?;
     m.add_class::<PyPdfPage>()?;
     m.add_class::<PyPdfText>()?;
@@ -7473,7 +7670,7 @@ fn pdf_oxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "barcodes")]
     m.add_function(pyo3::wrap_pyfunction!(generate_qr_svg, m)?)?;
     m.add("VERSION", env!("CARGO_PKG_VERSION"))?;
-    // Cryptographic-provider surface (issue #236) — exposes the
+    // Cryptographic-provider surface — exposes the
     // FIPS-validated AwsLcProvider as a runtime opt-in. Functions
     // (not classes) so callers don't need to instantiate Rust types.
     m.add_function(pyo3::wrap_pyfunction!(crypto_active_provider, m)?)?;
@@ -7689,7 +7886,7 @@ fn crypto_use_fips() -> pyo3::PyResult<()> {
 /// Install the process-wide runtime crypto-governance policy (#230).
 ///
 /// ``spec`` grammar: ``mode[;clause]*`` where
-/// ``mode ∈ {compat, strict, fips-strict}`` and
+/// ``mode ∈ {compat, strict, fips-strict}``
 /// ``clause = (allow|deny):<alg>@<read|write>`` — e.g.
 /// ``"compat;deny:rc4@write;deny:md5@write"`` or ``"fips-strict"``.
 ///
