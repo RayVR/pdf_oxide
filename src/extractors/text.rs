@@ -1972,6 +1972,24 @@ enum ByteMode {
     ShiftJIS,
 }
 
+/// True when a Type0 font's `/Encoding` is a UTF-8 (variable-width) CMap —
+/// `Uni-Utf8-H` (embedded, pdf.js issue18117) or the Adobe predefined
+/// `UniGB-UTF8-H` / `UniCNS-UTF8-H` / `UniJIS-UTF8-H` / `UniKS-UTF8-H` family.
+/// Such codes are 1–4 bytes and must be segmented by UTF-8 lead-byte rules
+/// (see `decode_text_to_unicode`), not the fixed 1/2-byte `ByteMode`. Matching
+/// on the CMap name keeps the change isolated to these fonts. See #610.
+fn font_has_utf8_cmap(font: &FontInfo) -> bool {
+    if font.subtype != "Type0" {
+        return false;
+    }
+    if let crate::fonts::Encoding::Standard(name) = &font.encoding {
+        let lower = name.to_ascii_lowercase();
+        lower.contains("utf8") || lower.contains("utf-8")
+    } else {
+        false
+    }
+}
+
 /// Get byte grouping mode for a font (v0.3.14).
 fn get_byte_mode(font: Option<&FontInfo>) -> ByteMode {
     if let Some(font) = font {
@@ -2092,6 +2110,39 @@ fn decode_text_to_unicode(bytes: &[u8], font: Option<&FontInfo>) -> String {
                         result.push_str(&char_str);
                     }
                 }
+            }
+        } else if font_has_utf8_cmap(font) {
+            // Type0 font whose /Encoding is an embedded CMap with a UTF-8
+            // (variable-width) codespace — e.g. `Uni-Utf8-H` (pdf.js
+            // issue18117) and the Adobe predefined `Uni*-UTF8-H` family.
+            // Codes are 1–4 bytes segmented by UTF-8 lead-byte rules, which
+            // exceed the u16 of `TextCharIter`. Segment here into u32 codes
+            // and resolve via the (present) ToUnicode CMap, which is keyed by
+            // the same multi-byte codes. Isolated to UTF-8-CMap fonts: every
+            // other font keeps the path below unchanged. See #610.
+            let n = bytes.len();
+            let mut i = 0;
+            while i < n {
+                let lead = bytes[i];
+                let width = match lead {
+                    0x00..=0x7F => 1,
+                    0xC0..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF7 => 4,
+                    _ => 1, // invalid lead byte → consume one, avoids stalling
+                }
+                .min(n - i);
+                let mut code: u32 = 0;
+                for &b in &bytes[i..i + width] {
+                    code = (code << 8) | b as u32;
+                }
+                let char_str = font
+                    .char_to_unicode(code)
+                    .unwrap_or_else(|| fallback_char_to_unicode(code));
+                if char_str != "\u{FFFD}" || preserve_unmapped_glyphs() {
+                    result.push_str(&char_str);
+                }
+                i += width;
             }
         } else {
             // Complex font: use unified iterator for robust multi-byte decoding
