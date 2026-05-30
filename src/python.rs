@@ -4214,6 +4214,16 @@ fn path_to_py_dict(py: Python<'_>, path: &crate::elements::PathContent) -> PyRes
     }
     d.set_item("operations_count", path.operations.len())?;
 
+    // Optional Content Group (PDF "layer") name resolved from the
+    // enclosing `BDC /OC … EMC` markers in the source content stream.
+    // `None` when the path was emitted outside any /OC region or when
+    // the PDF has no optional-content metadata. See PDF spec
+    // ISO 32000-1:2008 §8.11 (Optional Content) and §14.6 (Marked Content).
+    match path.layer {
+        Some(ref name) => d.set_item("layer", name.as_str())?,
+        None => d.set_item("layer", py.None())?,
+    }
+
     // Expose path operations as list of dicts for vector extraction use cases
     let ops_list = pyo3::types::PyList::empty(py);
     for op in &path.operations {
