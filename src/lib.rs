@@ -178,6 +178,9 @@ pub mod xref_reconstruction;
 // Stream decoders
 pub mod decoders;
 
+// PDF function evaluators (Type 4 PostScript calculator)
+pub mod functions;
+
 // Colour management (ICC profile handling)
 pub mod color;
 
@@ -196,6 +199,7 @@ pub mod layout;
 pub mod content;
 pub mod extractors;
 pub mod fonts;
+pub mod optional_content;
 pub mod text;
 
 // Document structure

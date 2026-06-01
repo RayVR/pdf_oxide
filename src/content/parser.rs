@@ -2299,9 +2299,9 @@ fn find_and_extract_image_data(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
     Ok((inp, input[..ei_pos].to_vec()))
 }
 
-/// Check if a byte is whitespace (space, tab, CR, LF, FF).
+/// Check if a byte is whitespace (null, tab, LF, FF, CR, space — PDF spec Table 1).
 fn is_whitespace(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0C')
+    matches!(byte, b'\x00' | b'\t' | b'\r' | b'\n' | b'\x0C' | b' ')
 }
 
 /// Check if a byte is whitespace or a PDF delimiter.
@@ -4200,6 +4200,20 @@ mod tests {
         assert!(ops.iter().any(|op| matches!(op, Operator::RestoreState)));
     }
 
+    #[test]
+    fn test_parse_inline_image_null_before_ei() {
+        // PDF spec Table 1 lists NULL (0x00) as whitespace.
+        let mut stream = b"q BI /W 2 /H 2 ID AB".to_vec();
+        stream.extend_from_slice(b"\x00EI Q BT (Hi) Tj ET");
+        let ops = parse_content_stream(&stream).unwrap();
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, Operator::InlineImage { .. })));
+        assert!(ops.iter().any(|op| matches!(op, Operator::RestoreState)));
+        // Text after the inline image must still be extracted
+        assert!(ops.iter().any(|op| matches!(op, Operator::Tj { .. })));
+    }
+
     // ── Number parsing edge cases ───────────────────────────────────
 
     #[test]
@@ -5561,6 +5575,8 @@ mod tests {
 
     #[test]
     fn test_is_whitespace() {
+        // NUL (0x00) is one of the six PDF white-space chars (ISO 32000-1:2008 §7.2, Table 1).
+        assert!(is_whitespace(0x00));
         assert!(is_whitespace(b' '));
         assert!(is_whitespace(b'\t'));
         assert!(is_whitespace(b'\r'));
