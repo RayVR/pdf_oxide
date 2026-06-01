@@ -10580,9 +10580,11 @@ impl PdfDocument {
     /// declared inside a Form XObject's local `/Resources /ColorSpace`
     /// dictionary will not be enumerated — even though the renderer and
     /// extractor will still honor them at use time. Callers populating a
-    /// UI picker from this list may miss XObject-local inks; if that
-    /// matters, walk the page's XObject resources separately or
-    /// enumerate inks from the content stream operators.
+    /// UI picker from this list may miss XObject-local inks.
+    ///
+    /// For the full walk that follows `Do` operators into Form XObject
+    /// resources, use [`Self::get_page_inks_deep`] — that is what the
+    /// separation renderer uses to allocate plates.
     pub fn get_page_inks(&self, page_index: usize) -> Result<Vec<String>> {
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
@@ -22098,7 +22100,12 @@ mod ink_dict_extractor_tests {
     }
 
     fn separation_cs(ink: &str) -> Object {
-        Object::Array(vec![name("Separation"), name(ink), name("DeviceCMYK"), Object::Null])
+        Object::Array(vec![
+            name("Separation"),
+            name(ink),
+            name("DeviceCMYK"),
+            Object::Null,
+        ])
     }
 
     fn device_n_cs(inks: &[&str]) -> Object {
@@ -22122,15 +22129,16 @@ mod ink_dict_extractor_tests {
     #[test]
     fn extracts_devicen_ink_names_in_declared_order() {
         let mut cs_dict = HashMap::new();
-        cs_dict.insert(
-            "CS0".to_string(),
-            device_n_cs(&["Cyan", "Magenta", "SpotGold"]),
-        );
+        cs_dict.insert("CS0".to_string(), device_n_cs(&["Cyan", "Magenta", "SpotGold"]));
         let mut out = Vec::new();
         extract_inks_from_color_space_dict(&cs_dict, None, &mut out);
         assert_eq!(
             out,
-            vec!["Cyan".to_string(), "Magenta".to_string(), "SpotGold".to_string()]
+            vec![
+                "Cyan".to_string(),
+                "Magenta".to_string(),
+                "SpotGold".to_string()
+            ]
         );
     }
 
@@ -22140,10 +22148,7 @@ mod ink_dict_extractor_tests {
         let mut cs_dict = HashMap::new();
         cs_dict.insert("CS0".to_string(), separation_cs("All"));
         cs_dict.insert("CS1".to_string(), separation_cs("None"));
-        cs_dict.insert(
-            "CS2".to_string(),
-            device_n_cs(&["All", "Spot1", "None"]),
-        );
+        cs_dict.insert("CS2".to_string(), device_n_cs(&["All", "Spot1", "None"]));
         let mut out = Vec::new();
         extract_inks_from_color_space_dict(&cs_dict, None, &mut out);
         assert_eq!(out, vec!["Spot1".to_string()]);
@@ -22152,10 +22157,7 @@ mod ink_dict_extractor_tests {
     #[test]
     fn ignores_non_separation_color_spaces() {
         let mut cs_dict = HashMap::new();
-        cs_dict.insert(
-            "CS0".to_string(),
-            Object::Array(vec![name("ICCBased"), Object::Null]),
-        );
+        cs_dict.insert("CS0".to_string(), Object::Array(vec![name("ICCBased"), Object::Null]));
         cs_dict.insert("CS1".to_string(), name("DeviceCMYK"));
         let mut out = Vec::new();
         extract_inks_from_color_space_dict(&cs_dict, None, &mut out);

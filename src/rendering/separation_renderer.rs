@@ -27,7 +27,11 @@
 //! - **Raster image XObjects** (`Do` with `Subtype /Image`), including
 //!   DeviceN / Separation-encoded TIFFs and CMYK photographs. The
 //!   sample data is dropped. Vector artwork inside Form XObjects is
-//!   recursed into and rendered normally.
+//!   recursed into and rendered normally; spot / DeviceN ink
+//!   *declarations* in nested Form XObject `/Resources` are also
+//!   surfaced as plates via
+//!   [`crate::document::PdfDocument::get_page_inks_deep`] even when the
+//!   form's local content stream doesn't paint them.
 //! - **Shading patterns** (`sh` operator) — gradients used as fills.
 //! - **Tiling and shading patterns** invoked via `scn` / `SCN` with a
 //!   `/Pattern` colour space.
