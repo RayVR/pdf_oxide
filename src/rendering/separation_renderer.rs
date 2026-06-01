@@ -630,9 +630,49 @@ fn load_fonts(doc: &PdfDocument, resources: &Object) -> HashMap<String, Arc<Font
     fonts
 }
 
-/// Compute the tint contribution to `target_ink` for the current colour
-/// state. Returns `None` if the current colour does not touch this
-/// plate; `Some(tint)` otherwise, with `tint` in 0.0..=1.0.
+/// Per-plate routing decision for a single paint operation, after applying
+/// the overprint rules of ISO 32000-1 §11.7.4.
+///
+/// - [`PaintAction::Paint`] writes the given tint into the plate. A tint
+///   of 0.0 is the spec-default "knockout" — the existing
+///   [`fill_separation`] / [`stroke_separation`] use opaque source-over,
+///   so writing 0.0 erases any underlying ink at the touched pixels.
+/// - [`PaintAction::Skip`] leaves the plate completely untouched. Used
+///   when (a) the source colour space doesn't reference this plate and
+///   overprint is enabled, or (b) the source is DeviceCMYK with OPM=1
+///   and the component is exactly 0.0 (the "Adobe nonzero overprint"
+///   rule, §11.7.4).
+enum PaintAction {
+    Paint(f32),
+    Skip,
+}
+
+/// Decide how the current paint operation contributes to `target_ink`,
+/// honoring ISO 32000-1 §11.7.4 (Overprint Control).
+///
+/// The decision tree:
+///
+/// ```text
+/// For each plate P, source colour space S with component vector c[]:
+///
+///   if S = Separation(/All):                              Paint(c[0])
+///   if S = Separation(/None) or empty components:         Skip
+///   if S = Separation(name) and name == P:                Paint(c[0])
+///   if S = Separation(name) and name != P:
+///         overprint? Skip : Paint(0.0)                    // §11.7.4 default knockout
+///
+///   if S = DeviceN(names) and P in names:                 Paint(c[index_of_P])
+///   if S = DeviceN(names) and P not in names:
+///         overprint? Skip : Paint(0.0)
+///
+///   if S = DeviceCMYK / IccCmyk:
+///         if P in {C, M, Y, K}:
+///             overprint && opm == 1 && tint == 0.0 ? Skip : Paint(tint)
+///         else:                                            // spot plate
+///             overprint? Skip : Paint(0.0)                 // §11.7.4 default knockout
+///
+///   if S = RGB/Gray/IccRgb/IccGray:                       Skip
+/// ```
 fn tint_for_ink(
     fill: bool,
     gs: &GraphicsState,
@@ -642,7 +682,7 @@ fn tint_for_ink(
     target_ink: &str,
     fill_components: &[f32],
     stroke_components: &[f32],
-) -> Option<f32> {
+) -> PaintAction {
     let space_name = if fill {
         &gs.fill_color_space
     } else {
@@ -653,10 +693,28 @@ fn tint_for_ink(
     } else {
         stroke_components
     };
+    let overprint = if fill {
+        gs.fill_overprint
+    } else {
+        gs.stroke_overprint
+    };
+    // §11.7.4.3: OPM applies only when the source is DeviceCMYK (or implicit
+    // conversion thereto). The match arms below check this where relevant.
+    let opm = gs.overprint_mode;
+
+    // Default action when the source colour space doesn't name the
+    // target plate: under OP=true, leave it alone; under OP=false (the
+    // spec default), erase it to 0.0 ("areas of unspecified colorants
+    // are erased" — §11.7.4).
+    let other_plate_action = if overprint {
+        PaintAction::Skip
+    } else {
+        PaintAction::Paint(0.0)
+    };
 
     let resolved = resolve_color_space(space_name, color_spaces, resources, doc);
     match resolved {
-        ResolvedSpace::Cmyk => {
+        ResolvedSpace::Cmyk | ResolvedSpace::IccCmyk => {
             let cmyk_state = if fill {
                 gs.fill_color_cmyk
             } else {
@@ -667,35 +725,47 @@ fn tint_for_ink(
             } else if components.len() >= 4 {
                 (components[0], components[1], components[2], components[3])
             } else {
-                return None;
+                return PaintAction::Skip;
             };
-            match target_ink {
-                "Cyan" => Some(c),
-                "Magenta" => Some(m),
-                "Yellow" => Some(y),
-                "Black" => Some(k),
-                _ => None,
+            let tint = match target_ink {
+                "Cyan" => c,
+                "Magenta" => m,
+                "Yellow" => y,
+                "Black" => k,
+                // Spot plate — not in DeviceCMYK's colorant set.
+                _ => return other_plate_action,
+            };
+            // §11.7.4 OPM=1 nonzero overprint: zero source components on
+            // DeviceCMYK are treated as "not specified" — leave the
+            // matching plate untouched. OPM=0 (default) paints zero,
+            // which erases (knocks out) the plate.
+            if overprint && opm == 1 && tint == 0.0 {
+                PaintAction::Skip
+            } else {
+                PaintAction::Paint(tint)
             }
         },
         ResolvedSpace::Rgb
         | ResolvedSpace::Gray
         | ResolvedSpace::IccRgb
         | ResolvedSpace::IccGray => {
-            // RGB / Gray content does not contribute to ink plates.
-            // Converting RGB → CMYK is intentionally not done: prepress
-            // workflows want artwork that was authored in process or
-            // spot colours, not synthesised process from RGB.
-            None
+            // §11.7.4: overprint is a separation-space concept. RGB / Gray
+            // sources do not route to ink plates at all. Converting them
+            // would require a tint transform and is intentionally not done.
+            PaintAction::Skip
         },
         ResolvedSpace::Separation(ink) => {
-            // §8.6.6.4: /All paints to every output separation; /None paints
-            // nothing. Treat the rest as a regular per-ink match.
-            if ink == "None" || components.is_empty() {
-                None
-            } else if ink == "All" || ink == target_ink {
-                Some(components[0])
+            // §8.6.6.4: /All paints to every plate; /None paints nothing.
+            if components.is_empty() || ink == "None" {
+                return PaintAction::Skip;
+            }
+            if ink == "All" {
+                return PaintAction::Paint(components[0]);
+            }
+            if ink == target_ink {
+                PaintAction::Paint(components[0])
             } else {
-                None
+                other_plate_action
             }
         },
         ResolvedSpace::DeviceN(names) => {
@@ -704,26 +774,12 @@ fn tint_for_ink(
                     continue;
                 }
                 if (n == "All" || n == target_ink) && i < components.len() {
-                    return Some(components[i]);
+                    return PaintAction::Paint(components[i]);
                 }
             }
-            None
+            other_plate_action
         },
-        ResolvedSpace::IccCmyk => {
-            // Heuristic: 4-component ICC space = CMYK. See module docs.
-            if components.len() >= 4 {
-                match target_ink {
-                    "Cyan" => Some(components[0]),
-                    "Magenta" => Some(components[1]),
-                    "Yellow" => Some(components[2]),
-                    "Black" => Some(components[3]),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        },
-        ResolvedSpace::Unknown => None,
+        ResolvedSpace::Unknown => PaintAction::Skip,
     }
 }
 
@@ -1088,7 +1144,7 @@ fn execute_separation_operators(
                     let transform = combine_transforms(base_transform, &gs.ctm);
                     let clip = clip_stack.last().and_then(|c| c.as_ref());
                     for (i, &ink) in target_inks.iter().enumerate() {
-                        if let Some(tint) = tint_for_ink(
+                        if let PaintAction::Paint(tint) = tint_for_ink(
                             false,
                             gs,
                             color_spaces,
@@ -1120,7 +1176,7 @@ fn execute_separation_operators(
                     let transform = combine_transforms(base_transform, &gs.ctm);
                     let clip = clip_stack.last().and_then(|c| c.as_ref());
                     for (i, &ink) in target_inks.iter().enumerate() {
-                        if let Some(tint) = tint_for_ink(
+                        if let PaintAction::Paint(tint) = tint_for_ink(
                             true,
                             gs,
                             color_spaces,
@@ -1159,7 +1215,7 @@ fn execute_separation_operators(
                     let transform = combine_transforms(base_transform, &gs.ctm);
                     let clip = clip_stack.last().and_then(|c| c.as_ref());
                     for (i, &ink) in target_inks.iter().enumerate() {
-                        if let Some(tint) = tint_for_ink(
+                        if let PaintAction::Paint(tint) = tint_for_ink(
                             true,
                             gs,
                             color_spaces,
@@ -1198,7 +1254,7 @@ fn execute_separation_operators(
                     let transform = combine_transforms(base_transform, &gs.ctm);
                     let clip = clip_stack.last().and_then(|c| c.as_ref());
                     for (i, &ink) in target_inks.iter().enumerate() {
-                        if let Some(tint) = tint_for_ink(
+                        if let PaintAction::Paint(tint) = tint_for_ink(
                             true,
                             gs,
                             color_spaces,
@@ -1217,7 +1273,7 @@ fn execute_separation_operators(
                                 clip,
                             );
                         }
-                        if let Some(tint) = tint_for_ink(
+                        if let PaintAction::Paint(tint) = tint_for_ink(
                             false,
                             gs,
                             color_spaces,
@@ -1249,7 +1305,7 @@ fn execute_separation_operators(
                     let transform = combine_transforms(base_transform, &gs.ctm);
                     let clip = clip_stack.last().and_then(|c| c.as_ref());
                     for (i, &ink) in target_inks.iter().enumerate() {
-                        if let Some(tint) = tint_for_ink(
+                        if let PaintAction::Paint(tint) = tint_for_ink(
                             true,
                             gs,
                             color_spaces,
@@ -1268,7 +1324,7 @@ fn execute_separation_operators(
                                 clip,
                             );
                         }
-                        if let Some(tint) = tint_for_ink(
+                        if let PaintAction::Paint(tint) = tint_for_ink(
                             false,
                             gs,
                             color_spaces,
@@ -1616,8 +1672,8 @@ fn render_text_to_plate(
             &cs.fill_components,
             &cs.stroke_components,
         ) {
-            Some(t) => t,
-            None => continue,
+            PaintAction::Paint(t) => t,
+            PaintAction::Skip => continue,
         };
 
         // Build a faked-grayscale GraphicsState so the rasteriser paints in
