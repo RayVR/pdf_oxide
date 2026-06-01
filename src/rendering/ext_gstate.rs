@@ -40,6 +40,15 @@ impl ParsedExtGState {
         if let Some(ref m) = self.blend_mode {
             gs.blend_mode = m.clone();
         }
+        if let Some(v) = self.fill_overprint {
+            gs.fill_overprint = v;
+        }
+        if let Some(v) = self.stroke_overprint {
+            gs.stroke_overprint = v;
+        }
+        if let Some(v) = self.overprint_mode {
+            gs.overprint_mode = v;
+        }
     }
 }
 
