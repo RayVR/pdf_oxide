@@ -464,6 +464,79 @@ fn cmyk_fill_with_op_true_preserves_unrelated_spot_plate() {
 }
 
 // ========================================================================
+// Form XObject inheritance (§8.10.1)
+// ========================================================================
+
+#[test]
+fn overprint_propagates_into_form_xobject() {
+    // §8.10.1: a Form XObject's initial graphics state is the calling
+    // context's graphics state. The caller sets OP=true + OPM=1, then
+    // invokes a form whose content is `0 0 0 1 k 40 40 50 50 re f`.
+    // Under the inherited OPM=1 nonzero rule, the zero M component is
+    // treated as "not specified" and the M plate is preserved. Without
+    // inheritance, OPM defaults back to 0 at the form boundary and the
+    // M plate gets knocked out — that failure is what this test catches.
+    let content = "0 1 0 0 k\n10 10 50 50 re f\n\
+                   q /GS1 gs /Fm Do Q\n";
+    let form_content = "0 0 0 1 k\n40 40 50 50 re f\n";
+    let form_obj = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let pdf = build_pdf(
+        content,
+        "/ExtGState << /GS1 << /OP true /op true /OPM 1 >> >> \
+         /XObject << /Fm 5 0 R >>",
+        &[&form_obj],
+    );
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let m = plate(&plates, "Magenta");
+    let k = plate(&plates, "Black");
+
+    assert!(
+        sample(m, OVERLAP_X, OVERLAP_Y) > 200,
+        "M preserved inside Form XObject under inherited OP=true + OPM=1 (got {})",
+        sample(m, OVERLAP_X, OVERLAP_Y)
+    );
+    assert!(sample(k, OVERLAP_X, OVERLAP_Y) > 200, "Black painted by form's CMYK fill");
+}
+
+#[test]
+fn overprint_caller_unaffected_by_inner_form_overprint_changes() {
+    // The form's OP changes must not leak back to the caller. Form
+    // content sets /GS1 gs (OP=true OPM=1), then the form ends. After
+    // the `Do`, the caller's gs is restored from the q/Q frame and OP
+    // is back to the original false. A subsequent caller fill must
+    // knock out per the default.
+    let content = "0 1 0 0 k\n10 10 50 50 re f\n\
+                   q /Fm Do Q\n\
+                   0 0 0 1 k\n40 40 50 50 re f\n";
+    // Form content sets OP=true / OPM=1 internally; this should NOT
+    // affect the outer scope after Do returns.
+    let form_content = "/GS1 gs\n";
+    let form_obj = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /ExtGState << /GS1 << /OP true /op true /OPM 1 >> >> >> \
+         /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let pdf = build_pdf(content, "/XObject << /Fm 5 0 R >>", &[&form_obj]);
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let m = plate(&plates, "Magenta");
+
+    assert_eq!(
+        sample(m, OVERLAP_X, OVERLAP_Y),
+        0,
+        "Form's OP/OPM state must not leak past the q/Q frame"
+    );
+}
+
+// ========================================================================
 // Sanity: outside both shapes, plates are zero
 // ========================================================================
 

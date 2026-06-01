@@ -848,6 +848,9 @@ struct InheritedState {
     stroke_color_cmyk: Option<(f32, f32, f32, f32)>,
     fill_components: Vec<f32>,
     stroke_components: Vec<f32>,
+    fill_overprint: bool,
+    stroke_overprint: bool,
+    overprint_mode: u8,
 }
 
 /// Execute operators for separation plate rendering, dispatching paint
@@ -878,6 +881,14 @@ fn execute_separation_operators(
             gs.stroke_color_space = inh.stroke_color_space.clone();
             gs.fill_color_cmyk = inh.fill_color_cmyk;
             gs.stroke_color_cmyk = inh.stroke_color_cmyk;
+            // §8.10.1: inherit the caller's overprint state too. Without
+            // this, an outer `gs` setting OP=true would be silently
+            // dropped at the Form XObject boundary and the form's CMYK
+            // content would knock out underlying inks against the
+            // caller's intent.
+            gs.fill_overprint = inh.fill_overprint;
+            gs.stroke_overprint = inh.stroke_overprint;
+            gs.overprint_mode = inh.overprint_mode;
         } else {
             gs.fill_color_space = "DeviceGray".to_string();
             gs.stroke_color_space = "DeviceGray".to_string();
@@ -1597,6 +1608,9 @@ fn execute_separation_operators(
                                             stroke_color_cmyk: gs.stroke_color_cmyk,
                                             fill_components: cs.fill_components.clone(),
                                             stroke_components: cs.stroke_components.clone(),
+                                            fill_overprint: gs.fill_overprint,
+                                            stroke_overprint: gs.stroke_overprint,
+                                            overprint_mode: gs.overprint_mode,
                                         };
 
                                         let form_ops = parse_content_stream(&stream_data)?;
