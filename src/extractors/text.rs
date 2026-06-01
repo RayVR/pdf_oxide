@@ -2877,16 +2877,31 @@ impl<'doc> TextExtractor<'doc> {
         if let Some(cs_array) = self.resolve_color_space(name) {
             if cs_array.len() >= 2 {
                 if let Some(cs_type) = cs_array[0].as_name() {
+                    // §8.6.6.2 / §8.6.6.3: the colorant slot (Separation's
+                    // ink-name, DeviceN's names array) can be an indirect
+                    // reference. Some subsetters share the names list across
+                    // multiple DeviceN spaces, emitting
+                    // `[/DeviceN 4 0 R /DeviceCMYK <attrs>]` where `4 0 R`
+                    // points to the actual names list. Resolve before
+                    // pattern-matching.
+                    let deref = |obj: &Object| -> Object {
+                        match (obj.as_reference(), self.document) {
+                            (Some(r), Some(d)) => d.load_object(r).unwrap_or_else(|_| obj.clone()),
+                            _ => obj.clone(),
+                        }
+                    };
                     match cs_type {
                         "Separation" => {
                             // [/Separation /InkName /AlternateCS /TintTransform]
-                            if let Some(ink_name) = cs_array[1].as_name() {
+                            let name_obj = deref(&cs_array[1]);
+                            if let Some(ink_name) = name_obj.as_name() {
                                 return self.excluded_inks.contains(ink_name);
                             }
                         },
                         "DeviceN" => {
-                            // [/DeviceN [/Ink1 /Ink2 ...] /AlternateCS /TintTransform]
-                            if let Some(ink_names) = cs_array[1].as_array() {
+                            // [/DeviceN <names-array> /AlternateCS /TintTransform <attrs>]
+                            let names_obj = deref(&cs_array[1]);
+                            if let Some(ink_names) = names_obj.as_array() {
                                 return ink_names.iter().any(|obj| {
                                     obj.as_name()
                                         .map(|n| self.excluded_inks.contains(n))
