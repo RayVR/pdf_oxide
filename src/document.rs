@@ -10619,6 +10619,169 @@ impl PdfDocument {
         Ok(ink_names)
     }
 
+    /// List ink / separation names declared on a page **including** those
+    /// declared inside Form XObjects reached through the page's content-stream
+    /// `Do` operators.
+    ///
+    /// Walks the page's content stream looking for `Do` operators that invoke
+    /// Form XObjects (§8.10), recurses into each form's `/Resources/ColorSpace`
+    /// dictionary, and accumulates `/Separation` and `/DeviceN` ink names from
+    /// every visited resource tree.
+    ///
+    /// **Cycle handling:** indirect XObject references are deduplicated by
+    /// `ObjectRef`; recursion depth is bounded at `MAX_RECURSION_DEPTH` (100).
+    /// A cycle below the depth bound is silently terminated; a tree deeper
+    /// than the bound returns [`Error::RecursionLimitExceeded`].
+    ///
+    /// **Out of scope:** tiling / shading patterns (§8.7) and annotation
+    /// appearance streams (§12.5.5) — both can declare their own colour
+    /// spaces but the separation renderer does not paint into them, so
+    /// surfacing their inks here would create plates that stay empty.
+    pub fn get_page_inks_deep(&self, page_index: usize) -> Result<Vec<String>> {
+        let resources = self.get_page_resources(page_index)?;
+        let content_data = self.get_page_content_data(page_index)?;
+        let operators = crate::content::parser::parse_content_stream(&content_data)?;
+
+        let mut ink_names: Vec<String> = Vec::new();
+        let mut visited: std::collections::HashSet<crate::object::ObjectRef> =
+            std::collections::HashSet::new();
+
+        self.collect_inks_from_resources(&resources, &mut ink_names)?;
+        self.walk_form_xobject_tree_for_inks(
+            &operators,
+            &resources,
+            &mut ink_names,
+            &mut visited,
+            0,
+        )?;
+
+        ink_names.sort();
+        ink_names.dedup();
+        Ok(ink_names)
+    }
+
+    /// Append inks declared in `resources./ColorSpace` (resolving indirect
+    /// references) to `out`. Internal helper for both
+    /// [`Self::get_page_inks_deep`] and the recursive form walker.
+    fn collect_inks_from_resources(&self, resources: &Object, out: &mut Vec<String>) -> Result<()> {
+        let res_dict = match resources.as_dict() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let cs_obj = match res_dict.get("ColorSpace") {
+            Some(obj) => self.resolve_object(obj)?,
+            None => return Ok(()),
+        };
+        let cs_dict_raw = match cs_obj.as_dict() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        let mut resolved: std::collections::HashMap<String, Object> =
+            std::collections::HashMap::with_capacity(cs_dict_raw.len());
+        for (name, cs_def) in cs_dict_raw.iter() {
+            let v = match cs_def.as_reference() {
+                Some(r) => match self.load_object(r) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                },
+                None => cs_def.clone(),
+            };
+            resolved.insert(name.clone(), v);
+        }
+        extract_inks_from_color_space_dict(&resolved, out);
+        Ok(())
+    }
+
+    /// Recursive walker: for every `Operator::Do { name }` in `operators` that
+    /// resolves to a Form XObject, scan that form's `/Resources/ColorSpace`
+    /// and recurse into the form's own content stream.
+    ///
+    /// `visited` is keyed on the XObject's `ObjectRef` (indirect references
+    /// only). Inline-stream forms cannot self-reference (no name to invoke);
+    /// the depth limit is the backstop for any other malformed shape.
+    fn walk_form_xobject_tree_for_inks(
+        &self,
+        operators: &[crate::content::operators::Operator],
+        parent_resources: &Object,
+        out: &mut Vec<String>,
+        visited: &mut std::collections::HashSet<crate::object::ObjectRef>,
+        depth: u32,
+    ) -> Result<()> {
+        if depth >= MAX_RECURSION_DEPTH {
+            return Err(Error::RecursionLimitExceeded(MAX_RECURSION_DEPTH));
+        }
+        let xobjects = match parent_resources.as_dict() {
+            Some(rd) => match rd.get("XObject") {
+                Some(o) => self.resolve_object(o)?,
+                None => return Ok(()),
+            },
+            None => return Ok(()),
+        };
+        let xobj_dict = match xobjects.as_dict() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        for op in operators {
+            let name = match op {
+                crate::content::operators::Operator::Do { name } => name,
+                _ => continue,
+            };
+            let xobj_entry = match xobj_dict.get(name) {
+                Some(o) => o,
+                None => continue,
+            };
+            let xobj_ref = xobj_entry.as_reference();
+            if let Some(r) = xobj_ref {
+                // Cycle through indirect refs: silent skip below depth bound.
+                if !visited.insert(r) {
+                    continue;
+                }
+            }
+            let xobj = match self.resolve_object(xobj_entry) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            let (form_dict, form_stream) = match xobj {
+                Object::Stream { ref dict, .. } => {
+                    if dict.get("Subtype").and_then(Object::as_name) != Some("Form") {
+                        continue;
+                    }
+                    let data = match xobj_ref {
+                        Some(r) => self.decode_stream_with_encryption(&xobj, r)?,
+                        None => xobj.decode_stream_data()?,
+                    };
+                    (dict.clone(), data)
+                },
+                _ => continue,
+            };
+
+            // §8.10.1: form may override resources or inherit the parent's.
+            let form_resources = match form_dict.get("Resources") {
+                Some(res) => self.resolve_object(res)?,
+                None => parent_resources.clone(),
+            };
+            self.collect_inks_from_resources(&form_resources, out)?;
+
+            // Recurse into the form's own content stream looking for nested
+            // `Do`. Malformed streams are tolerated — we want graceful
+            // degradation in a discovery API, not a hard error.
+            let form_ops = match crate::content::parser::parse_content_stream(&form_stream) {
+                Ok(ops) => ops,
+                Err(_) => continue,
+            };
+            self.walk_form_xobject_tree_for_inks(
+                &form_ops,
+                &form_resources,
+                out,
+                visited,
+                depth + 1,
+            )?;
+        }
+        Ok(())
+    }
+
     /// # Performance Note
     ///
     /// Character extraction is typically 30-50% faster than span extraction
