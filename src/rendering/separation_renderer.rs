@@ -1680,9 +1680,9 @@ fn execute_separation_operators(
 /// The returned advance is shared across all plates (the rasteriser is
 /// deterministic for a given font/text/state, so each plate's advance
 /// agrees) — we use the last computed value, matching the single-plate
-/// behaviour. If no plate is touched (all tints are `None` or render
-/// mode 3) the advance is computed from the font metrics so the text
-/// matrix still progresses correctly.
+/// behaviour. If no plate is touched (every plate's [`PaintAction`] is
+/// `Skip`, or render mode 3) the advance is computed from the font
+/// metrics so the text matrix still progresses correctly.
 #[allow(clippy::too_many_arguments)]
 fn render_text_to_plate(
     pixmaps: &mut [Pixmap],

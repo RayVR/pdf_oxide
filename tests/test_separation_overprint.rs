@@ -188,6 +188,58 @@ fn cmyk_black_with_op_true_opm1_preserves_underlying_magenta() {
 }
 
 // ========================================================================
+// ICCBased(N=4) — OPM=1 nonzero-overprint scope per §11.7.4.3
+// ========================================================================
+
+/// ICCBased /N 4 colour-space object. The profile stream payload is
+/// empty (length 0); the resolver only consults /N to classify as
+/// IccCmyk per the renderer's documented 4-component heuristic.
+fn icc_cmyk_cs_obj() -> &'static str {
+    "5 0 obj\n[/ICCBased 6 0 R]\nendobj\n"
+}
+
+fn icc_cmyk_stream_obj() -> &'static str {
+    "6 0 obj\n<< /N 4 /Alternate /DeviceCMYK /Length 0 >>\nstream\n\nendstream\nendobj\n"
+}
+
+#[test]
+fn icc_cmyk_with_op_true_opm1_preserves_underlying_magenta() {
+    // §11.7.4.3 OPM scope: "applies only to painting operations that use
+    // the current color in the graphics state when the current color
+    // space is DeviceCMYK (or is implicitly converted to DeviceCMYK)."
+    // An ICCBased N=4 space classified as IccCmyk falls under the
+    // "implicitly converted to DeviceCMYK" clause for our renderer
+    // (per the module-level ICCBased heuristic). OPM=1 + OP=true on an
+    // IccCmyk source should still skip plates whose component is 0.0.
+    //
+    // Layout: paint M=1 background, then paint `0 0 0 1 scn` through
+    // /CS1 (an ICCBased N=4 space) under /GS1 (OP=true / OPM=1). The
+    // Magenta plate must be preserved in the overlap.
+    let pdf = build_pdf(
+        "0 1 0 0 k\n10 10 50 50 re f\n\
+         /GS1 gs /CS1 cs 0 0 0 1 scn\n40 40 50 50 re f\n",
+        "/ColorSpace << /CS1 5 0 R >> \
+         /ExtGState << /GS1 << /OP true /op true /OPM 1 >> >>",
+        &[icc_cmyk_cs_obj(), icc_cmyk_stream_obj()],
+    );
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let m = plate(&plates, "Magenta");
+    let k = plate(&plates, "Black");
+
+    assert!(
+        sample(m, OVERLAP_X, OVERLAP_Y) > 200,
+        "OPM=1 on IccCmyk: M preserved in overlap (got {})",
+        sample(m, OVERLAP_X, OVERLAP_Y)
+    );
+    assert!(
+        sample(k, OVERLAP_X, OVERLAP_Y) > 200,
+        "K painted in overlap (got {})",
+        sample(k, OVERLAP_X, OVERLAP_Y)
+    );
+}
+
+// ========================================================================
 // Separation / Spot ink against CMYK process background
 // ========================================================================
 
