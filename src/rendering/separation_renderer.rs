@@ -50,6 +50,39 @@
 //! coverage on the press, not transparent compositing. Callers who need the
 //! transparent intent (e.g. a 50%-alpha spot text overlay) should evaluate it
 //! against the underlying content with [`super::page_renderer`] first.
+//!
+//! # Overprint
+//!
+//! The renderer implements the per-plate overprint model defined in
+//! ISO 32000-1 §11.7.4 ("Overprint Control"). The ExtGState entries
+//! `/OP` (stroke), `/op` (non-stroke), and `/OPM` (overprint mode) are
+//! parsed and applied to the graphics state.
+//!
+//! - **Default (`OP = false`):** for every plate, the spec rule "areas
+//!   of unspecified colorants are erased (painted with a tint value of
+//!   0.0)" applies. A DeviceCMYK fill knocks out underlying Cyan,
+//!   Magenta, Yellow, Black, *and* any spot inks within its shape; a
+//!   Separation `/Pantone-185` fill knocks out underlying process and
+//!   other-spot plates within its shape. This is the standard
+//!   per-plate prepress convention.
+//! - **`OP = true`:** plates outside the source's colorant set are left
+//!   untouched. Designers use this to overlay spot inks on process
+//!   backgrounds without knocking them out (the typical packaging /
+//!   label authoring workflow).
+//! - **`OPM = 1` (Adobe nonzero overprint):** when the source colour
+//!   space is DeviceCMYK and overprint is enabled, a component value of
+//!   exactly `0.0` is treated as "colorant not specified" — the
+//!   matching plate is left untouched. Per §11.7.4.3, OPM applies only
+//!   to DeviceCMYK sources; Separation and DeviceN content is
+//!   unaffected by OPM and routes through OP/op alone.
+//!
+//! Overprint state participates in `q`/`Q` save/restore via the existing
+//! graphics-state stack and propagates into Form XObjects per §8.10.1.
+//! The decision happens in `tint_for_ink`, which returns either
+//! `PaintAction::Paint(tint)` (write tint into the plate; 0.0 = knockout)
+//! or `PaintAction::Skip` (leave the plate untouched). Spot/DeviceN
+//! sources route to their named plates regardless of overprint, matching
+//! the inherent behavior of real separation devices.
 #![allow(
     clippy::field_reassign_with_default,
     clippy::ptr_arg,
