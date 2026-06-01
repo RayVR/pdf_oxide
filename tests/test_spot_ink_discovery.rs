@@ -8,6 +8,7 @@
 #![cfg(feature = "rendering")]
 
 use pdf_oxide::document::PdfDocument;
+use pdf_oxide::rendering::render_separations;
 
 /// Build a single-page PDF whose page-level /Resources/ColorSpace is empty
 /// and whose content stream invokes one Form XObject. The Form XObject's
@@ -303,5 +304,81 @@ fn deep_dedupes_spot_declared_in_multiple_forms() {
         count, 1,
         "SharedSpot must dedupe across forms; got {:?}",
         deep
+    );
+}
+
+#[test]
+fn render_separations_allocates_plate_for_nested_form_spot() {
+    // The bug that motivated this whole plan: a spot ink declared only
+    // inside a Form XObject must show up as a plate from render_separations.
+    let doc = PdfDocument::from_bytes(build_pdf_with_spot_in_nested_form()).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let plate_names: Vec<&str> = plates.iter().map(|p| p.ink_name.as_str()).collect();
+    assert!(
+        plate_names.contains(&"SpotRed"),
+        "render_separations must allocate a plate for nested-form spot; got {:?}",
+        plate_names
+    );
+}
+
+/// DeviceN colour space whose names array is an **indirect reference**:
+///   /CS1 → [/DeviceN 4 0 R /DeviceCMYK <<attrs>>]
+///   4 0 obj [/Cyan /Magenta /Yellow /yellow#20fluorescent] endobj
+///
+/// This is a common emission pattern for DeviceN spaces with many inks
+/// — the names list is shared as a separate indirect object. The
+/// extractor must resolve `4 0 R` before pulling ink names out.
+fn build_pdf_with_devicen_indirect_names() -> Vec<u8> {
+    let page_content = b"";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ColorSpace << /CS1 5 0 R >> >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    // CS1 → DeviceN with the names list as an indirect ref (6 0 R).
+    buf.extend_from_slice(b"5 0 obj\n[/DeviceN 6 0 R /DeviceCMYK 7 0 R]\nendobj\n");
+    offsets.push(buf.len());
+    // Indirect names list with a #20-escaped multi-word ink name.
+    buf.extend_from_slice(
+        b"6 0 obj\n[/Cyan /Magenta /Yellow /yellow#20fluorescent]\nendobj\n",
+    );
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"7 0 obj\n<< /FunctionType 2 /Domain [0 1 0 1 0 1 0 1] /N 1 \
+            /C0 [0 0 0 0] /C1 [0 0 0 1] >>\nendobj\n",
+    );
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn deep_resolves_indirect_devicen_names_array() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_devicen_indirect_names()).expect("parse");
+    let deep = doc.get_page_inks_deep(0).expect("deep");
+    assert!(
+        deep.contains(&"yellow fluorescent".to_string()),
+        "deep walk must resolve indirect /DeviceN names arrays and decode #20 escapes; got {:?}",
+        deep
+    );
+    // Same content is reachable from the shallow scan too — page-level CS.
+    let shallow = doc.get_page_inks(0).expect("shallow");
+    assert!(
+        shallow.contains(&"yellow fluorescent".to_string()),
+        "shallow get_page_inks must also resolve indirect names arrays; got {:?}",
+        shallow
     );
 }
