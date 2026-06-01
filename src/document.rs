@@ -10667,7 +10667,7 @@ impl PdfDocument {
     /// spaces but the separation renderer does not paint into them, so
     /// surfacing their inks here would create plates that stay empty.
     pub fn get_page_inks_deep(&self, page_index: usize) -> Result<Vec<String>> {
-        let resources = self.get_page_resources(page_index)?;
+        let resources = self.page_resources_for_inks(page_index)?;
         let content_data = self.get_page_content_data(page_index)?;
         let operators = crate::content::parser::parse_content_stream(&content_data)?;
 
@@ -10689,6 +10689,36 @@ impl PdfDocument {
         Ok(ink_names)
     }
 
+    /// Resolve the page's `/Resources` entry, following an indirect
+    /// reference if present. Mirrors the same pattern used by
+    /// [`Self::get_page_inks`]. Internal helper that does not depend on
+    /// the `rendering`-feature-gated [`Self::get_page_resources`].
+    fn page_resources_for_inks(&self, page_index: usize) -> Result<Object> {
+        let page = self.get_page(page_index)?;
+        let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
+            offset: 0,
+            reason: "Page is not a dictionary".to_string(),
+        })?;
+        let resources = match page_dict.get("Resources") {
+            Some(r) => match r.as_reference() {
+                Some(rr) => self.load_object(rr)?,
+                None => r.clone(),
+            },
+            None => Object::Dictionary(std::collections::HashMap::new()),
+        };
+        Ok(resources)
+    }
+
+    /// Dereference `obj` if it is an indirect reference; otherwise clone.
+    /// Internal helper that mirrors the rendering-gated
+    /// [`Self::resolve_object`] without taking the gate.
+    fn deref_object_for_inks(&self, obj: &Object) -> Result<Object> {
+        match obj.as_reference() {
+            Some(r) => self.load_object(r),
+            None => Ok(obj.clone()),
+        }
+    }
+
     /// Append inks declared in `resources./ColorSpace` (resolving indirect
     /// references) to `out`. Internal helper for both
     /// [`Self::get_page_inks_deep`] and the recursive form walker.
@@ -10698,7 +10728,7 @@ impl PdfDocument {
             None => return Ok(()),
         };
         let cs_obj = match res_dict.get("ColorSpace") {
-            Some(obj) => self.resolve_object(obj)?,
+            Some(obj) => self.deref_object_for_inks(obj)?,
             None => return Ok(()),
         };
         let cs_dict_raw = match cs_obj.as_dict() {
@@ -10742,7 +10772,7 @@ impl PdfDocument {
         }
         let xobjects = match parent_resources.as_dict() {
             Some(rd) => match rd.get("XObject") {
-                Some(o) => self.resolve_object(o)?,
+                Some(o) => self.deref_object_for_inks(o)?,
                 None => return Ok(()),
             },
             None => return Ok(()),
@@ -10768,7 +10798,7 @@ impl PdfDocument {
                     continue;
                 }
             }
-            let xobj = match self.resolve_object(xobj_entry) {
+            let xobj = match self.deref_object_for_inks(xobj_entry) {
                 Ok(o) => o,
                 Err(_) => continue,
             };
@@ -10788,7 +10818,7 @@ impl PdfDocument {
 
             // §8.10.1: form may override resources or inherit the parent's.
             let form_resources = match form_dict.get("Resources") {
-                Some(res) => self.resolve_object(res)?,
+                Some(res) => self.deref_object_for_inks(res)?,
                 None => parent_resources.clone(),
             };
             self.collect_inks_from_resources(&form_resources, out)?;
@@ -12779,7 +12809,7 @@ impl PdfDocument {
                 return Ok(arc);
             }
         }
-        let resolved = self.resolve_object(font_obj)?;
+        let resolved = self.deref_object_for_inks(font_obj)?;
         let info = crate::fonts::FontInfo::from_dict(&resolved, self)?;
         let arc = Arc::new(info);
         if let Some(font_ref) = font_obj.as_reference() {
