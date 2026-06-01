@@ -636,13 +636,26 @@ fn contains_objstm_marker(window: &[u8]) -> bool {
 /// in `cs_dict` to `out`. Reserved colorants `/All` and `/None` (§8.6.6.4)
 /// are skipped. Caller is responsible for deduping across multiple calls.
 ///
+/// When `doc` is `Some`, indirect references inside each colour-space array
+/// (e.g. a DeviceN whose names list is `4 0 R` rather than inline) are
+/// resolved. Tools that hand-build inline arrays and don't need indirection
+/// resolution can pass `None`.
+///
 /// Used by both [`PdfDocument::get_page_inks`] and
 /// [`PdfDocument::get_page_inks_deep`] so the per-colorant rules live in
 /// exactly one place.
 fn extract_inks_from_color_space_dict(
     cs_dict: &std::collections::HashMap<String, Object>,
+    doc: Option<&PdfDocument>,
     out: &mut Vec<String>,
 ) {
+    let deref = |obj: &Object| -> Object {
+        match (obj.as_reference(), doc) {
+            (Some(r), Some(d)) => d.load_object(r).unwrap_or_else(|_| obj.clone()),
+            _ => obj.clone(),
+        }
+    };
+
     for cs_def in cs_dict.values() {
         let arr = match cs_def.as_array() {
             Some(a) => a,
@@ -657,14 +670,28 @@ fn extract_inks_from_color_space_dict(
         };
         match cs_type {
             "Separation" => {
-                if let Some(ink) = arr.get(1).and_then(Object::as_name) {
+                // §8.6.6.2: [/Separation /InkName /AlternateCS /TintTransform].
+                // The name slot is usually inline but resolve indirects for safety.
+                let name_obj = match arr.get(1) {
+                    Some(o) => deref(o),
+                    None => continue,
+                };
+                if let Some(ink) = name_obj.as_name() {
                     if ink != "All" && ink != "None" {
                         out.push(ink.to_string());
                     }
                 }
             },
             "DeviceN" => {
-                if let Some(Object::Array(inks)) = arr.get(1) {
+                // §8.6.6.3: [/DeviceN <names-array> /AlternateCS /TintTransform <attrs>].
+                // The names array is commonly emitted as an indirect reference
+                // when the same colorant set is shared across multiple DeviceN
+                // spaces; resolve before unpacking the names.
+                let names_obj = match arr.get(1) {
+                    Some(o) => deref(o),
+                    None => continue,
+                };
+                if let Some(inks) = names_obj.as_array() {
                     for ink_obj in inks {
                         if let Some(ink) = ink_obj.as_name() {
                             if ink != "All" && ink != "None" {
@@ -10612,7 +10639,7 @@ impl PdfDocument {
         }
 
         let mut ink_names = Vec::new();
-        extract_inks_from_color_space_dict(&resolved, &mut ink_names);
+        extract_inks_from_color_space_dict(&resolved, Some(self), &mut ink_names);
 
         ink_names.sort();
         ink_names.dedup();
@@ -10689,7 +10716,7 @@ impl PdfDocument {
             };
             resolved.insert(name.clone(), v);
         }
-        extract_inks_from_color_space_dict(&resolved, out);
+        extract_inks_from_color_space_dict(&resolved, Some(self), out);
         Ok(())
     }
 
@@ -22088,7 +22115,7 @@ mod ink_dict_extractor_tests {
         let mut cs_dict = HashMap::new();
         cs_dict.insert("CS0".to_string(), separation_cs("Pantone-185"));
         let mut out = Vec::new();
-        extract_inks_from_color_space_dict(&cs_dict, &mut out);
+        extract_inks_from_color_space_dict(&cs_dict, None, &mut out);
         assert_eq!(out, vec!["Pantone-185".to_string()]);
     }
 
@@ -22100,7 +22127,7 @@ mod ink_dict_extractor_tests {
             device_n_cs(&["Cyan", "Magenta", "SpotGold"]),
         );
         let mut out = Vec::new();
-        extract_inks_from_color_space_dict(&cs_dict, &mut out);
+        extract_inks_from_color_space_dict(&cs_dict, None, &mut out);
         assert_eq!(
             out,
             vec!["Cyan".to_string(), "Magenta".to_string(), "SpotGold".to_string()]
@@ -22118,7 +22145,7 @@ mod ink_dict_extractor_tests {
             device_n_cs(&["All", "Spot1", "None"]),
         );
         let mut out = Vec::new();
-        extract_inks_from_color_space_dict(&cs_dict, &mut out);
+        extract_inks_from_color_space_dict(&cs_dict, None, &mut out);
         assert_eq!(out, vec!["Spot1".to_string()]);
     }
 
@@ -22131,7 +22158,7 @@ mod ink_dict_extractor_tests {
         );
         cs_dict.insert("CS1".to_string(), name("DeviceCMYK"));
         let mut out = Vec::new();
-        extract_inks_from_color_space_dict(&cs_dict, &mut out);
+        extract_inks_from_color_space_dict(&cs_dict, None, &mut out);
         assert!(out.is_empty());
     }
 }
