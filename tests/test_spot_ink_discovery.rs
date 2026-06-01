@@ -234,11 +234,7 @@ fn deep_terminates_on_form_cycle() {
     let doc = PdfDocument::from_bytes(build_pdf_with_cyclic_forms()).expect("parse");
     let deep = doc.get_page_inks_deep(0).expect("deep");
     let count = deep.iter().filter(|s| s.as_str() == "CycleSpot").count();
-    assert_eq!(
-        count, 1,
-        "CycleSpot must appear exactly once after dedupe; got {:?}",
-        deep
-    );
+    assert_eq!(count, 1, "CycleSpot must appear exactly once after dedupe; got {:?}", deep);
 }
 
 /// Two sibling forms whose /Resources/ColorSpace each point at the SAME
@@ -300,11 +296,7 @@ fn deep_dedupes_spot_declared_in_multiple_forms() {
     let doc = PdfDocument::from_bytes(build_pdf_with_shared_spot_in_two_forms()).expect("parse");
     let deep = doc.get_page_inks_deep(0).expect("deep");
     let count = deep.iter().filter(|s| s.as_str() == "SharedSpot").count();
-    assert_eq!(
-        count, 1,
-        "SharedSpot must dedupe across forms; got {:?}",
-        deep
-    );
+    assert_eq!(count, 1, "SharedSpot must dedupe across forms; got {:?}", deep);
 }
 
 #[test]
@@ -354,9 +346,7 @@ fn build_pdf_with_devicen_indirect_names() -> Vec<u8> {
     buf.extend_from_slice(b"5 0 obj\n[/DeviceN 6 0 R /DeviceCMYK 7 0 R]\nendobj\n");
     offsets.push(buf.len());
     // Indirect names list with a #20-escaped multi-word ink name.
-    buf.extend_from_slice(
-        b"6 0 obj\n[/Cyan /Magenta /Yellow /yellow#20fluorescent]\nendobj\n",
-    );
+    buf.extend_from_slice(b"6 0 obj\n[/Cyan /Magenta /Yellow /yellow#20fluorescent]\nendobj\n");
     offsets.push(buf.len());
     buf.extend_from_slice(
         b"7 0 obj\n<< /FunctionType 2 /Domain [0 1 0 1 0 1 0 1] /N 1 \

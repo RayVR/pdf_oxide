@@ -221,9 +221,9 @@ impl PyPdfDocument {
     ///     inks = doc.get_page_inks_deep(0)
     ///     # ['Cut', 'PANTONE 186 C', 'yellow fluorescent']
     fn get_page_inks_deep(&mut self, page: usize) -> PyResult<Vec<String>> {
-        self.inner.get_page_inks_deep(page).map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to get page inks (deep): {}", e))
-        })
+        self.inner
+            .get_page_inks_deep(page)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page inks (deep): {}", e)))
     }
 
     /// Enumerate existing PDF signatures. Returns a list of
