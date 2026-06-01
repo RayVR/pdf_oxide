@@ -632,6 +632,53 @@ fn contains_objstm_marker(window: &[u8]) -> bool {
     false
 }
 
+/// Append ink names declared by `Separation` and `DeviceN` colour spaces
+/// in `cs_dict` to `out`. Reserved colorants `/All` and `/None` (§8.6.6.4)
+/// are skipped. Caller is responsible for deduping across multiple calls.
+///
+/// Used by both [`PdfDocument::get_page_inks`] and
+/// [`PdfDocument::get_page_inks_deep`] so the per-colorant rules live in
+/// exactly one place.
+fn extract_inks_from_color_space_dict(
+    cs_dict: &std::collections::HashMap<String, Object>,
+    out: &mut Vec<String>,
+) {
+    for cs_def in cs_dict.values() {
+        let arr = match cs_def.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+        if arr.len() < 2 {
+            continue;
+        }
+        let cs_type = match arr.first().and_then(Object::as_name) {
+            Some(n) => n,
+            None => continue,
+        };
+        match cs_type {
+            "Separation" => {
+                if let Some(ink) = arr.get(1).and_then(Object::as_name) {
+                    if ink != "All" && ink != "None" {
+                        out.push(ink.to_string());
+                    }
+                }
+            },
+            "DeviceN" => {
+                if let Some(Object::Array(inks)) = arr.get(1) {
+                    for ink_obj in inks {
+                        if let Some(ink) = ink_obj.as_name() {
+                            if ink != "All" && ink != "None" {
+                                out.push(ink.to_string());
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
 impl PdfDocument {
     /// Open a PDF document from in-memory bytes.
     ///
@@ -10548,9 +10595,12 @@ impl PdfDocument {
             None => return Ok(Vec::new()),
         };
 
-        let mut ink_names = Vec::new();
-        for (_name, cs_def) in cs_dict.iter() {
-            let cs_arr_obj = if let Some(r) = cs_def.as_reference() {
+        // Resolve any indirect references so the extractor sees inline
+        // arrays. Mirrors the pre-existing per-entry resolve loop.
+        let mut resolved: std::collections::HashMap<String, Object> =
+            std::collections::HashMap::with_capacity(cs_dict.len());
+        for (name, cs_def) in cs_dict.iter() {
+            let v = if let Some(r) = cs_def.as_reference() {
                 match self.load_object(r) {
                     Ok(o) => o,
                     Err(_) => continue,
@@ -10558,39 +10608,11 @@ impl PdfDocument {
             } else {
                 cs_def.clone()
             };
-
-            if let Some(arr) = cs_arr_obj.as_array() {
-                if arr.len() >= 2 {
-                    if let Some(Object::Name(cs_type)) = arr.first() {
-                        match cs_type.as_str() {
-                            "Separation" => {
-                                // [/Separation /InkName /AlternateCS /TintTransform]
-                                // §8.6.6.4: /All and /None are reserved colorant names
-                                // (paint to all / paint to none) and never name a plate.
-                                if let Some(Object::Name(ink)) = arr.get(1) {
-                                    if ink != "All" && ink != "None" {
-                                        ink_names.push(ink.clone());
-                                    }
-                                }
-                            },
-                            "DeviceN" => {
-                                // [/DeviceN [/Ink1 /Ink2 ...] /AlternateCS /TintTransform]
-                                if let Some(Object::Array(inks)) = arr.get(1) {
-                                    for ink_obj in inks {
-                                        if let Object::Name(ink) = ink_obj {
-                                            if ink != "All" && ink != "None" {
-                                                ink_names.push(ink.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            _ => {},
-                        }
-                    }
-                }
-            }
+            resolved.insert(name.clone(), v);
         }
+
+        let mut ink_names = Vec::new();
+        extract_inks_from_color_space_dict(&resolved, &mut ink_names);
 
         ink_names.sort();
         ink_names.dedup();
@@ -21873,5 +21895,80 @@ mod tests {
         let paths = doc.extract_paths(0).unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].layer, None);
+    }
+}
+
+#[cfg(test)]
+mod ink_dict_extractor_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn name(s: &str) -> Object {
+        Object::Name(s.to_string())
+    }
+
+    fn separation_cs(ink: &str) -> Object {
+        Object::Array(vec![name("Separation"), name(ink), name("DeviceCMYK"), Object::Null])
+    }
+
+    fn device_n_cs(inks: &[&str]) -> Object {
+        Object::Array(vec![
+            name("DeviceN"),
+            Object::Array(inks.iter().map(|s| name(s)).collect()),
+            name("DeviceCMYK"),
+            Object::Null,
+        ])
+    }
+
+    #[test]
+    fn extracts_separation_ink_name() {
+        let mut cs_dict = HashMap::new();
+        cs_dict.insert("CS0".to_string(), separation_cs("Pantone-185"));
+        let mut out = Vec::new();
+        extract_inks_from_color_space_dict(&cs_dict, &mut out);
+        assert_eq!(out, vec!["Pantone-185".to_string()]);
+    }
+
+    #[test]
+    fn extracts_devicen_ink_names_in_declared_order() {
+        let mut cs_dict = HashMap::new();
+        cs_dict.insert(
+            "CS0".to_string(),
+            device_n_cs(&["Cyan", "Magenta", "SpotGold"]),
+        );
+        let mut out = Vec::new();
+        extract_inks_from_color_space_dict(&cs_dict, &mut out);
+        assert_eq!(
+            out,
+            vec!["Cyan".to_string(), "Magenta".to_string(), "SpotGold".to_string()]
+        );
+    }
+
+    #[test]
+    fn skips_all_and_none_colorants() {
+        // §8.6.6.4: /All and /None are reserved; never plate names.
+        let mut cs_dict = HashMap::new();
+        cs_dict.insert("CS0".to_string(), separation_cs("All"));
+        cs_dict.insert("CS1".to_string(), separation_cs("None"));
+        cs_dict.insert(
+            "CS2".to_string(),
+            device_n_cs(&["All", "Spot1", "None"]),
+        );
+        let mut out = Vec::new();
+        extract_inks_from_color_space_dict(&cs_dict, &mut out);
+        assert_eq!(out, vec!["Spot1".to_string()]);
+    }
+
+    #[test]
+    fn ignores_non_separation_color_spaces() {
+        let mut cs_dict = HashMap::new();
+        cs_dict.insert(
+            "CS0".to_string(),
+            Object::Array(vec![name("ICCBased"), Object::Null]),
+        );
+        cs_dict.insert("CS1".to_string(), name("DeviceCMYK"));
+        let mut out = Vec::new();
+        extract_inks_from_color_space_dict(&cs_dict, &mut out);
+        assert!(out.is_empty());
     }
 }
