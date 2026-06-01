@@ -1435,6 +1435,45 @@ pub fn decode_cmyk_jpeg_to_rgb(jpeg_data: &[u8]) -> Result<Vec<u8>> {
 /// `PdfImage::save_as_*` when the source image carries an ICCBased
 /// colour space (or when the document's `OutputIntents` supplied a
 /// default CMYK profile).
+/// Decode a DeviceCMYK JPEG to raw 8-bpc CMYK samples (W*H*4 bytes,
+/// channel order C, M, Y, K). Applies the Adobe APP14 marker's
+/// inverted-channel convention when present (Photoshop / InDesign /
+/// Illustrator default), so output is always "physical ink coverage"
+/// — 0 = no ink, 255 = full coverage.
+///
+/// Used by the separation pipeline to route CMYK image channels directly
+/// to the matching ink plates without going through a colour-space
+/// conversion to RGB and back.
+pub(crate) fn decode_cmyk_jpeg_to_raw_cmyk(jpeg_data: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg_data));
+    let cmyk = decoder
+        .decode()
+        .map_err(|e| Error::Decode(format!("Failed to decode CMYK JPEG: {}", e)))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| Error::Decode("JPEG info unavailable".to_string()))?;
+
+    let pixel_count = (info.width as usize) * (info.height as usize);
+    let expected = pixel_count * 4;
+    if cmyk.len() < expected {
+        return Err(Error::Decode(format!(
+            "CMYK JPEG decoded {} bytes, expected {}",
+            cmyk.len(),
+            expected
+        )));
+    }
+
+    let adobe_inverted = scan_adobe_inverted(jpeg_data);
+    let mut raw = cmyk;
+    raw.truncate(expected);
+    if adobe_inverted {
+        for b in raw.iter_mut() {
+            *b = 255 - *b;
+        }
+    }
+    Ok(raw)
+}
+
 pub fn decode_cmyk_jpeg_to_rgb_with_profile(
     jpeg_data: &[u8],
     transform: Option<&crate::color::Transform>,
