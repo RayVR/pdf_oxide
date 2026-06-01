@@ -1,9 +1,36 @@
 //! CFF (Compact Font Format) encoding parser.
 //!
-//! Parses the built-in encoding table from CFF font programs to extract
-//! character code → glyph name mappings. Per PDF spec §9.6.6.2, when no
-//! /BaseEncoding is specified in the encoding dictionary, the implicit base
-//! encoding shall be the font program's built-in encoding.
+//! Parses the built-in encoding table from CFF font programs and resolves
+//! PDF content-stream bytes to glyph IDs.
+//!
+//! # Two byte → GID resolution paths
+//!
+//! Simple CFF fonts have two potential sources of byte → glyph mapping
+//! information, and PDFs decide between them according to ISO 32000-1
+//! §9.6.6:
+//!
+//! 1. **The PDF font dictionary's `/Encoding`** is authoritative for
+//!    simple fonts (Type 1 / TrueType / CFF). It supplies byte → glyph
+//!    *name*; the CFF Charset then resolves the name → SID → GID.
+//!    [`parse_cff_gid_mapping_with_pdf_encoding`] implements this path.
+//!
+//! 2. **The CFF font program's own Encoding table** (CFF Tech Note #5176
+//!    §12) supplies byte → GID directly. This is the *fallback* when no
+//!    PDF-level encoding is supplied (e.g. an `Encoding::Identity` caller).
+//!    [`parse_cff_gid_mapping`] implements this path.
+//!
+//! Subsetter-emitted CFF Encoding tables are frequently sparse —
+//! some prepress subsetters commonly emit only `0x20 → space` and
+//! `0x41 → A` while the Charset enumerates the full subset — so callers
+//! that have the PDF `/Encoding` in hand should always go through the
+//! `_with_pdf_encoding` entrypoint. The CFF Encoding path is preserved
+//! for backwards compatibility and as a final fallback when the PDF side
+//! cannot supply a byte → name resolver.
+//!
+//! Per PDF spec §9.6.6.2, when no `/BaseEncoding` is specified in an
+//! encoding dictionary, the implicit base encoding is the font program's
+//! built-in encoding — this module also provides [`parse_cff_encoding`]
+//! for that legacy lookup.
 
 use std::collections::HashMap;
 
@@ -1041,12 +1068,8 @@ pub fn parse_cff_gid_mapping_with_pdf_encoding(
         return parse_cff_gid_mapping(font_data);
     };
 
-    let resolved = resolve_bytes_via_pdf_encoding(
-        &charset_sids,
-        &string_index,
-        pdf_encoding,
-        differences,
-    );
+    let resolved =
+        resolve_bytes_via_pdf_encoding(&charset_sids, &string_index, pdf_encoding, differences);
 
     if resolved.is_empty() {
         // PDF /Encoding yielded zero hits against the Charset. Fall back to
@@ -1088,9 +1111,8 @@ fn resolve_bytes_via_pdf_encoding(
     // ASCII overlap with MacRoman and StandardEncoding is total, and the
     // small non-ASCII divergences haven't surfaced as a real-world issue —
     // see Out-of-Scope note in the originating plan).
-    let resolve_base_byte = |byte: u8| -> Option<&'static str> {
-        FontInfo::gid_to_standard_glyph_name(byte as u16)
-    };
+    let resolve_base_byte =
+        |byte: u8| -> Option<&'static str> { FontInfo::gid_to_standard_glyph_name(byte as u16) };
 
     let mut out: HashMap<u8, u16> = HashMap::new();
     for byte_code in 0u16..256 {
@@ -1990,12 +2012,7 @@ mod tests {
         let pdf_enc = Encoding::Standard("WinAnsiEncoding".to_string());
         let differences: HashMap<u8, String> = HashMap::new();
 
-        let map = resolve_bytes_via_pdf_encoding(
-            &charset,
-            &string_index,
-            &pdf_enc,
-            &differences,
-        );
+        let map = resolve_bytes_via_pdf_encoding(&charset, &string_index, &pdf_enc, &differences);
 
         assert_eq!(map.get(&0x20), Some(&1), "0x20 (space) → GID 1");
         assert_eq!(map.get(&0x41), Some(&2), "0x41 (A) → GID 2");
@@ -2022,12 +2039,7 @@ mod tests {
         // path is exercised (and would beat a divergent base encoding).
         differences.insert(0x95u8, "bullet".to_string());
 
-        let map = resolve_bytes_via_pdf_encoding(
-            &charset,
-            &string_index,
-            &pdf_enc,
-            &differences,
-        );
+        let map = resolve_bytes_via_pdf_encoding(&charset, &string_index, &pdf_enc, &differences);
         assert_eq!(map.get(&0x95), Some(&1));
     }
 
@@ -2039,12 +2051,7 @@ mod tests {
         let string_index: Vec<&[u8]> = Vec::new();
         let pdf_enc = Encoding::Identity;
         let differences: HashMap<u8, String> = HashMap::new();
-        let map = resolve_bytes_via_pdf_encoding(
-            &charset,
-            &string_index,
-            &pdf_enc,
-            &differences,
-        );
+        let map = resolve_bytes_via_pdf_encoding(&charset, &string_index, &pdf_enc, &differences);
         assert!(map.is_empty(), "Identity → no base byte→name resolution");
     }
 
@@ -2060,12 +2067,7 @@ mod tests {
         let mut differences = HashMap::new();
         differences.insert(0x21u8, "customGlyph".to_string());
 
-        let map = resolve_bytes_via_pdf_encoding(
-            &charset,
-            &string_index,
-            &pdf_enc,
-            &differences,
-        );
+        let map = resolve_bytes_via_pdf_encoding(&charset, &string_index, &pdf_enc, &differences);
         assert_eq!(map.get(&0x21), Some(&1));
     }
 }
