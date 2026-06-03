@@ -1438,7 +1438,9 @@ pub fn decode_cmyk_jpeg_to_rgb(jpeg_data: &[u8]) -> Result<Vec<u8>> {
 ///
 /// Used by the separation pipeline to route CMYK image channels directly
 /// to the matching ink plates without going through a colour-space
-/// conversion to RGB and back.
+/// conversion to RGB and back. Only the rendering feature consumes this;
+/// without it the function would be dead code under `-D warnings`.
+#[cfg(feature = "rendering")]
 pub(crate) fn decode_cmyk_jpeg_to_raw_cmyk(jpeg_data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg_data));
     let cmyk = decoder
