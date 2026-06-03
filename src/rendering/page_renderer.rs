@@ -19,7 +19,43 @@ use crate::content::parser::parse_content_stream;
 use crate::document::PdfDocument;
 use crate::error::{Error, Result};
 use crate::object::{Object, ObjectRef};
-use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState};
+use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState, SoftMaskSpec};
+use std::borrow::Cow;
+
+/// Returns the current effective clip for paint operators — the intersection
+/// of the active clipping-path mask and the active ExtGState soft-mask
+/// (§11.6.5.2). The intersection is the per-pixel minimum of the two alpha
+/// buffers, which is what "both masks must let the paint through" means for
+/// 8-bpc alpha. Allocation only happens when *both* stacks contribute a
+/// mask at the current level.
+fn effective_clip<'a>(
+    clip_stack: &'a [Option<tiny_skia::Mask>],
+    soft_mask_stack: &'a [Option<tiny_skia::Mask>],
+) -> Option<Cow<'a, tiny_skia::Mask>> {
+    let clip = clip_stack.last().and_then(|c| c.as_ref());
+    let smask = soft_mask_stack.last().and_then(|s| s.as_ref());
+    match (clip, smask) {
+        (None, None) => None,
+        (Some(c), None) => Some(Cow::Borrowed(c)),
+        (None, Some(s)) => Some(Cow::Borrowed(s)),
+        (Some(c), Some(s)) => {
+            if c.width() != s.width() || c.height() != s.height() {
+                // Mismatched mask dimensions — fall back to the clip alone
+                // rather than mixing buffers of different sizes. The MVP
+                // soft-mask code renders the group at page pixmap dimensions,
+                // so this should not fire in practice.
+                return Some(Cow::Borrowed(c));
+            }
+            let mut out = c.clone();
+            let dst = out.data_mut();
+            let src = s.data();
+            for (d, &v) in dst.iter_mut().zip(src.iter()) {
+                *d = ((*d as u32 * v as u32) / 255) as u8;
+            }
+            Some(Cow::Owned(out))
+        },
+    }
+}
 use crate::rendering::path_rasterizer::PathRasterizer;
 use crate::rendering::text_rasterizer::TextRasterizer;
 
@@ -426,6 +462,11 @@ impl PageRenderer {
         let mut current_path = PathBuilder::new();
         let mut pending_clip: Option<(tiny_skia::Path, tiny_skia::FillRule)> = None;
         let mut clip_stack: Vec<Option<tiny_skia::Mask>> = vec![None]; // Start with no clip at depth 0
+        // §11.6.5.2 soft-mask stack — mirrors `clip_stack` so q/Q save/restore
+        // the active mask along with the rest of the graphics state. The
+        // `Option<Mask>` is a pre-rendered alpha buffer (subtype `/Alpha`);
+        // see `materialise_soft_mask_alpha` for how it is built.
+        let mut soft_mask_stack: Vec<Option<tiny_skia::Mask>> = vec![None];
 
         // OCG layer exclusion tracking.
         // `excluded_layer_depth` counts how many nested BDC/OC scopes we are
@@ -465,6 +506,8 @@ impl PageRenderer {
                     // This allows the current level to modify its clip without affecting parents
                     let current_clip = clip_stack.last().cloned().flatten();
                     clip_stack.push(current_clip);
+                    let current_smask = soft_mask_stack.last().cloned().flatten();
+                    soft_mask_stack.push(current_smask);
                     log::debug!(
                         "q (SaveState), depth={}, clip_stack depth={}",
                         gs_stack.depth(),
@@ -476,6 +519,9 @@ impl PageRenderer {
                     // Restore previous clipping region by popping current level
                     if clip_stack.len() > 1 {
                         clip_stack.pop();
+                    }
+                    if soft_mask_stack.len() > 1 {
+                        soft_mask_stack.pop();
                     }
                     log::debug!(
                         "Q (RestoreState), depth={}, clip_stack depth={}",
@@ -1044,7 +1090,8 @@ impl PageRenderer {
                             base_transform,
                             &gs_stack,
                         );
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
@@ -1065,7 +1112,8 @@ impl PageRenderer {
                             base_transform,
                             &gs_stack,
                         );
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
@@ -1094,7 +1142,8 @@ impl PageRenderer {
                             base_transform,
                             &gs_stack,
                         );
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
@@ -1122,7 +1171,8 @@ impl PageRenderer {
                             base_transform,
                             &gs_stack,
                         );
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
@@ -1204,7 +1254,8 @@ impl PageRenderer {
                     if in_text_object {
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
-                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             self.text_rasterizer.render_text(
                                 pixmap,
@@ -1236,7 +1287,8 @@ impl PageRenderer {
 
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
-                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "' (Quote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -1270,7 +1322,8 @@ impl PageRenderer {
                     if in_text_object {
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
-                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "TJ: rendering array at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -1319,7 +1372,8 @@ impl PageRenderer {
 
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
-                            let clip = clip_stack.last().and_then(|c| c.as_ref());
+                            let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "\" (DoubleQuote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -1355,7 +1409,8 @@ impl PageRenderer {
                     if excluded_layer_depth == 0 {
                         let gs = gs_stack.current();
                         let transform = combine_transforms(base_transform, &gs.ctm);
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                         log::debug!("Do: rendering XObject '{}'", name);
                         self.render_xobject(
                             pixmap, name, transform, gs, resources, doc, page_num, clip,
@@ -1440,6 +1495,44 @@ impl PageRenderer {
                             ParsedExtGState::default()
                         });
                     entry.apply(gs_stack.current_mut());
+                    // §11.6.5.2 soft mask handling. `/SMask /None` clears
+                    // the active mask; `/SMask <dict>` rasterises the
+                    // group into a pixmap and stashes its alpha channel
+                    // as the new mask. Rasterisation is deferred to here
+                    // (rather than the parser) because it needs the page
+                    // pixmap context and the renderer's own `render_form_xobject`.
+                    if let Some(spec) = entry.soft_mask.clone() {
+                        match spec {
+                            SoftMaskSpec::None => {
+                                if let Some(slot) = soft_mask_stack.last_mut() {
+                                    *slot = None;
+                                }
+                            },
+                            SoftMaskSpec::Dict(dict_obj) => {
+                                match self.materialise_soft_mask_alpha(
+                                    &dict_obj,
+                                    pixmap.width(),
+                                    pixmap.height(),
+                                    base_transform,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                ) {
+                                    Ok(mask) => {
+                                        if let Some(slot) = soft_mask_stack.last_mut() {
+                                            *slot = Some(mask);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Skipping SMask on /{}: {}",
+                                            dict_name, e
+                                        );
+                                    },
+                                }
+                            },
+                        }
+                    }
                 },
 
                 // EndPath (n operator): discard current path without painting,
@@ -1468,7 +1561,8 @@ impl PageRenderer {
                     if excluded_layer_depth == 0 {
                         let gs = gs_stack.current();
                         let transform = combine_transforms(base_transform, &gs.ctm);
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
+                        let clip = clip_owned.as_deref();
                         self.render_shading(pixmap, name, transform, gs, resources, doc, clip)?;
                     }
                 },
@@ -2199,6 +2293,100 @@ impl PageRenderer {
         }
 
         Ok(())
+    }
+
+    /// Render an ExtGState `/SMask` group into an offscreen pixmap and
+    /// return its alpha channel as a `tiny_skia::Mask` for use as a clip on
+    /// subsequent paint operations (ISO 32000-1 §11.6.5.2).
+    ///
+    /// Only subtype `/Alpha` is supported in this MVP — `/Luminosity`,
+    /// `/BC` (backdrop colour), and `/TR` (transfer function) are deferred.
+    /// The group is rendered at the page pixmap's dimensions so the alpha
+    /// buffer pixel-aligns with subsequent paint operations on the page.
+    #[allow(clippy::too_many_arguments)]
+    fn materialise_soft_mask_alpha(
+        &mut self,
+        smask_dict_obj: &Object,
+        width: u32,
+        height: u32,
+        base_transform: Transform,
+        doc: &PdfDocument,
+        page_num: usize,
+        resources: &Object,
+    ) -> Result<tiny_skia::Mask> {
+        let smask_dict = smask_dict_obj.as_dict().ok_or_else(|| {
+            crate::error::Error::InvalidPdf("SMask is not a dictionary".to_string())
+        })?;
+
+        let subtype = smask_dict
+            .get("S")
+            .and_then(|o| o.as_name())
+            .unwrap_or("Alpha");
+        if subtype != "Alpha" {
+            return Err(crate::error::Error::InvalidPdf(format!(
+                "SMask subtype /{subtype} not yet supported (Alpha only in this build)"
+            )));
+        }
+
+        let group_obj = smask_dict.get("G").ok_or_else(|| {
+            crate::error::Error::InvalidPdf("SMask missing /G transparency group".to_string())
+        })?;
+        let group_resolved = doc.resolve_object(group_obj)?;
+        let group_dict = match &group_resolved {
+            Object::Stream { dict, .. } => dict.clone(),
+            _ => {
+                return Err(crate::error::Error::InvalidPdf(
+                    "SMask /G is not a stream".to_string(),
+                ))
+            },
+        };
+        let group_data = if let Some(stream_ref) = group_obj.as_reference() {
+            doc.decode_stream_with_encryption(&group_resolved, stream_ref)?
+        } else {
+            group_resolved.decode_stream_data()?
+        };
+
+        // Render the group into a fresh pixmap matching the page's dimensions.
+        // Form /Matrix + /BBox position the painted content inside that buffer.
+        // Areas outside the group's painted region keep their initial alpha = 0,
+        // which is the correct subtractive default for `/S /Alpha`.
+        let mut group_pixmap = Pixmap::new(width, height).ok_or_else(|| {
+            crate::error::Error::InvalidPdf(
+                "Failed to allocate SMask group pixmap".to_string(),
+            )
+        })?;
+
+        let form_resources = group_dict
+            .get("Resources")
+            .cloned()
+            .unwrap_or_else(|| resources.clone());
+        let old_fonts = self.fonts.clone();
+        let old_cs = self.color_spaces.clone();
+        self.load_resources(doc, &form_resources)?;
+
+        let render_res = self.render_form_xobject(
+            &mut group_pixmap,
+            &group_dict,
+            &group_data,
+            base_transform,
+            doc,
+            page_num,
+            &form_resources,
+        );
+
+        self.fonts = old_fonts;
+        self.color_spaces = old_cs;
+        render_res?;
+
+        // Build the Mask from the group pixmap's alpha channel.
+        let mut mask = tiny_skia::Mask::new(width, height).ok_or_else(|| {
+            crate::error::Error::InvalidPdf("Failed to allocate SMask alpha buffer".to_string())
+        })?;
+        let mask_data = mask.data_mut();
+        for (i, chunk) in group_pixmap.data().chunks_exact(4).enumerate() {
+            mask_data[i] = chunk[3];
+        }
+        Ok(mask)
     }
 
     /// Render a Form XObject by parsing its content stream recursively.

@@ -10,10 +10,10 @@ use crate::document::PdfDocument;
 use crate::error::Result;
 use crate::object::Object;
 
-/// Parsed effects of a PDF `ExtGState` dictionary. Only the fields actually
-/// applied during rendering are captured (fill/stroke alpha, blend mode, and
-/// the overprint parameters from ISO 32000-1 §11.7.4). Anything else
-/// (TK / SMask / AIS) is intentionally ignored so the cached entry stays tiny.
+/// Parsed effects of a PDF `ExtGState` dictionary. Captures fill/stroke
+/// alpha, blend mode, overprint parameters (§11.7.4), and the soft-mask
+/// reference (§11.6.5.2). Anything else (TK / AIS) is intentionally ignored
+/// so the cached entry stays tiny.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ParsedExtGState {
     pub(crate) fill_alpha: Option<f32>,
@@ -25,6 +25,22 @@ pub(crate) struct ParsedExtGState {
     pub(crate) fill_overprint: Option<bool>,
     /// Overprint mode (ExtGState `/OPM`, §11.7.4). 0 = standard, 1 = nonzero.
     pub(crate) overprint_mode: Option<u8>,
+    /// Soft-mask reference (§11.6.5.2). The renderer materialises this into
+    /// an alpha mask pixmap after parsing — the parser stays pure, just
+    /// captures the dict / `/None` sentinel for the caller to act on.
+    pub(crate) soft_mask: Option<SoftMaskSpec>,
+}
+
+/// What an ExtGState `/SMask` entry tells the renderer to do.
+#[derive(Clone, Debug)]
+pub(crate) enum SoftMaskSpec {
+    /// `/SMask /None` — clear any currently-active soft mask.
+    None,
+    /// `/SMask <dict>` — the dict is captured verbatim so the renderer can
+    /// read `/S` (subtype) and `/G` (the transparency-group Form XObject)
+    /// at render time, when it has the page pixmap context needed to
+    /// rasterise the group.
+    Dict(Object),
 }
 
 impl ParsedExtGState {
@@ -104,6 +120,17 @@ pub(crate) fn parse_ext_g_state_inner(
         // value is undefined; clamp to 0 so a malformed PDF doesn't
         // accidentally enable nonzero-overprint mode.
         out.overprint_mode = Some(if opm == 1 { 1 } else { 0 });
+    }
+
+    // §11.6.5.2: `/SMask /None` clears any active soft mask; `/SMask <dict>`
+    // installs a new one. We capture the dict here and defer the actual
+    // group rasterisation to the renderer where the page pixmap exists.
+    if let Some(smask) = state_dict.get("SMask") {
+        let resolved = doc.resolve_object(smask)?;
+        out.soft_mask = Some(match &resolved {
+            Object::Name(n) if n == "None" => SoftMaskSpec::None,
+            _ => SoftMaskSpec::Dict(resolved),
+        });
     }
 
     Ok(out)
