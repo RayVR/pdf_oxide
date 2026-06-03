@@ -47,6 +47,63 @@ fn parse_form_matrix(dict: &std::collections::HashMap<String, Object>) -> tiny_s
     }
 }
 
+/// Knockout transparency group threshold for the alpha short-circuit
+/// (§11.6.6.2). A fully opaque paint is visually identical between the
+/// knockout and non-knockout paths, so we short-circuit the buffer dance
+/// when `alpha >= 1.0 - eps`. Slightly under 1.0 to absorb f32 rounding.
+const KNOCKOUT_ALPHA_OPAQUE: f32 = 0.9999;
+
+/// Run a paint operation in a knockout-aware fashion. When the enclosing
+/// group has a knockout backdrop and the effective alpha is below
+/// [`KNOCKOUT_ALPHA_OPAQUE`], the paint targets a temp pixmap initialised
+/// from the backdrop and the result is merged via [`knockout_merge`] —
+/// each painted pixel replaces whatever the previous paint left there.
+/// Fully opaque paints (and any paint outside a knockout group) target
+/// `pixmap` directly, with zero overhead.
+fn knockout_aware_paint<F, R>(
+    pixmap: &mut Pixmap,
+    knockout_backdrop: Option<&Pixmap>,
+    effective_alpha: f32,
+    paint_fn: F,
+) -> R
+where
+    F: FnOnce(&mut Pixmap) -> R,
+{
+    if effective_alpha < KNOCKOUT_ALPHA_OPAQUE {
+        if let Some(backdrop) = knockout_backdrop {
+            let mut temp = backdrop.clone();
+            let result = paint_fn(&mut temp);
+            knockout_merge(pixmap, &temp, backdrop);
+            return result;
+        }
+    }
+    paint_fn(pixmap)
+}
+
+/// Merge a temp pixmap (a paint rendered against the knockout backdrop)
+/// back into the group's accumulating buffer. For each pixel that differs
+/// between `temp` and `backdrop` — i.e. each pixel the paint touched —
+/// the temp's value replaces the destination. Pixels the paint didn't
+/// touch remain whatever the previous paint left in `dest`.
+///
+/// All three pixmaps must share dimensions; callers always allocate them
+/// at the group pixmap's W*H so this holds.
+fn knockout_merge(dest: &mut Pixmap, temp: &Pixmap, backdrop: &Pixmap) {
+    let temp_data = temp.data();
+    let backdrop_data = backdrop.data();
+    let dest_data = dest.data_mut();
+    let len = dest_data.len();
+    // chunks_exact(4) over RGBA pixels. Pixmap allocates W*H*4 bytes by
+    // construction so no trailing partial pixel.
+    let mut i = 0;
+    while i + 4 <= len {
+        if temp_data[i..i + 4] != backdrop_data[i..i + 4] {
+            dest_data[i..i + 4].copy_from_slice(&temp_data[i..i + 4]);
+        }
+        i += 4;
+    }
+}
+
 /// Returns the current effective clip for paint operators — the intersection
 /// of the active clipping-path mask and the active ExtGState soft-mask
 /// (§11.6.5.2). The intersection composes the two alphas multiplicatively
@@ -351,7 +408,15 @@ impl PageRenderer {
         };
 
         // Execute operators
-        self.execute_operators(&mut pixmap, transform, &operators, doc, page_num, &resources)?;
+        self.execute_operators(
+            &mut pixmap,
+            transform,
+            &operators,
+            doc,
+            page_num,
+            &resources,
+            None,
+        )?;
 
         // Render annotations (if requested and present)
         if self.options.render_annotations {
@@ -465,6 +530,7 @@ impl PageRenderer {
     /// OCG layer exclusion is sourced from `self.options.excluded_layers`;
     /// BDC/EMC operators referencing matching layers cause graphical operators
     /// inside that scope to be silently dropped.
+    #[allow(clippy::too_many_arguments)]
     fn execute_operators(
         &mut self,
         pixmap: &mut Pixmap,
@@ -473,6 +539,7 @@ impl PageRenderer {
         doc: &PdfDocument,
         page_num: usize,
         resources: &Object,
+        knockout_backdrop: Option<&Pixmap>,
     ) -> Result<()> {
         // Per-render snapshot lives on `self.excluded_layers_snapshot` (filled
         // by `render_page_with_options`). Recursive calls into this function
@@ -504,6 +571,12 @@ impl PageRenderer {
         // `Option<Mask>` is a pre-rendered alpha buffer (subtype `/Alpha`);
         // see `materialise_soft_mask_alpha` for how it is built.
         let mut soft_mask_stack: Vec<Option<tiny_skia::Mask>> = vec![None];
+        // §11.6.6.2 knockout backdrop. When the enclosing transparency group
+        // has /K true the parent calls us with a snapshot of the group's
+        // initial pixmap; every translucent paint inside this content stream
+        // composites against that backdrop rather than the accumulating
+        // group buffer. `Option` keeps the non-knockout path zero-cost.
+        let knockout_backdrop: Option<Pixmap> = knockout_backdrop.cloned();
 
         // OCG layer exclusion tracking.
         // `excluded_layer_depth` counts how many nested BDC/OC scopes we are
@@ -1132,8 +1205,16 @@ impl PageRenderer {
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            self.path_rasterizer
-                                .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                            let path_rasterizer = &mut self.path_rasterizer;
+                            knockout_aware_paint(
+                                pixmap,
+                                knockout_backdrop.as_ref(),
+                                gs.stroke_alpha,
+                                |target| {
+                                    path_rasterizer
+                                        .stroke_path_clipped(target, &path, transform, gs, clip);
+                                },
+                            );
                         }
                     } else {
                         let _ = current_path.finish();
@@ -1154,13 +1235,21 @@ impl PageRenderer {
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            self.path_rasterizer.fill_path_clipped(
+                            let path_rasterizer = &mut self.path_rasterizer;
+                            knockout_aware_paint(
                                 pixmap,
-                                &path,
-                                transform,
-                                gs,
-                                tiny_skia::FillRule::Winding,
-                                clip,
+                                knockout_backdrop.as_ref(),
+                                gs.fill_alpha,
+                                |target| {
+                                    path_rasterizer.fill_path_clipped(
+                                        target,
+                                        &path,
+                                        transform,
+                                        gs,
+                                        tiny_skia::FillRule::Winding,
+                                        clip,
+                                    );
+                                },
                             );
                         }
                     } else {
@@ -1189,10 +1278,26 @@ impl PageRenderer {
                             } else {
                                 tiny_skia::FillRule::Winding
                             };
-                            self.path_rasterizer
-                                .fill_path_clipped(pixmap, &path, transform, gs, fill_rule, clip);
-                            self.path_rasterizer
-                                .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                            let path_rasterizer = &mut self.path_rasterizer;
+                            knockout_aware_paint(
+                                pixmap,
+                                knockout_backdrop.as_ref(),
+                                gs.fill_alpha,
+                                |target| {
+                                    path_rasterizer.fill_path_clipped(
+                                        target, &path, transform, gs, fill_rule, clip,
+                                    );
+                                },
+                            );
+                            knockout_aware_paint(
+                                pixmap,
+                                knockout_backdrop.as_ref(),
+                                gs.stroke_alpha,
+                                |target| {
+                                    path_rasterizer
+                                        .stroke_path_clipped(target, &path, transform, gs, clip);
+                                },
+                            );
                         }
                     } else {
                         let _ = current_path.finish();
@@ -1213,17 +1318,33 @@ impl PageRenderer {
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            self.path_rasterizer.fill_path_clipped(
+                            let path_rasterizer = &mut self.path_rasterizer;
+                            knockout_aware_paint(
                                 pixmap,
-                                &path,
-                                transform,
-                                gs,
-                                tiny_skia::FillRule::EvenOdd,
-                                clip,
+                                knockout_backdrop.as_ref(),
+                                gs.fill_alpha,
+                                |target| {
+                                    path_rasterizer.fill_path_clipped(
+                                        target,
+                                        &path,
+                                        transform,
+                                        gs,
+                                        tiny_skia::FillRule::EvenOdd,
+                                        clip,
+                                    );
+                                },
                             );
                             if matches!(op, Operator::FillStrokeEvenOdd) {
-                                self.path_rasterizer
-                                    .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                                knockout_aware_paint(
+                                    pixmap,
+                                    knockout_backdrop.as_ref(),
+                                    gs.stroke_alpha,
+                                    |target| {
+                                        path_rasterizer.stroke_path_clipped(
+                                            target, &path, transform, gs, clip,
+                                        );
+                                    },
+                                );
                             }
                         }
                     } else {
@@ -1292,17 +1413,19 @@ impl PageRenderer {
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
                             let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
-                        let clip = clip_owned.as_deref();
+                            let clip = clip_owned.as_deref();
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            self.text_rasterizer.render_text(
+                            let text_rasterizer = &mut self.text_rasterizer;
+                            let fonts = &self.fonts;
+                            knockout_aware_paint(
                                 pixmap,
-                                text,
-                                transform,
-                                gs,
-                                resources,
-                                doc,
-                                clip,
-                                &self.fonts,
+                                knockout_backdrop.as_ref(),
+                                gs.fill_alpha,
+                                |target| {
+                                    text_rasterizer.render_text(
+                                        target, text, transform, gs, resources, doc, clip, fonts,
+                                    )
+                                },
                             )?
                         } else {
                             self.text_rasterizer.measure_text(text, gs, &self.fonts)
@@ -1325,26 +1448,19 @@ impl PageRenderer {
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
                             let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
-                        let clip = clip_owned.as_deref();
+                            let clip = clip_owned.as_deref();
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            log::debug!(
-                                "' (Quote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
-                                gs.text_matrix.a,
-                                gs.text_matrix.b,
-                                gs.text_matrix.c,
-                                gs.text_matrix.d,
-                                gs.text_matrix.e,
-                                gs.text_matrix.f
-                            );
-                            self.text_rasterizer.render_text(
+                            let text_rasterizer = &mut self.text_rasterizer;
+                            let fonts = &self.fonts;
+                            knockout_aware_paint(
                                 pixmap,
-                                text,
-                                transform,
-                                gs,
-                                resources,
-                                doc,
-                                clip,
-                                &self.fonts,
+                                knockout_backdrop.as_ref(),
+                                gs.fill_alpha,
+                                |target| {
+                                    text_rasterizer.render_text(
+                                        target, text, transform, gs, resources, doc, clip, fonts,
+                                    )
+                                },
                             )?
                         } else {
                             self.text_rasterizer.measure_text(text, gs, &self.fonts)
@@ -1371,15 +1487,17 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
-                            self.text_rasterizer.render_tj_array(
+                            let text_rasterizer = &mut self.text_rasterizer;
+                            let fonts = &self.fonts;
+                            knockout_aware_paint(
                                 pixmap,
-                                array,
-                                transform,
-                                gs,
-                                resources,
-                                doc,
-                                clip,
-                                &self.fonts,
+                                knockout_backdrop.as_ref(),
+                                gs.fill_alpha,
+                                |target| {
+                                    text_rasterizer.render_tj_array(
+                                        target, array, transform, gs, resources, doc, clip, fonts,
+                                    )
+                                },
                             )?
                         } else {
                             self.text_rasterizer
@@ -1410,7 +1528,7 @@ impl PageRenderer {
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
                             let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
-                        let clip = clip_owned.as_deref();
+                            let clip = clip_owned.as_deref();
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "\" (DoubleQuote): rendering text at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -1421,15 +1539,17 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
-                            self.text_rasterizer.render_text(
+                            let text_rasterizer = &mut self.text_rasterizer;
+                            let fonts = &self.fonts;
+                            knockout_aware_paint(
                                 pixmap,
-                                text,
-                                transform,
-                                gs,
-                                resources,
-                                doc,
-                                clip,
-                                &self.fonts,
+                                knockout_backdrop.as_ref(),
+                                gs.fill_alpha,
+                                |target| {
+                                    text_rasterizer.render_text(
+                                        target, text, transform, gs, resources, doc, clip, fonts,
+                                    )
+                                },
                             )?
                         } else {
                             self.text_rasterizer.measure_text(text, gs, &self.fonts)
@@ -1449,8 +1569,20 @@ impl PageRenderer {
                         let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
                         let clip = clip_owned.as_deref();
                         log::debug!("Do: rendering XObject '{}'", name);
-                        self.render_xobject(
-                            pixmap, name, transform, gs, resources, doc, page_num, clip,
+                        // §11.6.6.2: treat the Do as one element for
+                        // knockout purposes — render the image or form into
+                        // a backdrop-relative temp and merge so it replaces
+                        // (rather than blends with) prior paints in the group.
+                        let alpha = gs.fill_alpha;
+                        knockout_aware_paint(
+                            pixmap,
+                            knockout_backdrop.as_ref(),
+                            alpha,
+                            |target| {
+                                self.render_xobject(
+                                    target, name, transform, gs, resources, doc, page_num, clip,
+                                )
+                            },
                         )?;
                     }
                 },
@@ -1626,7 +1758,17 @@ impl PageRenderer {
                         let transform = combine_transforms(base_transform, &gs.ctm);
                         let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
                         let clip = clip_owned.as_deref();
-                        self.render_shading(pixmap, name, transform, gs, resources, doc, clip)?;
+                        let alpha = gs.fill_alpha;
+                        knockout_aware_paint(
+                            pixmap,
+                            knockout_backdrop.as_ref(),
+                            alpha,
+                            |target| {
+                                self.render_shading(
+                                    target, name, transform, gs, resources, doc, clip,
+                                )
+                            },
+                        )?;
                     }
                 },
 
@@ -2682,6 +2824,7 @@ impl PageRenderer {
             doc,
             page_num,
             &form_resources,
+            None,
         );
         self.smask_depth -= 1;
 
@@ -2777,17 +2920,28 @@ impl PageRenderer {
             // Per PDF spec 11.6.6: Render transparency group to a separate pixmap,
             // then composite onto the parent. For isolated groups (I=true), the
             // initial backdrop is fully transparent.
-            let is_isolated = dict
-                .get("Group")
-                .and_then(|g| g.as_dict())
+            let group_dict = dict.get("Group").and_then(|g| g.as_dict());
+            let is_isolated = group_dict
                 .and_then(|gd| gd.get("I"))
                 .map(|i| match i {
                     Object::Boolean(b) => *b,
                     _ => false,
                 })
                 .unwrap_or(false);
+            // §11.6.6.2 knockout flag — when true, each painted element
+            // composites against the group's *initial backdrop* rather than
+            // the accumulating result.
+            let is_knockout = group_dict
+                .and_then(|gd| gd.get("K"))
+                .map(|i| match i {
+                    Object::Boolean(b) => *b,
+                    _ => false,
+                })
+                .unwrap_or(false);
 
-            log::debug!("Rendering transparency group (isolated={})", is_isolated);
+            log::debug!(
+                "Rendering transparency group (isolated={is_isolated}, knockout={is_knockout})"
+            );
 
             // Create a separate pixmap for the group
             let mut group_pixmap =
@@ -2801,6 +2955,15 @@ impl PageRenderer {
             }
             // Isolated groups start fully transparent (default Pixmap state)
 
+            // For knockout groups, snapshot the initial pixmap state — every
+            // paint inside the group's content stream needs to composite
+            // against this backdrop instead of the accumulating buffer.
+            let knockout_backdrop = if is_knockout {
+                Some(group_pixmap.clone())
+            } else {
+                None
+            };
+
             // Execute operators into the group pixmap
             self.execute_operators(
                 &mut group_pixmap,
@@ -2809,6 +2972,7 @@ impl PageRenderer {
                 doc,
                 page_num,
                 &form_resources,
+                knockout_backdrop.as_ref(),
             )?;
 
             if is_isolated {
@@ -2834,6 +2998,7 @@ impl PageRenderer {
                 doc,
                 page_num,
                 &form_resources,
+                None,
             )?;
         }
 
