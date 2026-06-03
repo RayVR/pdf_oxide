@@ -75,10 +75,15 @@ pub(crate) fn create_stroke_paint(gs: &GraphicsState, blend_mode: &str) -> Paint
     paint
 }
 
-/// Convert PDF blend mode to tiny-skia.
+/// Convert PDF blend mode (ISO 32000-1 §11.3.5) to tiny-skia. The four
+/// non-separable modes (`Hue`, `Saturation`, `Color`, `Luminosity` —
+/// §11.3.5.3) are dispatched to tiny-skia's native HSL-based blend
+/// stages, which match the W3C / Skia / Acrobat formulas. The separable
+/// modes are the §11.3.5.2 set.
 pub(crate) fn pdf_blend_mode_to_skia(mode: &str) -> tiny_skia::BlendMode {
     match mode {
         "Normal" => tiny_skia::BlendMode::SourceOver,
+        // Separable (§11.3.5.2)
         "Multiply" => tiny_skia::BlendMode::Multiply,
         "Screen" => tiny_skia::BlendMode::Screen,
         "Overlay" => tiny_skia::BlendMode::Overlay,
@@ -90,6 +95,12 @@ pub(crate) fn pdf_blend_mode_to_skia(mode: &str) -> tiny_skia::BlendMode {
         "SoftLight" => tiny_skia::BlendMode::SoftLight,
         "Difference" => tiny_skia::BlendMode::Difference,
         "Exclusion" => tiny_skia::BlendMode::Exclusion,
+        // Non-separable (§11.3.5.3). These collapse to SourceOver if the
+        // tiny-skia version ever drops the HSL stages.
+        "Hue" => tiny_skia::BlendMode::Hue,
+        "Saturation" => tiny_skia::BlendMode::Saturation,
+        "Color" => tiny_skia::BlendMode::Color,
+        "Luminosity" => tiny_skia::BlendMode::Luminosity,
         _ => tiny_skia::BlendMode::SourceOver,
     }
 }
