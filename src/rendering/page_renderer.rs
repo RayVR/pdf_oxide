@@ -2358,14 +2358,33 @@ impl PageRenderer {
         Ok(())
     }
 
+}
+
+/// Which channel of the rendered SMask group becomes the alpha mask buffer
+/// (ISO 32000-1 §11.6.5).
+#[derive(Clone, Copy)]
+enum SoftMaskKind {
+    /// Subtype `/Alpha` (§11.6.5.2): use the group's alpha channel.
+    Alpha,
+    /// Subtype `/Luminosity` (§11.6.5.3): use the per-pixel BT.601 luma of
+    /// the group's premultiplied RGB.
+    Luminosity,
+}
+
+impl PageRenderer {
     /// Render an ExtGState `/SMask` group into an offscreen pixmap and
-    /// return its alpha channel as a `tiny_skia::Mask` for use as a clip on
-    /// subsequent paint operations (ISO 32000-1 §11.6.5.2).
+    /// return its mask buffer as a `tiny_skia::Mask` for use as a clip on
+    /// subsequent paint operations (ISO 32000-1 §11.6.5.2 / §11.6.5.3).
     ///
-    /// Only subtype `/Alpha` is supported in this MVP — `/Luminosity`,
-    /// `/BC` (backdrop colour), and `/TR` (transfer function) are deferred.
-    /// The group is rendered at the page pixmap's dimensions so the alpha
-    /// buffer pixel-aligns with subsequent paint operations on the page.
+    /// Subtypes:
+    ///   - `/Alpha`: the rendered group's alpha channel is the mask.
+    ///   - `/Luminosity`: per-pixel BT.601 luma of the rendered group's
+    ///     premultiplied RGB. Unpainted areas (RGBA 0,0,0,0) give
+    ///     luminance 0, which matches §11.6.5.3's default `/BC` of black.
+    ///
+    /// `/BC` (backdrop colour) and `/TR` (transfer function) are not yet
+    /// honoured. The group is rendered at the page pixmap's dimensions so
+    /// the mask buffer pixel-aligns with subsequent paint operations.
     #[allow(clippy::too_many_arguments)]
     fn materialise_soft_mask_alpha(
         &mut self,
@@ -2396,17 +2415,15 @@ impl PageRenderer {
                 "SMask dict missing required /S (subtype) — skipping".to_string(),
             )
         })?;
-        if subtype != "Alpha" {
-            // /Luminosity is the more common subtype in Adobe-authored
-            // artwork (drop shadows, vignettes); log at debug so production
-            // logs aren't flooded until the Luminosity path lands.
-            log::debug!(
-                "SMask subtype /{subtype} not yet supported (Alpha only); skipping"
-            );
-            return Err(crate::error::Error::InvalidPdf(format!(
-                "SMask subtype /{subtype} not implemented"
-            )));
-        }
+        let smask_kind = match subtype {
+            "Alpha" => SoftMaskKind::Alpha,
+            "Luminosity" => SoftMaskKind::Luminosity,
+            other => {
+                return Err(crate::error::Error::InvalidPdf(format!(
+                    "SMask subtype /{other} not recognised"
+                )));
+            },
+        };
 
         let group_obj = smask_dict.get("G").ok_or_else(|| {
             crate::error::Error::InvalidPdf("SMask missing /G transparency group".to_string())
@@ -2476,13 +2493,33 @@ impl PageRenderer {
         self.color_spaces = old_cs;
         render_res?;
 
-        // Build the Mask from the group pixmap's alpha channel.
+        // Build the Mask buffer from the group pixmap. Source pixels are
+        // tiny-skia's premultiplied RGBA; for /Luminosity we read straight
+        // from the premultiplied R/G/B which is correct for the default
+        // black /BC (unpainted pixels contribute zero, painted pixels'
+        // luminance scales with their own alpha — both spec-aligned for the
+        // common case).
         let mut mask = tiny_skia::Mask::new(width, height).ok_or_else(|| {
-            crate::error::Error::InvalidPdf("Failed to allocate SMask alpha buffer".to_string())
+            crate::error::Error::InvalidPdf("Failed to allocate SMask buffer".to_string())
         })?;
         let mask_data = mask.data_mut();
-        for (i, chunk) in group_pixmap.data().chunks_exact(4).enumerate() {
-            mask_data[i] = chunk[3];
+        match smask_kind {
+            SoftMaskKind::Alpha => {
+                for (i, chunk) in group_pixmap.data().chunks_exact(4).enumerate() {
+                    mask_data[i] = chunk[3];
+                }
+            },
+            SoftMaskKind::Luminosity => {
+                for (i, chunk) in group_pixmap.data().chunks_exact(4).enumerate() {
+                    // BT.601 luma: Y = 0.299·R + 0.587·G + 0.114·B.
+                    // Integer form with weights × 256 (77 + 150 + 29 = 256)
+                    // and `>> 8` so the result stays inside u8.
+                    let r = chunk[0] as u32;
+                    let g = chunk[1] as u32;
+                    let b = chunk[2] as u32;
+                    mask_data[i] = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
+                }
+            },
         }
         Ok(mask)
     }

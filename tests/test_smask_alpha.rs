@@ -379,6 +379,86 @@ fn ext_gstate_alpha_smask_honours_install_time_ctm() {
     );
 }
 
+/// Build a fixture exercising `/S /Luminosity`. The mask `/G` paints a
+/// mid-grey rectangle (`0.5 g … 0 50 100 50 re f`) in the top half of its
+/// BBox and leaves the bottom half unpainted. Under Luminosity:
+///   - top half luminance ≈ 128 → mask passes paint at ~50% intensity, so a
+///     full-page black fill composites to mid-grey.
+///   - bottom half luminance = 0 (default black backdrop on unpainted
+///     pixels) → mask blocks paint; the white page background stays.
+///
+/// This distinguishes from `/S /Alpha` (which would see alpha = 255 in the
+/// top half and paint fully black) and from "no mask installed" (which
+/// would paint the whole page fully black).
+fn build_pdf_with_luminosity_smask() -> Vec<u8> {
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\nQ\n";
+    let group_content = b"0.5 g\n0 50 100 50 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn ext_gstate_luminosity_smask_modulates_paint_by_group_luma() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_smask()).expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    let top = rgba.get_pixel(50, 25);
+    let bottom = rgba.get_pixel(50, 75);
+
+    // Top half: mid-grey luminance ≈ 128 modulates black-over-white
+    // SourceOver to ~128. Allow a generous tolerance window for JPEG-free
+    // rasteriser rounding. Must not be full black (Alpha would give that)
+    // and must not be near white (no mask would not).
+    assert!(
+        top[0] > 80 && top[0] < 200,
+        "Luminosity SMask top should composite mid-grey; got R={} (G={} B={} A={})",
+        top[0], top[1], top[2], top[3]
+    );
+
+    // Bottom half: unpainted /G → luminance 0 → paint blocked → background white.
+    assert!(
+        bottom[0] > 200,
+        "Luminosity SMask bottom should be the white background; got R={} (G={} B={} A={})",
+        bottom[0], bottom[1], bottom[2], bottom[3]
+    );
+}
+
 #[test]
 fn ext_gstate_alpha_smask_blocks_paint_under_transparent_mask() {
     let pdf = build_pdf_with_alpha_smask();
