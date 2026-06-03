@@ -30,9 +30,11 @@ pub(crate) struct ParsedExtGState {
     /// captures the dict / `/None` sentinel for the caller to act on.
     pub(crate) soft_mask: Option<SoftMaskSpec>,
     /// Cached materialised soft-mask alpha buffer, populated by the renderer
-    /// on first use. Keyed implicitly on `cached_install_transform` so a
-    /// repeat `gs` call at a *different* CTM correctly re-rasterises the
-    /// group instead of reusing a stale buffer.
+    /// on first use. The outer cache (the `ext_g_state_cache` HashMap in
+    /// `execute_operators`) is keyed by `dict_name`; this field is a
+    /// validity check against `cached_install_transform` so a repeat `gs`
+    /// call at a *different* CTM correctly re-rasterises the group instead
+    /// of reusing a stale buffer.
     pub(crate) cached_soft_mask_alpha: Option<tiny_skia::Mask>,
     /// CTM that produced `cached_soft_mask_alpha`. Compared bitwise to the
     /// current install-time CTM to decide whether the cache is reusable.

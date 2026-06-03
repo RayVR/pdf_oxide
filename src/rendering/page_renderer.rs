@@ -2407,40 +2407,61 @@ fn parse_soft_mask_transfer(
     let func_type = dict.get("FunctionType").and_then(|o| o.as_integer())?;
     match func_type {
         2 => {
-            let c0 = dict
-                .get("C0")
-                .and_then(|o| o.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|o| match o {
-                    Object::Real(v) => Some(*v),
-                    Object::Integer(v) => Some(*v as f64),
-                    _ => None,
-                })
-                .unwrap_or(0.0);
-            let c1 = dict
-                .get("C1")
-                .and_then(|o| o.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|o| match o {
-                    Object::Real(v) => Some(*v),
-                    Object::Integer(v) => Some(*v as f64),
-                    _ => None,
-                })
-                .unwrap_or(1.0);
-            let n = dict
-                .get("N")
-                .and_then(|o| match o {
-                    Object::Real(v) => Some(*v),
-                    Object::Integer(v) => Some(*v as f64),
-                    _ => None,
-                })
-                .unwrap_or(1.0);
+            // §7.10.3: Type 2 produces `n`-component output where
+            // `n = len(C0) = len(C1)`. SMask /TR is single-component;
+            // reject multi-component functions outright rather than
+            // silently picking C0[0] / C1[0] from a wider vector.
+            let c0_arr = dict.get("C0").and_then(|o| o.as_array());
+            let c1_arr = dict.get("C1").and_then(|o| o.as_array());
+            let c0 = if let Some(arr) = c0_arr {
+                if arr.len() != 1 {
+                    log::debug!(
+                        "SMask /TR Type 2 has {}-component /C0; expected 1",
+                        arr.len()
+                    );
+                    return None;
+                }
+                as_f64(arr.first()?).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let c1 = if let Some(arr) = c1_arr {
+                if arr.len() != 1 {
+                    log::debug!(
+                        "SMask /TR Type 2 has {}-component /C1; expected 1",
+                        arr.len()
+                    );
+                    return None;
+                }
+                as_f64(arr.first()?).unwrap_or(1.0)
+            } else {
+                1.0
+            };
+            let n = dict.get("N").and_then(as_f64).unwrap_or(1.0);
+            // §7.10.3 requires N > 0 (and for non-integer N, Domain must
+            // exclude 0). Reject N <= 0 — `0_f64.powf(0.0)` returns 1.0
+            // (IEEE 754) which would flip a "blocked" mask pixel into
+            // "fully passes", exactly the wrong direction for a malformed
+            // function.
+            if !(n > 0.0 && n.is_finite()) {
+                log::debug!("SMask /TR Type 2 has invalid /N = {n}; skipping");
+                return None;
+            }
             Some(SoftMaskTransfer::Type2 { c0, c1, n })
         },
         other => {
             log::debug!("SMask /TR FunctionType {other} not supported; skipping");
             None
         },
+    }
+}
+
+/// Coerce a PDF numeric object to `f64`. Returns `None` for anything else.
+fn as_f64(obj: &Object) -> Option<f64> {
+    match obj {
+        Object::Real(v) => Some(*v),
+        Object::Integer(v) => Some(*v as f64),
+        _ => None,
     }
 }
 
@@ -2454,13 +2475,7 @@ fn parse_soft_mask_transfer(
 /// only needs to pre-fill when a non-default backdrop is present.
 fn parse_soft_mask_backdrop(bc_obj: Option<&Object>, group_cs: &str) -> Option<[u8; 4]> {
     let arr = bc_obj?.as_array()?;
-    let get = |i: usize| -> Option<f32> {
-        arr.get(i).and_then(|o| match o {
-            Object::Real(v) => Some(*v as f32),
-            Object::Integer(v) => Some(*v as f32),
-            _ => None,
-        })
-    };
+    let get = |i: usize| -> Option<f32> { arr.get(i).and_then(as_f64).map(|v| v as f32) };
     // Determine component count from /CS, falling back to array length when
     // the CS is unknown.
     let (r, g, b) = match (group_cs, arr.len()) {
@@ -2624,11 +2639,19 @@ impl PageRenderer {
         // /BC by spec (the alpha channel of "no paint" is 0 regardless).
         // /BC is only honoured for Luminosity; the default black backdrop
         // requires no pre-fill since `Pixmap::new` already gives (0,0,0,0).
+        // §11.6.6 group /CS may be a name or an array (`[/ICCBased <ref>]`,
+        // `[/CalRGB <dict>]`, etc.). Resolve the array form to its first-
+        // element name so /BC interprets components against the right CS
+        // family; defaults to DeviceRGB when neither shape is present.
         let group_cs = group_dict
             .get("Group")
             .and_then(|g| g.as_dict())
             .and_then(|gd| gd.get("CS"))
-            .and_then(|cs| cs.as_name())
+            .and_then(|cs| match cs {
+                Object::Name(n) => Some(n.as_str()),
+                Object::Array(a) => a.first().and_then(|o| o.as_name()),
+                _ => None,
+            })
             .unwrap_or("DeviceRGB");
         if matches!(smask_kind, SoftMaskKind::Luminosity) {
             if let Some(bg) = parse_soft_mask_backdrop(smask_dict.get("BC"), group_cs) {
