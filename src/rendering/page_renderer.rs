@@ -22,6 +22,31 @@ use crate::object::{Object, ObjectRef};
 use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState, SoftMaskSpec};
 use std::borrow::Cow;
 
+/// Parse a Form XObject's `/Matrix` entry into a `tiny_skia::Transform`.
+/// Defaults to identity when absent or malformed (§8.10.1).
+fn parse_form_matrix(dict: &std::collections::HashMap<String, Object>) -> tiny_skia::Transform {
+    match dict.get("Matrix") {
+        Some(Object::Array(arr)) => {
+            let get = |i: usize, default: f32| -> f32 {
+                match arr.get(i) {
+                    Some(Object::Real(v)) => *v as f32,
+                    Some(Object::Integer(v)) => *v as f32,
+                    _ => default,
+                }
+            };
+            tiny_skia::Transform::from_row(
+                get(0, 1.0),
+                get(1, 0.0),
+                get(2, 0.0),
+                get(3, 1.0),
+                get(4, 0.0),
+                get(5, 0.0),
+            )
+        },
+        _ => tiny_skia::Transform::identity(),
+    }
+}
+
 /// Returns the current effective clip for paint operators — the intersection
 /// of the active clipping-path mask and the active ExtGState soft-mask
 /// (§11.6.5.2). The intersection composes the two alphas multiplicatively
@@ -1528,26 +1553,45 @@ impl PageRenderer {
                                     base_transform,
                                     &gs_stack.current().ctm,
                                 );
-                                match self.materialise_soft_mask_alpha(
-                                    &dict_obj,
-                                    pixmap.width(),
-                                    pixmap.height(),
-                                    install_transform,
-                                    doc,
-                                    page_num,
-                                    resources,
-                                ) {
-                                    Ok(mask) => {
-                                        if let Some(slot) = soft_mask_stack.last_mut() {
-                                            *slot = Some(mask);
-                                        }
-                                    },
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Skipping SMask on /{}: {}",
-                                            dict_name, e
-                                        );
-                                    },
+                                // Cache reuse: only when the install CTM
+                                // matches bitwise. A different CTM produces a
+                                // different mask, so falling through to the
+                                // materialise path is required for correctness.
+                                let cache_hit = entry
+                                    .cached_install_transform
+                                    .map(|t| t == install_transform)
+                                    .unwrap_or(false)
+                                    && entry.cached_soft_mask_alpha.is_some();
+                                if cache_hit {
+                                    if let Some(slot) = soft_mask_stack.last_mut() {
+                                        *slot = entry.cached_soft_mask_alpha.clone();
+                                    }
+                                } else {
+                                    match self.materialise_soft_mask_alpha(
+                                        &dict_obj,
+                                        pixmap.width(),
+                                        pixmap.height(),
+                                        install_transform,
+                                        doc,
+                                        page_num,
+                                        resources,
+                                    ) {
+                                        Ok(mask) => {
+                                            entry.cached_soft_mask_alpha =
+                                                Some(mask.clone());
+                                            entry.cached_install_transform =
+                                                Some(install_transform);
+                                            if let Some(slot) = soft_mask_stack.last_mut() {
+                                                *slot = Some(mask);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            log::warn!(
+                                                "Skipping SMask on /{}: {}",
+                                                dict_name, e
+                                            );
+                                        },
+                                    }
                                 }
                             },
                         }
@@ -2404,12 +2448,24 @@ impl PageRenderer {
         let old_cs = self.color_spaces.clone();
         self.load_resources(doc, &form_resources)?;
 
+        // Render the form's contents directly into `group_pixmap`. We
+        // deliberately bypass `render_form_xobject`: that path would detect
+        // the form's `/Group /S /Transparency` and allocate a *second*
+        // page-sized pixmap to act as the transparency-group buffer. But
+        // `group_pixmap` *is* the transparency-group buffer — it starts
+        // fully transparent (Pixmap::new) which is the correct isolated-
+        // group initial backdrop, so the double allocation is pure waste.
+        // Nested Form XObjects inside the SMask group still go through
+        // `render_form_xobject` via `Operator::Do`, so their own
+        // transparency groups are honoured.
+        let form_matrix = parse_form_matrix(&group_dict);
+        let install_transform = base_transform.pre_concat(form_matrix);
+        let operators = parse_content_stream(&group_data)?;
         self.smask_depth += 1;
-        let render_res = self.render_form_xobject(
+        let render_res = self.execute_operators(
             &mut group_pixmap,
-            &group_dict,
-            &group_data,
-            base_transform,
+            install_transform,
+            &operators,
             doc,
             page_num,
             &form_resources,
@@ -2445,32 +2501,7 @@ impl PageRenderer {
         page_num: usize,
         parent_resources: &Object,
     ) -> Result<()> {
-        // Parse /Matrix from form dict (default: identity)
-        let form_matrix = if let Some(Object::Array(arr)) = dict.get("Matrix") {
-            let get_f32 = |i: usize| -> f32 {
-                match arr.get(i) {
-                    Some(Object::Real(v)) => *v as f32,
-                    Some(Object::Integer(v)) => *v as f32,
-                    _ => {
-                        if i == 0 || i == 3 {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    },
-                }
-            };
-            Transform::from_row(
-                get_f32(0),
-                get_f32(1),
-                get_f32(2),
-                get_f32(3),
-                get_f32(4),
-                get_f32(5),
-            )
-        } else {
-            Transform::identity()
-        };
+        let form_matrix = parse_form_matrix(dict);
 
         // Combine parent transform with form matrix
         let combined_transform = parent_transform.pre_concat(form_matrix);
