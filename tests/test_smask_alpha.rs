@@ -739,6 +739,180 @@ fn ext_gstate_luminosity_smask_group_cs_devicegray_yields_50pct_paint() {
     );
 }
 
+/// Build a PDF that paints two rows of text — one at PDF y=70 (top half,
+/// mask passes), one at y=20 (bottom half, mask blocks) — under an Alpha
+/// SMask. The text rasterizer calls into the same `effective_clip`
+/// machinery as paths and images, so the bottom-row glyphs should be
+/// blocked and the top-row glyphs should render.
+fn build_pdf_with_text_under_smask() -> Vec<u8> {
+    // Text at y=70 (top half, PNG row ~30) and y=20 (bottom half, PNG row ~80).
+    let page_content = b"q\n/GS1 gs\nBT\n/F1 18 Tf\n0 g\n1 0 0 1 10 70 Tm\n(TOP) Tj\n1 0 0 1 10 20 Tm\n(BOTTOM) Tj\nET\nQ\n";
+    let group_content = b"0 50 100 50 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> \
+                        /Font << /F1 8 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Alpha /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"8 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    );
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn smask_clips_text_paint() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_text_under_smask()).expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    // PNG rows 0..50 = top half (mask passes) — TOP text should produce
+    // dark pixels among the white background. Scan the band where the
+    // 18-pt baseline-at-y=70 glyphs land (PDF y 70..82 → PNG rows 18..30).
+    let mut top_has_dark = false;
+    for y in 18..40 {
+        for x in 10..50 {
+            if rgba.get_pixel(x, y)[0] < 100 {
+                top_has_dark = true;
+                break;
+            }
+        }
+        if top_has_dark {
+            break;
+        }
+    }
+    assert!(top_has_dark, "TOP text should leave dark pixels (mask passes)");
+
+    // PNG rows 50..100 = bottom half (mask blocks). Scan the band where
+    // the BOTTOM glyphs would have landed (PDF y 20..32 → PNG rows 68..80)
+    // and assert no dark pixels appear.
+    for y in 65..85 {
+        for x in 10..70 {
+            let p = rgba.get_pixel(x, y);
+            assert!(
+                p[0] > 200,
+                "BOTTOM text leaked through the masked region at ({x}, {y}); \
+                 got {p:?}"
+            );
+        }
+    }
+}
+
+/// Build a PDF that paints a black-filled image under an Alpha SMask whose
+/// `/G` paints the top half opaque. The mask is applied via
+/// `effective_clip` at the `Do` paint site, so the image's pixels in the
+/// bottom half (mask alpha = 0) should be transparent and reveal the
+/// white background.
+fn build_pdf_with_image_under_smask() -> Vec<u8> {
+    let page_content = b"q\n/GS1 gs\n50 0 0 50 25 25 cm\n/Im1 Do\nQ\n";
+    let group_content = b"0 50 100 50 re\nf\n";
+
+    // 1×1 fully-opaque solid black image: DeviceRGB, 1 pixel = (0, 0, 0).
+    let img_bytes: &[u8] = &[0u8, 0u8, 0u8];
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> \
+                        /XObject << /Im1 8 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Alpha /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    let img_hdr = format!(
+        "8 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+        img_bytes.len()
+    );
+    buf.extend_from_slice(img_hdr.as_bytes());
+    buf.extend_from_slice(img_bytes);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn smask_clips_image_paint() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_image_under_smask()).expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    // Image bbox in PDF user space is (25..75, 25..75) — PNG rows 25..75.
+    // Mask covers top half of page (PDF y 50..100 → PNG rows 0..50).
+    // So inside the image bbox:
+    //   - PNG row 30 (top, mask passes): image's black should land.
+    //   - PNG row 70 (bottom, mask blocks): white background visible.
+    let top = rgba.get_pixel(50, 30);
+    let bottom = rgba.get_pixel(50, 70);
+    assert!(
+        top[0] < 60,
+        "SMask should let image black through in the top half; got {top:?}"
+    );
+    assert!(
+        bottom[0] > 200,
+        "SMask should block image paint in the bottom half; got {bottom:?}"
+    );
+}
+
 #[test]
 fn ext_gstate_alpha_smask_blocks_paint_under_transparent_mask() {
     let pdf = build_pdf_with_alpha_smask();
