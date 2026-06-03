@@ -2371,6 +2371,133 @@ enum SoftMaskKind {
     Luminosity,
 }
 
+/// SMask `/TR` transfer function. PDF functions can be of several types;
+/// only the ones plausibly used for soft masks are implemented here.
+/// Identity is represented by `None` at the call site.
+#[derive(Clone, Debug)]
+enum SoftMaskTransfer {
+    /// Type 2 exponential: `y = C0 + x^N * (C1 - C0)`.
+    /// For SMask mask buffers `C0` and `C1` are always 1-vector entries.
+    Type2 { c0: f64, c1: f64, n: f64 },
+}
+
+impl SoftMaskTransfer {
+    /// Apply the transfer function to a mask value in `[0, 1]`.
+    fn apply(&self, x: f64) -> f64 {
+        match *self {
+            SoftMaskTransfer::Type2 { c0, c1, n } => c0 + x.powf(n) * (c1 - c0),
+        }
+    }
+}
+
+/// Parse the SMask `/TR` entry. Returns `None` when the entry is absent,
+/// is the name `/Identity`, or is a function of an unsupported type — the
+/// caller treats those identically to "skip transfer". Unknown shapes log
+/// a `debug` so production logs don't flood.
+fn parse_soft_mask_transfer(
+    tr_obj: Option<&Object>,
+    doc: &PdfDocument,
+) -> Option<SoftMaskTransfer> {
+    let tr = tr_obj?;
+    let resolved = doc.resolve_object(tr).ok()?;
+    if matches!(&resolved, Object::Name(n) if n == "Identity") {
+        return None;
+    }
+    let dict = resolved.as_dict()?;
+    let func_type = dict.get("FunctionType").and_then(|o| o.as_integer())?;
+    match func_type {
+        2 => {
+            let c0 = dict
+                .get("C0")
+                .and_then(|o| o.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|o| match o {
+                    Object::Real(v) => Some(*v),
+                    Object::Integer(v) => Some(*v as f64),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            let c1 = dict
+                .get("C1")
+                .and_then(|o| o.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|o| match o {
+                    Object::Real(v) => Some(*v),
+                    Object::Integer(v) => Some(*v as f64),
+                    _ => None,
+                })
+                .unwrap_or(1.0);
+            let n = dict
+                .get("N")
+                .and_then(|o| match o {
+                    Object::Real(v) => Some(*v),
+                    Object::Integer(v) => Some(*v as f64),
+                    _ => None,
+                })
+                .unwrap_or(1.0);
+            Some(SoftMaskTransfer::Type2 { c0, c1, n })
+        },
+        other => {
+            log::debug!("SMask /TR FunctionType {other} not supported; skipping");
+            None
+        },
+    }
+}
+
+/// Parse the SMask `/BC` (backdrop colour) entry into an opaque RGBA pixel.
+/// `group_cs` is the group's blend colour space name (e.g. `DeviceRGB`,
+/// `DeviceGray`, `DeviceCMYK`); other / array spaces fall through to
+/// "treat the components as RGB if 3, gray if 1, CMYK if 4".
+///
+/// Returns `None` for the default backdrop (black in the group CS), which
+/// already matches the all-zero initial state of `Pixmap::new`. The caller
+/// only needs to pre-fill when a non-default backdrop is present.
+fn parse_soft_mask_backdrop(bc_obj: Option<&Object>, group_cs: &str) -> Option<[u8; 4]> {
+    let arr = bc_obj?.as_array()?;
+    let get = |i: usize| -> Option<f32> {
+        arr.get(i).and_then(|o| match o {
+            Object::Real(v) => Some(*v as f32),
+            Object::Integer(v) => Some(*v as f32),
+            _ => None,
+        })
+    };
+    // Determine component count from /CS, falling back to array length when
+    // the CS is unknown.
+    let (r, g, b) = match (group_cs, arr.len()) {
+        ("DeviceGray" | "CalGray", _) | (_, 1) => {
+            let v = get(0)?;
+            let q = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            (q, q, q)
+        },
+        ("DeviceRGB" | "CalRGB" | "ICCBased", _) | (_, 3) => {
+            let r = (get(0)?.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let g = (get(1)?.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let b = (get(2)?.clamp(0.0, 1.0) * 255.0).round() as u8;
+            (r, g, b)
+        },
+        ("DeviceCMYK" | "CalCMYK", _) | (_, 4) => {
+            // Approximate CMYK→RGB without ICC: R = (1 - C)(1 - K) etc.
+            // Correct for the common "K-only" and "process-CMYK" backdrops
+            // we expect from real artwork; full ICC fidelity is out of scope.
+            let c = get(0)?.clamp(0.0, 1.0);
+            let m = get(1)?.clamp(0.0, 1.0);
+            let y = get(2)?.clamp(0.0, 1.0);
+            let k = get(3)?.clamp(0.0, 1.0);
+            let r = ((1.0 - c) * (1.0 - k) * 255.0).round() as u8;
+            let g = ((1.0 - m) * (1.0 - k) * 255.0).round() as u8;
+            let b = ((1.0 - y) * (1.0 - k) * 255.0).round() as u8;
+            (r, g, b)
+        },
+        _ => return None,
+    };
+    // Default backdrop (black) requires no pre-fill; the pixmap is already
+    // (0, 0, 0, 0).
+    if r == 0 && g == 0 && b == 0 {
+        return None;
+    }
+    Some([r, g, b, 255])
+}
+
 impl PageRenderer {
     /// Render an ExtGState `/SMask` group into an offscreen pixmap and
     /// return its mask buffer as a `tiny_skia::Mask` for use as a clip on
@@ -2378,13 +2505,35 @@ impl PageRenderer {
     ///
     /// Subtypes:
     ///   - `/Alpha`: the rendered group's alpha channel is the mask.
+    ///     `/BC` is ignored per spec.
     ///   - `/Luminosity`: per-pixel BT.601 luma of the rendered group's
-    ///     premultiplied RGB. Unpainted areas (RGBA 0,0,0,0) give
-    ///     luminance 0, which matches §11.6.5.3's default `/BC` of black.
+    ///     premultiplied RGB.  Always BT.601 on the rasterised RGB —
+    ///     there is no `/CS`-aware luma dispatch.  Implications:
+    ///       * Valid DeviceGray groups (`R = G = B`) collapse to
+    ///         `Y = R`, matching the spec result.
+    ///       * Valid DeviceRGB groups get the spec result up to the
+    ///         BT.601 vs Rec.709 vs ICC-defined luma weighting choice.
+    ///       * Valid DeviceCMYK groups go through the renderer's
+    ///         CMYK→RGB pre-conversion before luma is read; this is an
+    ///         approximation and will drift from a spec-correct
+    ///         CMYK-blend-space luma calculation.
+    ///       * Malformed groups (e.g. `/CS /DeviceGray` with RGB paint
+    ///         operators) get BT.601 on the actual RGB; see
+    ///         `tests/test_smask_alpha.rs::ext_gstate_luminosity_smask_malformed_devicegray_with_rgb_paint_uses_bt601`.
+    ///     A proper `/CS` dispatch would need a non-RGB blend buffer
+    ///     (separate gray / CMYK pixmaps) which the renderer does not
+    ///     currently provide.
     ///
-    /// `/BC` (backdrop colour) and `/TR` (transfer function) are not yet
-    /// honoured. The group is rendered at the page pixmap's dimensions so
-    /// the mask buffer pixel-aligns with subsequent paint operations.
+    /// `/BC` (backdrop colour) for Luminosity: parsed against the group's
+    /// declared `/CS` (DeviceGray / DeviceRGB / DeviceCMYK; other CS fall
+    /// back to component-count inference) and pre-filled into the offscreen
+    /// pixmap so unpainted areas contribute the right luminance. ICC and
+    /// Lab conversions for `/BC` are not implemented.
+    ///
+    /// `/TR` (transfer function): applied pointwise after the subtype
+    /// buffer is computed. Type 2 (exponential) is supported directly;
+    /// `/Identity`, missing `/TR`, and other types (0 sampled, 3 stitching,
+    /// 4 PostScript) are no-ops.
     #[allow(clippy::too_many_arguments)]
     fn materialise_soft_mask_alpha(
         &mut self,
@@ -2425,6 +2574,11 @@ impl PageRenderer {
             },
         };
 
+        // §11.6.5.3 /TR — a function applied to each mask value after the
+        // subtype-specific buffer is computed. Most SMasks have no /TR or
+        // use /Identity, in which case `transfer` stays `None`.
+        let transfer = parse_soft_mask_transfer(smask_dict.get("TR"), doc);
+
         let group_obj = smask_dict.get("G").ok_or_else(|| {
             crate::error::Error::InvalidPdf("SMask missing /G transparency group".to_string())
         })?;
@@ -2464,6 +2618,25 @@ impl PageRenderer {
         let old_fonts = self.fonts.clone();
         let old_cs = self.color_spaces.clone();
         self.load_resources(doc, &form_resources)?;
+
+        // §11.6.5.3 /BC + §11.6.6 Group /CS — pre-fill the group pixmap
+        // with the backdrop colour for Luminosity masks. Alpha masks ignore
+        // /BC by spec (the alpha channel of "no paint" is 0 regardless).
+        // /BC is only honoured for Luminosity; the default black backdrop
+        // requires no pre-fill since `Pixmap::new` already gives (0,0,0,0).
+        let group_cs = group_dict
+            .get("Group")
+            .and_then(|g| g.as_dict())
+            .and_then(|gd| gd.get("CS"))
+            .and_then(|cs| cs.as_name())
+            .unwrap_or("DeviceRGB");
+        if matches!(smask_kind, SoftMaskKind::Luminosity) {
+            if let Some(bg) = parse_soft_mask_backdrop(smask_dict.get("BC"), group_cs) {
+                for chunk in group_pixmap.data_mut().chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&bg);
+                }
+            }
+        }
 
         // Render the form's contents directly into `group_pixmap`. We
         // deliberately bypass `render_form_xobject`: that path would detect
@@ -2521,6 +2694,18 @@ impl PageRenderer {
                 }
             },
         }
+
+        // §11.6.5 /TR — apply the transfer function pointwise to the
+        // computed mask buffer. Mask byte 0..=255 maps to function input
+        // 0.0..=1.0; the function's output is clamped back to 0..=255.
+        if let Some(tr) = transfer.as_ref() {
+            for byte in mask_data.iter_mut() {
+                let input = *byte as f64 / 255.0;
+                let output = tr.apply(input).clamp(0.0, 1.0);
+                *byte = (output * 255.0).round() as u8;
+            }
+        }
+
         Ok(mask)
     }
 

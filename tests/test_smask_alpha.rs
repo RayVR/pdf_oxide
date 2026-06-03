@@ -459,6 +459,286 @@ fn ext_gstate_luminosity_smask_modulates_paint_by_group_luma() {
     );
 }
 
+/// `/BC` (backdrop colour) test: an empty `/G` form (no paint at all) under
+/// `/S /Luminosity`. With `/BC [1 1 1]` the unpainted backdrop is white, so
+/// luminance = 255 and the page paint passes through. Without `/BC`
+/// (default black), luminance = 0 and the page paint is fully blocked.
+fn build_pdf_with_luminosity_smask_backdrop_white() -> Vec<u8> {
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\nQ\n";
+    // /G paints nothing — the entire mask area is "backdrop only".
+    let group_content = b"";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R /BC [1 1 1] >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS /DeviceRGB >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn ext_gstate_luminosity_smask_bc_white_backdrop_passes_paint() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_smask_backdrop_white())
+        .expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    let centre = rgba.get_pixel(50, 50);
+    assert!(
+        centre[0] < 60,
+        "/BC [1 1 1] backdrop should give luma 255 → paint passes (black); \
+         got R={} (G={} B={} A={})",
+        centre[0], centre[1], centre[2], centre[3]
+    );
+}
+
+/// `/TR` transfer function test: Luminosity SMask whose /G paints mid-grey
+/// (luma ≈ 128) over its entire BBox. With `/TR Identity` (or no /TR) the
+/// page paint composites at ~50%. With a Type 2 exponential `/TR
+/// {N: 2}`, the mask is squared: 0.5² = 0.25, so the paint composites at
+/// ~25%, leaving the rendered pixel substantially closer to white.
+fn build_pdf_with_luminosity_smask_squared_transfer() -> Vec<u8> {
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\nQ\n";
+    let group_content = b"0.5 g\n0 0 100 100 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    // /TR is an indirect reference to a Type 2 exponential function:
+    //   Domain [0 1], Range [0 1], C0 [0], C1 [1], N 2  →  y = x²
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R /TR 8 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"8 0 obj\n<< /FunctionType 2 /Domain [0 1] /Range [0 1] \
+            /C0 [0] /C1 [1] /N 2 >>\nendobj\n",
+    );
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn ext_gstate_luminosity_smask_tr_type2_squared_attenuates_paint() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_smask_squared_transfer())
+        .expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    let centre = rgba.get_pixel(50, 50);
+    // Without /TR: 0.5 luma → 50% black over white → R ≈ 128.
+    // With /TR squaring: 0.25 luma → 25% black over white → R ≈ 192.
+    // Use a wide-but-positioned assertion so the test fails closed if /TR
+    // is silently ignored (R stays ~128).
+    assert!(
+        centre[0] > 160,
+        "/TR squaring should attenuate the paint (expect R ≳ 192); got R={} \
+         (without /TR this lands ~128)",
+        centre[0]
+    );
+}
+
+/// `/Group /CS /DeviceGray` test: the SMask group declares a single-component
+/// blend space. Luma calculation should treat the rendered gray channel as
+/// luma directly. For a uniform 50%-gray /G, the resulting mask should
+/// produce ~50% composited paint regardless of /CS (since gray's BT.601
+/// reduces to the gray value itself), but the impl must not crash or
+/// silently drop the mask when /CS is non-RGB.
+fn build_pdf_with_luminosity_smask_gray_cs() -> Vec<u8> {
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\nQ\n";
+    let group_content = b"0.5 g\n0 0 100 100 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS /DeviceGray >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+/// Pins the current behaviour for a malformed group: `/CS /DeviceGray`
+/// declared but the form's content uses an RGB paint operator (`1 0 0 rg`,
+/// pure red). pdf_oxide's renderer rasterises into an RGB pixmap regardless
+/// of the declared `/CS`, and `materialise_soft_mask_alpha` runs BT.601
+/// luma unconditionally — there is no `/CS` dispatch for the luma path.
+///
+/// For valid gray content (`R = G = B`) BT.601 reduces to the gray value,
+/// so a hypothetical "DeviceGray → read channel 0" shortcut would behave
+/// identically. For non-gray content the two paths diverge: BT.601 gives a
+/// weighted blend (red → luma 76); single-channel R-as-luma would give 255.
+/// This test fails on the single-channel interpretation, locking in the
+/// BT.601-unconditional choice so a future refactor that adds /CS dispatch
+/// is forced to think about the malformed case.
+fn build_pdf_with_devicegray_group_painting_red() -> Vec<u8> {
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\nQ\n";
+    // Pure red paint inside a group declared as /CS /DeviceGray.
+    let group_content = b"1 0 0 rg\n0 0 100 100 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS /DeviceGray >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn ext_gstate_luminosity_smask_malformed_devicegray_with_rgb_paint_uses_bt601() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_devicegray_group_painting_red())
+        .expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    let centre = rgba.get_pixel(50, 50);
+    // BT.601 luma of pure red is 0.299·255 ≈ 76, so a black fill composites
+    // at ~30% over the white background: R ≈ 0.7·255 + 0.3·0 ≈ 179.
+    // A single-channel "DeviceGray reads R" interpretation would instead
+    // give luma 255 → full black → R ≈ 0.
+    assert!(
+        centre[0] > 130 && centre[0] < 220,
+        "Malformed DeviceGray group painting red: BT.601 luma ≈ 76 should \
+         compose to R ≈ 179; got R={} (single-channel R-as-luma would give R ≈ 0)",
+        centre[0]
+    );
+}
+
+#[test]
+fn ext_gstate_luminosity_smask_group_cs_devicegray_yields_50pct_paint() {
+    let doc =
+        PdfDocument::from_bytes(build_pdf_with_luminosity_smask_gray_cs()).expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    let centre = rgba.get_pixel(50, 50);
+    // 50% gray luma → 50% black over white → R ≈ 128.
+    assert!(
+        centre[0] > 80 && centre[0] < 200,
+        "Luminosity SMask with /CS /DeviceGray should still composite ~mid-grey; \
+         got R={}",
+        centre[0]
+    );
+}
+
 #[test]
 fn ext_gstate_alpha_smask_blocks_paint_under_transparent_mask() {
     let pdf = build_pdf_with_alpha_smask();
