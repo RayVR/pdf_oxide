@@ -157,6 +157,20 @@ fn ext_gstate_smask_none_clears_active_soft_mask() {
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let rgba = decode_png(&img.data);
 
+    // First fill (under /GS1's mask) lands in the top half — PNG rows
+    // 0..50. Without the first mask installing at all (the regression mode
+    // the standalone basic test guards against), the FIRST fill would have
+    // painted the whole page black and the post-/None second fill would be
+    // a no-op — the bottom-half assertion alone wouldn't distinguish that
+    // failure from the correct path.
+    let top = rgba.get_pixel(50, 25);
+    assert!(
+        top[0] < 60,
+        "first fill under /GS1 must still land on the top half; \
+         got R={} G={} B={} A={}",
+        top[0], top[1], top[2], top[3]
+    );
+
     // After `/SMask /None`, the second fill (PDF y = 0..50, the bottom half
     // in user space — PNG rows 50..100) lands. Without /None handling the
     // first mask would still be active and the bottom half would stay white.
@@ -170,12 +184,13 @@ fn ext_gstate_smask_none_clears_active_soft_mask() {
 }
 
 /// Same fixture as the basic alpha test, but the page paints inside a
-/// nested `q`/`Q` block. The soft mask installed before `q` must still be
-/// in effect inside, and must still be in effect after `Q` if any further
-/// painting follows. Pins the soft-mask stack push/pop in lockstep with
+/// nested `q`/`Q` block AND paints a second rectangle after the `Q`.
+/// The soft mask installed before `q` must be in effect inside, and must
+/// still be in effect after `Q` (because the stack pop must not lose the
+/// outer-level mask). Pins the soft-mask stack push/pop in lockstep with
 /// the clip stack.
 fn build_pdf_with_smask_through_q_save_restore() -> Vec<u8> {
-    let page_content = b"/GS1 gs\nq\n0 g\n0 0 100 100 re\nf\nQ\n";
+    let page_content = b"/GS1 gs\nq\n0 g\n0 0 100 100 re\nf\nQ\n0 0 100 100 re\nf\n";
     let group_content = b"0 50 100 50 re\nf\n";
 
     let mut buf = Vec::new();
@@ -228,6 +243,140 @@ fn ext_gstate_smask_survives_q_save_restore() {
     let bottom = rgba.get_pixel(50, 75);
     assert!(top[0] < 60, "top under mask should be black; got {top:?}");
     assert!(bottom[0] > 200, "bottom under mask should be white; got {bottom:?}");
+}
+
+/// Build a fixture where the page applies a scale CTM *before* installing
+/// the SMask. The form's `/BBox` is small (`0..2`) but a `50 0 0 50 0 0 cm`
+/// runs before `/GS1 gs`, so per §11.6.5.2 the mask group must be rendered
+/// at the CTM that was current at install time — i.e. scaled 50× so the
+/// form's `0..2` BBox spans `0..100` device pixels and covers the whole
+/// painted area. Without that, the mask renders at identity into a 2×2-px
+/// region and blocks 99% of the paint.
+fn build_pdf_with_smask_under_active_ctm() -> Vec<u8> {
+    let page_content = b"q\n50 0 0 50 0 0 cm\n/GS1 gs\n0 g\n0 0 2 2 re\nf\nQ\n";
+    let group_content = b"0 1 2 1 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Alpha /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 2 2] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+/// Adversarial fixture: the SMask `/G` form's `/Resources` declares the same
+/// `/GS1` ExtGState (which has the same `/SMask /G` pointing back at the
+/// form), and the form's content stream invokes `/GS1 gs`. Every gs in the
+/// chain triggers another mask rasterisation, which renders the form again,
+/// which invokes gs again. Without a depth cap this stack-overflows.
+fn build_pdf_with_cyclic_smask() -> Vec<u8> {
+    // Page content paints a black square through /GS1.
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\nQ\n";
+    // Form's content paints the top half *and* re-invokes /GS1, which
+    // closes the cycle.
+    let group_content = b"/GS1 gs\n0 50 100 50 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Alpha /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    // The form's /Resources references the same /GS1 → 5 0 R, closing the cycle.
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << /ExtGState << /GS1 5 0 R >> >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn ext_gstate_smask_cyclic_g_does_not_stack_overflow() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_cyclic_smask()).expect("parse");
+    // Should render without panic or stack overflow. The depth guard kicks
+    // in after MAX_SMASK_DEPTH (32) levels of nested SMask materialisation,
+    // logs a warning, and drops the mask on overflow — subsequent paints
+    // land normally. The page output is non-empty PNG.
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    assert!(img.data.len() > 200, "cyclic SMask render produced empty PNG");
+}
+
+#[test]
+fn ext_gstate_alpha_smask_honours_install_time_ctm() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_smask_under_active_ctm()).expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    // With the scaled CTM applied to the SMask rasterisation, the form's
+    // `0 1 2 1 re f` fills the *top* half of the 100×100 device region.
+    // The paint covers the whole 100×100, so the top half lands black and
+    // the bottom stays white.
+    let top = rgba.get_pixel(50, 25);
+    let bottom = rgba.get_pixel(50, 75);
+    assert!(
+        top[0] < 60,
+        "scaled-CTM SMask: top of paint area should be black; got {top:?}"
+    );
+    assert!(
+        bottom[0] > 200,
+        "scaled-CTM SMask: bottom of paint area should be background white; \
+         got {bottom:?}"
+    );
 }
 
 #[test]

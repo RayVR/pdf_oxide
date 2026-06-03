@@ -24,10 +24,10 @@ use std::borrow::Cow;
 
 /// Returns the current effective clip for paint operators — the intersection
 /// of the active clipping-path mask and the active ExtGState soft-mask
-/// (§11.6.5.2). The intersection is the per-pixel minimum of the two alpha
-/// buffers, which is what "both masks must let the paint through" means for
-/// 8-bpc alpha. Allocation only happens when *both* stacks contribute a
-/// mask at the current level.
+/// (§11.6.5.2). The intersection composes the two alphas multiplicatively
+/// per pixel (`out = a * b / 255`), which is the §11.3.4 "shape × opacity"
+/// rule for 8-bpc alpha. Allocation only happens when *both* stacks
+/// contribute a mask at the current level.
 fn effective_clip<'a>(
     clip_stack: &'a [Option<tiny_skia::Mask>],
     soft_mask_stack: &'a [Option<tiny_skia::Mask>],
@@ -188,7 +188,18 @@ pub struct PageRenderer {
     /// access per `render_page` invocation. Stays `None` (no allocation) when
     /// the set is empty — the common case.
     excluded_layers_snapshot: Option<Arc<HashSet<String>>>,
+    /// Re-entrancy depth of `materialise_soft_mask_alpha`. The chain
+    /// SMask → /G content stream → `Do` → /GS → SMask is legal but
+    /// adversarial PDFs can construct self-referential cycles that would
+    /// stack-overflow the process. Capped at [`MAX_SMASK_DEPTH`].
+    smask_depth: u32,
 }
+
+/// Hard cap on nested ExtGState soft-mask materialisations within a single
+/// page render. Cyclic `/G` references would otherwise recurse without
+/// bound. 32 levels is well above any legitimate artwork; deeper than this
+/// strongly indicates a malformed or adversarial fixture.
+const MAX_SMASK_DEPTH: u32 = 32;
 
 impl PageRenderer {
     /// Create a new page renderer with the specified options.
@@ -200,6 +211,7 @@ impl PageRenderer {
             fonts: HashMap::new(),
             color_spaces: HashMap::new(),
             excluded_layers_snapshot: None,
+            smask_depth: 0,
         }
     }
 
@@ -1509,11 +1521,18 @@ impl PageRenderer {
                                 }
                             },
                             SoftMaskSpec::Dict(dict_obj) => {
+                                // §11.6.5.2: the SMask group is rendered at the
+                                // CTM that was current at install time, not the
+                                // page-level base transform alone.
+                                let install_transform = combine_transforms(
+                                    base_transform,
+                                    &gs_stack.current().ctm,
+                                );
                                 match self.materialise_soft_mask_alpha(
                                     &dict_obj,
                                     pixmap.width(),
                                     pixmap.height(),
-                                    base_transform,
+                                    install_transform,
                                     doc,
                                     page_num,
                                     resources,
@@ -2314,17 +2333,34 @@ impl PageRenderer {
         page_num: usize,
         resources: &Object,
     ) -> Result<tiny_skia::Mask> {
+        if self.smask_depth >= MAX_SMASK_DEPTH {
+            return Err(crate::error::Error::InvalidPdf(format!(
+                "SMask nesting exceeded {MAX_SMASK_DEPTH} levels — possible cyclic /G reference",
+            )));
+        }
+
         let smask_dict = smask_dict_obj.as_dict().ok_or_else(|| {
             crate::error::Error::InvalidPdf("SMask is not a dictionary".to_string())
         })?;
 
-        let subtype = smask_dict
-            .get("S")
-            .and_then(|o| o.as_name())
-            .unwrap_or("Alpha");
+        // §11.6.5.2 Table 144 marks /S as required. Real-world PDFs
+        // occasionally omit it; rather than picking a wrong default and
+        // mis-rasterising the group, skip-with-debug. The outer
+        // SetExtGState handler logs a `warn` for the skip itself.
+        let subtype = smask_dict.get("S").and_then(|o| o.as_name()).ok_or_else(|| {
+            crate::error::Error::InvalidPdf(
+                "SMask dict missing required /S (subtype) — skipping".to_string(),
+            )
+        })?;
         if subtype != "Alpha" {
+            // /Luminosity is the more common subtype in Adobe-authored
+            // artwork (drop shadows, vignettes); log at debug so production
+            // logs aren't flooded until the Luminosity path lands.
+            log::debug!(
+                "SMask subtype /{subtype} not yet supported (Alpha only); skipping"
+            );
             return Err(crate::error::Error::InvalidPdf(format!(
-                "SMask subtype /{subtype} not yet supported (Alpha only in this build)"
+                "SMask subtype /{subtype} not implemented"
             )));
         }
 
@@ -2356,14 +2392,19 @@ impl PageRenderer {
             )
         })?;
 
-        let form_resources = group_dict
-            .get("Resources")
-            .cloned()
-            .unwrap_or_else(|| resources.clone());
+        // §7.8.3: /Resources may be an indirect reference. The previous code
+        // grabbed it raw and `load_resources` would short-circuit because it
+        // only handles Dictionaries — fonts/colorspaces declared by the SMask
+        // group itself silently failed to load.
+        let form_resources = match group_dict.get("Resources") {
+            Some(o) => doc.resolve_object(o)?,
+            None => resources.clone(),
+        };
         let old_fonts = self.fonts.clone();
         let old_cs = self.color_spaces.clone();
         self.load_resources(doc, &form_resources)?;
 
+        self.smask_depth += 1;
         let render_res = self.render_form_xobject(
             &mut group_pixmap,
             &group_dict,
@@ -2373,6 +2414,7 @@ impl PageRenderer {
             page_num,
             &form_resources,
         );
+        self.smask_depth -= 1;
 
         self.fonts = old_fonts;
         self.color_spaces = old_cs;
