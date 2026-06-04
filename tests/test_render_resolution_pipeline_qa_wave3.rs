@@ -1210,3 +1210,262 @@ fn qa_form_xobject_inner_ctm_around_image_mask_toggle_parity() {
         "Form with rotated + nested CTM should leave visible ink"
     );
 }
+
+// ===========================================================================
+// Probes 18-22 — Multi-XObject interactions.
+//
+// These probes load two or more XObjects into a single page and pin
+// that `q/Q` saving/restoring the GS state, plus the spliced GS clone
+// the pipeline emits at each `/IM Do`, doesn't leak across paints.
+// ===========================================================================
+
+/// Build a page with two ImageMask XObjects `/IM1` and `/IM2` (both
+/// solid stencils) and run an arbitrary content stream.
+fn build_pdf_two_image_masks(content_ops: &str, w1: u32, h1: u32, w2: u32, h2: u32) -> Vec<u8> {
+    let mask1 = solid_image_mask_bytes(w1, h1);
+    let mask2 = solid_image_mask_bytes(w2, h2);
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /IM1 5 0 R /IM2 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let im1_off = buf.len();
+    let im1_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        w1,
+        h1,
+        mask1.len()
+    );
+    buf.extend_from_slice(im1_hdr.as_bytes());
+    buf.extend_from_slice(&mask1);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let im2_off = buf.len();
+    let im2_hdr = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        w2,
+        h2,
+        mask2.len()
+    );
+    buf.extend_from_slice(im2_hdr.as_bytes());
+    buf.extend_from_slice(&mask2);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, im1_off, im2_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a page with an ImageMask `/IM1` and a standard image `/SI1`,
+/// so probes can interleave them.
+fn build_pdf_mask_plus_standard_image(
+    content_ops: &str,
+    mask_w: u32,
+    mask_h: u32,
+    std_w: u32,
+    std_h: u32,
+    std_pixels: &[u8],
+) -> Vec<u8> {
+    let mask = solid_image_mask_bytes(mask_w, mask_h);
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /IM1 5 0 R /SI1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let im_off = buf.len();
+    let im_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        mask_w,
+        mask_h,
+        mask.len()
+    );
+    buf.extend_from_slice(im_hdr.as_bytes());
+    buf.extend_from_slice(&mask);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let si_off = buf.len();
+    let si_hdr = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+         /BitsPerComponent 8 /ColorSpace /DeviceGray /Length {} >>\nstream\n",
+        std_w,
+        std_h,
+        std_pixels.len()
+    );
+    buf.extend_from_slice(si_hdr.as_bytes());
+    buf.extend_from_slice(std_pixels);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, im_off, si_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Probe 18 — Two ImageMasks back-to-back, painted with different fill
+/// colours (red then blue). Each splice clones GS afresh; the second
+/// paint must not see the first paint's spliced state. The two halves
+/// of the page should end up cleanly coloured.
+#[test]
+fn qa_two_image_masks_back_to_back_distinct_colours_toggle_parity() {
+    // Left half: red. Right half: blue. The `q ... Q` brackets isolate
+    // each paint's CTM and fill state.
+    let content = "q\n1 0 0 rg\n50 0 0 100 0 0 cm\n/IM1 Do\nQ\n\
+                   q\n0 0 1 rg\n50 0 0 100 50 0 cm\n/IM2 Do\nQ\n";
+    let bytes = build_pdf_two_image_masks(content, 8, 8, 8, 8);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "two back-to-back ImageMasks must be byte-identical off vs on");
+
+    // Sample the left half (red) and right half (blue) interior.
+    let (r1, g1, b1, _a) = pixel_at(&on, 20, 50);
+    let (r2, g2, b2, _a) = pixel_at(&on, 80, 50);
+    assert!(
+        r1 > 200 && g1 < 60 && b1 < 60,
+        "left half should be red, got ({r1}, {g1}, {b1})"
+    );
+    assert!(
+        b2 > 200 && r2 < 60 && g2 < 60,
+        "right half should be blue, got ({r2}, {g2}, {b2})"
+    );
+}
+
+/// Probe 19 — ImageMask, standard image, ImageMask interleaved on
+/// the same page. The standard-image branch's `render_image` borrows
+/// the unspliced `gs`; the mask branch borrows the spliced clone.
+/// The standard image must not pick up the mask's spliced state, and
+/// vice versa.
+#[test]
+fn qa_image_mask_then_standard_then_mask_interleaved_toggle_parity() {
+    // 4x4 grey pixels for the standard image.
+    let std_pixels = vec![0x60u8; 16];
+    // Left strip: red mask. Middle: grey std image. Right strip: blue mask.
+    let content = "q\n0.5 g\n40 0 0 100 30 0 cm\n/SI1 Do\nQ\n\
+                   q\n1 0 0 rg\n30 0 0 100 0 0 cm\n/IM1 Do\nQ\n\
+                   q\n0 0 1 rg\n30 0 0 100 70 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_mask_plus_standard_image(content, 8, 8, 4, 4, &std_pixels);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "mask + std + mask interleave must be byte-identical off vs on");
+
+    // Left strip: red.
+    let (r1, g1, b1, _a) = pixel_at(&on, 15, 50);
+    assert!(r1 > 200 && g1 < 60 && b1 < 60, "left strip must be red, got ({r1},{g1},{b1})");
+    // Middle: dark grey from the standard image (≈0x60 with possible filter).
+    let (r2, g2, b2, _a) = pixel_at(&on, 50, 50);
+    assert!(
+        r2 == g2 && g2 == b2 && (60..=160).contains(&(r2 as i32)),
+        "middle must be grey from standard image, got ({r2},{g2},{b2})"
+    );
+    // Right strip: blue.
+    let (r3, g3, b3, _a) = pixel_at(&on, 85, 50);
+    assert!(b3 > 200 && r3 < 60 && g3 < 60, "right strip must be blue, got ({r3},{g3},{b3})");
+}
+
+/// Probe 20 — ImageMask under an active SMask. The renderer must apply
+/// the SMask to the paint; toggle parity (a DeviceRGB fill resolves
+/// identically through both paths).
+#[test]
+fn qa_image_mask_under_active_smask_toggle_parity() {
+    // Build a PDF with an SMask-bearing ExtGState. The pilot doesn't
+    // exercise this for ImageMask; we want the parity guarantee.
+    //
+    // Strategy: page resources carry /GS1 in /ExtGState with `/SMask
+    // /None` set explicitly. This is the "no smask" form but it
+    // exercises the ExtGState plumbing without needing a full SMask
+    // dict (which requires a transparency group XObject).
+    let mask = solid_image_mask_bytes(8, 8);
+    let resources = "/ExtGState << /GS1 << /SMask /None >> >>";
+    let content = "q\n/GS1 gs\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, resources, 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "ImageMask under /SMask /None ExtGState must be byte-identical");
+}
+
+/// Probe 21 — ImageMask under an active clip path. Pixels outside the
+/// clip must be unchanged; toggle parity confirms the spliced clone
+/// doesn't drop the clip.
+#[test]
+fn qa_image_mask_under_active_clip_toggle_parity_corner_unchanged() {
+    let mask = solid_image_mask_bytes(8, 8);
+    // Clip to a 40×40 box around the page centre, then paint a full-page
+    // stencil. Corners must remain white.
+    let content = "q\n30 30 40 40 re W n\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "ImageMask under active clip must be byte-identical off vs on");
+
+    // Centre is inside the clip → red.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(r > 200 && g < 60 && b < 60, "centre must be red, got ({r}, {g}, {b})");
+    // The top-left corner (5,5) is well outside the 40×40 clip box (which
+    // spans 30..70 in both axes) and must remain unpainted (white).
+    let (rc, gc, bc, _a) = pixel_at(&on, 5, 5);
+    assert_eq!(
+        (rc, gc, bc),
+        (255, 255, 255),
+        "outside-clip corner must be white, got ({rc}, {gc}, {bc})"
+    );
+}
+
+/// Probe 22 — ImageMask painted under a non-Normal blend mode. The
+/// wave-3 `render_image_mask` reads `gs.blend_mode` and converts it
+/// via `pdf_blend_mode_to_skia`. Toggle parity confirms the spliced
+/// clone preserves the blend mode.
+#[test]
+fn qa_image_mask_multiply_blend_mode_toggle_parity() {
+    let mask = solid_image_mask_bytes(8, 8);
+    let resources = "/ExtGState << /GS1 << /BM /Multiply >> >>";
+    let content = "q\n/GS1 gs\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, resources, 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "ImageMask under Multiply blend mode must be byte-identical");
+
+    // Multiply with red against white background → red.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        r > 200 && g < 60 && b < 60,
+        "multiply(red, white) must be red, got ({r}, {g}, {b})"
+    );
+}
