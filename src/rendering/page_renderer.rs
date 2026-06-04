@@ -2750,13 +2750,22 @@ impl PageRenderer {
             PipelinePaintKind::PathStroke => (false, true),
             PipelinePaintKind::PathFillStroke => (true, true),
         };
+        // Resolve, then short-circuit when the resolved RGBA already
+        // equals the GS field that would supply it inline. For
+        // Device-family inputs the resolver always returns Some but
+        // the answer is the same colour the inline path would read,
+        // so a clone here is wasted work. Skipping it keeps the
+        // toggle-on Device case allocation-free — the common path
+        // most PDFs take.
         let fill_rgba = if fills {
             self.pipeline_resolve_rgba(doc, gs, PaintSide::Fill)
+                .filter(|c| !rgba_matches(*c, gs.fill_color_rgb, gs.fill_alpha))
         } else {
             None
         };
         let stroke_rgba = if strokes {
             self.pipeline_resolve_rgba(doc, gs, PaintSide::Stroke)
+                .filter(|c| !rgba_matches(*c, gs.stroke_color_rgb, gs.stroke_alpha))
         } else {
             None
         };
@@ -2808,13 +2817,20 @@ impl PageRenderer {
         if gs.render_mode == 3 {
             return None;
         }
+        // Same short-circuit as the path helper: a resolved RGBA that
+        // matches the GS field the rasteriser would read inline is a
+        // no-op override. Filtering it out lets the operator arm pass
+        // `None` straight through and skip the per-element
+        // `paint.set_color` write inside `render_text`.
         let fill = if matches!(gs.render_mode, 0 | 2 | 4 | 6) {
             self.pipeline_resolve_rgba(doc, gs, PaintSide::Fill)
+                .filter(|c| !rgba_matches(*c, gs.fill_color_rgb, gs.fill_alpha))
         } else {
             None
         };
         let stroke = if matches!(gs.render_mode, 1 | 2 | 5 | 6) {
             self.pipeline_resolve_rgba(doc, gs, PaintSide::Stroke)
+                .filter(|c| !rgba_matches(*c, gs.stroke_color_rgb, gs.stroke_alpha))
         } else {
             None
         };
@@ -2904,6 +2920,33 @@ fn read_pipeline_env() -> bool {
         Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => false,
     }
+}
+
+/// Per-channel `f32` comparison tolerance used by [`rgba_matches`]. The
+/// resolver folds Device-family inputs through the same RGB encoding the
+/// inline path uses, so an exact match is the expected case; the
+/// epsilon is sized to absorb single-ulp drift from intermediate
+/// computations (alpha fold, CMYK → RGB) without admitting an actual
+/// colour change. Anything coarser would risk dropping subtle overrides
+/// the renderer needs to honour.
+const RGBA_MATCH_EPSILON: f32 = 1.0e-6;
+
+/// Returns `true` when the resolved `(r, g, b, a)` matches the supplied
+/// rgb triple and alpha within [`RGBA_MATCH_EPSILON`] on every channel.
+///
+/// Used by the resolution-pipeline helpers to detect no-op overrides:
+/// for Device-family inputs the pipeline always produces an RGBA, but
+/// the value is the same one the inline path would have read from
+/// `gs.*_color_rgb` directly. Skipping the splice in that case keeps
+/// the toggle-on path allocation-free for the common case where no
+/// Separation/DeviceN colour space is in play.
+fn rgba_matches(resolved: (f32, f32, f32, f32), rgb: (f32, f32, f32), alpha: f32) -> bool {
+    let (r, g, b, a) = resolved;
+    let (gr, gg, gb) = rgb;
+    (r - gr).abs() <= RGBA_MATCH_EPSILON
+        && (g - gg).abs() <= RGBA_MATCH_EPSILON
+        && (b - gb).abs() <= RGBA_MATCH_EPSILON
+        && (a - alpha).abs() <= RGBA_MATCH_EPSILON
 }
 
 /// A unit-length placeholder path used by `pipeline_resolve_rgba` to
@@ -3292,6 +3335,77 @@ mod tests {
         // The fill channel must not have been resolved — the helper
         // selects only the side(s) the Tr mode names.
         assert!(colors.fill.is_none(), "Tr=1 must not touch the fill side");
+    }
+
+    #[test]
+    fn pipeline_resolve_paint_gs_short_circuits_when_resolved_matches_gs() {
+        // D-3 short-circuit. With the toggle on and a DeviceRGB fill
+        // already set on `gs`, the pipeline resolves to the same
+        // (r, g, b, alpha) as `gs.fill_color_rgb` / `gs.fill_alpha`.
+        // The helper must skip the GraphicsState clone in that case
+        // and return `None` — the caller borrows `gs` directly. This
+        // keeps the toggle-on Device-family path (the common case)
+        // allocation-free.
+        let mut renderer = PageRenderer::new(RenderOptions::default());
+        renderer.pipeline_enabled_cache = true;
+
+        let mut gs = GraphicsState::new();
+        gs.fill_color_space = "DeviceRGB".to_string();
+        gs.fill_color_components = smallvec![0.25, 0.5, 0.75];
+        // The dispatcher's inline path keeps `gs.fill_color_rgb` in
+        // sync with the components; mirror that here so the
+        // short-circuit comparison sees a true no-op.
+        gs.fill_color_rgb = (0.25, 0.5, 0.75);
+        gs.fill_alpha = 1.0;
+
+        let doc = fixture_doc();
+        assert!(
+            renderer
+                .pipeline_resolve_paint_gs(&doc, &gs, PipelinePaintKind::PathFill)
+                .is_none(),
+            "Device-family fill that resolves to the same RGBA as gs must short-circuit"
+        );
+    }
+
+    #[test]
+    fn pipeline_resolve_text_colors_short_circuits_when_resolved_matches_gs() {
+        // Same short-circuit on the text-side helper, Tr=0 fill-only:
+        // a DeviceRGB whose resolved value equals the current gs fields
+        // must produce no override (no per-element paint.set_color in
+        // the rasteriser).
+        let mut renderer = PageRenderer::new(RenderOptions::default());
+        renderer.pipeline_enabled_cache = true;
+
+        let mut gs = GraphicsState::new();
+        gs.render_mode = 0;
+        gs.fill_color_space = "DeviceRGB".to_string();
+        gs.fill_color_components = smallvec![0.1, 0.2, 0.3];
+        gs.fill_color_rgb = (0.1, 0.2, 0.3);
+        gs.fill_alpha = 1.0;
+
+        let doc = fixture_doc();
+        assert!(
+            renderer.pipeline_resolve_text_colors(&doc, &gs).is_none(),
+            "Device-family text fill that resolves to the same RGBA as gs must short-circuit"
+        );
+    }
+
+    #[test]
+    fn rgba_matches_within_epsilon() {
+        // The tolerance must absorb single-ulp drift from intermediate
+        // computations but reject any real colour change.
+        assert!(rgba_matches((0.25, 0.5, 0.75, 1.0), (0.25, 0.5, 0.75), 1.0));
+        // Sub-epsilon drift on every channel still matches.
+        let drift = RGBA_MATCH_EPSILON * 0.5;
+        assert!(rgba_matches(
+            (0.25 + drift, 0.5 + drift, 0.75 + drift, 1.0 + drift),
+            (0.25, 0.5, 0.75),
+            1.0
+        ));
+        // Anything beyond the epsilon is a real change and must not
+        // short-circuit — single-channel mismatch is enough.
+        assert!(!rgba_matches((0.26, 0.5, 0.75, 1.0), (0.25, 0.5, 0.75), 1.0));
+        assert!(!rgba_matches((0.25, 0.5, 0.75, 0.5), (0.25, 0.5, 0.75), 1.0));
     }
 
     #[test]
