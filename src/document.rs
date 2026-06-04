@@ -7427,6 +7427,7 @@ impl PdfDocument {
                     b: 0.0,
                 },
                 mcid: None,
+                mcid_scope: None,
                 sequence: base_sequence + idx,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -7592,6 +7593,7 @@ impl PdfDocument {
                     b: 0.0,
                 },
                 mcid: None,
+                mcid_scope: None,
                 sequence: base_sequence + idx,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -8469,12 +8471,18 @@ impl PdfDocument {
             .get(&page_index)
             .cloned()
             .unwrap_or_default();
-        let mcid_order: Vec<u32> = ordered_content.iter().filter_map(|c| c.mcid).collect();
+        let default_scope = crate::structure::McidScope::Page(page_index as u32);
+        let mcid_order: Vec<(crate::structure::McidScope, u32)> = ordered_content
+            .iter()
+            .filter_map(|c| {
+                c.mcid
+                    .map(|m| (c.mcid_scope.clone().unwrap_or(default_scope.clone()), m))
+            })
+            .collect();
         let actions = Self::actualtext_actions_for_page(
             at_index.as_deref(),
-            page_index as u32,
             &mcid_order,
-            |m| mcid_map.contains_key(&m),
+            |_scope, m| mcid_map.contains_key(&m),
             &mc_wins,
         );
 
@@ -8496,6 +8504,7 @@ impl PdfDocument {
             let Some(mcid) = content.mcid else {
                 continue;
             };
+            let mcid_scope_key = content.mcid_scope.clone().unwrap_or(default_scope.clone());
 
             // ActualText action dispatch. `EmitAndSuppress` is set only
             // on the first visible covered MCID of a consecutive-same-
@@ -8503,7 +8512,7 @@ impl PdfDocument {
             // `Suppress`. MC-scope-wins MCIDs (their BDC carried inline
             // /ActualText) are exempt and walk the raw-span path so
             // the extractor's in-stream replacement reaches output.
-            match actions.get(&mcid) {
+            match actions.get(&(mcid_scope_key, mcid)) {
                 Some(ActualTextAction::EmitAndSuppress(repl)) => {
                     consumed_mcids.insert(mcid);
                     if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('\n') {
@@ -8656,11 +8665,13 @@ impl PdfDocument {
             .cloned()
             .unwrap_or_default();
 
-        // Visibility = "has at least one raw span at this MCID".
-        let mut mcid_present: HashSet<u32> = HashSet::new();
+        let default_scope = crate::structure::McidScope::Page(page_index as u32);
+        // Visibility = "has at least one raw span at this (scope, mcid)".
+        let mut present: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
         for s in spans.iter() {
             if let Some(m) = s.mcid {
-                mcid_present.insert(m);
+                let scope = s.mcid_scope.clone().unwrap_or(default_scope.clone());
+                present.insert((scope, m));
             }
         }
         // Walk the structure-tree's per-page MCID order so the
@@ -8671,9 +8682,8 @@ impl PdfDocument {
             .unwrap_or_default();
         let actions = Self::actualtext_actions_for_page(
             Some(&idx),
-            page_index as u32,
             &mcid_order,
-            |m| mcid_present.contains(&m),
+            |scope, m| present.contains(&(scope.clone(), m)),
             &mc_wins,
         );
         if actions.is_empty() {
@@ -8681,17 +8691,19 @@ impl PdfDocument {
         }
 
         // Apply actions to the raw spans. EmitAndSuppress mutates the
-        // first span of the MCID; subsequent spans for the same MCID
-        // are dropped (so an MCID with multiple spans collapses to one
-        // span carrying the replacement). Suppress drops every span
-        // with that MCID.
-        let mut emit_used: HashSet<u32> = HashSet::new();
+        // first span of the (scope, mcid) key; subsequent spans for
+        // the same key are dropped (so a key with multiple spans
+        // collapses to one span carrying the replacement). Suppress
+        // drops every span with that key.
+        let mut emit_used: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
         let mut drop_idx: Vec<usize> = Vec::new();
         for (i, s) in spans.iter_mut().enumerate() {
             let Some(m) = s.mcid else { continue };
-            match actions.get(&m) {
+            let scope = s.mcid_scope.clone().unwrap_or(default_scope.clone());
+            let key = (scope, m);
+            match actions.get(&key) {
                 Some(ActualTextAction::EmitAndSuppress(repl)) => {
-                    if emit_used.insert(m) {
+                    if emit_used.insert(key) {
                         s.text = repl.to_string();
                     } else {
                         s.text.clear();
@@ -8733,10 +8745,12 @@ impl PdfDocument {
             .cloned()
             .unwrap_or_default();
 
-        let mut mcid_present: HashSet<u32> = HashSet::new();
+        let default_scope = crate::structure::McidScope::Page(page_index as u32);
+        let mut present: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
         for o in ordered.iter() {
             if let Some(m) = o.span.mcid {
-                mcid_present.insert(m);
+                let scope = o.span.mcid_scope.clone().unwrap_or(default_scope.clone());
+                present.insert((scope, m));
             }
         }
         let mcid_order = self
@@ -8745,21 +8759,22 @@ impl PdfDocument {
             .unwrap_or_default();
         let actions = Self::actualtext_actions_for_page(
             Some(&idx),
-            page_index as u32,
             &mcid_order,
-            |m| mcid_present.contains(&m),
+            |scope, m| present.contains(&(scope.clone(), m)),
             &mc_wins,
         );
         if actions.is_empty() {
             return;
         }
 
-        let mut emit_used: HashSet<u32> = HashSet::new();
+        let mut emit_used: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
         for o in ordered.iter_mut() {
             let Some(m) = o.span.mcid else { continue };
-            match actions.get(&m) {
+            let scope = o.span.mcid_scope.clone().unwrap_or(default_scope.clone());
+            let key = (scope, m);
+            match actions.get(&key) {
                 Some(ActualTextAction::EmitAndSuppress(repl)) => {
-                    if emit_used.insert(m) {
+                    if emit_used.insert(key) {
                         o.span.text = repl.to_string();
                         o.actualtext_replacement = Some(repl.clone());
                     } else {
@@ -8800,14 +8815,13 @@ impl PdfDocument {
     /// replacement applied by the extractor and are exempt from the
     /// ancestor struct-tree scope; they do not break the run dedup —
     /// the run can still find a non-MC-wins MCID to emit at.
-    fn actualtext_actions_for_page<F: Fn(u32) -> bool>(
+    fn actualtext_actions_for_page<F: Fn(&crate::structure::McidScope, u32) -> bool>(
         idx: Option<&crate::structure::ActualTextIndex>,
-        page: u32,
-        mcid_order: &[u32],
+        mcid_order: &[(crate::structure::McidScope, u32)],
         visible: F,
         mc_wins: &HashSet<u32>,
-    ) -> HashMap<u32, ActualTextAction> {
-        let mut out: HashMap<u32, ActualTextAction> = HashMap::new();
+    ) -> HashMap<(crate::structure::McidScope, u32), ActualTextAction> {
+        let mut out: HashMap<(crate::structure::McidScope, u32), ActualTextAction> = HashMap::new();
         let Some(idx) = idx else {
             return out;
         };
@@ -8816,70 +8830,75 @@ impl PdfDocument {
         }
 
         // Two-pass walk to support runs that span the input order
-        // perfectly: collect (mcid, replacement?) tuples for covered
-        // MCIDs on this page, then group consecutive equal-replacement
-        // entries into runs.
+        // perfectly: collect (scope, mcid, replacement?) tuples for
+        // covered MCIDs on this page (across all scopes that render on
+        // it), then group consecutive equal-replacement entries into
+        // runs.
         //
         // Replacement = None for `suppress_only` entries and for
-        // covered MCIDs whose `(page, mcid)` has no text (defensive —
-        // shouldn't happen given the builder invariants).
-        let mut entries: Vec<(u32, Option<&str>)> = Vec::new();
-        for &m in mcid_order {
-            if !idx.covered_mcids.contains(&(page, m)) {
+        // covered keys with no text (defensive — shouldn't happen
+        // given the builder invariants).
+        let mut entries: Vec<(crate::structure::McidScope, u32, Option<&str>)> = Vec::new();
+        for (scope, m) in mcid_order {
+            let key = (scope.clone(), *m);
+            if !idx.covered_mcids.contains(&key) {
                 continue;
             }
-            if idx.suppress_only.contains(&(page, m)) {
-                entries.push((m, None));
+            if idx.suppress_only.contains(&key) {
+                entries.push((scope.clone(), *m, None));
                 continue;
             }
-            let text = idx.mcid_to_actual_text.get(&(page, m)).map(|s| &**s);
-            entries.push((m, text));
+            let text = idx.mcid_to_actual_text.get(&key).map(|s| &**s);
+            entries.push((scope.clone(), *m, text));
         }
 
         // Walk entries and assign actions per consecutive same-
         // replacement run.
         let mut i = 0usize;
         while i < entries.len() {
-            let (_, repl_opt) = entries[i];
+            let repl_opt = entries[i].2;
             // Find the end of the consecutive run sharing this
             // replacement (None matches None — i.e. suppress-only runs
             // also collapse).
             let mut j = i;
-            while j < entries.len() && entries[j].1 == repl_opt {
+            while j < entries.len() && entries[j].2 == repl_opt {
                 j += 1;
             }
 
             if let Some(repl) = repl_opt {
-                // Find first emit-eligible MCID (visible, not MC-wins).
-                let mut emit_pick: Option<u32> = None;
-                for &(m, _) in &entries[i..j] {
-                    if visible(m) && !mc_wins.contains(&m) {
-                        emit_pick = Some(m);
+                // Find first emit-eligible entry (visible, not MC-wins).
+                // MC-wins keys are skipped because their replacement
+                // came from the extractor's in-stream BDC /ActualText.
+                let mut emit_pick: Option<(crate::structure::McidScope, u32)> = None;
+                for entry in &entries[i..j] {
+                    if visible(&entry.0, entry.1) && !mc_wins.contains(&entry.1) {
+                        emit_pick = Some((entry.0.clone(), entry.1));
                         break;
                     }
                 }
                 let repl_arc: std::sync::Arc<str> = std::sync::Arc::from(repl);
-                for &(m, _) in &entries[i..j] {
-                    if mc_wins.contains(&m) {
+                for entry in &entries[i..j] {
+                    if mc_wins.contains(&entry.1) {
                         // MC-scope wins: do not touch this MCID at all.
                         // The extractor's inline replacement reaches
                         // output unmodified.
                         continue;
                     }
-                    if Some(m) == emit_pick {
-                        out.insert(m, ActualTextAction::EmitAndSuppress(repl_arc.clone()));
+                    let key = (entry.0.clone(), entry.1);
+                    if emit_pick.as_ref() == Some(&key) {
+                        out.insert(key, ActualTextAction::EmitAndSuppress(repl_arc.clone()));
                     } else {
-                        out.insert(m, ActualTextAction::Suppress);
+                        out.insert(key, ActualTextAction::Suppress);
                     }
                 }
             } else {
-                // suppress_only run: every MCID is suppressed (no
+                // suppress_only run: every key is suppressed (no
                 // emission). MC-wins MCIDs stay untouched.
-                for &(m, _) in &entries[i..j] {
-                    if mc_wins.contains(&m) {
+                for entry in &entries[i..j] {
+                    if mc_wins.contains(&entry.1) {
                         continue;
                     }
-                    out.insert(m, ActualTextAction::Suppress);
+                    out.insert((entry.0.clone(), entry.1), ActualTextAction::Suppress);
                 }
             }
 
@@ -8896,7 +8915,7 @@ impl PdfDocument {
         &self,
         struct_tree: &crate::structure::StructTreeRoot,
         page_index: u32,
-    ) -> Vec<u32> {
+    ) -> Vec<(crate::structure::McidScope, u32)> {
         if self.structure_content_cache.lock_or_recover().is_none() {
             let all_content = crate::structure::traverse_structure_tree_all_pages(struct_tree);
             *self.structure_content_cache.lock_or_recover() = Some(all_content);
@@ -8905,7 +8924,24 @@ impl PdfDocument {
             .lock_or_recover()
             .as_ref()
             .and_then(|c| c.get(&page_index))
-            .map(|content| content.iter().filter_map(|c| c.mcid).collect())
+            .map(|content| {
+                content
+                    .iter()
+                    .filter_map(|c| {
+                        // Word break markers have mcid=None; skip.
+                        let m = c.mcid?;
+                        // Page-scoped MCIDs default to Page(c.page) when
+                        // the parser didn't capture a scope. New parses
+                        // always populate `mcid_scope`; the unwrap_or
+                        // is for legacy traversals only.
+                        let scope = c
+                            .mcid_scope
+                            .clone()
+                            .unwrap_or(crate::structure::McidScope::Page(c.page));
+                        Some((scope, m))
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -8979,12 +9015,18 @@ impl PdfDocument {
             .get(&page_index)
             .cloned()
             .unwrap_or_default();
-        let mcid_order: Vec<u32> = ordered_content.iter().filter_map(|c| c.mcid).collect();
+        let default_scope = crate::structure::McidScope::Page(page_index as u32);
+        let mcid_order: Vec<(crate::structure::McidScope, u32)> = ordered_content
+            .iter()
+            .filter_map(|c| {
+                c.mcid
+                    .map(|m| (c.mcid_scope.clone().unwrap_or(default_scope.clone()), m))
+            })
+            .collect();
         let actions = Self::actualtext_actions_for_page(
             at_index.as_deref(),
-            page_index as u32,
             &mcid_order,
-            |m| mcid_map.contains_key(&m),
+            |_scope, m| mcid_map.contains_key(&m),
             &mc_wins,
         );
 
@@ -9012,8 +9054,9 @@ impl PdfDocument {
             let Some(mcid) = content.mcid else {
                 continue;
             };
+            let mcid_scope_key = content.mcid_scope.clone().unwrap_or(default_scope.clone());
 
-            match actions.get(&mcid) {
+            match actions.get(&(mcid_scope_key, mcid)) {
                 Some(ActualTextAction::EmitAndSuppress(repl)) => {
                     consumed_mcids.insert(mcid);
                     if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('\n') {
@@ -10914,6 +10957,10 @@ impl PdfDocument {
         }
 
         let mut extractor = TextExtractor::with_config(config);
+        // Stamp the page index so spans carry McidScope::Page(page_index)
+        // by default; Form XObject Do invocations push their own scope
+        // on top of the stack inside the extractor.
+        extractor.set_page_index(page_index as u32);
         if !excluded_layers.is_empty() {
             extractor.set_excluded_layers(excluded_layers);
         }
@@ -12861,6 +12908,7 @@ impl PdfDocument {
                 is_monospace: false,
                 color: crate::layout::Color::black(),
                 mcid: w.mcid,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14303,6 +14351,7 @@ impl PdfDocument {
                 is_monospace: false,
                 color: crate::layout::Color::black(),
                 mcid: w.mcid,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -18632,6 +18681,7 @@ mod tests {
             is_monospace: false,
             color: crate::layout::Color::new(0.0, 0.0, 0.0),
             mcid: None,
+            mcid_scope: None,
             sequence: 0,
             split_boundary_before: false,
             offset_semantic: false,
@@ -18840,6 +18890,7 @@ mod tests {
             is_monospace: false,
             color: crate::layout::Color::new(0.0, 0.0, 0.0),
             mcid: None,
+            mcid_scope: None,
             sequence: 0,
             split_boundary_before: false,
             offset_semantic: false,
@@ -22064,6 +22115,7 @@ mod tests {
                     b: 0.0,
                 },
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -22127,6 +22179,7 @@ mod tests {
                 b: 0.0,
             },
             mcid: None,
+            mcid_scope: None,
             sequence: 0,
             split_boundary_before: false,
             offset_semantic: false,
@@ -22499,6 +22552,7 @@ mod tests {
                 is_monospace: false,
                 color: crate::layout::Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -22568,6 +22622,7 @@ mod tests {
                 is_monospace: false,
                 color: crate::layout::Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,

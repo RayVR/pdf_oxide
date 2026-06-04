@@ -2462,6 +2462,18 @@ pub struct TextExtractor<'doc> {
     /// Cached current font (updated on Tf). Avoids per-Tj HashMap lookup
     /// in advance_position_for_string.
     cached_current_font: Option<Arc<FontInfo>>,
+    /// Stack of MCID content-stream scopes (ISO 32000-1:2008 §14.7.4.3).
+    ///
+    /// Bottom of the stack is the page's own content-stream scope
+    /// (`McidScope::Page(page_index)`). Each entry into a Form XObject
+    /// via `Do` pushes a `McidScope::Form(form_ref)`; the matching
+    /// pop restores the outer scope. The top of the stack stamps every
+    /// `TextSpan` emitted while it is active. Tiling-Pattern walks are
+    /// not currently traversed by the extractor (patterns rasterize
+    /// independently); the spec-strict three-variant scope still
+    /// covers `Pattern(_)` in the data model so future pattern-content
+    /// walks can populate it.
+    mcid_scope_stack: Vec<crate::structure::McidScope>,
 }
 
 impl<'doc> TextExtractor<'doc> {
@@ -2545,7 +2557,37 @@ impl<'doc> TextExtractor<'doc> {
             current_x_position: 0.0,        // Start at origin
             word_boundary_mode,             // Word boundary detection mode
             cached_current_font: None,      // Set on first Tf
+            // Default to Page(0); `set_page_index` overrides before
+            // extraction. Form XObject `Do` invocations push their
+            // own scope on top.
+            mcid_scope_stack: vec![crate::structure::McidScope::Page(0)],
         }
+    }
+
+    /// Stamp this extractor with the page index it is processing.
+    ///
+    /// Used so spans (and the lookup keys for `/ActualText`) carry the
+    /// correct `McidScope::Page(page_index)` when the extractor is not
+    /// currently inside a Form XObject.
+    pub fn set_page_index(&mut self, page_index: u32) {
+        // The first entry is always the page scope (Form scopes are
+        // pushed on top by `Do` and popped before the extractor
+        // finishes); update it in place.
+        if let Some(first) = self.mcid_scope_stack.first_mut() {
+            *first = crate::structure::McidScope::Page(page_index);
+        } else {
+            self.mcid_scope_stack
+                .push(crate::structure::McidScope::Page(page_index));
+        }
+    }
+
+    /// Current MCID scope (top of the stack) — what should be stamped
+    /// on every new `TextSpan`.
+    fn current_mcid_scope(&self) -> crate::structure::McidScope {
+        self.mcid_scope_stack
+            .last()
+            .cloned()
+            .unwrap_or(crate::structure::McidScope::Page(0))
     }
 
     /// Create a new text extractor with custom merging configuration.
@@ -6187,6 +6229,15 @@ impl<'doc> TextExtractor<'doc> {
                 let state = self.state_stack.current_mut();
                 state.ctm = form_matrix.multiply(&state.ctm);
 
+                // Push the Form XObject scope (ISO 32000-1:2008
+                // §14.7.4.3). Every MCID emitted inside this form's
+                // content stream lives in the form's MCID namespace,
+                // *not* the page's. Two distinct forms on the same
+                // page that both emit MCID 0 stay distinct because
+                // they push different `Form(form_ref)` scopes.
+                self.mcid_scope_stack
+                    .push(crate::structure::McidScope::Form(xobject_ref));
+
                 self.xobject_depth += 1;
                 let parse_result = if self.excluded_inks.is_empty() {
                     parse_and_execute_text_only(&stream_data, |op| self.execute_operator(op))
@@ -6203,6 +6254,11 @@ impl<'doc> TextExtractor<'doc> {
                     }
                 };
                 self.xobject_depth -= 1;
+                // Pop the Form XObject scope pushed before the
+                // content-stream walk. Cleared regardless of parse
+                // success so the parent stream's scope is correctly
+                // restored even on errors.
+                self.mcid_scope_stack.pop();
                 if let Err(e) = parse_result {
                     log::debug!(
                         "Error parsing Form XObject '{}' content stream: {}, partial text may be extracted",
@@ -6351,6 +6407,7 @@ impl<'doc> TextExtractor<'doc> {
                 buffer.fill_color_rgb.2,
             ),
             mcid: buffer.mcid,
+            mcid_scope: Some(self.current_mcid_scope()),
             sequence: self.span_sequence_counter,
             split_boundary_before: false,
             offset_semantic: false,
@@ -6709,6 +6766,10 @@ impl<'doc> TextExtractor<'doc> {
             return Ok(());
         }
 
+        // Snapshot the current MCID scope before borrowing graphics
+        // state so the borrow checker doesn't reject the
+        // `current_mcid_scope()` call at span construction time.
+        let mcid_scope = self.current_mcid_scope();
         let state = self.state_stack.current();
 
         // Step 1: Calculate bounding box from character positions in text space
@@ -6871,6 +6932,7 @@ impl<'doc> TextExtractor<'doc> {
                 state.fill_color_rgb.2,
             ),
             mcid: self.current_mcid,
+            mcid_scope: Some(mcid_scope),
             sequence: self.span_sequence_counter,
             split_boundary_before: false,
             offset_semantic: false,
@@ -7440,6 +7502,7 @@ impl<'doc> TextExtractor<'doc> {
 
     /// Insert a space character as a separate span.
     fn insert_space_as_span(&mut self) -> Result<()> {
+        let mcid_scope = self.current_mcid_scope();
         let state = self.state_stack.current();
         let font_size = state.font_size;
         let text_matrix = state.text_matrix;
@@ -7491,6 +7554,7 @@ impl<'doc> TextExtractor<'doc> {
                 state.fill_color_rgb.2,
             ),
             mcid: self.current_mcid,
+            mcid_scope: Some(mcid_scope),
             sequence: self.span_sequence_counter,
             split_boundary_before: false,
             offset_semantic: true,
@@ -7641,6 +7705,7 @@ impl<'doc> TextExtractor<'doc> {
                         buffer.fill_color_rgb.2,
                     ),
                     mcid: buffer.mcid,
+                    mcid_scope: Some(self.current_mcid_scope()),
                     sequence: self.span_sequence_counter,
                     split_boundary_before: false,
                     offset_semantic: false,
@@ -8422,6 +8487,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -8449,6 +8515,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: true, // Marks this as part of a split boundary
                 offset_semantic: false,
@@ -9327,6 +9394,7 @@ mod tests {
             font_weight: FontWeight::Normal,
             color: Color::black(),
             mcid: None,
+            mcid_scope: None,
             sequence: seq,
             split_boundary_before: false,
             offset_semantic: false,
@@ -10208,6 +10276,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10230,6 +10299,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10277,6 +10347,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: seq,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10332,6 +10403,7 @@ mod tests {
             font_weight: FontWeight::Normal,
             color: Color::black(),
             mcid: None,
+            mcid_scope: None,
             sequence: seq,
             split_boundary_before: false,
             offset_semantic: false,
@@ -10383,6 +10455,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: i,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10576,6 +10649,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10598,6 +10672,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10634,6 +10709,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10656,6 +10732,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10697,6 +10774,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10719,6 +10797,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10753,6 +10832,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -10775,6 +10855,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: true, // TJ offset space
@@ -10797,6 +10878,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 2,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13162,6 +13244,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13184,6 +13267,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13216,6 +13300,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13238,6 +13323,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13330,6 +13416,7 @@ mod tests {
             font_weight: FontWeight::Normal,
             color: Color::black(),
             mcid: None,
+            mcid_scope: None,
             sequence: 0,
             split_boundary_before: false,
             offset_semantic: false,
@@ -13363,6 +13450,7 @@ mod tests {
             font_weight: FontWeight::Normal,
             color: Color::black(),
             mcid: None,
+            mcid_scope: None,
             sequence: 0,
             split_boundary_before: false,
             offset_semantic: false,
@@ -13543,6 +13631,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13565,6 +13654,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13643,6 +13733,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13665,6 +13756,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: true, // forces merge-with-space path
                 offset_semantic: false,
@@ -13962,6 +14054,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -13984,6 +14077,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14159,6 +14253,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14181,6 +14276,7 @@ mod tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: true, // forcing merge path
                 offset_semantic: true,
@@ -14713,6 +14809,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14735,6 +14832,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14776,6 +14874,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14798,6 +14897,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14839,6 +14939,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14861,6 +14962,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14908,6 +15010,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14930,6 +15033,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14969,6 +15073,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -14991,6 +15096,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -15027,6 +15133,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -15049,6 +15156,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -15089,6 +15197,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 0,
                 split_boundary_before: false,
                 offset_semantic: false,
@@ -15111,6 +15220,7 @@ mod profile_based_space_tests {
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
                 mcid: None,
+                mcid_scope: None,
                 sequence: 1,
                 split_boundary_before: false,
                 offset_semantic: false,

@@ -60,5 +60,6 @@ pub use traversal::{
     OrderedContent,
 };
 pub use types::{
-    ActualTextIndex, MarkInfo, ParentTree, StructChild, StructElem, StructTreeRoot, StructType,
+    ActualTextIndex, MarkInfo, McidScope, ParentTree, StructChild, StructElem, StructTreeRoot,
+    StructType,
 };

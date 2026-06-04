@@ -2,9 +2,56 @@
 //!
 //! Implements structure element types according to ISO 32000-1:2008 Section 14.7.2.
 
-use crate::object::Object;
+use crate::object::{Object, ObjectRef};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Source of a Marked Content Identifier (MCID).
+///
+/// Per ISO 32000-1:2008 §14.7.4.3, MCIDs are NOT page-global. Each
+/// content stream that can carry `/StructParents` defines its own MCID
+/// namespace:
+///
+/// - A **page** content stream (`Page::StructParents`).
+/// - A **Form XObject** content stream (`/Subtype /Form`,
+///   `Form::StructParents`).
+/// - A **Tiling Pattern** content stream (`/PatternType 1`,
+///   `Pattern::StructParents`).
+///
+/// Two Form XObjects rendered on the same page may both emit MCID `0`
+/// inside their respective streams; they refer to different structure
+/// elements and must NOT collapse onto a single key. The same applies
+/// to two Tiling Patterns. This enum is the namespace-discriminator that
+/// keeps them apart.
+///
+/// `ActualTextIndex` and `TextSpan::mcid_scope` use this enum as the
+/// scope half of their `(scope, mcid)` lookup key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum McidScope {
+    /// MCID drawn directly by the page content stream. The `u32` is the
+    /// 0-based page index.
+    Page(u32),
+    /// MCID drawn by a Form XObject content stream. The `ObjectRef`
+    /// identifies the form (so two distinct forms on one page stay
+    /// distinct).
+    Form(ObjectRef),
+    /// MCID drawn by a Tiling Pattern content stream. The `ObjectRef`
+    /// identifies the pattern (so two distinct patterns on one page
+    /// stay distinct).
+    Pattern(ObjectRef),
+}
+
+impl McidScope {
+    /// Returns the page index when the scope is `Page(p)`, otherwise
+    /// `None`. Useful for assemblers that want a fast-path on the
+    /// common case.
+    pub fn page(&self) -> Option<u32> {
+        match self {
+            McidScope::Page(p) => Some(*p),
+            _ => None,
+        }
+    }
+}
 
 /// The root of a PDF structure tree (StructTreeRoot dictionary).
 ///
@@ -127,6 +174,12 @@ pub enum StructChild {
         mcid: u32,
         /// Page number containing this marked content
         page: u32,
+        /// Content-stream scope this MCID belongs to (ISO 32000-1:2008
+        /// §14.7.4.3). `Page(_)` for MCIDs drawn directly by the page
+        /// content stream (the default when an MCR omits `/Stm`).
+        /// `Form(_)` / `Pattern(_)` when the MCR's `/Stm` resolves to
+        /// a Form XObject or Tiling Pattern stream.
+        scope: McidScope,
     },
 
     /// Object reference (indirect reference to another StructElem)
@@ -437,13 +490,21 @@ impl MarkInfo {
 /// the subtree rooted at the bearing element. Nested ActualText
 /// declarations override their ancestors for the spans they cover.
 ///
-/// ## Data model: keyed by `(page, mcid)`
+/// ## Data model: keyed by `(McidScope, mcid)`
 ///
-/// MCIDs are scoped to a single page per spec §14.7.4 — a `u32` MCID
-/// alone is ambiguous across pages, so every entry in this index is
-/// keyed by `(page, mcid)`. Cross-page coverage of one ActualText scope
-/// produces one entry per `(page, mcid)` it covers; consumers handle
-/// the multi-page emit-once rule via [`Self::suppress_only`].
+/// Per ISO 32000-1:2008 §14.7.4.3, MCIDs are NOT globally unique — they
+/// are unique only within a single content stream (page content stream,
+/// Form XObject content stream, or Tiling Pattern content stream). Two
+/// Form XObjects on the same page can both emit MCID `0` referring to
+/// distinct structure elements. Keying by `(McidScope, mcid)` keeps
+/// every namespace separate.
+///
+/// For page-scoped MCIDs, `McidScope::Page(page_index)` plays exactly
+/// the role the previous `(page, mcid)` keying did; the cross-page
+/// emit-once rule still applies via [`Self::suppress_only`]. Form- and
+/// Pattern-scoped MCIDs are intrinsically per-stream — every covered
+/// MCID emits at its anchor (the form/pattern's content stream covers
+/// a single namespace).
 ///
 /// ## Emission model: mcid-driven, consecutive-run dedup
 ///
@@ -464,32 +525,34 @@ impl MarkInfo {
 /// replacement at the first visible covered MCID in the run.
 #[derive(Debug, Clone, Default)]
 pub struct ActualTextIndex {
-    /// Map from `(page, mcid)` → its innermost replacement text.
+    /// Map from `(McidScope, mcid)` → its innermost replacement text.
     ///
     /// The "innermost" resolution honours nesting: when a descendant
     /// element redeclares `/ActualText`, the descendant's text replaces
-    /// the ancestor's for `(page, mcid)` keys in the inner subtree.
-    pub mcid_to_actual_text: HashMap<(u32, u32), Arc<str>>,
+    /// the ancestor's for `(scope, mcid)` keys in the inner subtree.
+    pub mcid_to_actual_text: HashMap<(McidScope, u32), Arc<str>>,
 
-    /// `(page, mcid)` pairs whose raw glyph spans must be suppressed
-    /// during assembly.
+    /// `(McidScope, mcid)` pairs whose raw glyph spans must be
+    /// suppressed during assembly.
     ///
     /// Every key in [`Self::mcid_to_actual_text`] is present here, and
     /// keys in [`Self::suppress_only`] are present here too. Suppression
     /// prevents duplicate output: the replacement is emitted via the
-    /// mcid-driven walk, and raw glyphs for the same `(page, mcid)` are
-    /// dropped.
-    pub covered_mcids: HashSet<(u32, u32)>,
+    /// mcid-driven walk, and raw glyphs for the same `(scope, mcid)`
+    /// are dropped.
+    pub covered_mcids: HashSet<(McidScope, u32)>,
 
-    /// `(page, mcid)` pairs that are covered (raw glyphs suppressed)
-    /// but must NOT emit a replacement.
+    /// `(McidScope, mcid)` pairs that are covered (raw glyphs
+    /// suppressed) but must NOT emit a replacement.
     ///
-    /// This is how the index encodes "emit-once on the first page" for
-    /// multi-page ActualText subtrees: the bearing element's first-page
-    /// `(page, mcid)` entries land in [`Self::mcid_to_actual_text`];
-    /// every other page's `(page, mcid)` entries land here so the raw
-    /// glyphs are still suppressed but no second emission fires.
-    pub suppress_only: HashSet<(u32, u32)>,
+    /// For page-scoped subtrees, this encodes "emit-once on the first
+    /// page" semantics: the bearing element's first-page `(Page(p), mcid)`
+    /// entries land in [`Self::mcid_to_actual_text`]; every other page's
+    /// `(Page(p), mcid)` entries land here so the raw glyphs are still
+    /// suppressed but no second emission fires. Form- and Pattern-
+    /// scoped subtrees do not populate this set: each
+    /// `Form` / `Pattern` covers a single namespace.
+    pub suppress_only: HashSet<(McidScope, u32)>,
 }
 
 impl ActualTextIndex {

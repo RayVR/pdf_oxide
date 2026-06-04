@@ -2,7 +2,9 @@
 //!
 //! Implements pre-order traversal of structure trees to determine correct reading order.
 
-use super::types::{ActualTextIndex, StructChild, StructElem, StructTreeRoot, StructType};
+use super::types::{
+    ActualTextIndex, McidScope, StructChild, StructElem, StructTreeRoot, StructType,
+};
 use crate::error::Error;
 use std::sync::Arc;
 
@@ -79,6 +81,17 @@ pub struct OrderedContent {
     /// Per PDF spec Section 14.9.4, when present this replaces all
     /// descendant content with the specified text.
     pub actual_text: Option<String>,
+
+    /// Content-stream scope of the MCID (ISO 32000-1:2008 §14.7.4.3).
+    ///
+    /// `McidScope::Page(page)` for MCIDs drawn directly by the page's
+    /// content stream (the dominant case). `Form(_)` / `Pattern(_)`
+    /// when the structure tree's MCR carried a `/Stm` reference into
+    /// a Form XObject or Tiling Pattern, so the ActualText applier can
+    /// look up `(scope, mcid)` without colliding with same-mcid keys
+    /// in other namespaces. None when this `OrderedContent` is a word-
+    /// break marker (no MCID).
+    pub mcid_scope: Option<McidScope>,
 }
 
 /// Inheritable context propagated down the structure tree during traversal.
@@ -251,7 +264,11 @@ fn traverse_element_all_pages(
     // Process children in order
     for child in &elem.children {
         match child {
-            StructChild::MarkedContentRef { mcid, page } => {
+            StructChild::MarkedContentRef {
+                mcid,
+                page,
+                scope: mcid_scope,
+            } => {
                 result.entry(*page).or_default().push(OrderedContent {
                     page: *page,
                     mcid: Some(*mcid),
@@ -264,6 +281,7 @@ fn traverse_element_all_pages(
                     is_word_break: false,
                     block_id: descended.block_id,
                     actual_text: None,
+                    mcid_scope: Some(mcid_scope.clone()),
                 });
             },
 
@@ -284,6 +302,7 @@ fn traverse_element_all_pages(
                             is_word_break: true,
                             block_id: descended.block_id,
                             actual_text: None,
+                            mcid_scope: None,
                         });
                     }
                 }
@@ -360,6 +379,7 @@ fn traverse_element(
             is_word_break: true,
             block_id: descended.block_id,
             actual_text: None,
+            mcid_scope: None,
         });
         // WB elements typically have no children, but process any just in case
     }
@@ -367,7 +387,11 @@ fn traverse_element(
     // Process children in order
     for child in &elem.children {
         match child {
-            StructChild::MarkedContentRef { mcid, page } => {
+            StructChild::MarkedContentRef {
+                mcid,
+                page,
+                scope: mcid_scope,
+            } => {
                 // If this marked content is on the target page, add it
                 if *page == target_page {
                     result.push(OrderedContent {
@@ -382,6 +406,7 @@ fn traverse_element(
                         is_word_break: false,
                         block_id: descended.block_id,
                         actual_text: None,
+                        mcid_scope: Some(mcid_scope.clone()),
                     });
                 }
             },
@@ -466,23 +491,30 @@ pub fn build_actualtext_index(struct_tree: &StructTreeRoot) -> ActualTextIndex {
 }
 
 /// One ActualText scope, threaded down the traversal so descendant
-/// `(page, mcid)` pairs know which scope to attribute them to.
+/// `(scope, mcid)` pairs know which scope to attribute them to.
 #[derive(Clone)]
 struct ActiveScope {
     /// Innermost active replacement text.
     text: Arc<str>,
-    /// First page (min pre-order) on which a descendant MCID of this
-    /// scope appears. `None` until the first descendant is visited;
-    /// the walker pre-scans each scope's subtree to compute it before
-    /// entering descendants.
-    first_page: u32,
+    /// First page (in pre-order) on which a Page-scoped descendant
+    /// MCID of this ActualText scope appears. The emit-once-across-
+    /// pages rule applies *only* to Page-scoped descendants: a
+    /// multi-page subtree emits once on `first_page` and `suppress_only`
+    /// covers the rest. Form- and Pattern-scoped descendants live in
+    /// their own per-stream namespace (ISO 32000-1:2008 §14.7.4.3); each
+    /// one emits at its own anchor.
+    ///
+    /// `None` when the subtree has no Page-scoped MCR descendant — in
+    /// which case the suppress-only fallback is irrelevant.
+    first_page: Option<u32>,
 }
 
 /// Pre-order walker for [`build_actualtext_index`].
 ///
 /// `inherited` carries the innermost active scope from our ancestors.
 /// For each element bearing `/ActualText` we pre-scan our own subtree
-/// to find the first page, then walk children with our scope active.
+/// to find the first Page-scoped page (so the across-pages emit-once
+/// rule still works), then walk children with our scope active.
 fn walk_actualtext(elem: &StructElem, inherited: Option<ActiveScope>, idx: &mut ActualTextIndex) {
     let own_text: Option<Arc<str>> = elem
         .actual_text
@@ -491,10 +523,23 @@ fn walk_actualtext(elem: &StructElem, inherited: Option<ActiveScope>, idx: &mut 
         .map(Arc::from);
 
     let active = if let Some(text) = own_text {
-        // Pre-scan to find this scope's first page (min pre-order over
-        // our descendants). When we have no descendant MCID, there is
-        // nothing to cover — drop the scope and inherit the ancestor's.
-        first_page_in_subtree(elem).map(|first_page| ActiveScope { text, first_page })
+        // Pre-scan to find this scope's first Page-scoped descendant.
+        // Subtrees with *only* Form/Pattern descendants get
+        // `first_page = None` — the per-stream namespaces don't share
+        // an emit-once rule (there is no "first page" for a Form
+        // XObject's content stream from the structure tree's
+        // perspective).
+        //
+        // When the subtree has no descendant MCR of any kind, drop
+        // the scope: nothing to attach to.
+        if has_any_mcr(elem) {
+            Some(ActiveScope {
+                text,
+                first_page: first_page_in_subtree(elem),
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -506,18 +551,36 @@ fn walk_actualtext(elem: &StructElem, inherited: Option<ActiveScope>, idx: &mut 
 
     for child in &elem.children {
         match child {
-            StructChild::MarkedContentRef { mcid, page } => {
+            StructChild::MarkedContentRef {
+                mcid,
+                page,
+                scope: mcid_scope,
+            } => {
                 if let Some(ref s) = scope {
-                    idx.covered_mcids.insert((*page, *mcid));
-                    if *page == s.first_page {
-                        idx.mcid_to_actual_text
-                            .insert((*page, *mcid), s.text.clone());
+                    let key = (mcid_scope.clone(), *mcid);
+                    idx.covered_mcids.insert(key.clone());
+
+                    // Emit-once rule:
+                    // - Page-scoped: emit on the first page seen, suppress
+                    //   on the others (cross-page subtrees).
+                    // - Form/Pattern-scoped: emit on every covered key;
+                    //   each form/pattern is its own namespace and the
+                    //   StructElem covers one such stream at most for
+                    //   each contained MCID.
+                    let should_emit = match mcid_scope {
+                        crate::structure::McidScope::Page(_) => s.first_page == Some(*page),
+                        crate::structure::McidScope::Form(_)
+                        | crate::structure::McidScope::Pattern(_) => true,
+                    };
+
+                    if should_emit {
+                        idx.mcid_to_actual_text.insert(key, s.text.clone());
                     } else {
-                        // Non-first-page coverage for a multi-page
+                        // Non-first-page coverage for a multi-page Page
                         // subtree: suppress raw glyphs but do not
                         // re-emit; the replacement already fired on
                         // `s.first_page`.
-                        idx.suppress_only.insert((*page, *mcid));
+                        idx.suppress_only.insert(key);
                     }
                 }
             },
@@ -532,13 +595,18 @@ fn walk_actualtext(elem: &StructElem, inherited: Option<ActiveScope>, idx: &mut 
     }
 }
 
-/// Find the first page (in pre-order) on which any descendant MCR
-/// inside `elem`'s subtree sits. `None` when the subtree carries no
-/// MCR at all.
+/// Find the first Page-scoped page (in pre-order) on which any
+/// descendant MCR inside `elem`'s subtree sits. `None` when no
+/// descendant is Page-scoped (the subtree may still have Form- or
+/// Pattern-scoped descendants).
 fn first_page_in_subtree(elem: &StructElem) -> Option<u32> {
     for child in &elem.children {
         match child {
-            StructChild::MarkedContentRef { page, .. } => return Some(*page),
+            StructChild::MarkedContentRef { page, scope, .. } => {
+                if matches!(scope, crate::structure::McidScope::Page(_)) {
+                    return Some(*page);
+                }
+            },
             StructChild::StructElem(c) => {
                 if let Some(p) = first_page_in_subtree(c) {
                     return Some(p);
@@ -548,6 +616,23 @@ fn first_page_in_subtree(elem: &StructElem) -> Option<u32> {
         }
     }
     None
+}
+
+/// Returns true when `elem`'s subtree contains at least one
+/// `MarkedContentRef` of any scope.
+fn has_any_mcr(elem: &StructElem) -> bool {
+    for child in &elem.children {
+        match child {
+            StructChild::MarkedContentRef { .. } => return true,
+            StructChild::StructElem(c) => {
+                if has_any_mcr(c) {
+                    return true;
+                }
+            },
+            StructChild::ObjectRef(_, _) => {},
+        }
+    }
+    false
 }
 
 /// Extract all marked content IDs in reading order for a page.
@@ -589,10 +674,18 @@ mod tests {
         let mut root = StructElem::new(StructType::Document);
 
         let mut p1 = StructElem::new(StructType::P);
-        p1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        p1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut p2 = StructElem::new(StructType::P);
-        p2.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        p2.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         root.add_child(StructChild::StructElem(Box::new(p1)));
         root.add_child(StructChild::StructElem(Box::new(p2)));
@@ -611,10 +704,18 @@ mod tests {
         let mut root = StructElem::new(StructType::Document);
 
         let mut p1 = StructElem::new(StructType::P);
-        p1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        p1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut p2 = StructElem::new(StructType::P);
-        p2.add_child(StructChild::MarkedContentRef { mcid: 1, page: 1 });
+        p2.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 1,
+            scope: crate::structure::McidScope::Page(1),
+        });
 
         root.add_child(StructChild::StructElem(Box::new(p1)));
         root.add_child(StructChild::StructElem(Box::new(p2)));
@@ -643,10 +744,18 @@ mod tests {
         let mut sect = StructElem::new(StructType::Sect);
 
         let mut h1 = StructElem::new(StructType::H1);
-        h1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        h1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut p = StructElem::new(StructType::P);
-        p.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        p.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         sect.add_child(StructChild::StructElem(Box::new(h1)));
         sect.add_child(StructChild::StructElem(Box::new(p)));
@@ -671,12 +780,20 @@ mod tests {
         let mut root = StructElem::new(StructType::P);
 
         let mut span1 = StructElem::new(StructType::Span);
-        span1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        span1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let wb = StructElem::new(StructType::WB);
 
         let mut span2 = StructElem::new(StructType::Span);
-        span2.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        span2.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         root.add_child(StructChild::StructElem(Box::new(span1)));
         root.add_child(StructChild::StructElem(Box::new(wb)));
@@ -711,7 +828,11 @@ mod tests {
     fn test_empty_page() {
         let mut root = StructElem::new(StructType::Document);
         let mut p = StructElem::new(StructType::P);
-        p.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        p.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         root.add_child(StructChild::StructElem(Box::new(p)));
 
         let mut struct_tree = StructTreeRoot::new();
@@ -730,7 +851,11 @@ mod tests {
         // Reproduces issue #377 word365_structure regression.
         let mut h1 = StructElem::new(StructType::H1);
         let mut span = StructElem::new(StructType::Span);
-        span.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         h1.add_child(StructChild::StructElem(Box::new(span)));
 
         let mut struct_tree = StructTreeRoot::new();
@@ -762,7 +887,11 @@ mod tests {
         // when emitting markdown bullets.
         let mut li = StructElem::new(StructType::LI);
         let mut lbody = StructElem::new(StructType::LBody);
-        lbody.add_child(StructChild::MarkedContentRef { mcid: 7, page: 0 });
+        lbody.add_child(StructChild::MarkedContentRef {
+            mcid: 7,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         li.add_child(StructChild::StructElem(Box::new(lbody)));
         let mut l = StructElem::new(StructType::L);
         l.add_child(StructChild::StructElem(Box::new(li)));
@@ -801,7 +930,11 @@ mod tests {
             let mut head = StructElem::new(h_type.clone());
             let mut sect = StructElem::new(StructType::Sect);
             let mut span = StructElem::new(StructType::Span);
-            span.add_child(StructChild::MarkedContentRef { mcid: 42, page: 0 });
+            span.add_child(StructChild::MarkedContentRef {
+                mcid: 42,
+                page: 0,
+                scope: crate::structure::McidScope::Page(0),
+            });
             sect.add_child(StructChild::StructElem(Box::new(span)));
             head.add_child(StructChild::StructElem(Box::new(sect)));
             let mut tree = StructTreeRoot::new();
@@ -831,7 +964,11 @@ mod tests {
     fn test_generic_h_without_level_defaults_to_h1() {
         let mut h = StructElem::new(StructType::H);
         let mut span = StructElem::new(StructType::Span);
-        span.add_child(StructChild::MarkedContentRef { mcid: 9, page: 0 });
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 9,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         h.add_child(StructChild::StructElem(Box::new(span)));
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(h);
@@ -849,9 +986,17 @@ mod tests {
     fn test_heading_role_does_not_bleed_into_following_paragraph() {
         let mut doc = StructElem::new(StructType::Document);
         let mut h1 = StructElem::new(StructType::H1);
-        h1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        h1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut p = StructElem::new(StructType::P);
-        p.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        p.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         doc.add_child(StructChild::StructElem(Box::new(h1)));
         doc.add_child(StructChild::StructElem(Box::new(p)));
         let mut tree = StructTreeRoot::new();
@@ -878,12 +1023,24 @@ mod tests {
         //        └─ LBody (mcid=2)         → role = LBody
         let mut l = StructElem::new(StructType::L);
         let mut li_a = StructElem::new(StructType::LI);
-        li_a.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        li_a.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut li_b = StructElem::new(StructType::LI);
         let mut lbl = StructElem::new(StructType::Lbl);
-        lbl.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        lbl.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut lbody = StructElem::new(StructType::LBody);
-        lbody.add_child(StructChild::MarkedContentRef { mcid: 2, page: 0 });
+        lbody.add_child(StructChild::MarkedContentRef {
+            mcid: 2,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         li_b.add_child(StructChild::StructElem(Box::new(lbl)));
         li_b.add_child(StructChild::StructElem(Box::new(lbody)));
         l.add_child(StructChild::StructElem(Box::new(li_a)));
@@ -910,13 +1067,25 @@ mod tests {
         let mut doc = StructElem::new(StructType::Document);
         let mut p1 = StructElem::new(StructType::P);
         let mut span_a = StructElem::new(StructType::Span);
-        span_a.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        span_a.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut span_b = StructElem::new(StructType::Span);
-        span_b.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        span_b.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         p1.add_child(StructChild::StructElem(Box::new(span_a)));
         p1.add_child(StructChild::StructElem(Box::new(span_b)));
         let mut p2 = StructElem::new(StructType::P);
-        p2.add_child(StructChild::MarkedContentRef { mcid: 2, page: 0 });
+        p2.add_child(StructChild::MarkedContentRef {
+            mcid: 2,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         doc.add_child(StructChild::StructElem(Box::new(p1)));
         doc.add_child(StructChild::StructElem(Box::new(p2)));
         let mut tree = StructTreeRoot::new();
@@ -940,7 +1109,11 @@ mod tests {
     #[test]
     fn test_root_span_has_block_id_zero() {
         let mut span = StructElem::new(StructType::Span);
-        span.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(span);
         let ordered = traverse_structure_tree(&tree, 0).unwrap();
@@ -951,7 +1124,11 @@ mod tests {
     fn test_object_ref_skipped() {
         let mut root = StructElem::new(StructType::Document);
         root.add_child(StructChild::ObjectRef(42, 0));
-        root.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        root.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut struct_tree = StructTreeRoot::new();
         struct_tree.add_root_element(root);
@@ -965,13 +1142,25 @@ mod tests {
         let mut root = StructElem::new(StructType::Document);
 
         let mut p1 = StructElem::new(StructType::P);
-        p1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        p1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut p2 = StructElem::new(StructType::P);
-        p2.add_child(StructChild::MarkedContentRef { mcid: 1, page: 1 });
+        p2.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 1,
+            scope: crate::structure::McidScope::Page(1),
+        });
 
         let mut p3 = StructElem::new(StructType::P);
-        p3.add_child(StructChild::MarkedContentRef { mcid: 2, page: 0 });
+        p3.add_child(StructChild::MarkedContentRef {
+            mcid: 2,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         root.add_child(StructChild::StructElem(Box::new(p1)));
         root.add_child(StructChild::StructElem(Box::new(p2)));
@@ -997,7 +1186,11 @@ mod tests {
         let mut root = StructElem::new(StructType::Document);
         let mut elem = StructElem::new(StructType::Span);
         elem.actual_text = Some("Replacement text".to_string());
-        elem.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        elem.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         root.add_child(StructChild::StructElem(Box::new(elem)));
         let mut struct_tree = StructTreeRoot::new();
         struct_tree.add_root_element(root);
@@ -1011,8 +1204,15 @@ mod tests {
 
         // The replacement is resolved separately.
         let idx = build_actualtext_index(&struct_tree);
-        assert!(idx.covered_mcids.contains(&(0, 0)));
-        assert_eq!(idx.mcid_to_actual_text.get(&(0, 0)).map(|s| &**s), Some("Replacement text"));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 0)));
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(0), 0))
+                .map(|s| &**s),
+            Some("Replacement text")
+        );
     }
 
     #[test]
@@ -1021,7 +1221,11 @@ mod tests {
 
         let mut elem = StructElem::new(StructType::Span);
         elem.actual_text = Some("Replacement".to_string());
-        elem.add_child(StructChild::MarkedContentRef { mcid: 0, page: 1 });
+        elem.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 1,
+            scope: crate::structure::McidScope::Page(1),
+        });
 
         root.add_child(StructChild::StructElem(Box::new(elem)));
 
@@ -1033,8 +1237,15 @@ mod tests {
         let ordered = traverse_structure_tree(&struct_tree, 0).unwrap();
         assert!(ordered.is_empty());
         let idx = build_actualtext_index(&struct_tree);
-        assert!(idx.covered_mcids.contains(&(1, 0)));
-        assert_eq!(idx.mcid_to_actual_text.get(&(1, 0)).map(|s| &**s), Some("Replacement"));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(1), 0)));
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(1), 0))
+                .map(|s| &**s),
+            Some("Replacement")
+        );
     }
 
     #[test]
@@ -1042,10 +1253,18 @@ mod tests {
         let mut root = StructElem::new(StructType::Document);
 
         let mut h1 = StructElem::new(StructType::H1);
-        h1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        h1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut span = StructElem::new(StructType::Span);
-        span.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         root.add_child(StructChild::StructElem(Box::new(h1)));
         root.add_child(StructChild::StructElem(Box::new(span)));
@@ -1067,8 +1286,16 @@ mod tests {
         elem.page = Some(0);
 
         let mut child = StructElem::new(StructType::P);
-        child.add_child(StructChild::MarkedContentRef { mcid: 0, page: 1 });
-        child.add_child(StructChild::MarkedContentRef { mcid: 1, page: 2 });
+        child.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 1,
+            scope: crate::structure::McidScope::Page(1),
+        });
+        child.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 2,
+            scope: crate::structure::McidScope::Page(2),
+        });
 
         elem.add_child(StructChild::StructElem(Box::new(child)));
 
@@ -1087,8 +1314,16 @@ mod tests {
         let mut root = StructElem::new(StructType::Document);
         let mut elem = StructElem::new(StructType::Span);
         elem.actual_text = Some("Hello".to_string());
-        elem.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
-        elem.add_child(StructChild::MarkedContentRef { mcid: 1, page: 1 });
+        elem.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
+        elem.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 1,
+            scope: crate::structure::McidScope::Page(1),
+        });
         root.add_child(StructChild::StructElem(Box::new(elem)));
         let mut struct_tree = StructTreeRoot::new();
         struct_tree.add_root_element(root);
@@ -1106,10 +1341,18 @@ mod tests {
         let idx = build_actualtext_index(&struct_tree);
         // The bearing element covers both pages; first page wins for
         // emission, the second is suppress-only.
-        assert!(idx.covered_mcids.contains(&(0, 0)));
-        assert!(idx.covered_mcids.contains(&(1, 1)));
-        assert!(idx.mcid_to_actual_text.contains_key(&(0, 0)));
-        assert!(idx.suppress_only.contains(&(1, 1)));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 0)));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(1), 1)));
+        assert!(idx
+            .mcid_to_actual_text
+            .contains_key(&(crate::structure::McidScope::Page(0), 0)));
+        assert!(idx
+            .suppress_only
+            .contains(&(crate::structure::McidScope::Page(1), 1)));
     }
 
     #[test]
@@ -1118,7 +1361,11 @@ mod tests {
 
         let mut wb = StructElem::new(StructType::WB);
         let mut child = StructElem::new(StructType::Span);
-        child.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        child.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         wb.add_child(StructChild::StructElem(Box::new(child)));
 
         root.add_child(StructChild::StructElem(Box::new(wb)));
@@ -1137,7 +1384,11 @@ mod tests {
     fn test_traverse_all_pages_object_ref() {
         let mut root = StructElem::new(StructType::Document);
         root.add_child(StructChild::ObjectRef(99, 0));
-        root.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        root.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut struct_tree = StructTreeRoot::new();
         struct_tree.add_root_element(root);
@@ -1152,7 +1403,11 @@ mod tests {
         let mut root = StructElem::new(StructType::Document);
         let mut sect = StructElem::new(StructType::Sect);
         let mut p = StructElem::new(StructType::P);
-        p.add_child(StructChild::MarkedContentRef { mcid: 0, page: 3 });
+        p.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 3,
+            scope: crate::structure::McidScope::Page(3),
+        });
         sect.add_child(StructChild::StructElem(Box::new(p)));
         root.add_child(StructChild::StructElem(Box::new(sect)));
 
@@ -1180,14 +1435,25 @@ mod tests {
         // Span /ActualText "fi" /K 0 on page 0.
         let mut span = StructElem::new(StructType::Span);
         span.actual_text = Some("fi".to_string());
-        span.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(span);
 
         let idx = build_actualtext_index(&tree);
-        assert!(idx.covered_mcids.contains(&(0, 0)));
-        assert_eq!(idx.mcid_to_actual_text.get(&(0, 0)).map(|s| &**s), Some("fi"));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 0)));
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(0), 0))
+                .map(|s| &**s),
+            Some("fi")
+        );
         assert!(idx.suppress_only.is_empty());
     }
 
@@ -1197,7 +1463,11 @@ mod tests {
         // "inner" wrapping MCID 5. Inner replacement must win for MCID 5.
         let mut inner = StructElem::new(StructType::Span);
         inner.actual_text = Some("inner".to_string());
-        inner.add_child(StructChild::MarkedContentRef { mcid: 5, page: 0 });
+        inner.add_child(StructChild::MarkedContentRef {
+            mcid: 5,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut outer = StructElem::new(StructType::Span);
         outer.actual_text = Some("outer".to_string());
@@ -1208,8 +1478,15 @@ mod tests {
 
         let idx = build_actualtext_index(&tree);
         // The leaf MCID is covered by the INNER text (inner-wins).
-        assert_eq!(idx.mcid_to_actual_text.get(&(0, 5)).map(|s| &**s), Some("inner"));
-        assert!(idx.covered_mcids.contains(&(0, 5)));
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(0), 5))
+                .map(|s| &**s),
+            Some("inner")
+        );
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 5)));
     }
 
     #[test]
@@ -1223,21 +1500,43 @@ mod tests {
         // outer scope only).
         let mut inner = StructElem::new(StructType::Span);
         inner.actual_text = Some("I".to_string());
-        inner.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        inner.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut outer = StructElem::new(StructType::Span);
         outer.actual_text = Some("O".to_string());
         outer.add_child(StructChild::StructElem(Box::new(inner)));
-        outer.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        outer.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
 
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(outer);
         let idx = build_actualtext_index(&tree);
 
-        assert_eq!(idx.mcid_to_actual_text.get(&(0, 0)).map(|s| &**s), Some("I"));
-        assert_eq!(idx.mcid_to_actual_text.get(&(0, 1)).map(|s| &**s), Some("O"));
-        assert!(idx.covered_mcids.contains(&(0, 0)));
-        assert!(idx.covered_mcids.contains(&(0, 1)));
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(0), 0))
+                .map(|s| &**s),
+            Some("I")
+        );
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(0), 1))
+                .map(|s| &**s),
+            Some("O")
+        );
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 0)));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 1)));
     }
 
     #[test]
@@ -1247,20 +1546,41 @@ mod tests {
         // page 1 first, then page 0 — the first descendant wins (page 1).
         let mut h1 = StructElem::new(StructType::H1);
         h1.actual_text = Some("Heading X".to_string());
-        h1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 1 });
-        h1.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        h1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 1,
+            scope: crate::structure::McidScope::Page(1),
+        });
+        h1.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(h1);
         let idx = build_actualtext_index(&tree);
         // Both descendant pairs are covered.
-        assert!(idx.covered_mcids.contains(&(1, 0)));
-        assert!(idx.covered_mcids.contains(&(0, 1)));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(1), 0)));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 1)));
         // The first MCR in pre-order is (page 1, MCID 0): that page
         // wins for emission.
-        assert_eq!(idx.mcid_to_actual_text.get(&(1, 0)).map(|s| &**s), Some("Heading X"));
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(1), 0))
+                .map(|s| &**s),
+            Some("Heading X")
+        );
         // The other-page MCR is suppress-only.
-        assert!(idx.suppress_only.contains(&(0, 1)));
-        assert!(!idx.mcid_to_actual_text.contains_key(&(0, 1)));
+        assert!(idx
+            .suppress_only
+            .contains(&(crate::structure::McidScope::Page(0), 1)));
+        assert!(!idx
+            .mcid_to_actual_text
+            .contains_key(&(crate::structure::McidScope::Page(0), 1)));
     }
 
     #[test]
@@ -1270,14 +1590,25 @@ mod tests {
         let mut span = StructElem::new(StructType::Span);
         span.actual_text = Some("expanded".to_string());
         for m in [7, 8, 9] {
-            span.add_child(StructChild::MarkedContentRef { mcid: m, page: 0 });
+            span.add_child(StructChild::MarkedContentRef {
+                mcid: m,
+                page: 0,
+                scope: crate::structure::McidScope::Page(0),
+            });
         }
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(span);
         let idx = build_actualtext_index(&tree);
         for m in [7, 8, 9] {
-            assert!(idx.covered_mcids.contains(&(0, m)));
-            assert_eq!(idx.mcid_to_actual_text.get(&(0, m)).map(|s| &**s), Some("expanded"));
+            assert!(idx
+                .covered_mcids
+                .contains(&(crate::structure::McidScope::Page(0), m)));
+            assert_eq!(
+                idx.mcid_to_actual_text
+                    .get(&(crate::structure::McidScope::Page(0), m))
+                    .map(|s| &**s),
+                Some("expanded")
+            );
         }
     }
 
@@ -1285,7 +1616,11 @@ mod tests {
     fn test_actualtext_index_no_actualtext_yields_empty() {
         // A plain tree with no /ActualText anywhere builds an empty index.
         let mut p = StructElem::new(StructType::P);
-        p.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        p.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(p);
         let idx = build_actualtext_index(&tree);
@@ -1300,7 +1635,11 @@ mod tests {
         // wrote it likely means "no replacement".
         let mut span = StructElem::new(StructType::Span);
         span.actual_text = Some(String::new());
-        span.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(span);
         let idx = build_actualtext_index(&tree);
@@ -1324,11 +1663,20 @@ mod tests {
         // Figure /ActualText "logo text". Same shape as a Span.
         let mut fig = StructElem::new(StructType::Figure);
         fig.actual_text = Some("logo text".to_string());
-        fig.add_child(StructChild::MarkedContentRef { mcid: 4, page: 2 });
+        fig.add_child(StructChild::MarkedContentRef {
+            mcid: 4,
+            page: 2,
+            scope: crate::structure::McidScope::Page(2),
+        });
         let mut tree = StructTreeRoot::new();
         tree.add_root_element(fig);
         let idx = build_actualtext_index(&tree);
-        assert_eq!(idx.mcid_to_actual_text.get(&(2, 4)).map(|s| &**s), Some("logo text"));
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(2), 4))
+                .map(|s| &**s),
+            Some("logo text")
+        );
     }
 
     #[test]
@@ -1338,9 +1686,17 @@ mod tests {
         // The (page, mcid) keying must keep them independent.
         let mut h1 = StructElem::new(StructType::H1);
         h1.actual_text = Some("Heading".to_string());
-        h1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        h1.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
         let mut p = StructElem::new(StructType::P);
-        p.add_child(StructChild::MarkedContentRef { mcid: 0, page: 1 });
+        p.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 1,
+            scope: crate::structure::McidScope::Page(1),
+        });
 
         let mut doc = StructElem::new(StructType::Document);
         doc.add_child(StructChild::StructElem(Box::new(h1)));
@@ -1349,11 +1705,241 @@ mod tests {
         tree.add_root_element(doc);
 
         let idx = build_actualtext_index(&tree);
-        assert!(idx.covered_mcids.contains(&(0, 0)));
+        assert!(idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 0)));
         // Page-1 MCID 0 is NOT covered: it belongs to a plain /P with
         // no /ActualText.
-        assert!(!idx.covered_mcids.contains(&(1, 0)));
-        assert!(!idx.suppress_only.contains(&(1, 0)));
-        assert_eq!(idx.mcid_to_actual_text.get(&(0, 0)).map(|s| &**s), Some("Heading"));
+        assert!(!idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(1), 0)));
+        assert!(!idx
+            .suppress_only
+            .contains(&(crate::structure::McidScope::Page(1), 0)));
+        assert_eq!(
+            idx.mcid_to_actual_text
+                .get(&(crate::structure::McidScope::Page(0), 0))
+                .map(|s| &**s),
+            Some("Heading")
+        );
+    }
+
+    // ============================================================================
+    // McidScope (ISO 32000-1:2008 §14.7.4.3) — per-content-stream MCID namespaces.
+    //
+    // The earlier `(page, mcid)` keying silently merged MCIDs that
+    // came from distinct content streams on the same page. Per spec,
+    // page content / Form XObject content / Tiling Pattern content
+    // each define their own MCID namespace. These tests lock in that
+    // the builder keeps them apart.
+    // ============================================================================
+
+    /// The canonical bug shape: two Form XObjects on the same page,
+    /// both emitting MCID 0, each wrapped by an ActualText-bearing
+    /// StructElem. The pre-fix `(page, mcid)` keying would have
+    /// collapsed them onto `(0, 0) → "Y"` (last-writer-wins). The
+    /// fix keys by `(McidScope::Form(form_ref), mcid)` and keeps
+    /// both replacements distinct.
+    #[test]
+    fn two_forms_with_same_mcid_on_same_page_do_not_collide() {
+        let form_a = crate::object::ObjectRef::new(100, 0);
+        let form_b = crate::object::ObjectRef::new(101, 0);
+
+        let mut span_a = StructElem::new(StructType::Span);
+        span_a.actual_text = Some("X".to_string());
+        span_a.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Form(form_a),
+        });
+
+        let mut span_b = StructElem::new(StructType::Span);
+        span_b.actual_text = Some("Y".to_string());
+        span_b.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Form(form_b),
+        });
+
+        let mut doc = StructElem::new(StructType::Document);
+        doc.add_child(StructChild::StructElem(Box::new(span_a)));
+        doc.add_child(StructChild::StructElem(Box::new(span_b)));
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(doc);
+
+        let idx = build_actualtext_index(&tree);
+
+        // Both keys present.
+        let key_a = (crate::structure::McidScope::Form(form_a), 0);
+        let key_b = (crate::structure::McidScope::Form(form_b), 0);
+        assert!(idx.covered_mcids.contains(&key_a));
+        assert!(idx.covered_mcids.contains(&key_b));
+
+        // Each form's replacement preserved — pre-fix, the second
+        // overwrote the first.
+        assert_eq!(idx.mcid_to_actual_text.get(&key_a).map(|s| &**s), Some("X"));
+        assert_eq!(idx.mcid_to_actual_text.get(&key_b).map(|s| &**s), Some("Y"));
+    }
+
+    /// Form-scoped MCID lookup uses `McidScope::Form` regardless of
+    /// the page number recorded on the MCR (`/Pg`) — the form's
+    /// content stream is the namespace.
+    #[test]
+    fn actualtext_with_stm_form_resolves_to_form_scope() {
+        let form_ref = crate::object::ObjectRef::new(42, 0);
+        let mut span = StructElem::new(StructType::Span);
+        span.actual_text = Some("alt".to_string());
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 3,
+            page: 0,
+            scope: crate::structure::McidScope::Form(form_ref),
+        });
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(span);
+
+        let idx = build_actualtext_index(&tree);
+        let key = (crate::structure::McidScope::Form(form_ref), 3);
+        assert!(idx.covered_mcids.contains(&key));
+        assert_eq!(idx.mcid_to_actual_text.get(&key).map(|s| &**s), Some("alt"));
+        // Page-scoped lookup with the same MCID MUST miss — the keys
+        // are different namespaces.
+        assert!(!idx
+            .covered_mcids
+            .contains(&(crate::structure::McidScope::Page(0), 3)));
+    }
+
+    /// Same as above but for Tiling Patterns (§8.7.3.3 + §14.7.4.3).
+    #[test]
+    fn actualtext_with_stm_pattern_resolves_to_pattern_scope() {
+        let pattern_ref = crate::object::ObjectRef::new(7, 0);
+        let mut span = StructElem::new(StructType::Span);
+        span.actual_text = Some("dec".to_string());
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 0,
+            scope: crate::structure::McidScope::Pattern(pattern_ref),
+        });
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(span);
+
+        let idx = build_actualtext_index(&tree);
+        let key = (crate::structure::McidScope::Pattern(pattern_ref), 1);
+        assert!(idx.covered_mcids.contains(&key));
+        assert_eq!(idx.mcid_to_actual_text.get(&key).map(|s| &**s), Some("dec"));
+    }
+
+    /// Two Tiling Patterns on the same page emit MCID 0 in their
+    /// own streams — the index keeps them distinct.
+    #[test]
+    fn pattern_with_actualtext_keys_under_pattern_scope() {
+        let pat_a = crate::object::ObjectRef::new(70, 0);
+        let pat_b = crate::object::ObjectRef::new(71, 0);
+
+        let mut span_a = StructElem::new(StructType::Span);
+        span_a.actual_text = Some("alpha".to_string());
+        span_a.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Pattern(pat_a),
+        });
+
+        let mut span_b = StructElem::new(StructType::Span);
+        span_b.actual_text = Some("beta".to_string());
+        span_b.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Pattern(pat_b),
+        });
+
+        let mut doc = StructElem::new(StructType::Document);
+        doc.add_child(StructChild::StructElem(Box::new(span_a)));
+        doc.add_child(StructChild::StructElem(Box::new(span_b)));
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(doc);
+
+        let idx = build_actualtext_index(&tree);
+        let ka = (crate::structure::McidScope::Pattern(pat_a), 0);
+        let kb = (crate::structure::McidScope::Pattern(pat_b), 0);
+        assert_eq!(idx.mcid_to_actual_text.get(&ka).map(|s| &**s), Some("alpha"));
+        assert_eq!(idx.mcid_to_actual_text.get(&kb).map(|s| &**s), Some("beta"));
+    }
+
+    /// When the MCR omits `/Stm` (the parser hands the builder a
+    /// `McidScope::Page(p)`), the page namespace is used.
+    #[test]
+    fn actualtext_without_stm_falls_back_to_page_scope() {
+        let mut span = StructElem::new(StructType::Span);
+        span.actual_text = Some("plain".to_string());
+        span.add_child(StructChild::MarkedContentRef {
+            mcid: 5,
+            page: 2,
+            scope: crate::structure::McidScope::Page(2),
+        });
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(span);
+
+        let idx = build_actualtext_index(&tree);
+        let key = (crate::structure::McidScope::Page(2), 5);
+        assert!(idx.covered_mcids.contains(&key));
+        assert_eq!(idx.mcid_to_actual_text.get(&key).map(|s| &**s), Some("plain"));
+    }
+
+    /// Robustness: a malformed parent_tree / cycle should not panic
+    /// the builder. Tests the no-MCR case (the rest of the builder
+    /// is exercised by other tests).
+    #[test]
+    fn malformed_mcr_dict_does_not_panic_in_builder() {
+        // No descendants at all — drops the scope, returns empty index.
+        let mut span = StructElem::new(StructType::Span);
+        span.actual_text = Some("ghost".to_string());
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(span);
+        let idx = build_actualtext_index(&tree);
+        assert!(idx.is_empty());
+    }
+
+    /// Mixed scopes under one ActualText: Page-scoped descendants
+    /// follow the cross-page first-page rule; Form-scoped descendants
+    /// emit at every covered key (each form is its own namespace).
+    #[test]
+    fn mixed_scopes_under_one_actualtext_use_per_namespace_rules() {
+        let form_ref = crate::object::ObjectRef::new(50, 0);
+        let mut outer = StructElem::new(StructType::Span);
+        outer.actual_text = Some("alt".to_string());
+        // Page-scoped, page 0: this is the "first page" → emits.
+        outer.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Page(0),
+        });
+        // Page-scoped, page 1: not the first page → suppress-only.
+        outer.add_child(StructChild::MarkedContentRef {
+            mcid: 1,
+            page: 1,
+            scope: crate::structure::McidScope::Page(1),
+        });
+        // Form-scoped: independent namespace, emits regardless of
+        // page-scope first-page logic.
+        outer.add_child(StructChild::MarkedContentRef {
+            mcid: 0,
+            page: 0,
+            scope: crate::structure::McidScope::Form(form_ref),
+        });
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(outer);
+
+        let idx = build_actualtext_index(&tree);
+
+        let page0 = (crate::structure::McidScope::Page(0), 0);
+        let page1 = (crate::structure::McidScope::Page(1), 1);
+        let formk = (crate::structure::McidScope::Form(form_ref), 0);
+
+        // Page-scope first-page emits.
+        assert_eq!(idx.mcid_to_actual_text.get(&page0).map(|s| &**s), Some("alt"));
+        // Page-scope non-first-page is suppress-only.
+        assert!(idx.suppress_only.contains(&page1));
+        assert!(!idx.mcid_to_actual_text.contains_key(&page1));
+        // Form-scope emits independently of the page-first-page rule.
+        assert_eq!(idx.mcid_to_actual_text.get(&formk).map(|s| &**s), Some("alt"));
     }
 }
