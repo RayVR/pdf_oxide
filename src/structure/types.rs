@@ -3,7 +3,6 @@
 //! Implements structure element types according to ISO 32000-1:2008 Section 14.7.2.
 
 use crate::object::Object;
-use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -438,37 +437,59 @@ impl MarkInfo {
 /// the subtree rooted at the bearing element. Nested ActualText
 /// declarations override their ancestors for the spans they cover.
 ///
-/// This index resolves all those scopes in a single pre-order traversal
-/// so every extraction surface (`extract_text`, `to_markdown`, `to_html`,
-/// `extract_structured`) can apply ActualText consistently and without
-/// duplicating raw glyphs.
+/// ## Data model: keyed by `(page, mcid)`
+///
+/// MCIDs are scoped to a single page per spec §14.7.4 — a `u32` MCID
+/// alone is ambiguous across pages, so every entry in this index is
+/// keyed by `(page, mcid)`. Cross-page coverage of one ActualText scope
+/// produces one entry per `(page, mcid)` it covers; consumers handle
+/// the multi-page emit-once rule via [`Self::suppress_only`].
+///
+/// ## Emission model: mcid-driven, consecutive-run dedup
+///
+/// Consumers iterate per-page MCIDs in structure-tree order and emit
+/// `mcid_to_actual_text[(page, mcid)]` whenever the replacement
+/// changes between consecutive covered MCIDs. A subtree covering
+/// `[5, 6, 7]` with one replacement string therefore emits ONE
+/// replacement; a subtree where a nested ActualText overrides MCID 6
+/// gives THREE emissions (outer at 5, inner at 6, outer at 7), which
+/// is the correct inner-wins shape. Run-end is detected at the next
+/// non-covered MCID or at a covered MCID with a different replacement.
+///
+/// ## Visibility (OCG filtering)
+///
+/// When a covered MCID has been filtered out by an excluded OCG layer,
+/// the consumer skips emission for that MCID but does NOT break the
+/// consecutive-run dedup — so partial OCG visibility still emits the
+/// replacement at the first visible covered MCID in the run.
 #[derive(Debug, Clone, Default)]
 pub struct ActualTextIndex {
-    /// Map from leaf MCID → its innermost replacement text.
+    /// Map from `(page, mcid)` → its innermost replacement text.
     ///
-    /// A leaf MCID is one whose marked-content reference appears inside
-    /// the subtree of an ActualText-bearing element. The "innermost"
-    /// resolution honours nesting: when a descendant element redeclares
-    /// `/ActualText`, the descendant's text replaces the ancestor's for
-    /// MCIDs in the inner subtree.
-    pub mcid_to_actual_text: HashMap<u32, Arc<str>>,
+    /// The "innermost" resolution honours nesting: when a descendant
+    /// element redeclares `/ActualText`, the descendant's text replaces
+    /// the ancestor's for `(page, mcid)` keys in the inner subtree.
+    pub mcid_to_actual_text: HashMap<(u32, u32), Arc<str>>,
 
-    /// MCIDs whose raw glyph spans must be suppressed during assembly.
+    /// `(page, mcid)` pairs whose raw glyph spans must be suppressed
+    /// during assembly.
     ///
-    /// Every MCID present in [`Self::mcid_to_actual_text`] is also
-    /// present in this set. Suppression is required to prevent
-    /// duplicate output when the replacement text is emitted from an
-    /// [`ActualTextEmission`].
-    pub covered_mcids: HashSet<u32>,
+    /// Every key in [`Self::mcid_to_actual_text`] is present here, and
+    /// keys in [`Self::suppress_only`] are present here too. Suppression
+    /// prevents duplicate output: the replacement is emitted via the
+    /// mcid-driven walk, and raw glyphs for the same `(page, mcid)` are
+    /// dropped.
+    pub covered_mcids: HashSet<(u32, u32)>,
 
-    /// Emission points, in pre-order traversal order of the structure
-    /// tree.
+    /// `(page, mcid)` pairs that are covered (raw glyphs suppressed)
+    /// but must NOT emit a replacement.
     ///
-    /// Each entry corresponds to one ActualText-bearing structure
-    /// element and records where the replacement should be placed.
-    /// Multi-page subtrees emit on the first page only — see
-    /// [`ActualTextEmission::first_page`].
-    pub emissions: Vec<ActualTextEmission>,
+    /// This is how the index encodes "emit-once on the first page" for
+    /// multi-page ActualText subtrees: the bearing element's first-page
+    /// `(page, mcid)` entries land in [`Self::mcid_to_actual_text`];
+    /// every other page's `(page, mcid)` entries land here so the raw
+    /// glyphs are still suppressed but no second emission fires.
+    pub suppress_only: HashSet<(u32, u32)>,
 }
 
 impl ActualTextIndex {
@@ -479,39 +500,8 @@ impl ActualTextIndex {
 
     /// Returns true when no ActualText scopes were discovered.
     pub fn is_empty(&self) -> bool {
-        self.emissions.is_empty()
+        self.covered_mcids.is_empty()
     }
-}
-
-/// One ActualText replacement to be emitted into the assembled output.
-///
-/// An emission represents a single structure element that carries
-/// `/ActualText`. The replacement is emitted ONCE, on the first page
-/// where any of its descendant MCIDs appear (per ISO 32000-1:2008
-/// §14.9.4: ActualText replaces a region of content, not per-page
-/// repetition).
-#[derive(Debug, Clone)]
-pub struct ActualTextEmission {
-    /// The replacement text.
-    pub text: Arc<str>,
-
-    /// The first page (in struct-tree reading order) on which
-    /// descendant MCIDs appear. The emission is only produced when
-    /// assembling this page.
-    pub first_page: u32,
-
-    /// The descendant MCIDs covered by this emission, sorted ascending.
-    /// Used to:
-    /// 1. Decide whether the emission should be skipped because every
-    ///    covered MCID has been filtered out by an OCG layer.
-    /// 2. Position the synthesized span at the location of its first
-    ///    available descendant.
-    pub covered_mcids: SmallVec<[u32; 4]>,
-
-    /// The MCID whose ordered-content position determines where the
-    /// emission sits in reading order. Conventionally the first MCID
-    /// encountered in pre-order under the bearing element.
-    pub anchor_mcid: u32,
 }
 
 #[cfg(test)]

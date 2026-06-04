@@ -217,10 +217,9 @@ impl PdfBuilder {
             "<< /Marked true >>"
         };
         let oc_props = match ocg {
-            Some(o) => format!(
-                " /OCProperties << /OCGs [{} 0 R] /D << /Order [{} 0 R] >> >>",
-                o, o
-            ),
+            Some(o) => {
+                format!(" /OCProperties << /OCGs [{} 0 R] /D << /Order [{} 0 R] >> >>", o, o)
+            },
             None => String::new(),
         };
         objs.insert(
@@ -232,10 +231,7 @@ impl PdfBuilder {
             .into_bytes(),
         );
         if let (Some(ocg_num), Some(layer_name)) = (ocg, ocg_layer.clone()) {
-            objs.insert(
-                ocg_num,
-                format!("<< /Type /OCG /Name ({}) >>", layer_name).into_bytes(),
-            );
+            objs.insert(ocg_num, format!("<< /Type /OCG /Name ({}) >>", layer_name).into_bytes());
         }
 
         // Pages tree.
@@ -245,27 +241,17 @@ impl PdfBuilder {
             .join(" ");
         objs.insert(
             pages,
-            format!(
-                "<< /Type /Pages /Kids [{}] /Count {} >>",
-                kids, n_pages
-            )
-            .into_bytes(),
+            format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids, n_pages).into_bytes(),
         );
 
         // Font.
-        objs.insert(
-            font,
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-        );
+        objs.insert(font, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
 
         // Pages + contents.
         for i in 0..n_pages {
             let content_obj = first_content + i;
             let content_bytes = &self.page_contents[i as usize];
-            let stream_obj = format!(
-                "<< /Length {} >>\nstream\n",
-                content_bytes.len()
-            );
+            let stream_obj = format!("<< /Length {} >>\nstream\n", content_bytes.len());
             let mut stream = stream_obj.into_bytes();
             stream.extend_from_slice(content_bytes);
             stream.extend_from_slice(b"\nendstream");
@@ -322,18 +308,12 @@ impl PdfBuilder {
 
         // StructElems.
         for e in &self.elems {
-            let mut body = format!(
-                "<< /Type /StructElem /S /{} /P {} 0 R",
-                e.s, e.parent_obj
-            );
+            let mut body = format!("<< /Type /StructElem /S /{} /P {} 0 R", e.s, e.parent_obj);
             if let Some(pg) = e.page_obj {
                 body.push_str(&format!(" /Pg {} 0 R", pg));
             }
             if let Some(ref at) = e.actual_text {
-                body.push_str(&format!(
-                    " /ActualText {}",
-                    Self::pdf_string_utf16be(at)
-                ));
+                body.push_str(&format!(" /ActualText {}", Self::pdf_string_utf16be(at)));
             }
             if let Some(ref alt) = e.alt {
                 body.push_str(&format!(" /Alt {}", Self::pdf_string_utf16be(alt)));
@@ -344,11 +324,7 @@ impl PdfBuilder {
             // correct even when the bearing element has no /Pg of its
             // own (e.g. a multi-page heading).
             let mcr = |m: u32, pg_idx: u32| -> String {
-                format!(
-                    "<< /Type /MCR /Pg {} 0 R /MCID {} >>",
-                    first_page + pg_idx,
-                    m
-                )
+                format!("<< /Type /MCR /Pg {} 0 R /MCID {} >>", first_page + pg_idx, m)
             };
             if e.children.len() == 1 {
                 match &e.children[0] {
@@ -420,10 +396,7 @@ fn single_mcid_content(prefix_text: &str, mcid: u32, raw_glyph_text: &str) -> Ve
 fn three_mcid_content() -> Vec<u8> {
     let mut s = String::from("BT\n/F1 12 Tf\n50 700 Td\n");
     for m in [7u32, 8, 9] {
-        s.push_str(&format!(
-            "/Span << /MCID {} >> BDC\n(X) Tj\nEMC\n",
-            m
-        ));
+        s.push_str(&format!("/Span << /MCID {} >> BDC\n(X) Tj\nEMC\n", m));
     }
     s.push_str("ET\n");
     s.into_bytes()
@@ -431,11 +404,8 @@ fn three_mcid_content() -> Vec<u8> {
 
 /// Two-page page-0 content (one MCID) used by multi-page tests.
 fn one_mcid_simple(mcid: u32) -> Vec<u8> {
-    format!(
-        "BT\n/F1 12 Tf\n50 700 Td\n/Span << /MCID {} >> BDC\n(X) Tj\nEMC\nET\n",
-        mcid
-    )
-    .into_bytes()
+    format!("BT\n/F1 12 Tf\n50 700 Td\n/Span << /MCID {} >> BDC\n(X) Tj\nEMC\nET\n", mcid)
+        .into_bytes()
 }
 
 // ----------------------------------------------------------------------
@@ -453,7 +423,10 @@ fn fixture_simple() -> Vec<u8> {
             .to_vec(),
     );
     let _ = b.add_elem(
-        Elem::new(8, "Span", 7).page(4).actual_text("fi").k(K::Mcid(0, 0)),
+        Elem::new(8, "Span", 7)
+            .page(4)
+            .actual_text("fi")
+            .k(K::Mcid(0, 0)),
     );
     b.register_mcid(0, 0, 8);
     b.build()
@@ -470,20 +443,14 @@ fn actualtext_simple_emits_replacement_no_raw() {
     let html = doc.to_html(0, &opts).expect("to_html");
     let plain = doc.to_plain_text(0, &opts).expect("to_plain_text");
 
-    for (name, output) in [("extract_text", &extracted), ("to_markdown", &md),
-                            ("to_html", &html), ("to_plain_text", &plain)] {
-        assert!(
-            output.contains("fi"),
-            "{}: expected 'fi' (replacement), got {:?}",
-            name,
-            output
-        );
-        assert!(
-            !output.contains('X'),
-            "{}: raw 'X' must NOT appear, got {:?}",
-            name,
-            output
-        );
+    for (name, output) in [
+        ("extract_text", &extracted),
+        ("to_markdown", &md),
+        ("to_html", &html),
+        ("to_plain_text", &plain),
+    ] {
+        assert!(output.contains("fi"), "{}: expected 'fi' (replacement), got {:?}", name, output);
+        assert!(!output.contains('X'), "{}: raw 'X' must NOT appear, got {:?}", name, output);
     }
 }
 
@@ -497,10 +464,16 @@ fn fixture_nested_inner_wins() -> Vec<u8> {
     );
     // Outer Span (obj 8) wraps Inner Span (obj 9). Root elem comes first.
     let _outer = b.add_elem(
-        Elem::new(8, "Span", 7).page(4).actual_text("outer").k(K::Obj(9)),
+        Elem::new(8, "Span", 7)
+            .page(4)
+            .actual_text("outer")
+            .k(K::Obj(9)),
     );
     let _inner = b.add_elem(
-        Elem::new(9, "Span", 8).page(4).actual_text("inner").k(K::Mcid(0, 0)),
+        Elem::new(9, "Span", 8)
+            .page(4)
+            .actual_text("inner")
+            .k(K::Mcid(0, 0)),
     );
     b.register_mcid(0, 0, 9);
     b.build()
@@ -517,8 +490,12 @@ fn actualtext_nested_inner_wins() {
     let html = doc.to_html(0, &opts).expect("to_html");
     let plain = doc.to_plain_text(0, &opts).expect("to_plain_text");
 
-    for (name, output) in [("extract_text", &extracted), ("to_markdown", &md),
-                            ("to_html", &html), ("to_plain_text", &plain)] {
+    for (name, output) in [
+        ("extract_text", &extracted),
+        ("to_markdown", &md),
+        ("to_html", &html),
+        ("to_plain_text", &plain),
+    ] {
         assert!(
             output.contains("inner"),
             "{}: inner replacement must appear, got {:?}",
@@ -531,12 +508,7 @@ fn actualtext_nested_inner_wins() {
             name,
             output
         );
-        assert!(
-            !output.contains('X'),
-            "{}: raw 'X' must NOT appear, got {:?}",
-            name,
-            output
-        );
+        assert!(!output.contains('X'), "{}: raw 'X' must NOT appear, got {:?}", name, output);
     }
 }
 
@@ -568,8 +540,11 @@ fn actualtext_multi_mcid_subtree_emits_once() {
     let md = doc.to_markdown(0, &opts).expect("to_markdown");
     let html = doc.to_html(0, &opts).expect("to_html");
 
-    for (name, output) in [("extract_text", &extracted), ("to_markdown", &md), ("to_html", &html)]
-    {
+    for (name, output) in [
+        ("extract_text", &extracted),
+        ("to_markdown", &md),
+        ("to_html", &html),
+    ] {
         assert_eq!(
             output.matches("expanded").count(),
             1,
@@ -577,12 +552,7 @@ fn actualtext_multi_mcid_subtree_emits_once() {
             name,
             output
         );
-        assert!(
-            !output.contains('X'),
-            "{}: raw 'X' must NOT appear, got {:?}",
-            name,
-            output
-        );
+        assert!(!output.contains('X'), "{}: raw 'X' must NOT appear, got {:?}", name, output);
     }
 }
 
@@ -640,11 +610,7 @@ fn actualtext_multi_page_emits_only_first_page() {
         p1_md
     );
     // And page 1 must NOT leak the raw glyph either.
-    assert!(
-        !p1_text.contains('X'),
-        "page 1 raw glyph leak, got {:?}",
-        p1_text
-    );
+    assert!(!p1_text.contains('X'), "page 1 raw glyph leak, got {:?}", p1_text);
 }
 
 /// Fixture 6: /Alt + /ActualText — ActualText wins, /Alt is not output.
@@ -735,11 +701,7 @@ fn actualtext_on_figure_emits_replacement() {
         "figure ActualText must appear, got {:?}",
         extracted
     );
-    assert!(
-        !extracted.contains('X'),
-        "raw 'X' must NOT appear, got {:?}",
-        extracted
-    );
+    assert!(!extracted.contains('X'), "raw 'X' must NOT appear, got {:?}", extracted);
 }
 
 /// Fixture 9: Unicode (CJK + RTL + emoji) ActualText.
@@ -762,21 +724,13 @@ fn actualtext_unicode_round_trips() {
     let pdf = fixture_unicode();
     let doc = PdfDocument::from_bytes(pdf).expect("open");
     let extracted = doc.extract_text(0).expect("extract_text");
-    assert!(
-        extracted.contains("你好"),
-        "CJK characters must appear, got {:?}",
-        extracted
-    );
+    assert!(extracted.contains("你好"), "CJK characters must appear, got {:?}", extracted);
     assert!(
         extracted.contains("שלום"),
         "RTL Hebrew characters must appear, got {:?}",
         extracted
     );
-    assert!(
-        extracted.contains("🚀"),
-        "emoji must appear, got {:?}",
-        extracted
-    );
+    assert!(extracted.contains("🚀"), "emoji must appear, got {:?}", extracted);
 }
 
 /// Fixture 10: /MarkInfo /Suspects true — ActualText still emits.
@@ -803,11 +757,7 @@ fn actualtext_emits_when_suspects_true() {
         "ActualText must emit even when /MarkInfo /Suspects is true (decoupled from reading-order trust), got {:?}",
         extracted
     );
-    assert!(
-        !extracted.contains('X'),
-        "raw 'X' must NOT appear, got {:?}",
-        extracted
-    );
+    assert!(!extracted.contains('X'), "raw 'X' must NOT appear, got {:?}", extracted);
 }
 
 /// Fixture 3: MC-scope ActualText nested inside a struct-tree
@@ -851,11 +801,7 @@ fn mc_scope_actualtext_wins_over_struct_scope() {
         "struct-tree replacement 'struct' must NOT appear (MC-scope wins), got {:?}",
         extracted
     );
-    assert!(
-        !extracted.contains('X'),
-        "raw 'X' must NOT appear, got {:?}",
-        extracted
-    );
+    assert!(!extracted.contains('X'), "raw 'X' must NOT appear, got {:?}", extracted);
 }
 
 /// Fixture 11a: All covered MCIDs are inside an excluded OCG layer —
@@ -944,12 +890,7 @@ fn actualtext_cross_path_consistency() {
         ),
     ];
     for (name, out) in &surfaces {
-        assert!(
-            out.contains("fi"),
-            "{}: expected 'fi' on every surface, got {:?}",
-            name,
-            out
-        );
+        assert!(out.contains("fi"), "{}: expected 'fi' on every surface, got {:?}", name, out);
         assert!(
             !out.contains('X'),
             "{}: raw 'X' must NOT appear on any surface, got {:?}",
