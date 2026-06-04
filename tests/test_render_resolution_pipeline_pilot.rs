@@ -2539,15 +2539,15 @@ fn pilot_shading_type2_axial_type4_separation_pipeline_resolves_correctly() {
 // ---------- State preservation ----------
 
 #[test]
-fn pilot_shading_under_pipeline_preserves_ctm() {
-    // The `sh` arm reads `gs.ctm` and composes it with the page's
-    // base transform to map the shading's `/Coords` into device
-    // space. The pipeline pre-resolves the endpoint colours BEFORE
-    // `render_axial_shading` runs, so it never touches `gs`. To make
-    // the probe meaningful — i.e. to actually run the pipeline path
-    // rather than the trivial Device-family case — we use a Type 4
-    // Separation `/C0` so the helper produces magenta and the
-    // gradient stop changes colour off vs on.
+fn pilot_shading_type4_separation_under_pipeline_respects_user_space_ctm() {
+    // Capability-gain probe under a non-identity user-space CTM. The
+    // wave-4 splice only swaps the endpoint colours; it never touches
+    // the graphics state (the helper takes `&GraphicsState`, not
+    // `&mut`), so a true CTM perturbation isn't structurally
+    // expressible. What this test actually verifies is that a Type 4
+    // Separation `/C0` resolves to spec-correct magenta through the
+    // pipeline under a non-identity CTM, while the inline path keeps
+    // reading the raw `[1]` array as RGB white.
     //
     // CTM: scale by 50 and translate to (10, 10). The shading's
     // `/Coords [0 0 1 0]` maps the unit-x gradient from (10, 10) to
@@ -2556,9 +2556,7 @@ fn pilot_shading_under_pipeline_preserves_ctm() {
     // resolved magenta dominates the interpolation toward C1=white.
     //
     // In pixmap coordinates the renderer flips Y, so user (30, 10)
-    // lands at pixmap (30, 100 - 10) = (30, 90). If the pipeline
-    // perturbed the CTM, the gradient stripe would land elsewhere
-    // and this pixel would carry the page background.
+    // lands at pixmap (30, 100 - 10) = (30, 90).
     let type4 = "{ 0.0 exch 0.0 0.0 }";
     let content = "q\n50 0 0 50 10 10 cm\n/Sh1 sh\nQ\n";
     let space_str = "[/Separation /MagentaSpot /DeviceCMYK 6 0 R]";
@@ -2585,15 +2583,13 @@ fn pilot_shading_under_pipeline_preserves_ctm() {
     // (5, 5), which projects to t < 0 and lands in the Pad region.
     // This isolates the C0 value cleanly (no interpolation toward
     // C1), so we can pin the resolved-magenta vs raw-RGB-white
-    // divergence with tight thresholds. If the splice perturbed
-    // the CTM, the device-space gradient axis would shift and
-    // (5, 5) might no longer project to t < 0 — surfacing as a
-    // contaminated colour at this pixel.
+    // divergence with tight thresholds.
     let (r_on, g_on, b_on, a_on) = pixel_at(&on, 5, 95);
     assert!(
         r_on >= 250 && g_on <= 5 && b_on >= 250 && a_on == 255,
-        "pipeline's spliced clone must preserve the CTM so the gradient \
-         lands C0=magenta in the Pad region; got ({r_on}, {g_on}, {b_on}, {a_on})"
+        "under a non-identity CTM, the pipeline must paint the Pad-clamped \
+         C0 region pure magenta (Type-4 evaluation of /C0 [1] under the \
+         Separation space); got ({r_on}, {g_on}, {b_on}, {a_on})"
     );
 
     // The inline path reads /C0 [1] as `(1, 1, 1)` white, so the
@@ -2609,16 +2605,15 @@ fn pilot_shading_under_pipeline_preserves_ctm() {
 }
 
 #[test]
-fn pilot_shading_under_pipeline_preserves_clip() {
-    // Active `W n` clipping path. The shading paints across the
-    // whole pixmap; only pixels inside the clip box may be coloured.
-    // The pipeline splice operates on the endpoint colours — never
-    // on the clip stack — but a regression that read the clip from
-    // the wrong slot could leak paint outside.
-    //
-    // Same Type 4 Separation rationale as the CTM test: a Device
-    // `/C0` would short-circuit the resolver and skip the splice we
-    // want to probe.
+fn pilot_shading_type4_separation_under_pipeline_paints_clipped_region() {
+    // Capability-gain probe under an active `W n` clipping path.
+    // The wave-4 splice only swaps endpoint colours; it never
+    // perturbs the clip stack (the helper takes `&GraphicsState`,
+    // not `&mut`), so a true clip perturbation isn't structurally
+    // expressible. What this test actually verifies is that the
+    // pipeline's Type-4-Separation endpoint paints magenta only
+    // inside the clip box and leaves the page background untouched
+    // outside it.
     //
     // Clip: [30 60 70 100] in user space (the upper-right quarter).
     // Pixmap (top-left origin): x ∈ [30, 70], y ∈ [0, 40].
@@ -2648,9 +2643,7 @@ fn pilot_shading_under_pipeline_preserves_clip() {
          magenta; got ({r_in}, {g_in}, {b_in}, {a_in})"
     );
 
-    // Outside the clip box: page must be the white background. If
-    // the splice had perturbed the clip stack the shading would
-    // have painted this pixel too.
+    // Outside the clip box: page must be the white background.
     let (r_out, g_out, b_out, _) = pixel_at(&on, 10, 90);
     assert!(
         r_out >= 250 && g_out >= 250 && b_out >= 250,
