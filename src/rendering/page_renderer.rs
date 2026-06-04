@@ -1903,41 +1903,42 @@ impl PageRenderer {
         let cs_obj = shading.get("ColorSpace")?;
         let resolved_cs = doc.resolve_object(cs_obj).ok()?;
 
-        // Extract /C0 and /C1 from /Function. Handles Type 2
-        // (exponential) directly and Type 3 (stitching) by reading the
-        // first sub-function's /C0 and the last sub-function's /C1 —
-        // mirroring the layout `evaluate_shading_function` already
-        // understands.
+        // Per ISO 32000-1 §8.7.4.5.3, axial/radial shadings carry a
+        // `/Domain` array on the shading dict (default `[0 1]`) that
+        // names the parameter range mapped to the gradient axis.
+        // Geometric `t=0` evaluates the function at `Domain[0]` and
+        // `t=1` evaluates it at `Domain[1]` — the endpoints aren't
+        // necessarily `f(0)` and `f(1)`.
+        let (domain0, domain1) = shading
+            .get("Domain")
+            .and_then(|o| o.as_array())
+            .and_then(|arr| {
+                let d0 = arr.first()?;
+                let d1 = arr.get(1)?;
+                let parse = |o: &Object| -> Option<f32> {
+                    match o {
+                        Object::Real(v) => Some(*v as f32),
+                        Object::Integer(v) => Some(*v as f32),
+                        _ => None,
+                    }
+                };
+                Some((parse(d0)?, parse(d1)?))
+            })
+            .unwrap_or((0.0, 1.0));
+
+        // Extract endpoint component arrays from `/Function`. Handles
+        // Type 2 (exponential) — where the endpoints are evaluated by
+        // applying the shading's `/Domain` to the function's
+        // exponential interpolation — and Type 3 (stitching) — where
+        // the first sub-function's `/C0` and the last sub-function's
+        // `/C1` are taken at face value. Type 3 with non-trivial
+        // `/Encode` is not honoured (same gap as the inline
+        // `evaluate_shading_function` path); see the body comment
+        // below.
         let func_obj = shading.get("Function")?;
         let resolved_func = doc.resolve_object(func_obj).ok()?;
         let func_dict = resolved_func.as_dict()?;
         let func_type = func_dict.get("FunctionType").and_then(|o| o.as_integer())?;
-        let (c0_arr, c1_arr) = match func_type {
-            2 => {
-                let c0 = func_dict.get("C0").and_then(|o| o.as_array())?;
-                let c1 = func_dict.get("C1").and_then(|o| o.as_array())?;
-                (c0.clone(), c1.clone())
-            },
-            3 => {
-                let funcs = func_dict.get("Functions").and_then(|o| o.as_array())?;
-                let first = funcs.first()?;
-                let last = funcs.last().unwrap_or(first);
-                let first_resolved = doc.resolve_object(first).ok()?;
-                let last_resolved = doc.resolve_object(last).ok()?;
-                let first_dict = first_resolved.as_dict()?;
-                let last_dict = last_resolved.as_dict()?;
-                let c0 = first_dict.get("C0").and_then(|o| o.as_array())?;
-                let c1 = last_dict.get("C1").and_then(|o| o.as_array())?;
-                (c0.clone(), c1.clone())
-            },
-            // Function types 0 (sampled) and 4 (PostScript Type 4
-            // calculator) used as the shading's own /Function are
-            // out-of-scope for endpoint pre-resolution — they produce
-            // colours at intermediate domain points, not at two fixed
-            // /C0 / /C1 arrays. Caller falls back to inline.
-            _ => return None,
-        };
-
         let to_components = |arr: &[Object]| -> Vec<f32> {
             arr.iter()
                 .map(|o| match o {
@@ -1947,8 +1948,60 @@ impl PageRenderer {
                 })
                 .collect()
         };
-        let c0_comps = to_components(&c0_arr);
-        let c1_comps = to_components(&c1_arr);
+        let (c0_comps, c1_comps) = match func_type {
+            2 => {
+                // Type 2: exponential interpolation
+                // f(x) = C0 + x^N * (C1 - C0).
+                // The shading's geometric `t=0` evaluates `f(Domain[0])`
+                // and `t=1` evaluates `f(Domain[1])`, so when /Domain
+                // is non-default the endpoint colours are NOT raw /C0
+                // and /C1.
+                let c0 = to_components(func_dict.get("C0").and_then(|o| o.as_array())?);
+                let c1 = to_components(func_dict.get("C1").and_then(|o| o.as_array())?);
+                let n = func_dict
+                    .get("N")
+                    .and_then(|o| match o {
+                        Object::Real(v) => Some(*v as f32),
+                        Object::Integer(v) => Some(*v as f32),
+                        _ => None,
+                    })
+                    .unwrap_or(1.0);
+                let eval = |x: f32| -> Vec<f32> {
+                    let p = x.abs().powf(n) * x.signum();
+                    c0.iter()
+                        .zip(c1.iter())
+                        .map(|(a, b)| *a + p * (*b - *a))
+                        .collect()
+                };
+                (eval(domain0), eval(domain1))
+            },
+            3 => {
+                // Type 3: stitching. The shading's `/Domain` maps to a
+                // sub-function via stitching `/Bounds` and `/Encode`
+                // arrays. The current path takes the first
+                // sub-function's `/C0` and the last sub-function's
+                // `/C1` at face value — correct for the default
+                // `Domain [0 1]` with natural `Encode`, but ignores
+                // `Encode`-driven sub-domain remapping. Documented
+                // gap, same as `evaluate_shading_function`.
+                let funcs = func_dict.get("Functions").and_then(|o| o.as_array())?;
+                let first = funcs.first()?;
+                let last = funcs.last().unwrap_or(first);
+                let first_resolved = doc.resolve_object(first).ok()?;
+                let last_resolved = doc.resolve_object(last).ok()?;
+                let first_dict = first_resolved.as_dict()?;
+                let last_dict = last_resolved.as_dict()?;
+                let c0 = first_dict.get("C0").and_then(|o| o.as_array())?;
+                let c1 = last_dict.get("C1").and_then(|o| o.as_array())?;
+                (to_components(c0), to_components(c1))
+            },
+            // Function types 0 (sampled) and 4 (PostScript Type 4
+            // calculator) used as the shading's own /Function are
+            // out-of-scope for endpoint pre-resolution — they produce
+            // colours at intermediate domain points, not at two fixed
+            // /C0 / /C1 arrays. Caller falls back to inline.
+            _ => return None,
+        };
 
         // Fold in `gs.fill_alpha` here — it's the alpha the inline
         // code path multiplies into each gradient stop's RGBA when
@@ -2212,12 +2265,31 @@ impl PageRenderer {
         Ok(())
     }
 
-    /// Evaluate a shading function at t=0 and t=1 to get start/end colors.
+    /// Evaluate a shading function at the shading's `/Domain` endpoints
+    /// to get start/end colors. Per ISO 32000-1 §8.7.4.5.3 the gradient
+    /// parameter `t ∈ [0, 1]` maps to function input `x ∈ [Domain[0],
+    /// Domain[1]]` (default `[0, 1]`), so the start colour is
+    /// `f(Domain[0])` and the end colour is `f(Domain[1])`.
     fn evaluate_shading_function(
         &self,
         shading: &std::collections::HashMap<String, Object>,
         doc: &PdfDocument,
     ) -> Result<((f32, f32, f32), (f32, f32, f32))> {
+        let (domain0, domain1) = shading
+            .get("Domain")
+            .and_then(|o| o.as_array())
+            .and_then(|arr| {
+                let parse = |o: &Object| -> Option<f32> {
+                    match o {
+                        Object::Real(v) => Some(*v as f32),
+                        Object::Integer(v) => Some(*v as f32),
+                        _ => None,
+                    }
+                };
+                Some((parse(arr.first()?)?, parse(arr.get(1)?)?))
+            })
+            .unwrap_or((0.0, 1.0));
+
         // Try to parse a simple Type 2 (exponential interpolation) or Type 0 (sampled) function
         let func_obj = shading.get("Function");
         if let Some(func) = func_obj {
@@ -2229,7 +2301,9 @@ impl PageRenderer {
                     .unwrap_or(-1);
 
                 if func_type == 2 {
-                    // Type 2: Exponential interpolation f(x) = C0 + x^N * (C1 - C0)
+                    // Type 2: Exponential interpolation f(x) = C0 + x^N * (C1 - C0).
+                    // Evaluate at the shading's /Domain endpoints, not
+                    // raw /C0 and /C1.
                     let c0 = func_dict
                         .get("C0")
                         .and_then(|o| o.as_array())
@@ -2240,10 +2314,35 @@ impl PageRenderer {
                         .and_then(|o| o.as_array())
                         .map(|arr| Self::parse_color_array(arr))
                         .unwrap_or((1.0, 1.0, 1.0));
-                    return Ok((c0, c1));
+                    let n = func_dict
+                        .get("N")
+                        .and_then(|o| match o {
+                            Object::Real(v) => Some(*v as f32),
+                            Object::Integer(v) => Some(*v as f32),
+                            _ => None,
+                        })
+                        .unwrap_or(1.0);
+                    let lerp = |x: f32| -> (f32, f32, f32) {
+                        let p = x.abs().powf(n) * x.signum();
+                        (
+                            c0.0 + p * (c1.0 - c0.0),
+                            c0.1 + p * (c1.1 - c0.1),
+                            c0.2 + p * (c1.2 - c0.2),
+                        )
+                    };
+                    return Ok((lerp(domain0), lerp(domain1)));
                 } else if func_type == 3 {
-                    // Type 3: Stitching function — wraps multiple sub-functions
-                    // For gradient endpoints, evaluate first sub-function at domain bounds
+                    // Type 3: Stitching function — wraps multiple
+                    // sub-functions. For gradient endpoints, read the
+                    // first sub-function's `/C0` and the last
+                    // sub-function's `/C1` at face value. Per ISO
+                    // 32000-1 §7.10.4, the stitching `/Domain` is
+                    // partitioned by `/Bounds` and remapped per
+                    // sub-function via `/Encode`. The path below
+                    // honours neither — correct for the default
+                    // `Domain [0 1]` with natural `Encode` arrays, but
+                    // misrepresents non-default `Encode`-driven
+                    // sub-domain remapping. Documented gap.
                     if let Some(funcs) = func_dict.get("Functions").and_then(|o| o.as_array()) {
                         if let Some(first_func) = funcs.first() {
                             let sub_resolved = doc.resolve_object(first_func)?;
@@ -3416,6 +3515,13 @@ fn build_logical_color<'a>(
     // resolver's spec-conformance for these is verified by colour-stage
     // unit tests; routing through the same Device path keeps the pilot's
     // behaviour identical to the inline path for the non-Separation cases.
+    //
+    // Component-count mismatch (e.g. `/ColorSpace /DeviceCMYK` with only
+    // 1 component on the stack) falls through to the `_ =>` arm below,
+    // which routes through the resolver's gray fallback. Output happens
+    // to match the inline `parse_color_array` single-element-array
+    // expansion `(g, g, g)` — both paths paint the gray value across
+    // all three RGB channels.
     match space_name {
         "DeviceGray" | "G" if !components.is_empty() => {
             LogicalColor::Device(DeviceColor::Gray(components[0]))

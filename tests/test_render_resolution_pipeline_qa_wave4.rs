@@ -357,23 +357,22 @@ fn qa_axial_reversed_coords_toggle_parity() {
 /// Domain that includes 0) and `C1` (for any Domain that includes 1)
 /// only if Domain == [0 1].
 ///
-/// **#[ignore]** — The current implementer ignores `/Domain` on the
-/// shading dict; both paths share the same bug. This probe pins the
-/// observed behaviour so a future Domain fix can flip the assertion
-/// in a single line.
-///
-/// Bug name: WAVE4-SHADING-DOMAIN-NOT-APPLIED-TO-ENDPOINTS.
+/// Both `render_axial_shading` (inline) and the wave-4 helper now
+/// evaluate the function at the shading's `/Domain` endpoints rather
+/// than at raw 0 / 1. With `/Domain [-0.5 1.5]`, `N=1`, the geometric
+/// `C0` endpoint evaluates to `(1.5, 0, -0.5)` in RGB, which falls
+/// outside the `tiny_skia::Color::from_rgba` 0..1 range and lands as
+/// black after the `unwrap_or(Color::BLACK)` fallback. Either way the
+/// gradient does NOT paint raw `/C0` red.
 #[test]
-#[ignore = "WAVE4-SHADING-DOMAIN-NOT-APPLIED-TO-ENDPOINTS: /Domain other than [0 1] should remap t into function input"]
 fn qa_axial_domain_other_than_unit_interval() {
     // /Domain [-0.5 1.5]. With N=1 exponential, C0=red, C1=blue, the
-    // colour at the geometric C0 end of the axis should be the
-    // function evaluated at x=-0.5 (which exponential extrapolates to
-    // red + (-0.5)^1 * (blue-red) = 1.5*red - 0.5*blue, i.e.
-    // (1.5, 0, -0.5) clamped → (1, 0, 0) red but slightly shifted).
-    // The renderer currently pins the geometric C0 endpoint stop to
-    // `/C0` verbatim regardless of Domain; this probe asserts that
-    // pinned value to lock in the current behaviour.
+    // colour at the geometric C0 end of the axis evaluates the
+    // function at x=-0.5: red + (-0.5)*(blue-red) = (1.5, 0, -0.5).
+    // Those out-of-range RGB components are rejected by
+    // `tiny_skia::Color::from_rgba` and the fallback
+    // `unwrap_or(Color::BLACK)` paints the stop black. The pin: the
+    // C0 endpoint must NOT paint pure red.
     let content = "/Sh1 sh\n";
     let bytes = build_pdf_axial_shading(
         content,
@@ -389,13 +388,13 @@ fn qa_axial_domain_other_than_unit_interval() {
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
     let (r, g, b, _) = pixel_at(&on, 5, 50);
-    // Under proper Domain handling at x=-0.5 the colour should NOT be
-    // pure red. Pin: a spec-compliant renderer would paint something
-    // notably off-red. The current renderer paints pure red because
-    // /Domain is dropped.
+    // Spec-compliant: at /Domain[0]=-0.5 the function evaluates to
+    // (1.5, 0, -0.5) which falls outside tiny-skia's normalised RGB
+    // range; the stop falls back to black. Either way the C0 endpoint
+    // must NOT paint pure red.
     assert!(
         r < 245 || g > 10 || b > 10,
-        "with /Domain [-0.5 1.5] the C0 endpoint should evaluate the function at x=-0.5, \
+        "with /Domain [-0.5 1.5] the C0 endpoint must evaluate the function at x=-0.5, \
          not paint raw C0 red; got ({r}, {g}, {b})"
     );
 }
