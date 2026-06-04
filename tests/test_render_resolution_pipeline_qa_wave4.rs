@@ -532,3 +532,173 @@ fn qa_axial_extend_false_false_toggle_parity() {
     let on = render_with_pipeline(&doc, true);
     assert_eq!(off, on, "/Extend [false false] axial shading must keep off-vs-on parity");
 }
+
+// ===========================================================================
+// Probes 6-8 — Type 3 radial edges.
+//
+// `render_radial_shading` parses `/Coords [x0 y0 r0 x1 y1 r1]` but
+// **discards** `x0`, `y0`, and `r0` entirely — the start of the radial
+// is hard-coded to centre `(x1, y1)` with radius 0. This pre-existing
+// bug means non-concentric circles can't be rendered correctly and
+// non-zero `r0` is silently dropped. The wave-4 splice doesn't touch
+// this geometry — it only changes the two stop colours — but the QA
+// brief explicitly asks for these probes so we pin the current
+// behaviour and document the bug for a follow-up.
+// ===========================================================================
+
+/// Probe 6 — Non-concentric circles. `/Coords [x0 y0 r0 x1 y1 r1]`
+/// where (x0, y0) != (x1, y1). The PDF spec defines the gradient as
+/// a family of circles interpolating between the two, but
+/// `render_radial_shading` ignores x0/y0/r0 and centres both
+/// start and end on (x1, y1). Pin the toggle parity (the splice
+/// doesn't perturb the geometry) and the visible bug.
+///
+/// **#[ignore]** for the geometric probe — the visible result with
+/// non-concentric input matches concentric input around (x1, y1).
+///
+/// Bug name: WAVE4-RADIAL-NON-CONCENTRIC-COORDS-IGNORED.
+#[test]
+#[ignore = "WAVE4-RADIAL-NON-CONCENTRIC-COORDS-IGNORED: render_radial_shading discards x0/y0/r0 from /Coords"]
+fn qa_radial_non_concentric_circles_uses_x0_y0() {
+    // Inner circle at (20, 50) r=5; outer at (80, 50) r=30. A
+    // spec-compliant renderer would paint C0 red around (20, 50) and
+    // C1 white around (80, 50). The current renderer paints both
+    // around (80, 50). Pin: pixel at (20, 50) should be near-red if
+    // the gradient honoured x0/y0.
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_radial_shading(
+        content,
+        "/DeviceRGB",
+        "[20 50 5 80 50 30]",
+        "[1 0 0]",
+        "[1 1 1]",
+        "",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline(&doc, true);
+    let (r, g, b, _) = pixel_at(&on, 20, 50);
+    assert!(
+        r > 200 && g < 60 && b < 60,
+        "non-concentric radial: pixel at the inner-circle centre (20, 50) should be ~C0 red; \
+         got ({r}, {g}, {b}) — renderer is dropping x0/y0"
+    );
+}
+
+/// Probe 6b — Companion parity pin: the splice must preserve the
+/// (buggy) pre-existing geometry off vs on.
+#[test]
+fn qa_radial_non_concentric_circles_toggle_parity() {
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_radial_shading(
+        content,
+        "/DeviceRGB",
+        "[20 50 5 80 50 30]",
+        "[1 0 0]",
+        "[1 1 1]",
+        "",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "non-concentric radial DeviceRGB must keep off-vs-on parity");
+}
+
+/// Probe 7 — One zero-radius circle (origin point). `/Coords
+/// [x0 y0 0 x1 y1 r1]` defines a gradient growing from a point at
+/// (x0, y0) outward to a circle at (x1, y1) of radius r1. This is
+/// the most common radial-shading shape in real PDFs (highlight
+/// gradients, spotlight effects). The current renderer ignores
+/// (x0, y0, r0) and paints centred on (x1, y1) — the parity pin
+/// holds, the geometric correctness probe doesn't.
+///
+/// **#[ignore]** for the geometric pin.
+#[test]
+#[ignore = "WAVE4-RADIAL-NON-CONCENTRIC-COORDS-IGNORED: zero-radius inner circle at distinct (x0, y0) is dropped"]
+fn qa_radial_zero_radius_inner_at_distinct_point() {
+    // Inner point at (30, 30); outer circle at (60, 60) r=40. A
+    // correct renderer paints C0 only at (30, 30) and lerps outward.
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_radial_shading(
+        content,
+        "/DeviceRGB",
+        "[30 30 0 60 60 40]",
+        "[1 0 0]",
+        "[1 1 1]",
+        "",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline(&doc, true);
+    // Pixel close to the inner-circle origin should be near-C0 red
+    // under correct rendering. In pixmap coords y is flipped, so
+    // user (30, 30) maps to pixmap (30, 70).
+    let (r, g, b, _) = pixel_at(&on, 30, 70);
+    assert!(
+        r > 200 && g < 80 && b < 80,
+        "zero-r0 radial: pixel at the inner point should be ~C0; got ({r}, {g}, {b})"
+    );
+}
+
+/// Probe 7b — Companion parity pin for the zero-radius inner point.
+#[test]
+fn qa_radial_zero_radius_inner_at_distinct_point_toggle_parity() {
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_radial_shading(
+        content,
+        "/DeviceRGB",
+        "[30 30 0 60 60 40]",
+        "[1 0 0]",
+        "[1 1 1]",
+        "",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "zero-r0 radial DeviceRGB must keep off-vs-on parity");
+}
+
+/// Probe 8 — `/Extend [true true]`. The end-circle radius is small
+/// (r=20), centred at (50, 50). With Extend [true true] pixels
+/// outside the larger circle should be C1, pixels inside the
+/// degenerate inner point should be C0. The current renderer uses
+/// `SpreadMode::Pad` which happens to match the spec here — pin the
+/// parity and the visible behaviour.
+#[test]
+fn qa_radial_extend_true_true_toggle_parity_and_correctness() {
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_radial_shading(
+        content,
+        "/DeviceRGB",
+        "[50 50 0 50 50 20]",
+        "[1 0 0]", // C0 red (centre)
+        "[0 0 1]", // C1 blue (edge)
+        "/Extend [true true]",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "concentric radial /Extend [true true] must keep off-vs-on parity");
+
+    // Centre should be ~C0 red.
+    let (r_c, g_c, b_c, _) = pixel_at(&on, 50, 50);
+    assert!(
+        r_c > 200 && g_c < 80 && b_c < 80,
+        "radial centre should be ~C0 red; got ({r_c}, {g_c}, {b_c})"
+    );
+    // Corner of page (outside r=20 from centre): should be C1 blue
+    // under Pad/Extend-true.
+    let (r_e, g_e, b_e, _) = pixel_at(&on, 5, 5);
+    assert!(
+        b_e > 200 && r_e < 80 && g_e < 80,
+        "/Extend [true true] should fill outside radius with C1 blue; got ({r_e}, {g_e}, {b_e})"
+    );
+}
