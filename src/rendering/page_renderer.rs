@@ -213,15 +213,6 @@ pub struct PageRenderer {
     /// access per `render_page` invocation. Stays `None` (no allocation) when
     /// the set is empty — the common case.
     excluded_layers_snapshot: Option<Arc<HashSet<String>>>,
-    /// Cached truth value of the `PDF_OXIDE_RESOLUTION_PIPELINE` env var,
-    /// refreshed once per `render_page_with_options` call. The dispatcher
-    /// fires paint operators many thousands of times per page; reading the
-    /// env var on every `pipeline_resolve_rgba` call is well under a
-    /// microsecond but still measurable, and the toggle never changes
-    /// mid-render. Tests that flip the env var around `render_page` calls
-    /// pick up the new value on the next call because the cache is
-    /// recomputed there.
-    pipeline_enabled_cache: bool,
 }
 
 impl PageRenderer {
@@ -234,7 +225,6 @@ impl PageRenderer {
             fonts: HashMap::new(),
             color_spaces: HashMap::new(),
             excluded_layers_snapshot: None,
-            pipeline_enabled_cache: false,
         }
     }
 
@@ -252,12 +242,6 @@ impl PageRenderer {
         // Clear caches for new page
         self.fonts.clear();
         self.color_spaces.clear();
-
-        // Refresh the pipeline-toggle cache once per render. Tests that
-        // flip `PDF_OXIDE_RESOLUTION_PIPELINE` between renders pick up
-        // the new value here; the dispatcher reads the cached bool to
-        // avoid an env-var lookup per paint operator.
-        self.pipeline_enabled_cache = read_pipeline_env();
 
         // Refresh the excluded-layers snapshot once per page. The effective
         // set combines (a) the PDF's default-off OCGs per /OCProperties/D
@@ -1843,12 +1827,11 @@ impl PageRenderer {
         // per-vertex colours, not endpoints; this wave does NOT migrate
         // them. They fall straight through to the existing inline path,
         // unmodified.
-        let resolved_endpoints =
-            if self.pipeline_enabled_cache && (shading_type == 2 || shading_type == 3) {
-                self.pipeline_resolve_shading_endpoints(&shading, gs, doc)
-            } else {
-                None
-            };
+        let resolved_endpoints = if shading_type == 2 || shading_type == 3 {
+            self.pipeline_resolve_shading_endpoints(&shading, gs, doc)
+        } else {
+            None
+        };
 
         match shading_type {
             2 => self.render_axial_shading(
@@ -3245,9 +3228,6 @@ impl PageRenderer {
         gs: &GraphicsState,
         kind: PipelinePaintKind,
     ) -> Option<GraphicsState> {
-        if !self.pipeline_enabled_cache {
-            return None;
-        }
         let (fills, strokes) = match kind {
             // ImageMask paints the stencil with the current fill colour
             // and never reads the stroke side; at this helper layer it
@@ -3319,9 +3299,6 @@ impl PageRenderer {
         doc: &PdfDocument,
         gs: &GraphicsState,
     ) -> Option<ResolvedColors> {
-        if !self.pipeline_enabled_cache {
-            return None;
-        }
         if gs.render_mode == 3 {
             return None;
         }
@@ -3350,18 +3327,15 @@ impl PageRenderer {
         }
     }
 
-    /// Resolve the active colour for `side` through the resolution pipeline
-    /// when it is enabled. Returns `None` when the toggle is off (caller
-    /// keeps its inline behaviour) or when the resolver produces a non-RGBA
-    /// variant the composite backend cannot consume directly.
+    /// Resolve the active colour for `side` through the resolution pipeline.
+    /// Returns `None` when the resolver produces a non-RGBA variant the
+    /// composite backend cannot consume directly (per-channel outputs
+    /// reserved for separation backends).
     ///
-    /// When `PDF_OXIDE_RESOLUTION_PIPELINE` is unset or equal to "0", the
-    /// caller's existing path (read `gs.fill_color_rgb` /
-    /// `gs.stroke_color_rgb` directly) is the answer and this returns `None`.
-    /// When the toggle is on we route the current colour through
-    /// [`ResolutionPipeline`], which handles `Separation`/`DeviceN` colour
-    /// spaces backed by PostScript Type 4 tint transforms — the case the
-    /// inline match arms a few hundred lines up evaluate as `1.0 - tint`.
+    /// Routes the current colour through [`ResolutionPipeline`], which
+    /// handles `Separation`/`DeviceN` colour spaces backed by PostScript
+    /// Type 4 tint transforms — the case the inline match arms used to
+    /// evaluate as `1.0 - tint` before wave 5 deleted the fallback.
     ///
     /// Fill and stroke share one helper because the only differences are
     /// which `gs` fields supply the colour and which `PaintSide` the
@@ -3375,9 +3349,6 @@ impl PageRenderer {
         gs: &GraphicsState,
         side: PaintSide,
     ) -> Option<(f32, f32, f32, f32)> {
-        if !self.pipeline_enabled_cache {
-            return None;
-        }
         let pipeline = ResolutionPipeline::new();
         let color_spaces = &self.color_spaces;
         let ctx = ResolutionContext::new(doc, color_spaces);
@@ -3430,10 +3401,9 @@ impl PageRenderer {
     /// resolution because the gradient is composited as a single Source
     /// Over fill by the caller), and returns the RGBA.
     ///
-    /// Returns `None` when the toggle is off or when the resolver
-    /// produces a non-RGBA variant (per-channel outputs reserved for
-    /// future separation backends). The caller is then expected to fall
-    /// back to its inline behaviour.
+    /// Returns `None` only when the resolver produces a non-RGBA variant
+    /// (per-channel outputs reserved for separation backends). The
+    /// caller is then expected to fall back to its inline behaviour.
     pub(crate) fn pipeline_resolve_components(
         &self,
         doc: &PdfDocument,
@@ -3442,9 +3412,6 @@ impl PageRenderer {
         components: &[f32],
         alpha: f32,
     ) -> Option<(f32, f32, f32, f32)> {
-        if !self.pipeline_enabled_cache {
-            return None;
-        }
         // Derive a name + resolved-space pair from the supplied space
         // object. Two shapes appear in real PDFs for a shading dict's
         // `/ColorSpace`: a Name (either a Device alias like
@@ -3504,19 +3471,6 @@ impl PageRenderer {
             // caller's inline behaviour stays in force for those.
             _ => None,
         }
-    }
-}
-
-/// Read `PDF_OXIDE_RESOLUTION_PIPELINE` and parse it as a boolean toggle.
-///
-/// Called once per `render_page_with_options` invocation and the result
-/// is cached on `PageRenderer::pipeline_enabled_cache`; the dispatcher
-/// reads the cached bool. Tests pick up env-var flips on the next
-/// `render_page` call.
-fn read_pipeline_env() -> bool {
-    match std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE") {
-        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
     }
 }
 
@@ -4110,16 +4064,14 @@ mod tests {
     fn pipeline_resolve_text_colors_strokes_magenta_under_tr1() {
         // T-1 stroke-side resolution probe.
         //
-        // Construct a `PageRenderer` with the toggle on and a
-        // Separation/DeviceCMYK/Type-4 colour space attached to the
-        // stroke side. Under Tr=1 the helper must resolve the stroke
-        // side through the pipeline and yield the Type-4-evaluated RGB
-        // on the `stroke` channel of the returned `ResolvedColors`. The
-        // legacy `1.0 - tint = 0` fallback would put black on the stroke
-        // channel; the pipeline must produce magenta (R high, G low, B
-        // high).
+        // Construct a `PageRenderer` with a Separation/DeviceCMYK/Type-4
+        // colour space attached to the stroke side. Under Tr=1 the
+        // helper must resolve the stroke side through the pipeline and
+        // yield the Type-4-evaluated RGB on the `stroke` channel of the
+        // returned `ResolvedColors`. The legacy `1.0 - tint = 0`
+        // fallback would put black on the stroke channel; the pipeline
+        // must produce magenta (R high, G low, B high).
         let mut renderer = PageRenderer::new(RenderOptions::default());
-        renderer.pipeline_enabled_cache = true;
         renderer
             .color_spaces
             .insert("SpotMagenta".to_string(), type4_magenta_separation_space());
@@ -4157,8 +4109,7 @@ mod tests {
         // and return `None` — the caller borrows `gs` directly. This
         // keeps the toggle-on Device-family path (the common case)
         // allocation-free.
-        let mut renderer = PageRenderer::new(RenderOptions::default());
-        renderer.pipeline_enabled_cache = true;
+        let renderer = PageRenderer::new(RenderOptions::default());
 
         let mut gs = GraphicsState::new();
         gs.fill_color_space = "DeviceRGB".to_string();
@@ -4185,8 +4136,7 @@ mod tests {
         // `PipelinePaintKind::PathFill`: a Device-family fill whose
         // resolved RGBA already matches `gs.fill_color_rgb` returns
         // `None` (no clone), and the stroke side is never touched.
-        let mut renderer = PageRenderer::new(RenderOptions::default());
-        renderer.pipeline_enabled_cache = true;
+        let renderer = PageRenderer::new(RenderOptions::default());
 
         let mut gs = GraphicsState::new();
         gs.fill_color_space = "DeviceRGB".to_string();
@@ -4214,7 +4164,6 @@ mod tests {
         // routing — same helper, same colour-stage path, just driven
         // by the new variant.
         let mut renderer = PageRenderer::new(RenderOptions::default());
-        renderer.pipeline_enabled_cache = true;
         renderer
             .color_spaces
             .insert("SpotMagenta".to_string(), type4_magenta_separation_space());
@@ -4248,8 +4197,7 @@ mod tests {
         // a DeviceRGB whose resolved value equals the current gs fields
         // must produce no override (no per-element paint.set_color in
         // the rasteriser).
-        let mut renderer = PageRenderer::new(RenderOptions::default());
-        renderer.pipeline_enabled_cache = true;
+        let renderer = PageRenderer::new(RenderOptions::default());
 
         let mut gs = GraphicsState::new();
         gs.render_mode = 0;
@@ -4283,33 +4231,6 @@ mod tests {
         assert!(!rgba_matches((0.25, 0.5, 0.75, 0.5), (0.25, 0.5, 0.75), 1.0));
     }
 
-    #[test]
-    fn pipeline_resolve_text_colors_returns_none_when_toggle_off() {
-        // T-2 helper-disabled probe. With the toggle off the helper must
-        // return `None` regardless of how rich the inputs are — including
-        // a Tr=2 fill+stroke configuration that would otherwise drive
-        // both sides through the pipeline.
-        let renderer = PageRenderer::new(RenderOptions::default());
-        // `PageRenderer::new` leaves `pipeline_enabled_cache = false`; we
-        // re-assert it here as a guard against future drift in the
-        // constructor.
-        assert!(
-            !renderer.pipeline_enabled_cache,
-            "default-constructed renderer must have the pipeline toggle off"
-        );
-
-        let mut gs = GraphicsState::new();
-        gs.render_mode = 2;
-        gs.fill_color_space = "DeviceRGB".to_string();
-        gs.fill_color_components = smallvec![1.0, 0.0, 0.0];
-        gs.stroke_color_space = "DeviceRGB".to_string();
-        gs.stroke_color_components = smallvec![0.0, 0.0, 1.0];
-
-        let doc = fixture_doc();
-        let result = renderer.pipeline_resolve_text_colors(&doc, &gs);
-        assert!(result.is_none(), "helper must return None when the toggle is off; got Some(_)");
-    }
-
     // ---------------------------------------------------------------------
     // Wave 4 — `pipeline_resolve_components` helper unit pins.
     //
@@ -4329,8 +4250,7 @@ mod tests {
         // colour-stage and full-pipeline unit tests pin at lower
         // levels, here verified via the wave-4 shading-endpoint
         // overload.
-        let mut renderer = PageRenderer::new(RenderOptions::default());
-        renderer.pipeline_enabled_cache = true;
+        let renderer = PageRenderer::new(RenderOptions::default());
 
         let space = type4_magenta_separation_space();
         let doc = fixture_doc();
@@ -4359,8 +4279,7 @@ mod tests {
         // resolver's behaviour, not on the inline path: for each
         // device family the resolved RGBA must equal the
         // mathematically-correct device→RGB conversion.
-        let mut renderer = PageRenderer::new(RenderOptions::default());
-        renderer.pipeline_enabled_cache = true;
+        let renderer = PageRenderer::new(RenderOptions::default());
         let doc = fixture_doc();
         let color_spaces: HashMap<String, Object> = HashMap::new();
 
@@ -4406,33 +4325,6 @@ mod tests {
         assert!(
             r.abs() < 1.0e-3 && (g - 1.0).abs() < 1.0e-3 && (b - 1.0).abs() < 1.0e-3,
             "DeviceCMYK pure cyan must map to (0, 1, 1) under additive clamp; got ({r}, {g}, {b})"
-        );
-    }
-
-    #[test]
-    fn pipeline_resolve_components_returns_none_when_toggle_off() {
-        // The toggle is the gate the dispatcher relies on. With the
-        // cached toggle off, the helper must return None even when
-        // the inputs would otherwise resolve cleanly.
-        let renderer = PageRenderer::new(RenderOptions::default());
-        // Default-constructed renderer has the toggle off; pin that.
-        assert!(
-            !renderer.pipeline_enabled_cache,
-            "default-constructed renderer must have the pipeline toggle off"
-        );
-        let doc = fixture_doc();
-        let color_spaces: HashMap<String, Object> = HashMap::new();
-        let space = Object::Name("DeviceRGB".to_string());
-        let result = renderer.pipeline_resolve_components(
-            &doc,
-            &color_spaces,
-            &space,
-            &[1.0, 0.0, 0.0],
-            1.0,
-        );
-        assert!(
-            result.is_none(),
-            "helper must return None when toggle is off, even for valid DeviceRGB input"
         );
     }
 }
