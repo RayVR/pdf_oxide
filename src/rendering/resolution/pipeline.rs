@@ -80,11 +80,10 @@ impl ResolutionPipeline {
         let clip = self.clip.resolve_with_mask(clip_mask);
 
         Ok(ResolvedPaintCmd {
-            // PaintKind doesn't implement Clone (it borrows the path/font/
-            // image handle from the operator walker), so we re-construct
-            // here. The match yields the same variant kinds with the same
-            // borrows.
-            kind: kind_copy(&intent.kind),
+            // PaintKind is `Copy` — every variant holds only borrows
+            // and primitive copy types — so the memberwise copy is a
+            // single dereference.
+            kind: intent.kind,
             side: intent.side,
             color,
             overprint,
@@ -92,26 +91,6 @@ impl ResolutionPipeline {
             clip,
             ctm: intent.ctm,
         })
-    }
-}
-
-/// Shallow copy of [`super::intent::PaintKind`]. Each variant carries only
-/// borrows and copy types so this is genuinely a memberwise copy.
-fn kind_copy<'a>(k: &super::intent::PaintKind<'a>) -> super::intent::PaintKind<'a> {
-    use super::intent::PaintKind;
-    match *k {
-        PaintKind::Path { path, fill_rule } => PaintKind::Path { path, fill_rule },
-        PaintKind::Glyph {
-            glyph_id,
-            font,
-            advance_user,
-        } => PaintKind::Glyph {
-            glyph_id,
-            font,
-            advance_user,
-        },
-        PaintKind::Image { xobj_name } => PaintKind::Image { xobj_name },
-        PaintKind::Shading { shading_name } => PaintKind::Shading { shading_name },
     }
 }
 

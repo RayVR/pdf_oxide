@@ -20,6 +20,13 @@ use smallvec::SmallVec;
 
 /// The kind of paint operation being intended. Each variant corresponds to a
 /// family of PDF operators that all need the same resolved-colour evaluation.
+///
+/// All variants hold only `&'a T` references and primitive `Copy` types
+/// (`u16`, `f32`, `tiny_skia::FillRule`), so the enum derives `Copy`:
+/// the pipeline composer can copy a `PaintKind` into the
+/// [`super::ResolvedPaintCmd`] memberwise without an explicit clone
+/// match.
+#[derive(Clone, Copy)]
 pub(crate) enum PaintKind<'a> {
     /// Path fill / stroke (`f`, `F`, `S`, `B`, `b`, `f*`, `B*`, `b*`).
     /// `fill_rule` is meaningful only for fill sides; stroke sides ignore it.
