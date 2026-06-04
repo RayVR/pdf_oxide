@@ -2515,14 +2515,8 @@ fn paint_image_mask_to_plates(
         Object::Stream { dict, .. } => dict,
         _ => return Ok(()),
     };
-    let w = dict
-        .get("Width")
-        .and_then(|o| o.as_integer())
-        .unwrap_or(0) as usize;
-    let h = dict
-        .get("Height")
-        .and_then(|o| o.as_integer())
-        .unwrap_or(0) as usize;
+    let w = dict.get("Width").and_then(|o| o.as_integer()).unwrap_or(0) as usize;
+    let h = dict.get("Height").and_then(|o| o.as_integer()).unwrap_or(0) as usize;
     let pixel_count = w * h;
     if pixel_count == 0 {
         return Ok(());

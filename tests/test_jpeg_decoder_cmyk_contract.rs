@@ -51,17 +51,8 @@ fn jpeg_decoder_returns_straight_cmyk_for_app14_inverted_input() {
             chunk[0] > 200,
             "pixel {i}: Cyan channel after jpeg-decoder auto-inversion (expected ≳255); got {chunk:?}"
         );
-        assert!(
-            chunk[1] < 50,
-            "pixel {i}: Magenta channel low (expected ≈0); got {chunk:?}"
-        );
-        assert!(
-            chunk[2] < 50,
-            "pixel {i}: Yellow channel low (expected ≈0); got {chunk:?}"
-        );
-        assert!(
-            chunk[3] < 50,
-            "pixel {i}: Black channel low (expected ≈0); got {chunk:?}"
-        );
+        assert!(chunk[1] < 50, "pixel {i}: Magenta channel low (expected ≈0); got {chunk:?}");
+        assert!(chunk[2] < 50, "pixel {i}: Yellow channel low (expected ≈0); got {chunk:?}");
+        assert!(chunk[3] < 50, "pixel {i}: Black channel low (expected ≈0); got {chunk:?}");
     }
 }

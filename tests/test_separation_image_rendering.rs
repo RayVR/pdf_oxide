@@ -390,13 +390,9 @@ fn build_pdf_with_separation_image_decode(
 #[test]
 fn separation_image_decode_array_inverts_routing() {
     let samples = vec![0u8]; // 1×1 raw sample of 0; under /Decode [1 0] → full tint
-    let doc = PdfDocument::from_bytes(build_pdf_with_separation_image_decode(
-        &samples,
-        1,
-        1,
-        [1.0, 0.0],
-    ))
-    .expect("parse");
+    let doc =
+        PdfDocument::from_bytes(build_pdf_with_separation_image_decode(&samples, 1, 1, [1.0, 0.0]))
+            .expect("parse");
     let plates = render_separations(&doc, 0, 72).expect("render");
     let pantone = plate(&plates, "Pantone-185");
     assert!(
@@ -511,9 +507,7 @@ fn devicen_image_routes_each_channel_to_its_named_plate() {
     buf.extend_from_slice(&samples);
     buf.extend_from_slice(b"\nendstream\nendobj\n");
     offsets.push(buf.len());
-    buf.extend_from_slice(
-        b"6 0 obj\n[/DeviceN [/SpotRed /SpotBlue] /DeviceCMYK 7 0 R]\nendobj\n",
-    );
+    buf.extend_from_slice(b"6 0 obj\n[/DeviceN [/SpotRed /SpotBlue] /DeviceCMYK 7 0 R]\nendobj\n");
     offsets.push(buf.len());
     // Identity-ish tint transform: returns CMYK = (0, c0, c1, 0). For plate
     // routing the tint transform is not consulted (per the per-plate
@@ -569,7 +563,6 @@ fn encode_cmyk_jpeg(cmyk: &[u8], width: u16, height: u16) -> Vec<u8> {
         .expect("encode CMYK JPEG");
     out
 }
-
 
 /// Build a single-page PDF with a JPEG-encoded DeviceCMYK image.
 fn build_pdf_with_cmyk_jpeg(jpeg: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -640,4 +633,3 @@ fn cmyk_jpeg_app14_inversion_round_trips_to_correct_plate() {
          inversion; got M={magenta_v} Y={yellow_v} K={black_v}"
     );
 }
-
