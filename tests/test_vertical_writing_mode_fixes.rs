@@ -127,11 +127,7 @@ end"
         pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            xref
-        )
-        .as_bytes(),
+        format!("trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref).as_bytes(),
     );
 
     pdf
@@ -212,11 +208,7 @@ fn c2_c4_extractor_tj_array_vertical_advances_along_y() {
     let xs: Vec<f32> = s.iter().map(|sp| sp.bbox.x).collect();
     let x_min = xs.iter().cloned().fold(f32::INFINITY, f32::min);
     let x_max = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    assert!(
-        (x_max - x_min) < 1.0,
-        "vertical TJ array must keep X stable; got xs={:?}",
-        xs
-    );
+    assert!((x_max - x_min) < 1.0, "vertical TJ array must keep X stable; got xs={:?}", xs);
 
     // Y must decrease across the operator: A is at the top, B follows below.
     let a = s.iter().find(|sp| sp.text.contains('A')).unwrap();
@@ -281,15 +273,8 @@ fn c4_extract_chars_vertical_tj_offset_advances_along_y() {
 fn c5_to_unicode_wmode_does_not_override_encoding_wmode() {
     // Stale /WMode 1 def inside the ToUnicode prologue.
     let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj <0002> Tj ET";
-    let pdf = build_pdf(
-        "Identity-H",
-        content,
-        1000,
-        (880, -1000),
-        None,
-        Some("/WMode 1 def"),
-        None,
-    );
+    let pdf =
+        build_pdf("Identity-H", content, 1000, (880, -1000), None, Some("/WMode 1 def"), None);
     let doc = PdfDocument::from_bytes(pdf).expect("parse synthetic horizontal PDF");
     let spans = doc.extract_spans(0).expect("extract spans");
 
@@ -428,11 +413,7 @@ end";
         pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            xref
-        )
-        .as_bytes(),
+        format!("trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref).as_bytes(),
     );
 
     let doc = PdfDocument::from_bytes(pdf).expect("parse tategaki PDF");
@@ -551,10 +532,13 @@ endcmap
 CMapName currentdict /CMap defineresource pop
 end
 end";
-    // Two BT/ET blocks: the first paints A under Identity-H (F1), the
-    // second paints B under Identity-V (F2). Using separate BT/ET blocks
-    // sidesteps any in-flight buffer coalescing.
-    let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj ET BT /F2 12 Tf 200 600 Td <0002> Tj ET";
+    // One BT/ET, position set ONCE, then alternate Tf/Tj inside the
+    // block. Mid-BT Tf must flush the pending Tj span buffer so the
+    // post-switch glyph is emitted under its new font + wmode. (Earlier
+    // drafts used two BT/ET blocks as a defensive workaround; the
+    // probe36 investigation in the QA pass confirmed the in-block
+    // flush is correct, so the workaround is no longer required.)
+    let content = b"BT 100 700 Td /F1 12 Tf <0001> Tj /F2 12 Tf <0002> Tj ET";
 
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -603,11 +587,7 @@ end";
         pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer << /Size 10 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            xref
-        )
-        .as_bytes(),
+        format!("trailer << /Size 10 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref).as_bytes(),
     );
 
     let doc = PdfDocument::from_bytes(pdf).expect("parse mid-stream Tf PDF");
@@ -686,11 +666,7 @@ end";
         pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            xref
-        )
-        .as_bytes(),
+        format!("trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref).as_bytes(),
     );
 
     let doc = PdfDocument::from_bytes(pdf).expect("parse high-CID PDF");
@@ -759,8 +735,8 @@ fn c1_page_renderer_multi_tj_vertical_paints_a_column() {
     let doc = PdfDocument::from_bytes(pdf).expect("parse synthetic vertical PDF");
 
     let opts = pdf_oxide::rendering::RenderOptions::with_dpi(72).as_raw();
-    let rendered = pdf_oxide::rendering::render_page(&doc, 0, &opts)
-        .expect("render page 0 of vertical PDF");
+    let rendered =
+        pdf_oxide::rendering::render_page(&doc, 0, &opts).expect("render page 0 of vertical PDF");
 
     // Find the bounding box of non-white pixels. The renderer falls back
     // to rectangle painting when no system font is found, so the painted
@@ -798,10 +774,7 @@ fn c1_page_renderer_multi_tj_vertical_paints_a_column() {
             }
         }
     }
-    assert!(
-        hits > 100,
-        "vertical render produced too few non-white pixels ({hits})"
-    );
+    assert!(hits > 100, "vertical render produced too few non-white pixels ({hits})");
     let dx = (x_max - x_min) as f32;
     let dy = (y_max - y_min) as f32;
     // Three glyphs stacked vertically must occupy more y-extent than
@@ -818,15 +791,7 @@ fn c1_page_renderer_multi_tj_vertical_paints_a_column() {
 #[test]
 fn i2_tz_does_not_scale_vertical_advance() {
     let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj <0002> Tj ET";
-    let pdf = build_pdf(
-        "Identity-V",
-        content,
-        1000,
-        (880, -1000),
-        None,
-        None,
-        Some(150),
-    );
+    let pdf = build_pdf("Identity-V", content, 1000, (880, -1000), None, None, Some(150));
     let doc = PdfDocument::from_bytes(pdf).expect("parse synthetic vertical PDF (Tz=150)");
     let chars = doc.extract_chars(0).expect("extract chars (Tz=150)");
 

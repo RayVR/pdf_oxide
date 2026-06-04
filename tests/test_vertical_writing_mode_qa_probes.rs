@@ -51,7 +51,17 @@ fn build_pdf_full(
     extra_fonts: Option<&str>, // already-formatted bytes like "/F2 8 0 R"
     extra_objs: Option<&[(usize, Vec<u8>)]>, // (obj_num, body_bytes-without-num-prefix)
 ) -> Vec<u8> {
-    build_pdf_full_named("TestFont", encoding_name, content, dw, dw2, w2, cmap_extra, extra_fonts, extra_objs)
+    build_pdf_full_named(
+        "TestFont",
+        encoding_name,
+        content,
+        dw,
+        dw2,
+        w2,
+        cmap_extra,
+        extra_fonts,
+        extra_objs,
+    )
 }
 
 /// Like `build_pdf_full` but lets the caller supply a unique BaseFont name
@@ -172,12 +182,8 @@ end"
         pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer << /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            max_n + 1,
-            xref
-        )
-        .as_bytes(),
+        format!("trailer << /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", max_n + 1, xref)
+            .as_bytes(),
     );
     pdf
 }
@@ -224,8 +230,16 @@ fn probe05_pure_horizontal_extraction_advances_by_expected_x_steps() {
     let b = chars.iter().find(|c| c.char == 'B').expect("B");
     let c = chars.iter().find(|c| c.char == 'C').expect("C");
     // Each glyph occupies 12.0 user-space units at fs=12, DW=1000.
-    assert!((b.bbox.x - a.bbox.x - 12.0).abs() < 0.05, "A→B Δx ≠ 12.0: {}", b.bbox.x - a.bbox.x);
-    assert!((c.bbox.x - b.bbox.x - 12.0).abs() < 0.05, "B→C Δx ≠ 12.0: {}", c.bbox.x - b.bbox.x);
+    assert!(
+        (b.bbox.x - a.bbox.x - 12.0).abs() < 0.05,
+        "A→B Δx ≠ 12.0: {}",
+        b.bbox.x - a.bbox.x
+    );
+    assert!(
+        (c.bbox.x - b.bbox.x - 12.0).abs() < 0.05,
+        "B→C Δx ≠ 12.0: {}",
+        c.bbox.x - b.bbox.x
+    );
     // Y is stable at 700.
     assert!((a.bbox.y - 700.0).abs() < 1.0);
     assert!((b.bbox.y - 700.0).abs() < 1.0);
@@ -233,7 +247,11 @@ fn probe05_pure_horizontal_extraction_advances_by_expected_x_steps() {
     // wmode tag survives as 0.
     let spans = doc.extract_spans(0).expect("extract_spans");
     for s in &spans {
-        assert_eq!(s.wmode, 0, "horizontal page must keep wmode=0; got {} for {:?}", s.wmode, s.text);
+        assert_eq!(
+            s.wmode, 0,
+            "horizontal page must keep wmode=0; got {} for {:?}",
+            s.wmode, s.text
+        );
     }
 }
 
@@ -257,7 +275,11 @@ fn probe06_pipeline_does_not_route_pure_horizontal_through_tategaki() {
     // Horizontal LTR (Simple/Geometric/etc) must produce ascending X order:
     // A → B → C. Tategaki would reverse to right-to-left, giving C → B → A.
     let combined: String = ordered.iter().map(|o| o.span.text.as_str()).collect();
-    assert_eq!(combined, "ABC", "pure-horizontal page must NOT use tategaki sort; got {}", combined);
+    assert_eq!(
+        combined, "ABC",
+        "pure-horizontal page must NOT use tategaki sort; got {}",
+        combined
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +365,11 @@ fn probe09_boundary_thresholds() {
     let combined: String = ordered.iter().map(|o| o.span.text.as_str()).collect();
     // Horizontal sort: A B V (A and B left to right, V below). Must not be
     // right-to-left tategaki.
-    assert!(combined.starts_with('A'), "1/3 vertical must use horizontal sort; got {}", combined);
+    assert!(
+        combined.starts_with('A'),
+        "1/3 vertical must use horizontal sort; got {}",
+        combined
+    );
 
     // 2 vertical, 1 horizontal → 2*2 >= 3 → vertical majority.
     let spans2 = vec![
@@ -352,7 +378,9 @@ fn probe09_boundary_thresholds() {
         span_with_wmode("A", 100.0, 700.0, 0),
     ];
     let pipeline = TextPipeline::new();
-    let ordered = pipeline.process(spans2, ReadingOrderContext::new()).unwrap();
+    let ordered = pipeline
+        .process(spans2, ReadingOrderContext::new())
+        .unwrap();
     let combined: String = ordered.iter().map(|o| o.span.text.as_str()).collect();
     // Vertical majority: rightmost first → V then W then A.
     assert_eq!(combined, "VWA", "2/3 vertical must use tategaki; got {}", combined);
@@ -382,7 +410,10 @@ fn probe10_per_span_wmode_visible_via_extract_spans_but_not_in_html_output() {
     assert!(
         spans.iter().any(|s| s.wmode == 1),
         "at least one span must carry wmode=1 from Identity-V; spans = {:?}",
-        spans.iter().map(|s| (s.text.as_str(), s.wmode)).collect::<Vec<_>>()
+        spans
+            .iter()
+            .map(|s| (s.text.as_str(), s.wmode))
+            .collect::<Vec<_>>()
     );
 
     // HTML output does NOT propagate wmode (no writing-mode CSS).
@@ -571,14 +602,8 @@ fn probe16_w2_for_cid_without_horizontal_width_does_not_crash() {
     // No /W array, only /W2 — CID 1 has vertical metrics, horizontal falls
     // back to /DW = 1000.
     let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj ET";
-    let pdf = build_pdf(
-        "Identity-V",
-        content,
-        1000,
-        (880, -1000),
-        Some("[1 [-500 250 600]]"),
-        None,
-    );
+    let pdf =
+        build_pdf("Identity-V", content, 1000, (880, -1000), Some("[1 [-500 250 600]]"), None);
     let doc = PdfDocument::from_bytes(pdf).expect("parse");
     let chars = doc.extract_chars(0).expect("extract_chars");
     let a = chars.iter().find(|c| c.char == 'A').expect("A char");
@@ -624,14 +649,8 @@ fn probe17_w2_at_u16_max_does_not_panic_in_parse() {
 fn probe18_negative_v_x_v_y_in_w2_preserved() {
     // Negative v_x and v_y in a Form A triple.
     let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj ET";
-    let pdf = build_pdf(
-        "Identity-V",
-        content,
-        1000,
-        (880, -1000),
-        Some("[1 [-500 -100 -200]]"),
-        None,
-    );
+    let pdf =
+        build_pdf("Identity-V", content, 1000, (880, -1000), Some("[1 [-500 -100 -200]]"), None);
     let doc = PdfDocument::from_bytes(pdf).expect("parse");
     let chars = doc.extract_chars(0).expect("extract_chars");
     let a = chars.iter().find(|c| c.char == 'A').expect("A char");
@@ -687,10 +706,8 @@ fn probe20_w2_indirect_reference_resolves() {
     // Unique BaseFont to avoid cache poisoning — see probe_cache_poison_*.
     // The font's /W2 points to object 8, which holds the array.
     let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj <0002> Tj ET";
-    let extra_objs: Vec<(usize, Vec<u8>)> = vec![(
-        8,
-        b"8 0 obj [1 [-500 250 600]] endobj\n".to_vec(),
-    )];
+    let extra_objs: Vec<(usize, Vec<u8>)> =
+        vec![(8, b"8 0 obj [1 [-500 250 600]] endobj\n".to_vec())];
     let pdf = build_pdf_full_named(
         "Probe20Font",
         "Identity-V",
@@ -902,14 +919,11 @@ end";
         pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            xref
-        )
-        .as_bytes(),
+        format!("trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref).as_bytes(),
     );
     // Don't panic — extraction can fall back to empty or partial.
-    let doc = PdfDocument::from_bytes(pdf).expect("parse — must not panic on missing CIDSystemInfo");
+    let doc =
+        PdfDocument::from_bytes(pdf).expect("parse — must not panic on missing CIDSystemInfo");
     let _ = doc.extract_chars(0);
     let _ = doc.extract_spans(0);
 }
@@ -1013,10 +1027,9 @@ fn probe32_horizontal_text_with_90deg_rotated_ctm_advances_perpendicularly() {
     let pdf = build_pdf("Identity-H", content, 1000, (880, -1000), None, None);
     let doc = PdfDocument::from_bytes(pdf).expect("parse rotated horizontal");
     let chars = doc.extract_chars(0).expect("extract_chars");
-    if let (Some(a), Some(b)) = (
-        chars.iter().find(|c| c.char == 'A'),
-        chars.iter().find(|c| c.char == 'B'),
-    ) {
+    if let (Some(a), Some(b)) =
+        (chars.iter().find(|c| c.char == 'A'), chars.iter().find(|c| c.char == 'B'))
+    {
         // Under a 90° CCW CTM, the horizontal Tj advance becomes a +Y user
         // space advance. So B.y > A.y, and A.x ≈ B.x.
         let dx = (a.bbox.x - b.bbox.x).abs();
@@ -1069,7 +1082,11 @@ fn probe34_save_restore_preserves_outer_wmode() {
     let doc = PdfDocument::from_bytes(pdf).expect("parse");
     let spans = doc.extract_spans(0).expect("extract_spans");
     for s in &spans {
-        assert_eq!(s.wmode, 1, "wmode=1 must survive save/restore boundary; span {:?} has wmode={}", s.text, s.wmode);
+        assert_eq!(
+            s.wmode, 1,
+            "wmode=1 must survive save/restore boundary; span {:?} has wmode={}",
+            s.text, s.wmode
+        );
     }
 }
 
@@ -1191,7 +1208,9 @@ end";
         b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /FXO 8 0 R >> >> >> endobj\n",
     );
     let o4 = pdf.len();
-    pdf.extend_from_slice(format!("4 0 obj << /Length {} >> stream\n", page_content.len()).as_bytes());
+    pdf.extend_from_slice(
+        format!("4 0 obj << /Length {} >> stream\n", page_content.len()).as_bytes(),
+    );
     pdf.extend_from_slice(page_content);
     pdf.extend_from_slice(b"\nendstream\nendobj\n");
     let o5 = pdf.len();
@@ -1222,11 +1241,7 @@ end";
         pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer << /Size 9 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            xref
-        )
-        .as_bytes(),
+        format!("trailer << /Size 9 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref).as_bytes(),
     );
 
     let doc = PdfDocument::from_bytes(pdf).expect("parse XObject PDF");
@@ -1316,14 +1331,8 @@ fn probe_cache_poison_w2_collision_across_documents() {
     // PDF A: no /W2 override → CID 1 advances per /DW2 → dy=12.
     let pdf_a = build_pdf("Identity-V", content, 1000, (880, -1000), None, None);
     // PDF B: explicit /W2 forcing CID 1 to w1y=-500 → dy=6.
-    let pdf_b = build_pdf(
-        "Identity-V",
-        content,
-        1000,
-        (880, -1000),
-        Some("[1 [-500 250 600]]"),
-        None,
-    );
+    let pdf_b =
+        build_pdf("Identity-V", content, 1000, (880, -1000), Some("[1 [-500 250 600]]"), None);
 
     // Force PDF A to land in the cache first.
     let doc_a = PdfDocument::from_bytes(pdf_a).expect("parse A");
@@ -1389,10 +1398,20 @@ endbfchar
 endcmap
 end
 end";
-    let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj \
-                    /F2 12 Tf 200 700 Td <0002> Tj \
-                    /F1 12 Tf 300 700 Td <0003> Tj \
-                    /F2 12 Tf 400 700 Td <0004> Tj ET";
+    // Single BT/ET, position set ONCE via Td, then alternate Tf/Tj. This is
+    // the actual mid-BT Tf reproducer: every Tf inside the BT block must
+    // flush the pending Tj span buffer for its previous font and start a
+    // fresh buffer for the new font. (The earlier draft used cumulative Td
+    // between Tjs, which placed B/C/D far off the MediaBox and ran them
+    // straight into the postprocess off-page filter — incidentally
+    // unrelated to Tf flushing. The advance inside the block stays
+    // on-page: F1 is /Identity-V so its glyph advance is vertical;
+    // F2 is /Identity-H so it advances horizontally.)
+    let content = b"BT 100 700 Td \
+                    /F1 12 Tf <0001> Tj \
+                    /F2 12 Tf <0002> Tj \
+                    /F1 12 Tf <0003> Tj \
+                    /F2 12 Tf <0004> Tj ET";
 
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -1434,11 +1453,7 @@ end";
         pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer << /Size 10 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            xref
-        )
-        .as_bytes(),
+        format!("trailer << /Size 10 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref).as_bytes(),
     );
 
     let doc = PdfDocument::from_bytes(pdf).expect("parse two-font PDF");
@@ -1448,7 +1463,10 @@ end";
     let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
     let combined: String = texts.iter().copied().collect();
     assert!(
-        combined.contains('A') && combined.contains('B') && combined.contains('C') && combined.contains('D'),
+        combined.contains('A')
+            && combined.contains('B')
+            && combined.contains('C')
+            && combined.contains('D'),
         "mid-BT Tf font switch must emit all four glyphs as spans; got {:?}",
         texts
     );

@@ -4127,9 +4127,23 @@ impl<'doc> TextExtractor<'doc> {
                 },
             };
 
-            // Check if this span should be merged with the current one
+            // Spans drawn under different writing modes must never merge,
+            // even when their baselines coincide. A horizontal (`wmode=0`)
+            // span advances along x; a vertical (`wmode=1`) span advances
+            // along y. The text-level merge semantics (same word, same line,
+            // gap small enough to glue) all assume a single advance axis,
+            // and the bbox-extension at the end of the merge branch grows
+            // a horizontal bbox even if the right-hand side was a vertical
+            // column. Fold per-span wmode into the line-equality test
+            // up-front so all downstream merge variants (same-font,
+            // cross-font glue, small-caps, decimal-merge) inherit the
+            // gate. Without this, `BT 100 700 Td /F1 12 Tf (A) Tj
+            // /F2 12 Tf (B) Tj ET` with F1 horizontal + F2 vertical glues
+            // the two glyphs into a single horizontal span and clobbers
+            // the wmode metadata for the vertical glyph.
+            let wmode_compatible = current.wmode == span.wmode;
             let y_diff = (span.bbox.y - current.bbox.y).abs();
-            let same_line = y_diff < 1.0;
+            let same_line = y_diff < 1.0 && wmode_compatible;
 
             // Gap between end of current span and start of next span
             let current_end_x = current.bbox.x + current.bbox.width;
@@ -8000,14 +8014,16 @@ impl<'doc> TextExtractor<'doc> {
             let mut tx = if wmode == 0 {
                 glyph_width_user_space
                     + char_space * hs_factor
-                    + if char_code == 32 { word_space * hs_factor } else { 0.0 }
+                    + if char_code == 32 {
+                        word_space * hs_factor
+                    } else {
+                        0.0
+                    }
             } else {
                 let w1y = font
                     .map(|f| f.get_vertical_metrics(char_code).w1y)
                     .unwrap_or(crate::fonts::VerticalMetrics::SPEC_DEFAULT.w1y);
-                w1y * fs_factor
-                    + char_space
-                    + if char_code == 32 { word_space } else { 0.0 }
+                w1y * fs_factor + char_space + if char_code == 32 { word_space } else { 0.0 }
             };
 
             // For TextChar, we use the device-space width
