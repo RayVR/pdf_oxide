@@ -133,6 +133,7 @@ pub(crate) mod intent;
 pub(crate) mod overprint;
 pub(crate) mod pipeline;
 pub(crate) mod resolved;
+pub(crate) mod separation_backend;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -149,3 +150,4 @@ pub(crate) use resolved::{
     BlendPlan, ClipPlan, InkName, OverprintPlan, ParticipatingChannel, ResolvedColor,
     ResolvedPaintCmd,
 };
+pub(crate) use separation_backend::{SeparationBackend, SeparationSurface};
