@@ -702,3 +702,231 @@ fn qa_radial_extend_true_true_toggle_parity_and_correctness() {
         "/Extend [true true] should fill outside radius with C1 blue; got ({r_e}, {g_e}, {b_e})"
     );
 }
+
+// ===========================================================================
+// Probes 9-12 — Colour space stress.
+//
+// Wave-4's central capability: the shading dict's `/ColorSpace` finally
+// participates. The pilot covers Type-4 Separation/DeviceCMYK; this
+// probe group covers ICCBased N=4 (the most common spot CMYK proxy),
+// Indexed (lookup-table palette), DeviceN with multi-colorant Type-4
+// (multi-spot inks), and an inline-`/ColorSpace` form Type-4 Separation
+// (capability cross-check against the pilot's pattern).
+// ===========================================================================
+
+/// Probe 9 — Inline `/ColorSpace [/Separation /Magenta /DeviceCMYK
+/// <Type4>]` with `/C0 [1]`. Same shape the pilot covers as a
+/// stand-alone capability test; included here too so a regression that
+/// drops the inline-array branch of `pipeline_resolve_components`
+/// fails both files. Asserts the pipeline paints magenta at C0; the
+/// inline path paints white (it reads `/C0 [1]` as `(1, 1, 1)` RGB
+/// via the 1-element grayscale fallback in `parse_color_array`).
+#[test]
+fn qa_inline_separation_devicecmyk_type4_capability_pin() {
+    let type4 = "0.0 exch 0.0 0.0";
+    let func_obj = type4_function_object(6, type4, "[0 1 0 1 0 1 0 1]");
+    let bytes = build_pdf_axial_shading(
+        "/Sh1 sh\n",
+        "[/Separation /MagentaSpot /DeviceCMYK 6 0 R]",
+        "[0 50 100 50]",
+        "[1]",
+        "[1]",
+        "",
+        "",
+        "",
+        &[(6, func_obj)],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    // Inline at x=5 reads /C0 [1] as RGB(1, 1, 1) white.
+    let (r_off, g_off, b_off, _) = pixel_at(&off, 5, 50);
+    assert!(
+        r_off > 240 && g_off > 240 && b_off > 240,
+        "inline path reads /C0 [1] as white; got ({r_off}, {g_off}, {b_off})"
+    );
+    // Pipeline evaluates the Type-4 program → CMYK(0, 1, 0, 0) →
+    // RGB(1, 0, 1) magenta.
+    let (r_on, g_on, b_on, _) = pixel_at(&on, 5, 50);
+    assert!(
+        r_on >= 250 && g_on <= 5 && b_on >= 250,
+        "pipeline path must paint Type-4 magenta at C0 end; got ({r_on}, {g_on}, {b_on})"
+    );
+    assert_ne!(off, on);
+}
+
+/// Probe 10 — Shading with `/ColorSpace [/ICCBased <stream ref>]`,
+/// `/N 4` (CMYK-ish ICC profile), and `/C0 [0 1 0 0]` (magenta in
+/// CMYK). The inline path's `parse_color_array` reads only the first
+/// three components (`(0, 1, 0)` → green!), while the pipeline routes
+/// the components through the ICCBased branch which dispatches on
+/// `/N`: `N=4` → `four_as_cmyk` → CMYK(0, 1, 0, 0) → RGB magenta
+/// (1, 0, 1). The pipeline gets magenta; the inline path gets green.
+/// This is a capability gain — pin both behaviours.
+#[test]
+fn qa_iccbased_n4_cmyk_endpoint_pipeline_corrects_inline_truncation() {
+    // ICC profile stream: empty body is enough — the wave-4 helper
+    // reads only the dict (looks at /N), not the profile bytes.
+    let icc_stream = "6 0 obj\n<< /N 4 /Length 0 >>\nstream\n\nendstream\nendobj\n";
+    let space_str = "[/ICCBased 6 0 R]";
+    let bytes = build_pdf_axial_shading(
+        "/Sh1 sh\n",
+        space_str,
+        "[0 50 100 50]",
+        "[0 1 0 0]", // CMYK(0, 1, 0, 0) = magenta
+        "[0 1 0 0]", // C1 also magenta — keeps the whole gradient magenta
+        "",
+        "",
+        "",
+        &[(6, icc_stream.to_string())],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Inline path: parse_color_array reads (0, 1, 0) as RGB → green.
+    let (r_off, g_off, b_off, _) = center_pixel(&off);
+    assert!(
+        g_off > 200 && r_off < 60 && b_off < 60,
+        "inline path reads ICCBased N=4 /C0 [0 1 0 0] as RGB(0, 1, 0) green; \
+         got ({r_off}, {g_off}, {b_off})"
+    );
+
+    // Pipeline path: ICC N=4 → CMYK → RGB(1, 0, 1) magenta.
+    let (r_on, g_on, b_on, _) = center_pixel(&on);
+    assert!(
+        r_on > 240 && g_on < 20 && b_on > 240,
+        "pipeline must convert ICCBased N=4 /C0 [0 1 0 0] through CMYK→RGB to magenta; \
+         got ({r_on}, {g_on}, {b_on})"
+    );
+
+    // Capability gain — pixmaps must differ.
+    assert_ne!(
+        off, on,
+        "ICCBased N=4 endpoint must drive a visible toggle-on vs toggle-off delta"
+    );
+}
+
+/// Probe 11 — Shading with `/ColorSpace [/Indexed /DeviceRGB 255
+/// <lookup>]` and `/C0 [200]` (index into the lookup table). The
+/// pipeline does NOT do palette lookup — `resolve_indexed` returns
+/// `index/255` as a gray triple — so the resolved RGBA is
+/// `(0.784, 0.784, 0.784, alpha)`. The inline path's `parse_color_array`
+/// reads `[200]` as a 1-element grayscale → `(200, 200, 200)` as f32;
+/// `tiny_skia::Color::from_rgba` rejects those out-of-[0,1] values and
+/// the gradient stop falls back to `Color::BLACK`. Result: the
+/// pipeline paints a mid-grey gradient, the inline path paints black.
+///
+/// This is a toggle-on-vs-off **divergence**; both behaviours are
+/// "wrong" by spec (neither path does the palette lookup), but the
+/// pipeline's clamp accidentally produces a more sensible visible
+/// result. Pin both sides — the divergence is a known capability gap
+/// for Indexed gradients pending a proper palette-lookup
+/// implementation.
+#[test]
+fn qa_indexed_endpoint_pipeline_clamps_inline_falls_to_black() {
+    // Lookup table: 256 entries of arbitrary RGB. We never read it
+    // (neither path does the lookup), but it must be present for the
+    // PDF to be well-formed.
+    let lookup_stream = {
+        // 256 * 3 = 768 bytes of palette data. Zero-fill is fine —
+        // we're proving the renderer doesn't read it.
+        let body = vec![0u8; 768];
+        let header = format!("6 0 obj\n<< /Length {} >>\nstream\n", body.len());
+        let mut s = header.into_bytes();
+        s.extend_from_slice(&body);
+        s.extend_from_slice(b"\nendstream\nendobj\n");
+        String::from_utf8(s).unwrap()
+    };
+    let space_str = "[/Indexed /DeviceRGB 255 6 0 R]";
+    let bytes = build_pdf_axial_shading(
+        "/Sh1 sh\n",
+        space_str,
+        "[0 50 100 50]",
+        "[200]", // index 200
+        "[200]", // both endpoints same — colour is uniform across the gradient
+        "",
+        "",
+        "",
+        &[(6, lookup_stream)],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Inline: parse_color_array gives (200.0, 200.0, 200.0).
+    // tiny_skia rejects out-of-range and falls back to BLACK.
+    let (r_off, g_off, b_off, a_off) = center_pixel(&off);
+    assert!(
+        r_off < 20 && g_off < 20 && b_off < 20 && a_off == 255,
+        "inline Indexed-endpoint [200] falls back to BLACK (out-of-range f32); \
+         got ({r_off}, {g_off}, {b_off}, {a_off})"
+    );
+
+    // Pipeline: resolve_indexed clamps to gray = 200/255 ≈ 0.784.
+    let (r_on, g_on, b_on, a_on) = center_pixel(&on);
+    assert!(
+        r_on > 180 && r_on < 220 && g_on == r_on && b_on == r_on && a_on == 255,
+        "pipeline Indexed-endpoint must clamp to gray = index/255 ≈ 200; \
+         got ({r_on}, {g_on}, {b_on}, {a_on})"
+    );
+
+    assert_ne!(off, on, "Indexed endpoint must visibly diverge inline-black vs pipeline-gray");
+}
+
+/// Probe 12 — Shading with `/ColorSpace [/DeviceN [/SpotA /SpotB]
+/// /DeviceCMYK <Type4 multi-input>]`. Two colorants; the Type-4 tint
+/// transform takes two inputs and emits four CMYK outputs. `/C0
+/// [1 0]` (full SpotA, no SpotB) — the program "exch pop 0 1 0 0"
+/// maps that to CMYK(0, 1, 0, 0) magenta. The inline path
+/// `parse_color_array` reads `[1 0]` as a 2-element array → falls to
+/// the `(0, 0, 0)` else branch (black). The pipeline routes through
+/// `resolve_separation_or_devicen` → Type-4 evaluator → CMYK→RGB
+/// magenta.
+#[test]
+fn qa_devicen_two_colorant_type4_capability_pin() {
+    // Type-4 program: takes 2 inputs (SpotA tint, SpotB tint),
+    // returns 4 outputs (CMYK). Stack: bottom (last-evaluated) is
+    // top. PostScript `{ pop pop 0 1 0 0 }` discards both inputs
+    // and pushes constant magenta CMYK. Simpler than a real tint
+    // transform but adequate for the capability probe.
+    let program = "pop pop 0 1 0 0";
+    let func_obj = type4_function_object_multi(6, program, "[0 1 0 1]", "[0 1 0 1 0 1 0 1]");
+    let space_str = "[/DeviceN [/SpotA /SpotB] /DeviceCMYK 6 0 R]";
+    let bytes = build_pdf_axial_shading(
+        "/Sh1 sh\n",
+        space_str,
+        "[0 50 100 50]",
+        "[1 0]", // SpotA full, SpotB none
+        "[1 0]",
+        "",
+        "",
+        "",
+        &[(6, func_obj)],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Inline: parse_color_array on [1 0] (2 elements) falls to the
+    // else branch → (0, 0, 0) black. tiny_skia accepts those, paints
+    // black.
+    let (r_off, g_off, b_off, _) = center_pixel(&off);
+    assert!(
+        r_off < 20 && g_off < 20 && b_off < 20,
+        "inline DeviceN 2-component /C0 [1 0] falls to (0, 0, 0) black; \
+         got ({r_off}, {g_off}, {b_off})"
+    );
+
+    // Pipeline: DeviceN/CMYK/Type-4 → magenta.
+    let (r_on, g_on, b_on, _) = center_pixel(&on);
+    assert!(
+        r_on > 240 && g_on < 20 && b_on > 240,
+        "pipeline DeviceN/CMYK/Type-4 must produce magenta; got ({r_on}, {g_on}, {b_on})"
+    );
+
+    assert_ne!(
+        off, on,
+        "DeviceN multi-colorant Type-4 must drive a visible toggle-on vs off delta"
+    );
+}
