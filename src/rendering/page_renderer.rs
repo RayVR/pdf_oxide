@@ -21,6 +21,10 @@ use crate::error::{Error, Result};
 use crate::object::{Object, ObjectRef};
 use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState};
 use crate::rendering::path_rasterizer::PathRasterizer;
+use crate::rendering::resolution::{
+    DeviceColor, LogicalColor, PaintIntent, PaintKind, PaintSide, ResolutionContext,
+    ResolutionPipeline, ResolvedColor,
+};
 use crate::rendering::text_rasterizer::TextRasterizer;
 
 use crate::fonts::FontInfo;
@@ -509,40 +513,60 @@ impl PageRenderer {
 
                 // Color operators
                 Operator::SetFillRgb { r, g, b } => {
-                    gs_stack.current_mut().fill_color_rgb = (*r, *g, *b);
-                    gs_stack.current_mut().fill_color_space = "DeviceRGB".to_string();
+                    let gs = gs_stack.current_mut();
+                    gs.fill_color_rgb = (*r, *g, *b);
+                    gs.fill_color_space = "DeviceRGB".to_string();
+                    gs.fill_color_components.clear();
+                    gs.fill_color_components.extend_from_slice(&[*r, *g, *b]);
                     log::debug!("SetFillRgb: [{}, {}, {}]", r, g, b);
                 },
                 Operator::SetStrokeRgb { r, g, b } => {
-                    gs_stack.current_mut().stroke_color_rgb = (*r, *g, *b);
-                    gs_stack.current_mut().stroke_color_space = "DeviceRGB".to_string();
+                    let gs = gs_stack.current_mut();
+                    gs.stroke_color_rgb = (*r, *g, *b);
+                    gs.stroke_color_space = "DeviceRGB".to_string();
+                    gs.stroke_color_components.clear();
+                    gs.stroke_color_components.extend_from_slice(&[*r, *g, *b]);
                     log::debug!("SetStrokeRgb: [{}, {}, {}]", r, g, b);
                 },
                 Operator::SetFillGray { gray } => {
                     let g = *gray;
-                    gs_stack.current_mut().fill_color_rgb = (g, g, g);
-                    gs_stack.current_mut().fill_color_space = "DeviceGray".to_string();
+                    let gs = gs_stack.current_mut();
+                    gs.fill_color_rgb = (g, g, g);
+                    gs.fill_color_space = "DeviceGray".to_string();
+                    gs.fill_color_components.clear();
+                    gs.fill_color_components.push(g);
                     log::debug!("SetFillGray: {}", g);
                 },
                 Operator::SetStrokeGray { gray } => {
                     let g = *gray;
-                    gs_stack.current_mut().stroke_color_rgb = (g, g, g);
-                    gs_stack.current_mut().stroke_color_space = "DeviceGray".to_string();
+                    let gs = gs_stack.current_mut();
+                    gs.stroke_color_rgb = (g, g, g);
+                    gs.stroke_color_space = "DeviceGray".to_string();
+                    gs.stroke_color_components.clear();
+                    gs.stroke_color_components.push(g);
                     log::debug!("SetStrokeGray: {}", g);
                 },
                 Operator::SetFillCmyk { c, m, y, k } => {
                     // Convert CMYK to RGB
                     let (r, g, b) = cmyk_to_rgb(*c, *m, *y, *k);
-                    gs_stack.current_mut().fill_color_rgb = (r, g, b);
-                    gs_stack.current_mut().fill_color_cmyk = Some((*c, *m, *y, *k));
-                    gs_stack.current_mut().fill_color_space = "DeviceCMYK".to_string();
+                    let gs = gs_stack.current_mut();
+                    gs.fill_color_rgb = (r, g, b);
+                    gs.fill_color_cmyk = Some((*c, *m, *y, *k));
+                    gs.fill_color_space = "DeviceCMYK".to_string();
+                    gs.fill_color_components.clear();
+                    gs.fill_color_components
+                        .extend_from_slice(&[*c, *m, *y, *k]);
                     log::debug!("SetFillCmyk: [{}, {}, {}, {}] -> {:?}", c, m, y, k, (r, g, b));
                 },
                 Operator::SetStrokeCmyk { c, m, y, k } => {
                     let (r, g, b) = cmyk_to_rgb(*c, *m, *y, *k);
-                    gs_stack.current_mut().stroke_color_rgb = (r, g, b);
-                    gs_stack.current_mut().stroke_color_cmyk = Some((*c, *m, *y, *k));
-                    gs_stack.current_mut().stroke_color_space = "DeviceCMYK".to_string();
+                    let gs = gs_stack.current_mut();
+                    gs.stroke_color_rgb = (r, g, b);
+                    gs.stroke_color_cmyk = Some((*c, *m, *y, *k));
+                    gs.stroke_color_space = "DeviceCMYK".to_string();
+                    gs.stroke_color_components.clear();
+                    gs.stroke_color_components
+                        .extend_from_slice(&[*c, *m, *y, *k]);
                     log::debug!("SetStrokeCmyk: [{}, {}, {}, {}] -> {:?}", c, m, y, k, (r, g, b));
                 },
 
@@ -558,6 +582,8 @@ impl PageRenderer {
                     let gs = gs_stack.current_mut();
                     let space_name = gs.fill_color_space.clone();
                     let resolved_space = self.color_spaces.get(&space_name);
+                    gs.fill_color_components.clear();
+                    gs.fill_color_components.extend_from_slice(components);
 
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
@@ -723,6 +749,8 @@ impl PageRenderer {
                     let gs = gs_stack.current_mut();
                     let space_name = gs.stroke_color_space.clone();
                     let resolved_space = self.color_spaces.get(&space_name);
+                    gs.stroke_color_components.clear();
+                    gs.stroke_color_components.extend_from_slice(components);
 
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
@@ -803,6 +831,8 @@ impl PageRenderer {
                     let gs = gs_stack.current_mut();
                     let space_name = gs.fill_color_space.clone();
                     let resolved_space = self.color_spaces.get(&space_name);
+                    gs.fill_color_components.clear();
+                    gs.fill_color_components.extend_from_slice(components);
 
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
@@ -890,6 +920,8 @@ impl PageRenderer {
                     let gs = gs_stack.current_mut();
                     let space_name = gs.stroke_color_space.clone();
                     let resolved_space = self.color_spaces.get(&space_name);
+                    gs.stroke_color_components.clear();
+                    gs.stroke_color_components.extend_from_slice(components);
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
                             let g = components[0];
@@ -1068,15 +1100,36 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
+                            // Pilot routing: when the resolution-pipeline toggle
+                            // is on, evaluate the active fill colour through the
+                            // pipeline (which handles Type 4 tint transforms) and
+                            // splice the resulting RGBA into a transient
+                            // GraphicsState copy that the rasteriser consumes.
+                            // Off → no behaviour change.
+                            let pipeline_rgba = self.pipeline_resolve_fill_rgba(doc, gs);
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            self.path_rasterizer.fill_path_clipped(
-                                pixmap,
-                                &path,
-                                transform,
-                                gs,
-                                tiny_skia::FillRule::Winding,
-                                clip,
-                            );
+                            if let Some((r, g, b, a)) = pipeline_rgba {
+                                let mut spliced = gs.clone();
+                                spliced.fill_color_rgb = (r, g, b);
+                                spliced.fill_alpha = a;
+                                self.path_rasterizer.fill_path_clipped(
+                                    pixmap,
+                                    &path,
+                                    transform,
+                                    &spliced,
+                                    tiny_skia::FillRule::Winding,
+                                    clip,
+                                );
+                            } else {
+                                self.path_rasterizer.fill_path_clipped(
+                                    pixmap,
+                                    &path,
+                                    transform,
+                                    gs,
+                                    tiny_skia::FillRule::Winding,
+                                    clip,
+                                );
+                            }
                         }
                     } else {
                         let _ = current_path.finish();
@@ -1125,18 +1178,40 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
+                            let pipeline_rgba = self.pipeline_resolve_fill_rgba(doc, gs);
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            self.path_rasterizer.fill_path_clipped(
-                                pixmap,
-                                &path,
-                                transform,
-                                gs,
-                                tiny_skia::FillRule::EvenOdd,
-                                clip,
-                            );
-                            if matches!(op, Operator::FillStrokeEvenOdd) {
-                                self.path_rasterizer
-                                    .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                            if let Some((r, g, b, a)) = pipeline_rgba {
+                                let mut spliced = gs.clone();
+                                spliced.fill_color_rgb = (r, g, b);
+                                spliced.fill_alpha = a;
+                                self.path_rasterizer.fill_path_clipped(
+                                    pixmap,
+                                    &path,
+                                    transform,
+                                    &spliced,
+                                    tiny_skia::FillRule::EvenOdd,
+                                    clip,
+                                );
+                                if matches!(op, Operator::FillStrokeEvenOdd) {
+                                    // Stroke side is out of scope for the
+                                    // pilot — fall back to the existing
+                                    // colour.
+                                    self.path_rasterizer
+                                        .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                                }
+                            } else {
+                                self.path_rasterizer.fill_path_clipped(
+                                    pixmap,
+                                    &path,
+                                    transform,
+                                    gs,
+                                    tiny_skia::FillRule::EvenOdd,
+                                    clip,
+                                );
+                                if matches!(op, Operator::FillStrokeEvenOdd) {
+                                    self.path_rasterizer
+                                        .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                                }
                             }
                         }
                     } else {
@@ -2455,6 +2530,137 @@ impl PageRenderer {
             .map_err(|e| Error::InvalidPdf(format!("JPEG encoding failed: {}", e)))?;
 
         Ok(output.into_inner())
+    }
+
+    /// Resolve the current fill colour through the resolution pipeline if it
+    /// is enabled, returning a final RGBA the caller can install on a paint.
+    ///
+    /// When `PDF_OXIDE_RESOLUTION_PIPELINE` is unset or equal to "0", the
+    /// caller's existing path (read `gs.fill_color_rgb` directly) is the
+    /// answer and this returns `None`. When the toggle is on we route the
+    /// current colour through [`ResolutionPipeline`], which handles
+    /// `Separation`/`DeviceN` colour spaces backed by PostScript Type 4
+    /// tint transforms — the case the inline match arm a few hundred lines
+    /// up evaluates as `1.0 - tint`.
+    ///
+    /// Returns `None` (caller falls back to the inline result) whenever the
+    /// pipeline disagrees with the operator dispatcher about what to do —
+    /// e.g. the current fill components are empty (operator path hasn't
+    /// stamped anything yet), or the resolver returns a non-RGBA variant
+    /// that the composite backend cannot consume directly.
+    fn pipeline_resolve_fill_rgba(
+        &self,
+        doc: &PdfDocument,
+        gs: &GraphicsState,
+    ) -> Option<(f32, f32, f32, f32)> {
+        if !pipeline_is_enabled() {
+            return None;
+        }
+        let pipeline = ResolutionPipeline::new();
+        let color_spaces = &self.color_spaces;
+        let output_intent_cmyk = doc.output_intent_cmyk_profile();
+        let ctx = ResolutionContext::new(
+            doc,
+            color_spaces,
+            output_intent_cmyk.as_ref(),
+            crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent),
+        );
+        let space_name = gs.fill_color_space.as_str();
+        let resolved_space_obj = color_spaces.get(space_name);
+        let logical =
+            build_logical_color(space_name, &gs.fill_color_components, resolved_space_obj);
+
+        // Build a placeholder path-fill intent. The pipeline doesn't actually
+        // need the path geometry for colour resolution; passing an empty
+        // path-builder shape is fine — only the `color`, `gs`, and `side`
+        // fields are read by the colour stage.
+        //
+        // We pre-allocate a single-pixel path so the type-checker is happy;
+        // tiny-skia rejects empty paths.
+        let mut pb = PathBuilder::new();
+        pb.move_to(0.0, 0.0);
+        pb.line_to(0.0, 0.0);
+        let path = pb.finish()?;
+
+        let intent = PaintIntent {
+            kind: PaintKind::Path {
+                path: &path,
+                fill_rule: tiny_skia::FillRule::Winding,
+            },
+            side: PaintSide::Fill,
+            gs,
+            color: logical,
+            ctm: gs.ctm,
+        };
+        let cmd = pipeline.resolve(&intent, &ctx, None).ok()?;
+        match cmd.color {
+            ResolvedColor::Rgba { r, g, b, a } => Some((r, g, b, a)),
+            // Non-RGBA variants are produced when the pipeline grows
+            // CMYK/PerChannel outputs (for separation backends). The
+            // composite backend takes the no-op fallback here, which keeps
+            // the door open for migrating without breaking parity.
+            _ => None,
+        }
+    }
+}
+
+/// True when the resolution-pipeline pilot is enabled for path-fill.
+///
+/// Reads `PDF_OXIDE_RESOLUTION_PIPELINE` at every call site rather than
+/// caching, because callers may flip it inside test threads using
+/// `std::env::set_var`. The boolean is small and the env-var lookup is
+/// well under a microsecond.
+fn pipeline_is_enabled() -> bool {
+    match std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Build a [`LogicalColor`] from the dispatcher's view of the active colour:
+/// the fill colour space name, the raw components on the stack, and (when the
+/// space is non-Device) the resolved space object from the resources map.
+fn build_logical_color<'a>(
+    space_name: &str,
+    components: &[f32],
+    resolved_space: Option<&'a Object>,
+) -> LogicalColor<'a> {
+    // Device families fold directly into `LogicalColor::Device` — the
+    // resolver's spec-conformance for these is verified by colour-stage
+    // unit tests; routing through the same Device path keeps the pilot's
+    // behaviour identical to the inline path for the non-Separation cases.
+    match space_name {
+        "DeviceGray" | "G" if !components.is_empty() => {
+            LogicalColor::Device(DeviceColor::Gray(components[0]))
+        },
+        "DeviceRGB" | "RGB" if components.len() >= 3 => {
+            LogicalColor::Device(DeviceColor::Rgb(components[0], components[1], components[2]))
+        },
+        "DeviceCMYK" | "CMYK" if components.len() >= 4 => LogicalColor::Device(DeviceColor::Cmyk(
+            components[0],
+            components[1],
+            components[2],
+            components[3],
+        )),
+        _ => {
+            // Non-device space: hand the resolver the space object so it
+            // can dispatch on Separation / DeviceN / ICCBased / Indexed.
+            // Fall back to `DeviceGray` as a logical-colour shape if the
+            // resources map didn't carry an entry for this name — the
+            // resolver's gray fallback then matches the inline path.
+            //
+            // Use a thread-local static name object to satisfy the
+            // `'a` lifetime on the fallback arm without cloning.
+            use std::sync::OnceLock;
+            static GRAY_FALLBACK: OnceLock<Object> = OnceLock::new();
+            let space = resolved_space.unwrap_or_else(|| {
+                GRAY_FALLBACK.get_or_init(|| Object::Name("DeviceGray".to_string()))
+            });
+            LogicalColor::Spaced {
+                space,
+                components: components.iter().copied().collect(),
+            }
+        },
     }
 }
 
