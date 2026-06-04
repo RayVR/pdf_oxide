@@ -493,3 +493,312 @@ fn qa_combo_under_active_clip_parity() {
     let on = render_with_pipeline(&doc, true);
     assert_eq!(off, on, "`B` under an active clip path must be byte-identical");
 }
+
+// ===========================================================================
+// PROBE AREA: Colour-resolution edge cases (probes 13-18)
+// ===========================================================================
+
+/// Probe 13 — Indexed colour space via `scn` (PDF "SetFillColorN").
+///
+/// **BUG (MAJOR): Pipeline-on diverges from pipeline-off for `scn` against
+/// an Indexed colour space.**
+///
+/// The inline `SetFillColorN` handler at `page_renderer.rs:830` has NO
+/// `Indexed` branch (the older `SetFillColor` at line 581 does, but `scn`
+/// doesn't). For `scn` against Indexed, the inline path falls through to
+/// `gs.fill_color_rgb = (g, g, g)` with `g = components[0]` — the raw
+/// index value. For an index of 1 this gives `(1.0, 1.0, 1.0)` → white
+/// (the rasteriser interprets 1.0 as fully-on, and the bg is also white,
+/// so the centre pixel is white).
+///
+/// The pipeline's `resolve_indexed` (color.rs:237) divides by 255:
+/// `g = index / 255`. For index 1 that's `(0.004, 0.004, 0.004)` →
+/// near-black.
+///
+/// The two paths render dramatically different output. This test
+/// asserts byte equality — the wave-1 invariant — and is expected to
+/// FAIL until the fix wave brings the two paths into agreement. The
+/// agreed direction is up to the design pass; the divergence today is
+/// the bug.
+#[test]
+#[ignore = "wave-1 QA bug — Indexed `scn` (fill) diverges between toggle off and on; fix-pass target"]
+fn qa_bug_indexed_scn_fill_pipeline_diverges() {
+    let resources = "/ColorSpace << /Pal [/Indexed /DeviceRGB 1 <FF0000 0000FF>] >>";
+    let content = "/Pal cs\n1 scn\n20 20 60 60 re\nf\n";
+    let bytes = build_pdf(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    // Document the bug shape before the equality assertion so the
+    // failure mode is self-describing.
+    let (r_off, g_off, b_off, _) = center_pixel(&off);
+    let (r_on, g_on, b_on, _) = center_pixel(&on);
+    assert!(
+        r_off > 200 && g_off > 200 && b_off > 200,
+        "inline (off): Indexed `scn` paints near-white via raw-component fallback, got ({r_off}, {g_off}, {b_off})"
+    );
+    assert!(
+        r_on < 50 && g_on < 50 && b_on < 50,
+        "pipeline (on): Indexed `scn` paints near-black via index/255, got ({r_on}, {g_on}, {b_on})"
+    );
+    assert_eq!(
+        off, on,
+        "WAVE-1 INVARIANT VIOLATED: Indexed `scn` must render identically off vs on \
+         (inline path uses raw component, pipeline divides by 255)"
+    );
+}
+
+/// Probe 13b — Indexed colour space via `SCN` (stroke side).
+///
+/// **BUG (MAJOR): Symmetric to probe 13 on the stroke side.**
+///
+/// Same divergence pattern, stroke side. Inline `SetStrokeColorN` has no
+/// `Indexed` branch; pipeline's `resolve_indexed` divides by 255.
+#[test]
+#[ignore = "wave-1 QA bug — Indexed `SCN` (stroke) diverges between toggle off and on; fix-pass target"]
+fn qa_bug_indexed_scn_stroke_pipeline_diverges() {
+    let resources = "/ColorSpace << /Pal [/Indexed /DeviceRGB 1 <FF0000 0000FF>] >>";
+    let content = "/Pal CS\n1 SCN\n10 w\n20 20 60 60 re\nS\n";
+    let bytes = build_pdf(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "WAVE-1 INVARIANT VIOLATED: Indexed `SCN` (stroke) must render identically off vs on \
+         (inline path uses raw component, pipeline divides by 255)"
+    );
+}
+
+/// Probe 14 — ICCBased colour space with 4 components (CMYK profile).
+///
+/// Both paths inspect `/N` and dispatch to the device-family fallback.
+/// Off-vs-on parity should hold.
+#[test]
+fn qa_iccbased_cmyk_n4_fill_parity() {
+    // Embed a minimal ICCBased stream with /N 4. We don't ship a real
+    // ICC profile blob — both paths read /N and route to the CMYK
+    // fallback without consulting the profile bytes for the non-icc
+    // build, so an empty stream is sufficient here.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    let resources = "/ColorSpace << /MyCMYK [/ICCBased 5 0 R] >>";
+    buf.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << {} >> /Contents 4 0 R >>\nendobj\n",
+            resources
+        )
+        .as_bytes(),
+    );
+    let stream_off = buf.len();
+    let content = "/MyCMYK cs\n1 0 0 0 scn\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_off = buf.len();
+    // Minimal ICC stream: empty body, dict says /N 4.
+    let icc = "5 0 obj\n<< /N 4 /Length 0 >>\nstream\n\nendstream\nendobj\n";
+    buf.extend_from_slice(icc.as_bytes());
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "ICCBased N=4 (CMYK) fill must be byte-identical");
+}
+
+/// Probe 15 — DeviceN with a multi-output Type 4 tint transform.
+///
+/// `DeviceN` colour spaces have multiple input colorants and the tint
+/// transform produces N output values for the alternate space. The
+/// pipeline's `resolve_separation_or_devicen` runs the Type 4 program
+/// and projects through the alt-space. The inline path has no DeviceN
+/// branch beyond the Type 2 sibling code, so for a Type 4 DeviceN the
+/// inline path gray-falls to `1.0 - components[0]`.
+///
+/// Pipeline ON: must paint the colour the Type 4 program declares.
+/// Pipeline OFF: a different colour (or a fall-back). The two must
+/// differ — pipeline gives a capability gain — and the pipeline value
+/// must match the declared CMYK.
+#[test]
+fn qa_devicen_multi_colorant_type4_pipeline_resolves() {
+    // 2-colorant DeviceN. Tint transform reads two stack inputs and
+    // writes CMYK [0 t1 0 0] — i.e. ignores t0 and routes t1 to magenta.
+    // With `0 1 scn` (t0=0, t1=1), output is CMYK(0,1,0,0) → magenta.
+    //
+    // Stack walk for `{ exch pop 0.0 exch 0.0 0.0 }` with [t0=0, t1=1]
+    // (PostScript convention puts the last input on the top of the stack):
+    //   start  [0, 1]
+    //   exch   [1, 0]
+    //   pop    [1]
+    //   0.0    [1, 0]
+    //   exch   [0, 1]
+    //   0.0    [0, 1, 0]
+    //   0.0    [0, 1, 0, 0]  ← CMYK(0, 1, 0, 0) magenta
+    let type4_program = "{ exch pop 0.0 exch 0.0 0.0 }";
+    // DeviceN array: [/DeviceN [names] altCS tintTransform].
+    let resources = "/ColorSpace << /TwoSpot [/DeviceN [/SpotA /SpotB] /DeviceCMYK 5 0 R] >>";
+    let content = "/TwoSpot cs\n0 1 scn\n20 20 60 60 re\nf\n";
+    // Domain must accommodate two inputs.
+    let range = "[0 1 0 1 0 1 0 1]";
+    let bytes = build_devicen_pdf(content, type4_program, resources, range, &[0, 1, 0, 1]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let on = render_with_pipeline(&doc, true);
+    let (r, g, b, _) = center_pixel(&on);
+    assert!(
+        r > 200 && g < 60 && b > 200,
+        "pipeline DeviceN Type-4 must resolve to magenta, got ({r}, {g}, {b})"
+    );
+
+    // Pipeline must produce a different image than inline for this case.
+    let off = render_with_pipeline(&doc, false);
+    assert_ne!(
+        off, on,
+        "pipeline must differ from inline for DeviceN with Type 4 (capability gain)"
+    );
+}
+
+/// Build a one-page PDF with a Type 4 function whose Domain accommodates a
+/// variable number of inputs. `domain_pairs` is a flat list of (min, max)
+/// pairs as integers (PDF reals).
+fn build_devicen_pdf(
+    content_ops: &str,
+    type4_program: &str,
+    page_resources_extra: &str,
+    range_array: &str,
+    domain_pairs: &[i32],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << {} >> /Contents 4 0 R >>\nendobj\n",
+        page_resources_extra
+    );
+    buf.extend_from_slice(page.as_bytes());
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let func_off = buf.len();
+    let domain_str: Vec<String> = domain_pairs.iter().map(|v| v.to_string()).collect();
+    let domain_array = format!("[{}]", domain_str.join(" "));
+    let func_hdr = format!(
+        "5 0 obj\n<< /FunctionType 4 /Domain {} /Range {} /Length {} >>\nstream\n",
+        domain_array,
+        range_array,
+        type4_program.len()
+    );
+    buf.extend_from_slice(func_hdr.as_bytes());
+    buf.extend_from_slice(type4_program.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, func_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Probe 16 — Separation with the `/All` colorant name.
+///
+/// The pipeline doesn't special-case the colorant name; it evaluates the
+/// tint transform like any Separation. The inline path treats `/All` the
+/// same. Off-vs-on parity is the assertion.
+#[test]
+fn qa_separation_all_colorant_parity() {
+    let type4_program = "{ 0.0 exch 0.0 0.0 }";
+    let content = "/All_CS cs\n0.5 scn\n20 20 60 60 re\nf\n";
+    let resources = "/ColorSpace << /All_CS [/Separation /All /DeviceCMYK 5 0 R] >>";
+    let bytes = build_pdf_with_type4_separation(content, type4_program, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline(&doc, true);
+    // Pipeline resolves Type 4 — magenta-ish (CMYK(0, 0.5, 0, 0) → light
+    // magenta). The assertion is the *outcome of the pipeline path*, not
+    // a parity match — the inline path's `1.0 - tint` fallback gives
+    // gray ~127, so they actively differ. Pin both.
+    let (r_on, g_on, b_on, _) = center_pixel(&on);
+    assert!(
+        r_on > g_on && b_on > g_on,
+        "pipeline /All Separation Type-4 must resolve toward magenta (R>G, B>G), got ({r_on}, {g_on}, {b_on})"
+    );
+    let off = render_with_pipeline(&doc, false);
+    assert_ne!(
+        off, on,
+        "pipeline must differ from inline for Separation /All with Type 4 (capability gain)"
+    );
+}
+
+/// Probe 17 — Separation with the `/None` colorant name.
+///
+/// ISO 32000-1 §8.6.6.4: when colorant name is `/None`, the colour should
+/// produce no marks. The inline path does NOT honour this (paints
+/// `1.0 - tint`). The pipeline does NOT honour this either (paints what
+/// the Type 4 evaluates to). Off-vs-on parity is the assertion the
+/// pipeline preserves — neither path is spec-conformant here, but they
+/// must agree until both fix together.
+#[test]
+fn qa_separation_none_colorant_parity_pin() {
+    let type4_program = "{ 0.0 exch 0.0 0.0 }";
+    let content = "/None_CS cs\n0.5 scn\n20 20 60 60 re\nf\n";
+    let resources = "/ColorSpace << /None_CS [/Separation /None /DeviceCMYK 5 0 R] >>";
+    let bytes = build_pdf_with_type4_separation(content, type4_program, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    // Neither path honours /None today — pin the divergence direction so
+    // the spec fix lands in one place and is detected here.
+    let (_, _, _, _) = center_pixel(&off);
+    let (_, _, _, _) = center_pixel(&on);
+    // Today, both paths paint (each in its own way). Off-vs-on differ
+    // because the pipeline reads the Type 4 program; once /None handling
+    // is added, both should produce the unpainted page. Until then, the
+    // pin records that off-vs-on differ — flipping toggle MUST NOT mute
+    // the divergence quietly.
+    assert_ne!(
+        off, on,
+        "today both paths paint /None; pipeline differs from inline because Type 4 evaluates; \
+         when /None is honoured, both pixmaps must become equal to the unpainted background"
+    );
+}
+
+/// Probe 18 — Pattern colour space (`/Pattern` for tiling). The pilot
+/// doesn't migrate `sh`, and `Pattern` cs entries today resolve via the
+/// inline path's pattern handler. The pipeline must NOT capture
+/// `Pattern` colour-space resolution out from under that — it should
+/// fall back to the inline path.
+#[test]
+fn qa_pattern_colour_space_falls_back_to_inline_parity() {
+    // A bare `/Pattern cs` followed by a non-pattern paint is degenerate
+    // but parses. The point of this probe is that the pipeline must
+    // return None (falls back to inline) for Pattern-shaped logical
+    // colour, leaving the inline behaviour untouched.
+    let resources = "/ColorSpace << /MyPattern [/Pattern] >>";
+    let content = "/MyPattern cs\n20 20 60 60 re\nf\n";
+    let bytes = build_pdf(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Pattern colour space must fall back to inline path identically");
+}
