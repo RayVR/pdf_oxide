@@ -8564,6 +8564,157 @@ impl PdfDocument {
         ordered
     }
 
+    /// Apply struct-tree-scope `/ActualText` to a vector of raw
+    /// [`crate::layout::TextSpan`]s, in place.
+    ///
+    /// Used by paths that operate on raw spans rather than ordered
+    /// spans (`extract_page_text`, `extract_structured`,
+    /// `extract_spans_with_reading_order`). Mutates the anchor span's
+    /// text to the replacement; suppresses non-anchor covered spans.
+    ///
+    /// Untagged documents and pages with no emissions are no-ops.
+    pub(crate) fn apply_actualtext_to_spans(
+        &self,
+        page_index: usize,
+        spans: &mut Vec<crate::layout::TextSpan>,
+    ) {
+        let Some(idx) = self.actualtext_index() else {
+            return;
+        };
+        if idx.covered_mcids.is_empty() {
+            return;
+        }
+        // Group present MCIDs to determine emission visibility.
+        let mut mcid_present: HashMap<u32, Vec<TextSpan>> = HashMap::new();
+        for s in spans.iter() {
+            if let Some(m) = s.mcid {
+                mcid_present.entry(m).or_default().push(s.clone());
+            }
+        }
+        let emissions =
+            Self::actualtext_emissions_for_page(Some(&idx), page_index as u32, &mcid_present);
+
+        let mut anchor_text: HashMap<u32, std::sync::Arc<str>> = HashMap::new();
+        for em in &emissions {
+            anchor_text.insert(em.anchor_mcid, em.text.clone());
+        }
+
+        let mut anchor_emitted: HashSet<u32> = HashSet::new();
+        let mut drop_idx: Vec<usize> = Vec::new();
+        for (i, s) in spans.iter_mut().enumerate() {
+            let Some(m) = s.mcid else { continue };
+            if !idx.covered_mcids.contains(&m) {
+                continue;
+            }
+            if let Some(text) = anchor_text.get(&m) {
+                if anchor_emitted.insert(m) {
+                    s.text = text.to_string();
+                } else {
+                    s.text.clear();
+                    drop_idx.push(i);
+                }
+            } else {
+                s.text.clear();
+                drop_idx.push(i);
+            }
+        }
+        if !drop_idx.is_empty() {
+            // Drop from tail to head to keep indices stable.
+            for &i in drop_idx.iter().rev() {
+                spans.remove(i);
+            }
+        }
+    }
+
+    /// Apply struct-tree-scope `/ActualText` to a vector of ordered
+    /// spans, in place.
+    ///
+    /// Used by `to_markdown` / `to_html` / `to_plain_text` /
+    /// `extract_structured` after the reading-order pipeline produces
+    /// its `Vec<OrderedTextSpan>`. Mutates each covered span's text to
+    /// the replacement (anchor span receives the replacement; non-
+    /// anchor covered spans are suppressed to an empty string and
+    /// drained out). Renumbers `reading_order` so the downstream
+    /// converters see a contiguous sequence.
+    ///
+    /// Untagged documents and pages with no emissions are no-ops.
+    pub(crate) fn apply_actualtext_to_ordered_spans(
+        &self,
+        page_index: usize,
+        ordered: &mut Vec<crate::pipeline::OrderedTextSpan>,
+    ) {
+        let Some(idx) = self.actualtext_index() else {
+            return;
+        };
+        if idx.covered_mcids.is_empty() {
+            return;
+        }
+        // Build a mcid_map of present MCIDs to decide visibility.
+        let mut mcid_present: HashMap<u32, Vec<TextSpan>> = HashMap::new();
+        for o in ordered.iter() {
+            if let Some(m) = o.span.mcid {
+                mcid_present.entry(m).or_default().push(o.span.clone());
+            }
+        }
+        let emissions =
+            Self::actualtext_emissions_for_page(Some(&idx), page_index as u32, &mcid_present);
+        if emissions.is_empty() {
+            // Nothing to emit on this page, but we still suppress any
+            // covered MCIDs whose ancestor emission fires on a
+            // DIFFERENT page (the emit-once-first-page rule).
+        }
+
+        // Build a set of (page-firing) anchor MCIDs and a map from
+        // covered_mcid -> emission text for anchors.
+        let mut anchor_text: HashMap<u32, std::sync::Arc<str>> = HashMap::new();
+        for em in &emissions {
+            anchor_text.insert(em.anchor_mcid, em.text.clone());
+        }
+
+        // Walk spans: replace anchor mcid's first occurrence with the
+        // emission text, suppress the rest. Track which anchor mcid
+        // we've already replaced to avoid double-emission when
+        // multiple spans share the same mcid (a rare case, but the
+        // buffer architecture may emit a run that all carries the
+        // same MCID before a buffer flush).
+        //
+        // To keep the public surface stable, we mutate the underlying
+        // `span.text` field directly: the converters already read
+        // `span.span.text` everywhere and need no further changes. The
+        // `actualtext_replacement` field is set alongside for any
+        // downstream code that wants to know this was a replacement.
+        let mut anchor_emitted: HashSet<u32> = HashSet::new();
+        for o in ordered.iter_mut() {
+            let Some(m) = o.span.mcid else { continue };
+            if !idx.covered_mcids.contains(&m) {
+                continue;
+            }
+            if let Some(text) = anchor_text.get(&m) {
+                if anchor_emitted.insert(m) {
+                    o.span.text = text.to_string();
+                    o.actualtext_replacement = Some(text.clone());
+                } else {
+                    // Non-first span for the anchor MCID: suppress.
+                    o.span.text.clear();
+                    o.actualtext_replacement = Some(std::sync::Arc::from(""));
+                }
+            } else {
+                // A covered MCID that is not an anchor on this page —
+                // suppressed regardless of which page the emission
+                // fires on (the replacement is owned by some
+                // ancestor's anchor and never repeats).
+                o.span.text.clear();
+                o.actualtext_replacement = Some(std::sync::Arc::from(""));
+            }
+        }
+
+        // Drop fully-suppressed spans and renumber.
+        ordered.retain(|o| !o.is_suppressed());
+        for (i, o) in ordered.iter_mut().enumerate() {
+            o.reading_order = i;
+        }
+    }
+
     /// Select the [`crate::structure::ActualTextEmission`]s that should
     /// actually fire on the given page.
     ///
@@ -10775,6 +10926,9 @@ impl PdfDocument {
         if let Some(regions) = erase {
             spans.retain(|span| !regions.iter().any(|r| r.intersects(&span.bbox)));
         }
+
+        // Apply struct-tree-scope /ActualText (ISO 32000-1 §14.9.4).
+        self.apply_actualtext_to_spans(page_index, &mut spans);
 
         Ok(spans)
     }
@@ -14442,6 +14596,12 @@ impl PdfDocument {
             }
         }
 
+        // Apply struct-tree-scope /ActualText (ISO 32000-1 §14.9.4):
+        // replace covered MCIDs' text with the emission's replacement,
+        // suppress non-anchor spans of multi-MCID subtrees. Untagged
+        // documents are no-ops.
+        self.apply_actualtext_to_ordered_spans(page_index, &mut ordered_spans);
+
         // Step 8: Use pipeline converter with tables
         let converter = MarkdownOutputConverter::new();
         let mut markdown =
@@ -14757,7 +14917,11 @@ impl PdfDocument {
         };
 
         // Step 6: Process through pipeline (applies reading order strategy)
-        let ordered_spans = pipeline.process(spans, context)?;
+        let mut ordered_spans = pipeline.process(spans, context)?;
+
+        // Apply struct-tree-scope /ActualText; see `to_markdown` for
+        // the rationale.
+        self.apply_actualtext_to_ordered_spans(page_index, &mut ordered_spans);
 
         // Step 7: Use pipeline converter with tables
         let converter = HtmlOutputConverter::new();
@@ -14930,7 +15094,11 @@ impl PdfDocument {
         let context = ReadingOrderContext::new().with_page(page_index as u32);
 
         // Step 6: Process through pipeline (applies reading order strategy)
-        let ordered_spans = pipeline.process(spans, context)?;
+        let mut ordered_spans = pipeline.process(spans, context)?;
+
+        // Apply struct-tree-scope /ActualText; see `to_markdown` for
+        // the rationale.
+        self.apply_actualtext_to_ordered_spans(page_index, &mut ordered_spans);
 
         // Step 7: Use pipeline converter with tables
         let converter = PlainTextConverter::new();

@@ -4,6 +4,7 @@
 //! with reading order information.
 
 use crate::layout::TextSpan;
+use std::sync::Arc;
 
 /// Source of reading order assignment.
 ///
@@ -170,6 +171,22 @@ pub struct OrderedTextSpan {
     /// (issue #377 D5 — pdfa_049-style tight inter-paragraph layout).
     /// None for untagged documents.
     pub block_id: Option<u32>,
+
+    /// Struct-tree-scope `/ActualText` replacement (ISO 32000-1:2008
+    /// §14.9.4).
+    ///
+    /// When `Some(text)`, output converters emit `text` instead of
+    /// `span.text` for this span. The span's bbox/font are still used
+    /// for layout decisions (paragraph breaks, headings, list
+    /// markers) so the replacement participates in the same reading
+    /// flow as the underlying glyphs would have.
+    ///
+    /// When `Some("")`, the span is fully suppressed: its raw glyphs
+    /// were covered by an ancestor ActualText scope whose replacement
+    /// is emitted on a different span (the scope's anchor). Used to
+    /// drop the non-anchor spans of a multi-MCID subtree without
+    /// disturbing the reading-order vector's indexing.
+    pub actualtext_replacement: Option<Arc<str>>,
 }
 
 impl OrderedTextSpan {
@@ -183,6 +200,7 @@ impl OrderedTextSpan {
             order_info: ReadingOrderInfo::default(),
             struct_role: None,
             block_id: None,
+            actualtext_replacement: None,
         }
     }
 
@@ -195,7 +213,27 @@ impl OrderedTextSpan {
             order_info,
             struct_role: None,
             block_id: None,
+            actualtext_replacement: None,
         }
+    }
+
+    /// Resolve the effective text for output emission.
+    ///
+    /// Returns the struct-tree-scope `/ActualText` replacement when one
+    /// is attached; otherwise the underlying span's text. Returns an
+    /// empty borrowed string when the span has been suppressed by an
+    /// ancestor's emission (see [`actualtext_replacement`]).
+    pub fn effective_text(&self) -> &str {
+        match &self.actualtext_replacement {
+            Some(s) => s,
+            None => &self.span.text,
+        }
+    }
+
+    /// Returns true when the span has been suppressed by a struct-tree
+    /// ActualText emission attached to a sibling.
+    pub fn is_suppressed(&self) -> bool {
+        matches!(self.actualtext_replacement.as_deref(), Some(""))
     }
 
     /// Set the structure-tree role propagated from the source PDF's
