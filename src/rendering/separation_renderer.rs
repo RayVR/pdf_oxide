@@ -1843,6 +1843,10 @@ fn render_text_to_plate(
             text,
             transform,
             &faux,
+            // The separation backend bakes its own faux grayscale into
+            // `faux.fill_color_rgb`; the composite-side resolution pipeline
+            // is not in play here, so no colour override is needed.
+            None,
             resources,
             ctx.doc,
             clip,
