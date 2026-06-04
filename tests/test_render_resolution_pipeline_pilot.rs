@@ -1585,3 +1585,469 @@ fn pilot_text_helper_returns_none_when_pipeline_disabled() {
         "off-path must not be perturbed by Tr=2 gating; on-path Device colours must splice to no visible change"
     );
 }
+
+// =====================================================================
+// Wave 3 — Image XObject (`Do`) pilot
+//
+// ImageMask XObjects (`/Subtype /Image`, `/ImageMask true`) paint a 1-bit
+// stencil with the current fill colour. The pipeline routes that fill
+// through the resolution pipeline (Type 4 Separation evaluation, ICC
+// conversion, etc.). Standard images and Form XObjects pass through
+// untouched.
+// =====================================================================
+
+/// Build a one-page PDF with an ImageMask XObject `/IM1` filled with raw
+/// 1-bit stencil bytes. `content_ops` runs on the page (typically sets
+/// the fill colour, a CTM, then `/IM1 Do`). `resources_extra` is appended
+/// into the page's `/Resources` dictionary (use it for `/ColorSpace`
+/// when a non-device fill is required).
+fn build_pdf_image_mask(
+    content_ops: &str,
+    resources_extra: &str,
+    width: u32,
+    height: u32,
+    mask_data: &[u8],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /XObject << /IM1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
+        resources_extra
+    );
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        width,
+        height,
+        mask_data.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(mask_data);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a one-page PDF with an ImageMask XObject `/IM1` *and* an
+/// indirect Type 4 tint-transform function as object 6. The Separation
+/// colour space sits in the page's `/Resources /ColorSpace` dictionary
+/// passed via `resources_extra` and references object 6.
+fn build_pdf_image_mask_with_type4(
+    content_ops: &str,
+    resources_extra: &str,
+    width: u32,
+    height: u32,
+    mask_data: &[u8],
+    type4_program: &str,
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /XObject << /IM1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
+        resources_extra
+    );
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        width,
+        height,
+        mask_data.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(mask_data);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let func_off = buf.len();
+    let func_hdr = format!(
+        "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+        type4_program.len()
+    );
+    buf.extend_from_slice(func_hdr.as_bytes());
+    buf.extend_from_slice(type4_program.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off, func_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a one-page PDF with a standard (non-mask) Image XObject `/IM1`.
+/// `cs_name` selects the colour space; `pixel_bytes` is the raw image
+/// data (BPC=8). Used by the standard-image pass-through pilot.
+fn build_pdf_standard_image(
+    content_ops: &str,
+    width: u32,
+    height: u32,
+    pixel_bytes: &[u8],
+    cs_name: &str,
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /IM1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+         /BitsPerComponent 8 /ColorSpace /{} /Length {} >>\nstream\n",
+        width,
+        height,
+        cs_name,
+        pixel_bytes.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(pixel_bytes);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a one-page PDF with a Form XObject `/F1` that contains
+/// `form_content_ops` as its child content stream. The page's content
+/// stream is `page_content_ops` and typically issues `q ... cm /F1 Do
+/// Q`. The form has a `/BBox` of [0 0 100 100] and no `/Matrix` (so it
+/// inherits the parent transform).
+fn build_pdf_form_xobject(page_content_ops: &str, form_content_ops: &str) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(page_content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let form_off = buf.len();
+    let form_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n",
+        form_content_ops.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(form_content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, form_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Solid 1-bit stencil — every pixel is opaque under default `/Decode
+/// [0 1]`. Per ISO 32000-1 §8.9.6.4, an ImageMask sample of 0 means
+/// "paint with the current colour" and 1 means "leave the destination
+/// unaffected" (the polarity is reversed by `/Decode [1 0]`). So an
+/// all-zero stream paints the whole stencil opaque. Row stride is
+/// byte-aligned per PDF §8.9.3.
+fn solid_image_mask_bytes(width: u32, height: u32) -> Vec<u8> {
+    let row_bytes = (width as usize).div_ceil(8);
+    vec![0x00u8; row_bytes * height as usize]
+}
+
+// ---------- ImageMask parity tests (Device* fills) ----------
+
+#[test]
+fn pilot_image_mask_device_rgb_parity_pipeline_off_vs_on() {
+    // DeviceRGB fill on an ImageMask. Both inline and pipeline paths
+    // read the fill colour from `gs.fill_color_rgb` (set by `rg`); the
+    // resolved colour is the same, so pixmaps must match byte-for-byte.
+    //
+    // CTM: place a 100×100 stencil over the whole page (`100 0 0 100 0 0
+    // cm`). Solid stencil → the page is fully painted red.
+    let mask = solid_image_mask_bytes(8, 8);
+    let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "ImageMask DeviceRGB fill must be byte-identical off vs on");
+
+    // Sanity: the centre pixel is red.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(r > 200 && g < 60 && b < 60, "centre pixel must be red, got ({r}, {g}, {b})");
+}
+
+#[test]
+fn pilot_image_mask_device_gray_parity_pipeline_off_vs_on() {
+    let mask = solid_image_mask_bytes(8, 8);
+    let content = "q\n0.25 g\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "ImageMask DeviceGray fill must be byte-identical off vs on");
+
+    let (r, g, b, _a) = center_pixel(&on);
+    // 0.25 g → grey ≈ 64. Allow a generous tolerance for resampling/blend.
+    assert!(
+        (50..=90).contains(&(r as i32)) && r == g && g == b,
+        "centre pixel must be mid-grey, got ({r}, {g}, {b})"
+    );
+}
+
+#[test]
+fn pilot_image_mask_device_cmyk_parity_pipeline_off_vs_on() {
+    // Pure magenta (CMYK 0,1,0,0). Additive-clamp fallback → RGB(1,0,1).
+    let mask = solid_image_mask_bytes(8, 8);
+    let content = "q\n0 1 0 0 k\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "ImageMask DeviceCMYK fill must be byte-identical off vs on");
+}
+
+#[test]
+fn pilot_image_mask_indexed_parity_pipeline_off_vs_on() {
+    // Indexed colour space — palette of 4 RGB triplets. `0 sc` against
+    // index 0 selects the first triplet (1.0, 0.0, 0.0 → red). Both
+    // paths fold this through the colour-space resolver to a Device
+    // RGB; parity must hold.
+    let mask = solid_image_mask_bytes(8, 8);
+    let palette = "<FF0000 00FF00 0000FF FFFFFF>";
+    let resources = format!("/ColorSpace << /CS1 [/Indexed /DeviceRGB 3 {}] >>", palette);
+    let content = "q\n/CS1 cs\n0 sc\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, &resources, 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "ImageMask Indexed fill must be byte-identical off vs on");
+}
+
+// ---------- ImageMask capability gain (Type 4 Separation) ----------
+
+#[test]
+fn pilot_image_mask_with_type4_separation_fill_pipeline_resolves_correctly() {
+    // Wave 3 capability gain. The Separation colour space's tint
+    // transform is a PostScript Type 4 function the inline path falls
+    // back to `1 - tint` for, painting a full-tint stencil solid black.
+    // The pipeline runs the Type 4 program and paints with the
+    // function's actual output.
+    //
+    // Program: `{ 0.0 exch 0.0 0.0 }` — at tint=1.0 this leaves
+    // CMYK(0, 1, 0, 0) → RGB(1, 0, 1) magenta on the stack.
+    let mask = solid_image_mask_bytes(8, 8);
+    let type4 = "{ 0.0 exch 0.0 0.0 }";
+    let resources = "/ColorSpace << /SpotMagenta [/Separation /MagentaSpot /DeviceCMYK 6 0 R] >>";
+    let content = "q\n/SpotMagenta cs\n1 scn\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+
+    let bytes = build_pdf_image_mask_with_type4(content, resources, 8, 8, &mask, type4);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Inline path: full-tint Type 4 → solid black at the centre.
+    let (r_off, g_off, b_off, _a) = center_pixel(&off);
+    assert!(
+        r_off < 50 && g_off < 50 && b_off < 50,
+        "inline path must paint ImageMask black under full-tint Type 4 Separation, got ({r_off}, {g_off}, {b_off})"
+    );
+
+    // Pipeline: magenta — pin specific channel values (positive
+    // correctness, per the wave 1+2 lesson — "differs from black" is
+    // not enough; the actual channel values must be the Type 4
+    // function output).
+    let (r_on, g_on, b_on, a_on) = center_pixel(&on);
+    assert!(
+        r_on >= 250 && g_on <= 5 && b_on >= 250 && a_on == 255,
+        "pipeline must paint ImageMask magenta from the Type 4 program, got ({r_on}, {g_on}, {b_on}, {a_on})"
+    );
+
+    // And the pixmaps differ overall.
+    assert_ne!(
+        off, on,
+        "pipeline output must differ from inline output for Type 4 Separation ImageMask"
+    );
+}
+
+// ---------- Pass-through proofs ----------
+
+#[test]
+fn pilot_standard_image_xobject_pass_through_byte_identical() {
+    // Standard (non-mask) Image XObjects carry their colour in pixel
+    // data and do not interact with the pipeline. Even with the toggle
+    // on, the output must be byte-identical to the toggle-off render.
+    //
+    // Pin: 4×4 DeviceGray image, all pixels = 0x80 (50% grey). Stretch
+    // over 80×80 of the page so resampling artefacts are confined to a
+    // small band, then sample inside the body.
+    let pixels = vec![0x80u8; 16];
+    let content = "q\n80 0 0 80 10 10 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_standard_image(content, 4, 4, &pixels, "DeviceGray");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "standard Image XObject must pass through pipeline byte-identically");
+
+    // Pin a body pixel: well inside the 80x80 image footprint at (50, 50).
+    let (r, g, b, _a) = pixel_at(&on, 50, 50);
+    assert!(
+        r == g && g == b && (120..=140).contains(&(r as i32)),
+        "centre of standard image must be ≈50% grey, got ({r}, {g}, {b})"
+    );
+}
+
+#[test]
+fn pilot_form_xobject_pass_through_byte_identical() {
+    // Form XObjects are recursively rendered through page_renderer —
+    // their child operators flow through whatever pipeline arms have
+    // landed at each wave. The `Do` arm itself must not splice for
+    // Form XObjects (no fill-time colour resolve at the Do boundary).
+    //
+    // Build a Form whose child stream paints a 40×40 red rectangle via
+    // an inline `f`. Toggle-off vs toggle-on must be byte-identical:
+    // the child `f` IS pipeline-migrated (wave 1) but DeviceRGB is a
+    // no-op splice, so the result holds.
+    let page_ops = "q\n/Fm1 Do\nQ\n";
+    let form_ops = "1 0 0 rg\n30 30 40 40 re\nf\n";
+    let bytes = build_pdf_form_xobject(page_ops, form_ops);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Form XObject pass-through must be byte-identical off vs on");
+
+    // Sanity: the form did paint something visible.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        r > 200 && g < 60 && b < 60,
+        "Form-XObject-painted rectangle must be red at centre, got ({r}, {g}, {b})"
+    );
+}
+
+// ---------- State preservation under the pipeline ----------
+
+#[test]
+fn pilot_image_mask_under_pipeline_preserves_ctm() {
+    // The Do arm reads `gs.ctm` to position the image. The pipeline's
+    // splice clones `gs` but must not perturb `ctm`; if it did, the
+    // image would land in the wrong place between toggle states.
+    //
+    // Build a rotated-and-scaled CTM that places the mask in a
+    // distinctive position. Parity off-vs-on means the spliced clone's
+    // CTM equals the original's exactly.
+    let mask = solid_image_mask_bytes(8, 8);
+    // Rotate ~30° around centre, scale 60, translate.
+    let content = "q\n1 0 0 rg\n51.96 30 -30 51.96 50 25 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "ImageMask under a rotated/scaled CTM must round-trip through the pipeline byte-identically"
+    );
+}
+
+#[test]
+fn pilot_image_mask_under_pipeline_preserves_clip() {
+    // An active `W n` clipping path constrains where the stencil can
+    // paint. The pipeline splice must not drop the clip (the spliced
+    // clone is `gs` only — clip state lives on the operator walker's
+    // clip stack, not on `gs`). Parity off-vs-on covers this: if the
+    // clip leaked, the rendered footprint would differ.
+    //
+    // Clip to a 40×40 box in the upper half of the page, then paint a
+    // full-page stencil; only the clipped region carries colour.
+    let mask = solid_image_mask_bytes(8, 8);
+    let content = "q\n30 60 40 40 re W n\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "ImageMask under an active clip must round-trip through the pipeline byte-identically"
+    );
+}

@@ -51,6 +51,16 @@ pub(crate) enum PipelinePaintKind {
     /// both passes; the fill pass reads `fill_*` fields, the stroke pass
     /// reads `stroke_*` fields).
     PathFillStroke,
+    /// `Do` with `/Subtype /Image` and `/ImageMask true` — stencil mask
+    /// painted with the current fill colour. Behaviourally identical to
+    /// [`PipelinePaintKind::PathFill`] inside the helper (one fill-side
+    /// resolve, splice into `fill_color_rgb` / `fill_alpha`), but kept as
+    /// a distinct variant so the call site reads as "image-mask intent"
+    /// rather than "secretly a path fill" — and so a future wave that
+    /// needs image-mask-specific routing (e.g. per-pixel overprint
+    /// against an image mask painted with a spot colour) can branch on
+    /// this without changing the path-fill arms.
+    ImageMask,
 }
 
 /// Resolved RGBA colours destined for the text rasteriser, side by side.
@@ -2142,17 +2152,53 @@ impl PageRenderer {
                             if let Some(subtype) = dict.get("Subtype").and_then(|o| o.as_name()) {
                                 match subtype {
                                     "Image" => {
-                                        let smask = dict.get("SMask").cloned();
-                                        let mask = dict.get("Mask").cloned();
-                                        if let Err(e) = self.render_image(
-                                            pixmap, &xobj, xobj_ref, transform, doc, clip_mask,
-                                            smask, mask, gs,
-                                        ) {
-                                            log::warn!(
-                                                "Skipping unrenderable image XObject '{}': {}",
-                                                name,
-                                                e
+                                        // ImageMask XObjects (1-bit stencil painted with
+                                        // the current fill colour) take their fill from
+                                        // graphics state, not from the pixel data. Route
+                                        // that fill through the resolution pipeline
+                                        // (toggle-on) so a Type 4 Separation fill paints
+                                        // the mask with the function-evaluated tint
+                                        // rather than the inline `1 - tint` fallback.
+                                        //
+                                        // Standard images (`/ImageMask` absent or false)
+                                        // carry their colour in the pixel data and do
+                                        // not interact with the pipeline; they pass
+                                        // straight through to `render_image`.
+                                        let is_image_mask = dict
+                                            .get("ImageMask")
+                                            .map(|o| matches!(o, Object::Boolean(true)))
+                                            .unwrap_or(false);
+                                        if is_image_mask {
+                                            let spliced = self.pipeline_resolve_paint_gs(
+                                                doc,
+                                                gs,
+                                                PipelinePaintKind::ImageMask,
                                             );
+                                            let render_gs: &GraphicsState =
+                                                spliced.as_ref().unwrap_or(gs);
+                                            if let Err(e) = self.render_image_mask(
+                                                pixmap, &xobj, xobj_ref, transform, doc, clip_mask,
+                                                render_gs,
+                                            ) {
+                                                log::warn!(
+                                                    "Skipping unrenderable ImageMask XObject '{}': {}",
+                                                    name,
+                                                    e
+                                                );
+                                            }
+                                        } else {
+                                            let smask = dict.get("SMask").cloned();
+                                            let mask = dict.get("Mask").cloned();
+                                            if let Err(e) = self.render_image(
+                                                pixmap, &xobj, xobj_ref, transform, doc, clip_mask,
+                                                smask, mask, gs,
+                                            ) {
+                                                log::warn!(
+                                                    "Skipping unrenderable image XObject '{}': {}",
+                                                    name,
+                                                    e
+                                                );
+                                            }
                                         }
                                     },
                                     "Form" => {
@@ -2459,6 +2505,159 @@ impl PageRenderer {
         Ok(())
     }
 
+    /// Render an Image XObject with `/ImageMask true` — a 1-bit stencil
+    /// painted with the current fill colour.
+    ///
+    /// Per ISO 32000-1 §8.9.6.4, under the default `/Decode [0 1]` a
+    /// sample value of `0` paints the destination with the current
+    /// nonstroking colour and `1` leaves it unaffected; `/Decode [1 0]`
+    /// reverses the polarity. There is no `/ColorSpace`; the colour
+    /// comes from `gs.fill_color_rgb` / `gs.fill_alpha`. The caller (the
+    /// `Do` arm in `render_page_with_options`) is responsible for
+    /// routing that fill through the resolution pipeline when the
+    /// toggle is on, so this helper consumes whatever `gs` it is handed
+    /// without re-resolving.
+    ///
+    /// Only the minimum necessary to make the stencil paintable is
+    /// implemented here: 1-bit raw samples (no CCITT decode), default
+    /// and inverted `/Decode` polarities, bilinear/bicubic resampling
+    /// chosen by the image-space-to-user-space scale (matches
+    /// `render_image`). CCITT-compressed inline masks are out of scope
+    /// for wave 3 — they share the colour-resolution path and gain the
+    /// same pipeline routing as soon as their decode is added.
+    fn render_image_mask(
+        &mut self,
+        pixmap: &mut Pixmap,
+        xobject: &Object,
+        obj_ref: Option<ObjectRef>,
+        transform: Transform,
+        doc: &PdfDocument,
+        clip_mask: Option<&tiny_skia::Mask>,
+        gs: &GraphicsState,
+    ) -> Result<()> {
+        let dict = xobject
+            .as_dict()
+            .ok_or_else(|| Error::Image("ImageMask XObject is not a stream".to_string()))?;
+
+        let width = dict
+            .get("Width")
+            .and_then(|o| o.as_integer())
+            .ok_or_else(|| Error::Image("ImageMask missing /Width".to_string()))?
+            as u32;
+        let height = dict
+            .get("Height")
+            .and_then(|o| o.as_integer())
+            .ok_or_else(|| Error::Image("ImageMask missing /Height".to_string()))?
+            as u32;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        // PDF §8.9.6.4: ImageMask BitsPerComponent must be 1 when present.
+        // Some producers omit it; default to 1.
+        let bpc = dict
+            .get("BitsPerComponent")
+            .and_then(|o| o.as_integer())
+            .unwrap_or(1);
+        if bpc != 1 {
+            return Err(Error::Image(format!("ImageMask requires BitsPerComponent 1, got {bpc}")));
+        }
+
+        // /Decode array: [0 1] means bit 1 = opaque (default); [1 0]
+        // inverts. Other forms are spec-illegal for ImageMask.
+        let invert = match dict.get("Decode") {
+            Some(Object::Array(arr)) if arr.len() >= 2 => {
+                let first = match &arr[0] {
+                    Object::Real(v) => *v as f32,
+                    Object::Integer(v) => *v as f32,
+                    _ => 0.0,
+                };
+                first > 0.5
+            },
+            _ => false,
+        };
+
+        let raw = if let Some(r) = obj_ref {
+            doc.decode_stream_with_encryption(xobject, r)?
+        } else {
+            xobject.decode_stream_data()?
+        };
+
+        // Stencil pixels → premultiplied RGBA, applying the fill colour
+        // to each opaque sample. Rows are packed MSB-first; each row is
+        // padded to the next byte boundary.
+        let (fr, fg, fb) = gs.fill_color_rgb;
+        let fa = gs.fill_alpha.clamp(0.0, 1.0);
+        let pa = (fa * 255.0).round().clamp(0.0, 255.0) as u8;
+        // Premultiplied opaque sample: tiny-skia's Pixmap is
+        // premultiplied; build the channels accordingly so blends and
+        // SMask composition stay correct.
+        let pr = ((fr.clamp(0.0, 1.0) * fa) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let pg = ((fg.clamp(0.0, 1.0) * fa) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let pb = ((fb.clamp(0.0, 1.0) * fa) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+
+        let row_bytes = (width as usize + 7) / 8;
+        let expected = row_bytes * height as usize;
+        if raw.len() < expected {
+            return Err(Error::Image(format!(
+                "ImageMask stream too short: {} bytes for {}x{} (expected {})",
+                raw.len(),
+                width,
+                height,
+                expected
+            )));
+        }
+
+        let mut rgba: Vec<u8> = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            let row_off = (y as usize) * row_bytes;
+            for x in 0..width {
+                let byte_idx = row_off + (x / 8) as usize;
+                let bit_idx = 7 - (x % 8);
+                let bit = (raw[byte_idx] >> bit_idx) & 1 == 1;
+                let opaque = if invert { bit } else { !bit };
+                if opaque {
+                    let off = ((y * width + x) * 4) as usize;
+                    rgba[off] = pr;
+                    rgba[off + 1] = pg;
+                    rgba[off + 2] = pb;
+                    rgba[off + 3] = pa;
+                }
+            }
+        }
+
+        // PDF image space → user space: same flip as in `render_image`.
+        let image_transform = transform
+            .pre_translate(0.0, 1.0)
+            .pre_scale(1.0 / width as f32, -1.0 / height as f32);
+
+        let mut paint = PixmapPaint::default();
+        paint.opacity = 1.0; // fill_alpha already baked into the stencil pixels.
+        paint.blend_mode = crate::rendering::pdf_blend_mode_to_skia(&gs.blend_mode);
+        let (xs, ys) = image_transform.get_scale();
+        paint.quality = if xs >= 1.0 || ys >= 1.0 {
+            tiny_skia::FilterQuality::Bicubic
+        } else {
+            tiny_skia::FilterQuality::Bilinear
+        };
+
+        if let Some(stencil_pixmap) = Pixmap::from_vec(
+            rgba,
+            tiny_skia::IntSize::from_wh(width, height)
+                .ok_or_else(|| Error::Image("ImageMask invalid dimensions".to_string()))?,
+        ) {
+            pixmap.draw_pixmap(0, 0, stencil_pixmap.as_ref(), &paint, image_transform, clip_mask);
+        }
+
+        Ok(())
+    }
+
     /// Render a Form XObject by parsing its content stream recursively.
     ///
     /// Per PDF spec §8.10, a Form XObject contains its own content stream,
@@ -2749,6 +2948,9 @@ impl PageRenderer {
             PipelinePaintKind::PathFill => (true, false),
             PipelinePaintKind::PathStroke => (false, true),
             PipelinePaintKind::PathFillStroke => (true, true),
+            // ImageMask paints the stencil with the current fill colour;
+            // the stroke side is never read by the mask compositor.
+            PipelinePaintKind::ImageMask => (true, false),
         };
         // Resolve, then short-circuit when the resolved RGBA already
         // equals the GS field that would supply it inline. For
@@ -3364,6 +3566,70 @@ mod tests {
                 .pipeline_resolve_paint_gs(&doc, &gs, PipelinePaintKind::PathFill)
                 .is_none(),
             "Device-family fill that resolves to the same RGBA as gs must short-circuit"
+        );
+    }
+
+    #[test]
+    fn pipeline_resolve_paint_gs_image_mask_short_circuits_same_as_path_fill() {
+        // Wave 3 pin. `PipelinePaintKind::ImageMask` must follow the
+        // same fill-only resolve-and-short-circuit rules as
+        // `PipelinePaintKind::PathFill`: a Device-family fill whose
+        // resolved RGBA already matches `gs.fill_color_rgb` returns
+        // `None` (no clone), and the stroke side is never touched.
+        let mut renderer = PageRenderer::new(RenderOptions::default());
+        renderer.pipeline_enabled_cache = true;
+
+        let mut gs = GraphicsState::new();
+        gs.fill_color_space = "DeviceRGB".to_string();
+        gs.fill_color_components = smallvec![0.25, 0.5, 0.75];
+        gs.fill_color_rgb = (0.25, 0.5, 0.75);
+        gs.fill_alpha = 1.0;
+
+        let doc = fixture_doc();
+        assert!(
+            renderer
+                .pipeline_resolve_paint_gs(&doc, &gs, PipelinePaintKind::ImageMask)
+                .is_none(),
+            "ImageMask Device-family fill matching gs must short-circuit"
+        );
+    }
+
+    #[test]
+    fn pipeline_resolve_paint_gs_image_mask_resolves_type4_separation_fill() {
+        // Wave 3 capability pin. With the toggle on and a
+        // Separation/DeviceCMYK Type 4 colour space on the fill side,
+        // the `ImageMask` variant must produce a spliced
+        // `GraphicsState` whose `fill_color_rgb` is the Type 4 program
+        // output (magenta), NOT the legacy `1 - tint = 0` black. This
+        // is the wave-1-class bug regression check for the ImageMask
+        // routing — same helper, same colour-stage path, just driven
+        // by the new variant.
+        let mut renderer = PageRenderer::new(RenderOptions::default());
+        renderer.pipeline_enabled_cache = true;
+        renderer
+            .color_spaces
+            .insert("SpotMagenta".to_string(), type4_magenta_separation_space());
+
+        let mut gs = GraphicsState::new();
+        gs.fill_color_space = "SpotMagenta".to_string();
+        gs.fill_color_components = smallvec![1.0]; // full tint
+        gs.fill_color_rgb = (0.0, 0.0, 0.0); // legacy 1-tint=0 black
+        gs.fill_alpha = 1.0;
+
+        let doc = fixture_doc();
+        let spliced = renderer
+            .pipeline_resolve_paint_gs(&doc, &gs, PipelinePaintKind::ImageMask)
+            .expect("Type 4 Separation fill must splice through ImageMask variant");
+
+        let (r, g, b) = spliced.fill_color_rgb;
+        assert!(
+            r > 0.78 && g < 0.24 && b > 0.78,
+            "ImageMask fill must be magenta (Type 4 evaluated), not legacy black; got ({r}, {g}, {b})"
+        );
+        // Stroke side must remain untouched — the variant is fill-only.
+        assert_eq!(
+            spliced.stroke_color_rgb, gs.stroke_color_rgb,
+            "ImageMask variant must not touch the stroke channel"
         );
     }
 
