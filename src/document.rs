@@ -396,12 +396,16 @@ pub struct PdfDocument {
     /// Per-page set of MCIDs whose marked-content sequence carried an
     /// inline `/ActualText` property (ISO 32000-1:2008 §14.6).
     ///
-    /// Populated by the text extractor each time it processes a BDC
-    /// operator on a page. The struct-tree-scope ActualText applier
-    /// consults this set to enforce the precedence rule: the MC-scope
-    /// (inline) replacement is the innermost and most specific
-    /// declaration for the MCID it covers, so a struct-tree-scope
-    /// `/ActualText` on an ancestor element must NOT override it.
+    /// Populated by `extract_spans_impl` from the text extractor's
+    /// per-call detection: the per-page entry is REPLACED on each
+    /// extraction so MC-scope precedence reflects the latest run, not
+    /// stale data from an earlier filter set.
+    ///
+    /// The struct-tree-scope ActualText applier consults this set to
+    /// enforce the precedence rule: the MC-scope (inline) replacement
+    /// is the innermost and most specific declaration for the MCID
+    /// it covers, so a struct-tree-scope `/ActualText` on an ancestor
+    /// element must NOT override it.
     pub(crate) mc_actualtext_mcids: Mutex<HashMap<usize, HashSet<u32>>>,
     /// `Table` structure elements bucketed by page, built once via
     /// `find_table_elements_all_pages` (one tree walk) so the converter table
@@ -10919,13 +10923,19 @@ impl PdfDocument {
         // Drain MCIDs whose in-stream /ActualText was applied during
         // extraction and stash on the document so the struct-tree-
         // scope applier honours MC-scope-wins precedence (§14.9.4).
+        //
+        // The per-page entry is REPLACED, not extended: every
+        // `extract_spans_impl` call is a self-contained per-page
+        // extraction and its own MC-scope detections must be
+        // authoritative. Accumulating would make stale results from
+        // an earlier filter-set leak into a later, differently-
+        // filtered call.
         let mc_set = extractor.take_mc_actualtext_mcids();
-        if !mc_set.is_empty() {
-            self.mc_actualtext_mcids
-                .lock_or_recover()
-                .entry(page_index)
-                .or_default()
-                .extend(mc_set);
+        let mut guard = self.mc_actualtext_mcids.lock_or_recover();
+        if mc_set.is_empty() {
+            guard.remove(&page_index);
+        } else {
+            guard.insert(page_index, mc_set);
         }
         Ok(spans)
     }

@@ -217,22 +217,13 @@ impl OrderedTextSpan {
         }
     }
 
-    /// Resolve the effective text for output emission.
-    ///
-    /// Returns the struct-tree-scope `/ActualText` replacement when one
-    /// is attached; otherwise the underlying span's text. Returns an
-    /// empty borrowed string when the span has been suppressed by an
-    /// ancestor's emission (see
-    /// [`Self::actualtext_replacement`]).
-    pub fn effective_text(&self) -> &str {
-        match &self.actualtext_replacement {
-            Some(s) => s,
-            None => &self.span.text,
-        }
-    }
-
     /// Returns true when the span has been suppressed by a struct-tree
-    /// ActualText emission attached to a sibling.
+    /// ActualText emission attached to a sibling (or by the non-first-
+    /// page coverage of a multi-page scope).
+    ///
+    /// Suppressed spans are dropped from the output vector by the
+    /// applier in `document.rs`; this predicate is the single source
+    /// of truth for "drop me".
     pub fn is_suppressed(&self) -> bool {
         matches!(self.actualtext_replacement.as_deref(), Some(""))
     }
