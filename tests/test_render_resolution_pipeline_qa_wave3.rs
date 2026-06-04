@@ -1469,3 +1469,273 @@ fn qa_image_mask_multiply_blend_mode_toggle_parity() {
         "multiply(red, white) must be red, got ({r}, {g}, {b})"
     );
 }
+
+// ===========================================================================
+// Probes 23-26 — Capability at scale: DeviceN / `/All` / `/None` colorants
+// applied to an ImageMask fill, plus a 100-mask one-page stress test.
+//
+// Mirror of the wave-1 path-fill and wave-2 text-fill capability suites.
+// `render_image_mask` reads `gs.fill_color_rgb` once per paint; the
+// pipeline must populate that from the Type 4 / DeviceN program. The
+// `/All` / `/None` colorant-name special cases are not honoured today
+// (existing behaviour) — pin off-vs-on parity (or capability divergence,
+// as appropriate).
+// ===========================================================================
+
+/// Build a one-page PDF with an ImageMask XObject `/IM1` and an
+/// indirect Type 4 function (object 6) whose `Domain` accommodates a
+/// variable number of inputs (used for DeviceN). The Separation /
+/// DeviceN colour space is set via `resources_extra`.
+fn build_pdf_image_mask_with_devicen_type4(
+    content_ops: &str,
+    resources_extra: &str,
+    width: u32,
+    height: u32,
+    mask_data: &[u8],
+    type4_program: &str,
+    range_array: &str,
+    domain_pairs: &[i32],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /XObject << /IM1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
+        resources_extra
+    );
+    buf.extend_from_slice(page.as_bytes());
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        width,
+        height,
+        mask_data.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(mask_data);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let func_off = buf.len();
+    let domain_str: Vec<String> = domain_pairs.iter().map(|v| v.to_string()).collect();
+    let domain_array = format!("[{}]", domain_str.join(" "));
+    let func_hdr = format!(
+        "6 0 obj\n<< /FunctionType 4 /Domain {} /Range {} /Length {} >>\nstream\n",
+        domain_array,
+        range_array,
+        type4_program.len()
+    );
+    buf.extend_from_slice(func_hdr.as_bytes());
+    buf.extend_from_slice(type4_program.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off, func_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Probe 23 — Capability at scale: paint 100 ImageMasks on one page,
+/// each at a distinct CTM offset, each filled with the same Type 4
+/// Separation magenta. Inline path falls back to `1 - tint` → black
+/// for every paint; pipeline runs the Type 4 program → magenta for
+/// every paint. The two outputs must differ.
+#[test]
+fn qa_image_mask_100_paints_type4_separation_capability_at_scale() {
+    let mask = solid_image_mask_bytes(2, 2);
+    let type4 = "{ 0.0 exch 0.0 0.0 }";
+    let resources = "/ColorSpace << /SpotMagenta [/Separation /MagentaSpot /DeviceCMYK 6 0 R] >>";
+
+    // 10x10 grid: each tile 8x8 user units, spaced at 10-unit intervals.
+    let mut content = String::from("/SpotMagenta cs\n1 scn\n");
+    for row in 0..10 {
+        for col in 0..10 {
+            let x = col * 10;
+            let y = row * 10;
+            content.push_str(&format!("q 8 0 0 8 {} {} cm /IM1 Do Q\n", x, y));
+        }
+    }
+
+    // Use the imagemask-with-Type4 builder from the pilot helper shape.
+    // We duplicate the layout here to keep this file self-contained.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /XObject << /IM1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
+        resources
+    );
+    buf.extend_from_slice(page.as_bytes());
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width 2 /Height 2 /BitsPerComponent 1 /Length {} >>\nstream\n",
+        mask.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(&mask);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let func_off = buf.len();
+    let func_hdr = format!(
+        "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+        type4.len()
+    );
+    buf.extend_from_slice(func_hdr.as_bytes());
+    buf.extend_from_slice(type4.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off, func_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Pick a representative tile centre (col 5, row 5): tile starts at
+    // (50, 50), 8x8, so centre ≈ (54, 54).
+    let (r_off, g_off, b_off, _a) = pixel_at(&off, 54, 54);
+    assert!(
+        r_off < 50 && g_off < 50 && b_off < 50,
+        "inline 100-paint: tile centre must be black, got ({r_off},{g_off},{b_off})"
+    );
+    let (r_on, g_on, b_on, _a) = pixel_at(&on, 54, 54);
+    assert!(
+        r_on > 200 && g_on < 60 && b_on > 200,
+        "pipeline 100-paint: tile centre must be magenta, got ({r_on},{g_on},{b_on})"
+    );
+    assert_ne!(off, on, "100-paint capability gain must be visible");
+}
+
+/// Probe 24 — DeviceN multi-colorant Type 4 applied to an ImageMask.
+/// Mirrors wave-1's path-fill DeviceN test; the wave-3 ImageMask path
+/// must produce the same Type 4 evaluation result.
+#[test]
+fn qa_image_mask_devicen_multi_colorant_type4_capability() {
+    let mask = solid_image_mask_bytes(8, 8);
+    // `{ exch pop 0.0 exch 0.0 0.0 }` — pop the first colorant, leave
+    // CMYK(0, second, 0, 0) on the stack. With `0 1 scn` we get
+    // CMYK(0, 1, 0, 0) → magenta.
+    let type4 = "{ exch pop 0.0 exch 0.0 0.0 }";
+    let resources = "/ColorSpace << /TwoSpot [/DeviceN [/SpotA /SpotB] /DeviceCMYK 6 0 R] >>";
+    let content = "/TwoSpot cs 0 1 scn\n100 0 0 100 0 0 cm\n/IM1 Do\n";
+
+    let bytes = build_pdf_image_mask_with_devicen_type4(
+        content,
+        resources,
+        8,
+        8,
+        &mask,
+        type4,
+        "[0 1 0 1 0 1 0 1]",
+        &[0, 1, 0, 1],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline(&doc, true);
+    let (r_on, g_on, b_on, _a) = center_pixel(&on);
+    assert!(
+        r_on > 200 && g_on < 60 && b_on > 200,
+        "pipeline DeviceN Type-4 ImageMask must paint magenta, got ({r_on},{g_on},{b_on})"
+    );
+    let off = render_with_pipeline(&doc, false);
+    assert_ne!(off, on, "pipeline must differ from inline for DeviceN Type-4 ImageMask");
+}
+
+/// Probe 25 — Separation `/All` colorant applied to an ImageMask. The
+/// pipeline runs the tint transform like any other Separation; toggle-on
+/// must produce the Type-4-evaluated colour. Mirror of the wave-2 text
+/// `/All` test.
+#[test]
+fn qa_image_mask_separation_all_colorant_pipeline_paints_type4_output() {
+    let mask = solid_image_mask_bytes(8, 8);
+    let type4 = "{ 0.0 exch 0.0 0.0 }";
+    // tint=0.5 → CMYK(0, 0.5, 0, 0) → faint magenta.
+    let content = "/All_CS cs 0.5 scn\n100 0 0 100 0 0 cm\n/IM1 Do\n";
+    let resources = "/ColorSpace << /All_CS [/Separation /All /DeviceCMYK 6 0 R] >>";
+
+    let bytes = build_pdf_image_mask_with_devicen_type4(
+        content,
+        resources,
+        8,
+        8,
+        &mask,
+        type4,
+        "[0 1 0 1 0 1 0 1]",
+        &[0, 1],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline(&doc, true);
+    let (r_on, g_on, b_on, _a) = center_pixel(&on);
+    // Faint magenta: R high, B high, G middling.
+    assert!(
+        r_on > g_on && b_on > g_on,
+        "pipeline /All Separation Type-4 ImageMask must trend magenta (R>G, B>G), got ({r_on},{g_on},{b_on})"
+    );
+    let off = render_with_pipeline(&doc, false);
+    assert_ne!(off, on, "pipeline must differ from inline for /All Separation Type-4 ImageMask");
+}
+
+/// Probe 26 — Separation `/None` colorant applied to an ImageMask.
+/// Per spec, `/None` should produce no marks. Today neither path
+/// honours that special case (wave-1/2 documented the same for paths
+/// and text). Pin OFF and ON ink counts as both > 0 (current shared
+/// non-conformant behaviour); the toggle gains capability for `/None`
+/// the same way it does for other Separations (no special case).
+#[test]
+fn qa_image_mask_separation_none_colorant_parity_pin() {
+    let mask = solid_image_mask_bytes(8, 8);
+    let type4 = "{ 0.0 exch 0.0 0.0 }";
+    let content = "/None_CS cs 0.5 scn\n100 0 0 100 0 0 cm\n/IM1 Do\n";
+    let resources = "/ColorSpace << /None_CS [/Separation /None /DeviceCMYK 6 0 R] >>";
+
+    let bytes = build_pdf_image_mask_with_devicen_type4(
+        content,
+        resources,
+        8,
+        8,
+        &mask,
+        type4,
+        "[0 1 0 1 0 1 0 1]",
+        &[0, 1],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    let off_ink = count_ink_pixels(&off, 0, 0, 100, 100);
+    let on_ink = count_ink_pixels(&on, 0, 0, 100, 100);
+    // Current shared behaviour: both paint. When /None is honoured per
+    // spec this pin must be updated to require zero ink on both sides.
+    assert!(
+        off_ink > 0,
+        "inline /None ImageMask fill must paint SOMETHING today (no spec honor)"
+    );
+    assert!(on_ink > 0, "pipeline /None ImageMask fill must paint SOMETHING today");
+}
