@@ -70,7 +70,12 @@ fn build_pdf_with_type4_separation(
     type4_program: &str,
     page_resources_extra: &str,
 ) -> Vec<u8> {
-    build_pdf_with_type4_separation_range(content_ops, type4_program, page_resources_extra, "[0 1 0 1 0 1 0 1]")
+    build_pdf_with_type4_separation_range(
+        content_ops,
+        type4_program,
+        page_resources_extra,
+        "[0 1 0 1 0 1 0 1]",
+    )
 }
 
 fn build_pdf_with_type4_separation_range(
@@ -1118,8 +1123,8 @@ fn qa_corpus_simple_pdf_toggle_parity() {
 
 #[test]
 fn qa_corpus_hello_structure_pdf_toggle_parity() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/hello_structure.pdf");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello_structure.pdf");
     let bytes = std::fs::read(&path).expect("hello_structure.pdf fixture present");
     let doc = PdfDocument::from_bytes(bytes).expect("hello_structure.pdf parses");
     let off = render_with_pipeline(&doc, false);
