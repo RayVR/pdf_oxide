@@ -78,9 +78,59 @@ pub(crate) enum PaintKind<'a> {
         /// Horizontal advance in user units (post text-matrix).
         advance_user: f32,
     },
-    /// Image XObject (`Do` with `Subtype /Image`).
+    /// **Provisional — not yet emitted by any operator dispatcher.**
+    ///
+    /// Reserved for a future per-image colour-plane resolution stage.
+    /// Today the `Do` dispatcher for `Subtype /Image` either routes
+    /// through [`PaintKind::ColorOnly`] (for `/ImageMask true`, where
+    /// the fill colour comes from graphics state) or hands the pixel
+    /// data straight to the image rasteriser without going through the
+    /// pipeline (since standard image colour comes from sampled pixel
+    /// data, not the current GS fill colour). This variant exists
+    /// because subsequent waves are expected to consume it:
+    ///
+    /// * **Wave 5 separation backend** — per-channel routing of
+    ///   colour-space-bearing image XObjects (CMYK / ICCBased N=4 /
+    ///   Indexed / DeviceN images) to the right plate, which requires
+    ///   the backend to see the image as a paint intent rather than a
+    ///   rasteriser-only call.
+    /// * **Per-pixel colour resolution** for images with Separation or
+    ///   DeviceN colour spaces, where the tint transform must run on
+    ///   every sample rather than only on the fill register.
+    ///
+    /// This is distinct from [`PaintKind::Path`] because image colour
+    /// comes from sampled pixel data, not from the current GS fill
+    /// colour. Until those waves arrive the variant is unused; the
+    /// pipeline composer copies it through verbatim alongside every
+    /// other variant.
     Image { xobj_name: &'a str },
-    /// Shading pattern (`sh` operator).
+    /// **Provisional — not yet emitted by any operator dispatcher.**
+    ///
+    /// Reserved for a future shading-aware resolution stage. Today the
+    /// `sh` dispatcher drives endpoint-colour resolution out-of-band
+    /// (via the `pipeline_resolve_shading_endpoints` helper on the
+    /// page-renderer side) and hands the two resolved RGBAs to the
+    /// gradient backend; the colour stage does not see the shading
+    /// geometry, so no shading-shape schema needs to be committed to
+    /// here. This variant exists because subsequent waves are
+    /// expected to consume it:
+    ///
+    /// * **Wave 5 separation backend** — per-plate routing of gradient
+    ///   endpoints. A Type 4 Separation gradient resolves to one
+    ///   plate; the backend may need "this is a gradient on plate X
+    ///   spanning tint A to tint B" rather than two unrelated tint
+    ///   values, which requires the backend to see the gradient as a
+    ///   single paint intent rather than two endpoint-colour resolves.
+    /// * **Future overprint resolver** — ISO 32000-1 §11.7.4 has
+    ///   gradient-specific overprint semantics that key off the
+    ///   gradient axis / radii, not the per-stop colour.
+    /// * **Preflight / measurement backends** — integrating ink
+    ///   coverage across a gradient axis needs the gradient geometry,
+    ///   not just its endpoints.
+    ///
+    /// Until those waves arrive the variant is unused; the pipeline
+    /// composer copies it through verbatim alongside every other
+    /// variant.
     Shading { shading_name: &'a str },
 }
 
