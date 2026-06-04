@@ -1164,6 +1164,18 @@ impl PageRenderer {
                             &gs_stack,
                         );
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        // ISO 32000-1 §8.5.3.1 Table 60: `b` and `b*` close
+                        // the path before fill+stroke. The parser does not
+                        // decompose them (unlike `s`, which is emitted as
+                        // `ClosePath` + `Stroke`), so the dispatcher must
+                        // perform the close itself or the final segment of
+                        // an open subpath will not be painted by the stroke.
+                        if matches!(
+                            op,
+                            Operator::CloseFillStroke | Operator::CloseFillStrokeEvenOdd
+                        ) {
+                            current_path.close();
+                        }
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
