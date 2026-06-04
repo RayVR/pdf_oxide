@@ -1380,3 +1380,74 @@ fn qa_text_tj_with_active_clip_path_parity() {
         "clip must prevent ink outside the clipped region, got {total_outside}"
     );
 }
+
+// ============================================================================
+// Adversarial-input probes — empty / whitespace / extreme TJ offsets.
+// ============================================================================
+
+/// Probe 26 — Empty `Tj ()` paints no glyphs. The pipeline helper still
+/// runs (the operator-arm dispatch fires); the spliced GS clone might
+/// happen, but the rasteriser has zero glyphs to paint. Toggle parity
+/// must hold and the page must remain white.
+#[test]
+fn qa_text_empty_tj_parity_and_no_ink() {
+    let content = "BT 1 0 0 rg /F1 30 Tf 10 30 Td () Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "empty Tj must be byte-identical off vs on");
+    assert_eq!(count_ink_pixels(&on, 0, 0, 100, 100), 0, "empty Tj must paint zero pixels");
+}
+
+/// Probe 27 — Whitespace-only Tj string. Tw word-spacing affects only
+/// `0x20` glyphs in the rasteriser; with Tw=0 and a single space, no
+/// visible ink lands (space glyph has zero bbox). Parity must hold.
+#[test]
+fn qa_text_whitespace_only_tj_parity() {
+    let content = "BT 1 0 0 rg /F1 30 Tf 10 30 Td (   ) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "whitespace-only Tj must be byte-identical off vs on");
+}
+
+/// Probe 28 — TJ with an extreme negative numeric offset that would push
+/// the text cursor far off the page. The pipeline migration must not
+/// crash AND parity must hold.
+#[test]
+fn qa_text_tj_extreme_negative_offset_parity() {
+    // -32767 in TJ units is -32.767 × fontSize × Tz/100 ~ -491 pt at
+    // fontSize 15 — well past the 100-pt page edge.
+    let content = "BT 1 0 0 rg /F1 15 Tf 50 50 Td [(A) -32767 (B)] TJ ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false);
+    let on = render_with_pipeline_allow_fail(&doc, true);
+    // Both should produce a result (no panic). Parity must hold whichever
+    // way the rasteriser handles the extreme offset.
+    assert!(off.is_some(), "extreme TJ offset must not panic off-pipeline");
+    assert!(on.is_some(), "extreme TJ offset must not panic on-pipeline");
+    assert_eq!(off, on, "extreme TJ offset must be byte-identical off vs on");
+}
+
+/// Probe 29 — TJ array containing only numeric kerning offsets (no string
+/// segments). The array advances the text cursor but paints no glyphs.
+/// Parity must hold and no ink should appear.
+#[test]
+fn qa_text_tj_all_numeric_array_parity_and_no_ink() {
+    let content = "BT 1 0 0 rg /F1 30 Tf 10 50 Td [-100 -200 -300] TJ ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false);
+    let on = render_with_pipeline_allow_fail(&doc, true);
+    assert!(off.is_some(), "all-numeric TJ must not panic off-pipeline");
+    assert!(on.is_some(), "all-numeric TJ must not panic on-pipeline");
+    assert_eq!(off, on, "all-numeric TJ must be byte-identical off vs on");
+    assert_eq!(
+        count_ink_pixels(&on.unwrap(), 0, 0, 100, 100),
+        0,
+        "all-numeric TJ must paint zero pixels"
+    );
+}
