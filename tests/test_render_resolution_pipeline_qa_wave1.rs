@@ -989,3 +989,156 @@ fn qa_scn_too_few_components_no_panic() {
     assert!(off.is_some(), "DeviceN with too-few components must not panic the inline path");
     assert!(on.is_some(), "DeviceN with too-few components must not panic the pipeline path");
 }
+
+// ===========================================================================
+// PROBE AREA: Performance + memory (probes 25-26)
+// ===========================================================================
+
+/// Probe 25 — Wall-clock comparison: 1000 fills, toggle off vs on.
+///
+/// The pipeline allocates a single-pixel `PathBuilder`, builds a
+/// `LogicalColor`, instantiates a `ResolutionPipeline`, and runs the
+/// colour stage on every paint. The off path is a direct
+/// `gs.fill_color_rgb` read. The ratio is the cost of routing through
+/// the pipeline on the hot path.
+///
+/// This test does NOT assert a tight bound — wall-clock varies by
+/// system, and the wave-1 design intentionally favours correctness
+/// (capability gain) over hot-path latency. It exists to surface a
+/// 100×-scale regression that would be visible to operators: anything
+/// over 10× should warrant investigation. The bound is therefore
+/// generous (20×).
+#[test]
+fn qa_perf_thousand_fills_toggle_on_within_bound() {
+    let mut content = String::with_capacity(20_000);
+    content.push_str("1 0 0 rg\n");
+    for i in 0..1000 {
+        let x = (i % 50) as f32;
+        let y = ((i / 50) % 50) as f32;
+        content.push_str(&format!("{} {} 1 1 re\nf\n", x, y));
+    }
+    let bytes = build_pdf(&content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    // Warm up to amortise the first-call overhead in tiny_skia / font
+    // init etc.
+    let _ = render_with_pipeline(&doc, false);
+    let _ = render_with_pipeline(&doc, true);
+
+    let t_off = std::time::Instant::now();
+    let _ = render_with_pipeline(&doc, false);
+    let d_off = t_off.elapsed();
+
+    let t_on = std::time::Instant::now();
+    let _ = render_with_pipeline(&doc, true);
+    let d_on = t_on.elapsed();
+
+    // Print the ratio so cargo test output carries the perf signal.
+    println!(
+        "perf-1000-fills: off={:?}, on={:?}, ratio={:.2}x",
+        d_off,
+        d_on,
+        d_on.as_secs_f64() / d_off.as_secs_f64().max(1e-9)
+    );
+
+    // Generous bound — only catches catastrophic regression.
+    let ratio = d_on.as_secs_f64() / d_off.as_secs_f64().max(1e-9);
+    assert!(
+        ratio < 20.0,
+        "pipeline-on must not exceed 20x of pipeline-off wall-clock on 1000 fills; got {ratio:.2}x \
+         (off={d_off:?}, on={d_on:?})"
+    );
+}
+
+/// Probe 26 — Allocation symmetry of fill-stroke combo.
+///
+/// Each `B`/`b`/`B*`/`b*` calls `pipeline_resolve_fill_rgba` AND
+/// `pipeline_resolve_stroke_rgba`. Each call goes through
+/// `pipeline_resolve_rgba`, which allocates:
+///   - one `ResolutionPipeline` instance
+///   - one `ResolutionContext`
+///   - one `LogicalColor` (with a `Vec<f32>` of the components)
+///   - one `PathBuilder` plus a finished `Path`
+///   - one `PaintIntent`
+/// Per combo, that's two of each — 10 allocations per combo (roughly).
+///
+/// We can't measure heap activity in a stable way from inside `cargo
+/// test`, so this is a *behavioural* pin: render N combos under toggle
+/// on, render N combos under toggle off, and confirm both succeed and
+/// produce the same output. The intent is to flag the cost — N = 500
+/// combos exercising the hot path twice with two pipeline calls each =
+/// 1000 ResolutionPipeline instantiations per render. If this becomes a
+/// real ceiling, the cost is documented here.
+#[test]
+fn qa_perf_combo_alloc_pressure_does_not_break_correctness() {
+    let mut content = String::with_capacity(20_000);
+    content.push_str("0 1 0 rg\n1 0 0 RG\n1 w\n");
+    for i in 0..500 {
+        let x = (i % 25) as f32 * 4.0;
+        let y = ((i / 25) % 20) as f32 * 5.0;
+        content.push_str(&format!("{} {} 3 3 re\nB\n", x, y));
+    }
+    let bytes = build_pdf(&content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    // 500 combo operators × 2 pipeline calls each = 1000 ResolutionPipeline
+    // builds. Both renders must succeed and produce identical output.
+    assert_eq!(
+        off, on,
+        "500 combo operators under heavy pipeline alloc pressure must produce identical output"
+    );
+}
+
+// ===========================================================================
+// PROBE AREA: Regression coverage — corpus PDFs with toggle on (probe 27)
+// ===========================================================================
+
+/// Probe 27 — Real-world fixture PDFs render identically with toggle
+/// on vs off. The pilot's synthetic fixtures exercise specific code
+/// paths; a corpus PDF that doesn't use Separation or DeviceN colour
+/// spaces should produce byte-identical output under both toggles.
+///
+/// We pick `simple.pdf` because it's small, ship-checked-in, and
+/// exercises real text + path rendering through the pipeline-migrated
+/// operators. Other corpus PDFs are also worth pinning; we use one as
+/// a representative.
+#[test]
+fn qa_corpus_simple_pdf_toggle_parity() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple.pdf");
+    let bytes = std::fs::read(&path).expect("simple.pdf fixture present");
+    let doc = PdfDocument::from_bytes(bytes).expect("simple.pdf parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "tests/fixtures/simple.pdf must render byte-identically under toggle on vs off"
+    );
+}
+
+#[test]
+fn qa_corpus_hello_structure_pdf_toggle_parity() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hello_structure.pdf");
+    let bytes = std::fs::read(&path).expect("hello_structure.pdf fixture present");
+    let doc = PdfDocument::from_bytes(bytes).expect("hello_structure.pdf parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "tests/fixtures/hello_structure.pdf must render byte-identically under toggle on vs off"
+    );
+}
+
+#[test]
+fn qa_corpus_outline_pdf_toggle_parity() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/outline.pdf");
+    let bytes = std::fs::read(&path).expect("outline.pdf fixture present");
+    let doc = PdfDocument::from_bytes(bytes).expect("outline.pdf parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "tests/fixtures/outline.pdf must render byte-identically under toggle on vs off"
+    );
+}
