@@ -422,3 +422,322 @@ fn qa_image_mask_negative_determinant_ctm_toggle_parity() {
         "negative-det stencil should leave visible ink"
     );
 }
+
+// ===========================================================================
+// Probes 10-12 — Standard (non-mask) Image XObject pass-through.
+//
+// Wave 3 routes ONLY `/ImageMask true` through the pipeline; standard
+// images go to `render_image` unchanged. These probes pin that the
+// guard reads `/ImageMask true` strictly (not "any /ImageMask entry")
+// and that toggle-on remains byte-identical to toggle-off for
+// non-mask images across the colour spaces that matter.
+// ===========================================================================
+
+/// Build a one-page PDF with a standard (non-mask) Image XObject `/IM1`
+/// whose ColorSpace dict entry is rendered inline as `/{cs_name}` (use
+/// for `DeviceRGB`, `DeviceGray`, `DeviceCMYK`). `bits_per_component`
+/// is also written into the stream dict.
+fn build_pdf_standard_image_named_cs(
+    content_ops: &str,
+    width: u32,
+    height: u32,
+    bits_per_component: u32,
+    pixel_bytes: &[u8],
+    cs_name: &str,
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /IM1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+         /BitsPerComponent {} /ColorSpace /{} /Length {} >>\nstream\n",
+        width,
+        height,
+        bits_per_component,
+        cs_name,
+        pixel_bytes.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(pixel_bytes);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a one-page PDF with a standard Image XObject `/IM1` whose
+/// ColorSpace is `[/Indexed /DeviceRGB hival lookup_stream_ref]`.
+/// `palette_bytes` is the lookup table as raw RGB triples; `pixel_bytes`
+/// are the index samples (BPC=8).
+fn build_pdf_standard_image_indexed(
+    content_ops: &str,
+    width: u32,
+    height: u32,
+    pixel_bytes: &[u8],
+    palette_bytes: &[u8],
+    hival: u32,
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    // Render palette as a hex string so we can keep everything in one
+    // file without an extra indirect object.
+    let mut palette_hex = String::from("<");
+    for b in palette_bytes {
+        palette_hex.push_str(&format!("{:02X}", b));
+    }
+    palette_hex.push('>');
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /IM1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+         /BitsPerComponent 8 /ColorSpace [/Indexed /DeviceRGB {} {}] \
+         /Length {} >>\nstream\n",
+        width,
+        height,
+        hival,
+        palette_hex,
+        pixel_bytes.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(pixel_bytes);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Probe 10 — CMYK standard image (non-mask) pass-through. Wave 3
+/// must not splice the pipeline on these; output byte-identical
+/// regardless of the toggle.
+#[test]
+fn qa_standard_image_cmyk_pass_through_byte_identical() {
+    // 4x4 CMYK pixels, all (0, 1, 0, 0) → magenta under additive clamp.
+    // Each pixel is 4 bytes (one per component).
+    let mut pixels = Vec::with_capacity(16 * 4);
+    for _ in 0..16 {
+        pixels.extend_from_slice(&[0u8, 255, 0, 0]);
+    }
+    let content = "q\n80 0 0 80 10 10 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_standard_image_named_cs(content, 4, 4, 8, &pixels, "DeviceCMYK");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "standard CMYK image must pass through pipeline byte-identically");
+}
+
+/// Probe 11 — Indexed standard image (non-mask) pass-through. Palette
+/// of 256 entries (full 8-bit). Pixel data picks index 0 (red palette
+/// entry) for every sample.
+#[test]
+fn qa_standard_image_indexed_256_pass_through_byte_identical() {
+    // Build a 256-entry palette: index 0 = red, all others = white.
+    let mut palette = Vec::with_capacity(256 * 3);
+    palette.extend_from_slice(&[0xFFu8, 0x00, 0x00]); // index 0: red
+    for _ in 1..256 {
+        palette.extend_from_slice(&[0xFFu8, 0xFF, 0xFF]); // others: white
+    }
+    let pixels = vec![0u8; 16]; // 4x4 image, all index 0
+    let content = "q\n80 0 0 80 10 10 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_standard_image_indexed(content, 4, 4, &pixels, &palette, 255);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "standard Indexed image (256-entry palette) must pass through pipeline byte-identically"
+    );
+    // Pin a body pixel: well inside the 80x80 image footprint.
+    let (r, g, b, _a) = pixel_at(&on, 50, 50);
+    assert!(
+        r > 200 && g < 60 && b < 60,
+        "indexed image at index 0 (red palette) must be red at centre, got ({r}, {g}, {b})"
+    );
+}
+
+/// Probe 12 — `/ImageMask false` explicit (not omitted). The wave-3
+/// guard reads `matches!(o, Object::Boolean(true))`; the `false` case
+/// must take the standard-image branch. This is a regression pin
+/// against a future refactor that might switch to `o.is_some()`.
+#[test]
+fn qa_image_with_explicit_imagemask_false_routes_to_standard_image() {
+    // Mint a 4x4 DeviceGray standard image AND tag it with `/ImageMask
+    // false`. The renderer must NOT take the mask branch (no
+    // `render_image_mask` call), and toggle off vs on must be
+    // byte-identical because the pipeline isn't routed for standard
+    // images.
+    let pixels = vec![0x80u8; 16];
+    let content = "q\n80 0 0 80 10 10 cm\n/IM1 Do\nQ\n";
+
+    // Custom build with the extra dict key.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /IM1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask false \
+         /Width 4 /Height 4 /BitsPerComponent 8 /ColorSpace /DeviceGray \
+         /Length {} >>\nstream\n",
+        pixels.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(&pixels);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "standard image with explicit `/ImageMask false` must pass through pipeline byte-identically"
+    );
+    // Pin: centre is mid-grey, NOT painted with the (default-zero) fill
+    // colour. If the mask branch had erroneously fired, the stencil
+    // bits (0x80 = `1000 0000`) would have painted only the high bit
+    // as opaque, with the current fill colour, leaving most of the
+    // page unpainted.
+    let (r, g, b, _a) = pixel_at(&on, 50, 50);
+    assert!(
+        r == g && g == b && (110..=145).contains(&(r as i32)),
+        "explicit /ImageMask false must render the grey pixel data, got ({r}, {g}, {b})"
+    );
+}
+
+/// Probe 12b — ICCBased N=4 (CMYK ICC profile) standard image (non-mask)
+/// pass-through. The ICC profile is supplied as an indirect stream (object
+/// 6). Even if the extractor falls back when the ICC bytes are not a
+/// valid profile, the *routing decision* (mask vs standard) must remain
+/// stable: toggle off vs on byte-identical.
+#[test]
+fn qa_standard_image_iccbased_n4_pass_through_byte_identical() {
+    // 2x2 CMYK pixels (16 bytes), all magenta.
+    let mut pixels = Vec::with_capacity(16);
+    for _ in 0..4 {
+        pixels.extend_from_slice(&[0u8, 255, 0, 0]);
+    }
+    // Bogus ICC profile bytes — the extractor falls back to /Alternate
+    // or DeviceCMYK; what we're pinning is routing, not colour fidelity.
+    let icc_bytes = vec![0u8; 32];
+
+    let content = "q\n80 0 0 80 10 10 cm\n/IM1 Do\nQ\n";
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /IM1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 2 \
+         /BitsPerComponent 8 /ColorSpace [/ICCBased 6 0 R] /Length {} >>\nstream\n",
+        pixels.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(&pixels);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_off = buf.len();
+    let icc_hdr = format!(
+        "6 0 obj\n<< /N 4 /Alternate /DeviceCMYK /Length {} >>\nstream\n",
+        icc_bytes.len()
+    );
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(&icc_bytes);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "ICCBased N=4 standard image must pass through pipeline byte-identically"
+    );
+}
