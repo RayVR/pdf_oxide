@@ -2732,7 +2732,7 @@ impl PageRenderer {
     /// side-specific behaviour off `intent.side`, so a Type 4 Separation
     /// on the fill side and a plain DeviceRGB on the stroke side route
     /// correctly without contaminating each other.
-    fn pipeline_resolve_text_gs(
+    pub(crate) fn pipeline_resolve_text_gs(
         &self,
         doc: &PdfDocument,
         gs: &GraphicsState,
@@ -3136,5 +3136,134 @@ mod tests {
         assert!((ny - 170.0).abs() < 0.001);
         assert!((nw - 50.0).abs() < 0.001);
         assert!((nh - 30.0).abs() < 0.001);
+    }
+
+    // ---------------------------------------------------------------------
+    // Helper-level pins for the text-resolution splice.
+    //
+    // The text-side integration tests in
+    // `tests/test_render_resolution_pipeline_pilot.rs` exercise the full
+    // renderer end-to-end, but two properties are not directly observable
+    // from there today:
+    //
+    //   * Stroke-side resolution. The text rasteriser does not currently
+    //     paint stroked glyphs, so the spliced stroke colour never reaches
+    //     the pixmap. We probe it here by inspecting the
+    //     `GraphicsState` the helper returns.
+    //
+    //   * Helper-returns-`None` on the off-toggle path. The integration
+    //     test asserts byte-equal output between off and on for a no-op
+    //     splice, which holds whether the helper returns `None` or
+    //     `Some(clone)`. We probe the return value directly here.
+    //
+    // Both probes call `pipeline_resolve_text_gs` directly. The wider
+    // integration coverage stays untouched.
+    // ---------------------------------------------------------------------
+
+    use crate::content::graphics_state::GraphicsState;
+    use crate::rendering::resolution::test_support::fixture_doc;
+    use smallvec::smallvec;
+    use std::collections::HashMap;
+
+    fn type4_magenta_separation_space() -> Object {
+        // `{ 0.0 exch 0.0 0.0 }` — at full tint this yields CMYK(0,1,0,0),
+        // which the colour resolver converts to RGB ≈ (1, 0, 1) (magenta).
+        // Same shape as the colour-stage and pipeline regression tests.
+        let program = b"{ 0.0 exch 0.0 0.0 }";
+        let mut func_dict: HashMap<String, Object> = HashMap::new();
+        func_dict.insert("FunctionType".into(), Object::Integer(4));
+        func_dict
+            .insert("Domain".into(), Object::Array(vec![Object::Integer(0), Object::Integer(1)]));
+        func_dict.insert(
+            "Range".into(),
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(1),
+            ]),
+        );
+        let func_obj = Object::Stream {
+            dict: func_dict,
+            data: program.to_vec().into(),
+        };
+        Object::Array(vec![
+            Object::Name("Separation".into()),
+            Object::Name("MagentaSpot".into()),
+            Object::Name("DeviceCMYK".into()),
+            func_obj,
+        ])
+    }
+
+    #[test]
+    fn pipeline_resolve_text_gs_strokes_magenta_under_tr1() {
+        // T-1 stroke-side resolution probe.
+        //
+        // Construct a `PageRenderer` with the toggle on and a
+        // Separation/DeviceCMYK/Type-4 colour space attached to the
+        // stroke side. Under Tr=1 the helper must resolve the stroke
+        // side through the pipeline and splice the Type-4-evaluated RGB
+        // into `spliced.stroke_color_rgb`. The legacy `1.0 - tint = 0`
+        // fallback would put black on the stroke channel; the pipeline
+        // must produce magenta (R high, G low, B high).
+        let mut renderer = PageRenderer::new(RenderOptions::default());
+        renderer.pipeline_enabled_cache = true;
+        renderer
+            .color_spaces
+            .insert("SpotMagenta".to_string(), type4_magenta_separation_space());
+
+        let mut gs = GraphicsState::new();
+        gs.render_mode = 1; // Stroke-only text.
+        gs.stroke_color_space = "SpotMagenta".to_string();
+        gs.stroke_color_components = smallvec![1.0]; // full tint
+                                                     // Leave fill side at the GraphicsState default (DeviceGray, no
+                                                     // components) so a stray fill-side resolve attempt would fail
+                                                     // out — keeping the assertion focused on the stroke channel.
+
+        let doc = fixture_doc();
+        let spliced = renderer
+            .pipeline_resolve_text_gs(&doc, &gs)
+            .expect("Tr=1 stroke side must produce a spliced GraphicsState");
+
+        let (r, g, b) = spliced.stroke_color_rgb;
+        assert!(
+            r > 0.78 && g < 0.24 && b > 0.78,
+            "stroke side must be magenta (Type-4 evaluated), \
+             not the legacy 1-tint=0 black; got ({r}, {g}, {b})"
+        );
+        // The fill channel must not have been written — the helper
+        // resolves only the side(s) selected by the Tr mode.
+        assert_eq!(spliced.fill_color_rgb, gs.fill_color_rgb, "Tr=1 must not touch the fill side");
+    }
+
+    #[test]
+    fn pipeline_resolve_text_gs_returns_none_when_toggle_off() {
+        // T-2 helper-disabled probe. With the toggle off the helper must
+        // return `None` regardless of how rich the inputs are — including
+        // a Tr=2 fill+stroke configuration that would otherwise drive
+        // both sides through the pipeline.
+        let renderer = PageRenderer::new(RenderOptions::default());
+        // `PageRenderer::new` leaves `pipeline_enabled_cache = false`; we
+        // re-assert it here as a guard against future drift in the
+        // constructor.
+        assert!(
+            !renderer.pipeline_enabled_cache,
+            "default-constructed renderer must have the pipeline toggle off"
+        );
+
+        let mut gs = GraphicsState::new();
+        gs.render_mode = 2;
+        gs.fill_color_space = "DeviceRGB".to_string();
+        gs.fill_color_components = smallvec![1.0, 0.0, 0.0];
+        gs.stroke_color_space = "DeviceRGB".to_string();
+        gs.stroke_color_components = smallvec![0.0, 0.0, 1.0];
+
+        let doc = fixture_doc();
+        let result = renderer.pipeline_resolve_text_gs(&doc, &gs);
+        assert!(result.is_none(), "helper must return None when the toggle is off; got Some(_)");
     }
 }
