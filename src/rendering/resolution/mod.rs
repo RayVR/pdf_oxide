@@ -41,6 +41,61 @@
 //! PaintBackend trait   ← composite (RGBA) / separation (per-plate) / future
 //! ```
 //!
+//! # Design influences
+//!
+//! The shape of this module — operator dispatch → logical paint intent →
+//! composable resolution stages → backend-agnostic resolved command →
+//! pluggable backend — was driven by three public sources, named here for
+//! clarity:
+//!
+//! 1. **ISO 32000-1:2008 (PDF 1.7)** and **ISO 32000-2:2020 (PDF 2.0)**.
+//!    The layering separates spec concerns that the inline renderers had
+//!    conflated:
+//!      - §8.6 (colour spaces) and §8.6.6.4 (`tintTransform` for
+//!        Separation/DeviceN) drive the `ColorResolver` stage.
+//!      - §7.10 (functions) — Type 0 sampled, Type 2 exponential,
+//!        Type 3 stitching, Type 4 PostScript calculator — drive what the
+//!        resolver consults when a colour space carries a function.
+//!      - §11.7.4 (overprint, `/OP`, `/op`, `/OPM`) drives `OverprintResolver`.
+//!      - §11.3.5.1 / §11.3.5.2 (blend modes, separable vs. non-separable)
+//!        drive `BlendResolver`.
+//!      - §11.4 (transparency / soft masks / clipping) drives `ClipResolver`.
+//!      - §14.11.5 (`/OutputIntents`) and §10 (colour management) drive
+//!        what the resolver consults from [`crate::document`]
+//!        `output_intent_cmyk_profile()` and [`crate::color`].
+//!
+//! 2. **Existing pdf_oxide code** that already carried the capabilities the
+//!    inline renderers didn't consume:
+//!      - [`crate::functions`] — PostScript calculator implementation, with
+//!        Type 0/2/3/4 evaluators. Pre-dates this branch.
+//!      - [`crate::color`] — qcms-based ICC pipeline. Pre-dates this branch.
+//!      - [`crate::document::PdfDocument::output_intent_cmyk_profile`] —
+//!        `/OutputIntents` reader. Pre-dates this branch.
+//!      - [`super::ext_gstate`] `ParsedExtGState` — already parses
+//!        `/OP`, `/op`, `/OPM` into typed fields; the inline page renderer
+//!        was ignoring them.
+//!      - [`super::separation_renderer`] `tint_for_ink` — already implements
+//!        per-plate spot resolution; informed `InkRouter`'s shape.
+//!      - The [`crate::content::Operator`] enum, [`super::GraphicsState`]
+//!        struct, and the existing match-arm dispatch in
+//!        [`super::page_renderer`] — direct input to where the pipeline
+//!        slots in as the new layer between operator dispatch and the
+//!        rasteriser.
+//!
+//! 3. **General graphics-pipeline design patterns** — the operator-dispatch /
+//!    intent / resolution / backend layering is a long-standing public idiom
+//!    in graphics renderers (PostScript display lists, immediate-mode → IR →
+//!    backend separation in shader compilers, RIP architectures going back
+//!    to the late 1980s). The module's shape lifts these public patterns into
+//!    pdf_oxide; the specific stage decomposition is driven by the PDF spec
+//!    sections listed above, not by any particular implementation.
+//!
+//! **Not consulted**: any proprietary PDF rendering engine's source, API
+//! headers, or class hierarchy. The naming choices (`PaintIntent`,
+//! `ResolvedPaintCmd`, `PaintBackend`, the resolver stage names) are
+//! deliberately generic so as not to mirror any specific incumbent's API
+//! surface.
+//!
 //! # Status (this branch)
 //!
 //! The pipeline is wired behind an env-var toggle in the page renderer
