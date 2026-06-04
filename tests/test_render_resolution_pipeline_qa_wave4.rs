@@ -930,3 +930,183 @@ fn qa_devicen_two_colorant_type4_capability_pin() {
         "DeviceN multi-colorant Type-4 must drive a visible toggle-on vs off delta"
     );
 }
+
+// ===========================================================================
+// Probes 13-16 — Function shape edges.
+//
+// The wave-4 helper reads `/C0` from `Functions.first()` and `/C1` from
+// `Functions.last()` for Type-3 stitching. Probe the boundary cases:
+//
+//   - 3+ sub-functions: verify the gradient endpoints are the FIRST
+//     sub-function's C0 and the LAST sub-function's C1 — NOT the
+//     middle-sub-function's C0/C1 or the boundary-stitching values.
+//   - Sub-functions with non-default Domain: verify the helper doesn't
+//     accidentally pick a domain-boundary colour for the gradient
+//     endpoint.
+//   - Type 2 with N != 1: the exponent affects interpolation, not
+//     endpoint extraction. The helper must read C0/C1 verbatim
+//     regardless of N.
+//   - Type 4 as the shading's own /Function (NOT as a Separation tint
+//     transform): the helper falls through (function types 0 and 4
+//     used directly as the shading function don't have /C0 /C1
+//     arrays). Caller must fall back to the inline path; no panic.
+// ===========================================================================
+
+/// Build a stitching-function shading from N Type-2 sub-functions
+/// using equal `/Bounds`. Helper returns the full shading-dict body
+/// for `build_pdf_shading_raw`.
+fn type3_stitching_body(
+    space_str: &str,
+    coords: &str,
+    sub_c0_c1: &[(&str, &str)],
+    extra_shading_keys: &str,
+) -> String {
+    let n = sub_c0_c1.len();
+    let mut funcs = String::new();
+    for (c0, c1) in sub_c0_c1 {
+        funcs.push_str(&format!("<< /FunctionType 2 /Domain [0 1] /C0 {} /C1 {} /N 1 >> ", c0, c1));
+    }
+    let bounds: String = (1..n)
+        .map(|i| format!("{:.4}", i as f32 / n as f32))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let encode: String = (0..n).map(|_| "0 1").collect::<Vec<_>>().join(" ");
+    format!(
+        "<< /ShadingType 2 /ColorSpace {} /Coords {} /Domain [0 1] {} \
+         /Function << /FunctionType 3 /Domain [0 1] /Functions [{}] \
+         /Bounds [{}] /Encode [{}] >> >>",
+        space_str, coords, extra_shading_keys, funcs, bounds, encode
+    )
+}
+
+/// Probe 13 — Stitching with 3 sub-functions. Sub 0: red→green;
+/// sub 1: green→blue; sub 2: blue→yellow. Gradient C0 (at t=0) MUST
+/// be sub[0]./C0 = red. Gradient C1 (at t=1) MUST be sub[2]./C1 =
+/// yellow. A regression that picked sub[1]./C0 (green) or sub[1]./C1
+/// (blue) as the endpoint would show up here.
+#[test]
+fn qa_type3_stitching_three_subfunctions_uses_first_c0_and_last_c1() {
+    let body = type3_stitching_body(
+        "/DeviceRGB",
+        "[0 50 100 50]",
+        &[
+            ("[1 0 0]", "[0 1 0]"),
+            ("[0 1 0]", "[0 0 1]"),
+            ("[0 0 1]", "[1 1 0]"),
+        ],
+        "",
+    );
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", &body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "stitching DeviceRGB toggle parity");
+
+    let (r_l, g_l, b_l, _) = pixel_at(&on, 2, 50);
+    assert!(
+        r_l > 230 && g_l < 50 && b_l < 50,
+        "stitching C0 stop must be sub[0]./C0 red; got ({r_l}, {g_l}, {b_l})"
+    );
+    let (r_r, g_r, b_r, _) = pixel_at(&on, 98, 50);
+    assert!(
+        r_r > 220 && g_r > 220 && b_r < 60,
+        "stitching C1 stop must be sub[last]./C1 yellow; got ({r_r}, {g_r}, {b_r})"
+    );
+}
+
+/// Probe 14 — Stitching where sub-functions have non-default Domain.
+/// Per PDF spec, the sub-function's own /Domain affects its input
+/// mapping, NOT the C0/C1 values it produces — C0/C1 are always the
+/// outputs at the sub-function's domain endpoints. So reading
+/// `first.C0` for the gradient at t=0 still gives the correct value
+/// even when the sub-function's /Domain is something exotic.
+#[test]
+fn qa_type3_stitching_subfunction_domains_dont_perturb_endpoint() {
+    let funcs = "<< /FunctionType 2 /Domain [-2 5] /C0 [1 0 0] /C1 [0 1 0] /N 1 >> \
+                 << /FunctionType 2 /Domain [-2 5] /C0 [0 1 0] /C1 [0 0 1] /N 1 >>";
+    let body = format!(
+        "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 50 100 50] /Domain [0 1] \
+         /Function << /FunctionType 3 /Domain [0 1] /Functions [{}] /Bounds [0.5] /Encode [0 1 0 1] >> >>",
+        funcs
+    );
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", &body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "stitching with non-default sub-Domain must keep off-vs-on parity");
+
+    let (r_l, g_l, b_l, _) = pixel_at(&on, 2, 50);
+    assert!(
+        r_l > 230 && g_l < 50 && b_l < 50,
+        "stitching sub[0]./C0 must still be the geometric C0; got ({r_l}, {g_l}, {b_l})"
+    );
+    let (r_r, g_r, b_r, _) = pixel_at(&on, 98, 50);
+    assert!(
+        b_r > 230 && r_r < 50 && g_r < 50,
+        "stitching sub[last]./C1 must still be the geometric C1; got ({r_r}, {g_r}, {b_r})"
+    );
+}
+
+/// Probe 15 — Type 2 with `N != 1`. PDF §7.10.3: the exponent affects
+/// the interpolation curve, not the endpoint values. `f(0) = C0` and
+/// `f(1) = C1` for any N > 0. The wave-4 helper reads `C0` and `C1`
+/// without consulting `N`; pin that the endpoints are correct
+/// regardless of N.
+#[test]
+fn qa_type2_n_not_one_endpoint_extraction_unchanged() {
+    let shading_body =
+        "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 50 100 50] /Domain [0 1] \
+         /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 2 >> >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "DeviceRGB Type-2 with N=2 must keep off-vs-on parity");
+
+    let (r_l, g_l, b_l, _) = pixel_at(&on, 2, 50);
+    assert!(
+        r_l > 230 && g_l < 50 && b_l < 50,
+        "Type-2 N=2 must still paint C0 red at the axis t=0 endpoint; \
+         got ({r_l}, {g_l}, {b_l})"
+    );
+    let (r_r, g_r, b_r, _) = pixel_at(&on, 98, 50);
+    assert!(
+        b_r > 230 && r_r < 50 && g_r < 50,
+        "Type-2 N=2 must still paint C1 blue at the axis t=1 endpoint; \
+         got ({r_r}, {g_r}, {b_r})"
+    );
+}
+
+/// Probe 16 — Type 4 PostScript function as the SHADING'S OWN
+/// /Function (NOT as a Separation tint transform). The helper's match
+/// arm explicitly rejects FunctionType 0 and 4 used as the shading
+/// function (they produce colours at intermediate domain points, not
+/// at fixed /C0 / /C1 arrays). Caller falls back to the inline path
+/// which also doesn't handle Type 4 here — both paths render the
+/// default (0, 0, 0) → (1, 1, 1) endpoints. Pin no panic + toggle
+/// parity.
+#[test]
+fn qa_type4_as_shading_function_helper_returns_none_falls_back() {
+    let program = "{ 1.0 exch 0.0 0.0 }";
+    let func_body = format!(
+        "<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1] /Length {} >>\nstream\n{}\nendstream",
+        program.len(),
+        program
+    );
+    let shading_body = format!(
+        "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 50 100 50] /Domain [0 1] \
+         /Function {} >>",
+        func_body
+    );
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", &shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("toggle-off must not panic when /Function is Type 4 used as shading function");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("toggle-on must not panic when /Function is Type 4 used as shading function");
+    assert_eq!(
+        off, on,
+        "Type-4-as-shading-function must produce identical output off vs on \
+         (helper returns None, caller falls back to inline)"
+    );
+}
