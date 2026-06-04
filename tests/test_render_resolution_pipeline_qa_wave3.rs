@@ -858,3 +858,355 @@ fn qa_inline_standard_image_renderer_gap_pin() {
         "inline standard image currently goes unrendered (renderer gap)"
     );
 }
+
+// ===========================================================================
+// Probes 15-17 — Form-XObject ImageMask interactions.
+//
+// Form XObjects are rendered recursively. When the Form's content
+// stream invokes an ImageMask, the recursive walk should:
+//   - find the mask in the Form's own /Resources;
+//   - paint it through the wave-3 pipeline-routed path;
+//   - propagate the parent's CTM into the recursion.
+//
+// These probes pin those interactions.
+// ===========================================================================
+
+/// Build a one-page PDF whose `/Fm1` Form XObject internally invokes
+/// an ImageMask `/IM1`. Both are listed in the Form's own /Resources.
+/// The page invokes `/Fm1 Do`.
+fn build_pdf_form_with_inner_image_mask(
+    page_content: &str,
+    form_content: &str,
+    form_resources_extra: &str,
+    width: u32,
+    height: u32,
+    mask_data: &[u8],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(page_content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // Form XObject (object 5). Its /Resources lists /IM1 → object 6,
+    // plus any extra entries the caller wants (e.g. /ColorSpace).
+    let form_off = buf.len();
+    let form_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /XObject << /IM1 6 0 R >> {} >> /Length {} >>\nstream\n",
+        form_resources_extra,
+        form_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(form_content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // ImageMask XObject (object 6).
+    let im_off = buf.len();
+    let im_hdr = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        width,
+        height,
+        mask_data.len()
+    );
+    buf.extend_from_slice(im_hdr.as_bytes());
+    buf.extend_from_slice(mask_data);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, form_off, im_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a PDF with TWO Form XObjects: the page invokes `/Fm1`, `/Fm1`
+/// invokes `/Fm2`, and `/Fm2` invokes the ImageMask `/IM1`. Used to
+/// pin two-level recursion.
+fn build_pdf_form_in_form_with_image_mask(
+    page_content: &str,
+    outer_form_content: &str,
+    inner_form_content: &str,
+    width: u32,
+    height: u32,
+    mask_data: &[u8],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(page_content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // Outer form: lists /Fm2 (object 6) in its /XObject.
+    let outer_off = buf.len();
+    let outer_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /XObject << /Fm2 6 0 R >> >> /Length {} >>\nstream\n",
+        outer_form_content.len()
+    );
+    buf.extend_from_slice(outer_hdr.as_bytes());
+    buf.extend_from_slice(outer_form_content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // Inner form: lists /IM1 (object 7).
+    let inner_off = buf.len();
+    let inner_hdr = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /XObject << /IM1 7 0 R >> >> /Length {} >>\nstream\n",
+        inner_form_content.len()
+    );
+    buf.extend_from_slice(inner_hdr.as_bytes());
+    buf.extend_from_slice(inner_form_content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // ImageMask.
+    let im_off = buf.len();
+    let im_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        width,
+        height,
+        mask_data.len()
+    );
+    buf.extend_from_slice(im_hdr.as_bytes());
+    buf.extend_from_slice(mask_data);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for off in [
+        cat_off, pages_off, page_off, stream_off, outer_off, inner_off, im_off,
+    ] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a PDF with a Form containing an ImageMask AND a Type 4
+/// Separation in its /Resources/ColorSpace. The Form invokes the mask
+/// after setting the spot colour. Used by the capability-gain test for
+/// nested-Form Separation fills.
+fn build_pdf_form_with_imagemask_and_type4_separation(
+    page_content: &str,
+    form_content: &str,
+    type4_program: &str,
+    width: u32,
+    height: u32,
+    mask_data: &[u8],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(page_content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // Form with /SpotMagenta colour space (Type 4 tint → object 7).
+    let form_off = buf.len();
+    let form_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /XObject << /IM1 6 0 R >> \
+                       /ColorSpace << /SpotMagenta [/Separation /MagentaSpot /DeviceCMYK 7 0 R] >> \
+                     >> /Length {} >>\nstream\n",
+        form_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(form_content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // ImageMask.
+    let im_off = buf.len();
+    let im_hdr = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+        width,
+        height,
+        mask_data.len()
+    );
+    buf.extend_from_slice(im_hdr.as_bytes());
+    buf.extend_from_slice(mask_data);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // Type 4 function.
+    let func_off = buf.len();
+    let func_hdr = format!(
+        "7 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+        type4_program.len()
+    );
+    buf.extend_from_slice(func_hdr.as_bytes());
+    buf.extend_from_slice(type4_program.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for off in [
+        cat_off, pages_off, page_off, stream_off, form_off, im_off, func_off,
+    ] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Probe 15 — Form XObject whose internal content paints an
+/// ImageMask under a Type 4 Separation fill. The capability gain
+/// (full-tint → magenta vs `1 - tint` → black) must propagate through
+/// the recursive Form rendering.
+#[test]
+fn qa_form_xobject_with_inner_image_mask_type4_separation_capability_gain() {
+    let mask = solid_image_mask_bytes(8, 8);
+    let type4 = "{ 0.0 exch 0.0 0.0 }"; // tint=1 → magenta
+    let page = "q\n/Fm1 Do\nQ\n";
+    let form = "q\n/SpotMagenta cs\n1 scn\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+
+    let bytes = build_pdf_form_with_imagemask_and_type4_separation(page, form, type4, 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Inline (off): Type 4 falls back to 1 - tint → solid black.
+    let (r_off, g_off, b_off, _a) = center_pixel(&off);
+    assert!(
+        r_off < 50 && g_off < 50 && b_off < 50,
+        "inline Form-nested Type 4 Separation ImageMask must paint ~black, got ({r_off}, {g_off}, {b_off})"
+    );
+    // Pipeline (on): Type 4 program executes → magenta.
+    let (r_on, g_on, b_on, _a) = center_pixel(&on);
+    assert!(
+        r_on >= 250 && g_on <= 5 && b_on >= 250,
+        "pipeline-on Form-nested Type 4 Separation ImageMask must paint magenta, got ({r_on}, {g_on}, {b_on})"
+    );
+    assert_ne!(off, on, "Form-nested capability gain must be visible");
+}
+
+/// Probe 16 — Two-level Form recursion (Form-in-Form), where the
+/// innermost content invokes an ImageMask. Toggle parity for a
+/// DeviceRGB fill — the resolved colour is the same on both paths so
+/// the pixmaps must match.
+#[test]
+fn qa_form_in_form_with_image_mask_toggle_parity() {
+    let mask = solid_image_mask_bytes(8, 8);
+    let page = "q\n/Fm1 Do\nQ\n";
+    let outer = "q\n/Fm2 Do\nQ\n"; // delegate straight to inner
+                                   // Inner sets the fill colour itself and paints the mask. (Set the
+                                   // fill at the inner level so propagation through Form recursion is
+                                   // not co-mingled with the pipeline-routing pin we're after — the
+                                   // CTM and resource scope already test recursion.)
+    let inner = "q\n0 1 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+
+    let bytes = build_pdf_form_in_form_with_image_mask(page, outer, inner, 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "Form-in-Form ImageMask with DeviceRGB fill must be byte-identical off vs on"
+    );
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        g > 200 && r < 60 && b < 60,
+        "two-level Form ImageMask should paint green, got ({r}, {g}, {b})"
+    );
+}
+
+/// Probe 16b — Bug-found pin (UNRELATED to wave-3, but discovered while
+/// probing it). When the page sets the fill colour and then invokes a
+/// Form which paints an ImageMask, the Form's content stream does NOT
+/// see the page's `rg` — the centre paints black instead of the
+/// inherited fill. Symmetric across the pipeline toggle (so it is NOT
+/// a wave-3 regression, but rather a graphics-state-propagation gap
+/// at the Form recursion boundary).
+///
+/// Pinned `#[ignore]` to record the discovery without failing CI.
+/// Bug name: **FORM-RECURSION-FILL-NOT-INHERITED** — the renderer's
+/// recursive Form walk appears to reset (or not propagate) the GS
+/// fill colour on entry to the child Form's content stream. Per PDF
+/// §8.10.1 a Form XObject inherits the parent graphics state at the
+/// point of invocation, with only `q ... Q` saving/restoring around
+/// the call; the fill colour set with `rg` before `/Fm1 Do` should be
+/// visible inside the Form's content stream.
+#[ignore = "FORM-RECURSION-FILL-NOT-INHERITED: page-level fill not seen by Form's ImageMask paint"]
+#[test]
+fn qa_form_fill_inheritance_bug_pin() {
+    let mask = solid_image_mask_bytes(8, 8);
+    let page = "q\n0 1 0 rg\n/Fm1 Do\nQ\n";
+    // Form sets only the CTM — does NOT set a fill colour itself, so
+    // it must inherit the page-level `0 1 0 rg`.
+    let form = "100 0 0 100 0 0 cm\n/IM1 Do\n";
+    let bytes = build_pdf_form_with_inner_image_mask(page, form, "", 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline(&doc, true);
+    let (r, g, b, _a) = center_pixel(&on);
+    // Expected per spec: GS state propagates into child Form content
+    // stream. Observed: centre is (0, 0, 0) — the page-level `rg` did
+    // not stick across the Form boundary.
+    assert!(
+        g > 200 && r < 60 && b < 60,
+        "page-level fill must be visible at Form's ImageMask paint, got ({r}, {g}, {b}) — FORM-RECURSION-FILL-NOT-INHERITED"
+    );
+}
+
+/// Probe 17 — Form-XObject with a nested CTM transformation around
+/// the inner ImageMask. Inside the Form, an inner `q ... cm ... /IM1
+/// Do ... Q` must compose with the page's `cm` cleanly under both
+/// toggle states.
+#[test]
+fn qa_form_xobject_inner_ctm_around_image_mask_toggle_parity() {
+    let mask = solid_image_mask_bytes(8, 8);
+    // The page sets a 30° rotation; the form sets a translation and
+    // scale around the mask. CTM stack correctness across the form
+    // boundary is what's being pinned.
+    let page = "q\n0.866 0.5 -0.5 0.866 50 50 cm\n/Fm1 Do\nQ\n";
+    let form = "q\n1 0 0 rg\n40 0 0 40 -20 -20 cm\n/IM1 Do\nQ\n";
+
+    let bytes = build_pdf_form_with_inner_image_mask(page, form, "", 8, 8, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "Form-XObject inner CTM around ImageMask must round-trip byte-identically"
+    );
+    assert!(
+        count_ink_pixels(&on, 0, 0, 100, 100) > 100,
+        "Form with rotated + nested CTM should leave visible ink"
+    );
+}
