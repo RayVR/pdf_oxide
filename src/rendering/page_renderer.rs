@@ -29,8 +29,8 @@ use crate::rendering::text_rasterizer::TextRasterizer;
 
 use crate::fonts::FontInfo;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tiny_skia::{Color, PathBuilder, Pixmap, PixmapPaint, Transform};
+use std::sync::{Arc, OnceLock};
+use tiny_skia::{Color, Path, PathBuilder, Pixmap, PixmapPaint, Transform};
 
 /// Image output formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +156,15 @@ pub struct PageRenderer {
     /// access per `render_page` invocation. Stays `None` (no allocation) when
     /// the set is empty — the common case.
     excluded_layers_snapshot: Option<Arc<HashSet<String>>>,
+    /// Cached truth value of the `PDF_OXIDE_RESOLUTION_PIPELINE` env var,
+    /// refreshed once per `render_page_with_options` call. The dispatcher
+    /// fires paint operators many thousands of times per page; reading the
+    /// env var on every `pipeline_resolve_rgba` call is well under a
+    /// microsecond but still measurable, and the toggle never changes
+    /// mid-render. Tests that flip the env var around `render_page` calls
+    /// pick up the new value on the next call because the cache is
+    /// recomputed there.
+    pipeline_enabled_cache: bool,
 }
 
 impl PageRenderer {
@@ -168,6 +177,7 @@ impl PageRenderer {
             fonts: HashMap::new(),
             color_spaces: HashMap::new(),
             excluded_layers_snapshot: None,
+            pipeline_enabled_cache: false,
         }
     }
 
@@ -185,6 +195,12 @@ impl PageRenderer {
         // Clear caches for new page
         self.fonts.clear();
         self.color_spaces.clear();
+
+        // Refresh the pipeline-toggle cache once per render. Tests that
+        // flip `PDF_OXIDE_RESOLUTION_PIPELINE` between renders pick up
+        // the new value here; the dispatcher reads the cached bool to
+        // avoid an env-var lookup per paint operator.
+        self.pipeline_enabled_cache = read_pipeline_env();
 
         // Refresh the excluded-layers snapshot once per page. The effective
         // set combines (a) the PDF's default-off OCGs per /OCProperties/D
@@ -2689,7 +2705,7 @@ impl PageRenderer {
         gs: &GraphicsState,
         side: PaintSide,
     ) -> Option<(f32, f32, f32, f32)> {
-        if !pipeline_is_enabled() {
+        if !self.pipeline_enabled_cache {
             return None;
         }
         let pipeline = ResolutionPipeline::new();
@@ -2708,21 +2724,16 @@ impl PageRenderer {
         let resolved_space_obj = color_spaces.get(space_name);
         let logical = build_logical_color(space_name, components, resolved_space_obj);
 
-        // Build a placeholder path-fill intent. The pipeline doesn't actually
-        // need the path geometry for colour resolution; passing an empty
-        // path-builder shape is fine — only the `color`, `gs`, and `side`
-        // fields are read by the colour stage.
-        //
-        // We pre-allocate a single-pixel path so the type-checker is happy;
-        // tiny-skia rejects empty paths.
-        let mut pb = PathBuilder::new();
-        pb.move_to(0.0, 0.0);
-        pb.line_to(0.0, 0.0);
-        let path = pb.finish()?;
+        // Placeholder path-fill intent. The colour stage doesn't read the
+        // path geometry — only `color`, `gs`, and `side` — but `PaintKind`
+        // requires a `Path` to construct. Materialise a unit segment once
+        // per process and re-borrow it; the previous per-call allocation
+        // showed up in the wave-1 hot path.
+        let path = placeholder_path();
 
         let intent = PaintIntent {
             kind: PaintKind::Path {
-                path: &path,
+                path,
                 fill_rule: tiny_skia::FillRule::Winding,
             },
             side,
@@ -2742,17 +2753,31 @@ impl PageRenderer {
     }
 }
 
-/// True when the resolution-pipeline pilot is enabled for path-fill.
+/// Read `PDF_OXIDE_RESOLUTION_PIPELINE` and parse it as a boolean toggle.
 ///
-/// Reads `PDF_OXIDE_RESOLUTION_PIPELINE` at every call site rather than
-/// caching, because callers may flip it inside test threads using
-/// `std::env::set_var`. The boolean is small and the env-var lookup is
-/// well under a microsecond.
-fn pipeline_is_enabled() -> bool {
+/// Called once per `render_page_with_options` invocation and the result
+/// is cached on `PageRenderer::pipeline_enabled_cache`; the dispatcher
+/// reads the cached bool. Tests pick up env-var flips on the next
+/// `render_page` call.
+fn read_pipeline_env() -> bool {
     match std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE") {
         Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => false,
     }
+}
+
+/// A unit-length placeholder path used by `pipeline_resolve_rgba` to
+/// satisfy `PaintKind::Path`'s lifetime — the colour stage does not read
+/// path geometry, but the type system requires a `&Path` either way.
+/// Building the path once per process avoids the per-paint allocation.
+fn placeholder_path() -> &'static Path {
+    static PATH: OnceLock<Path> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let mut pb = PathBuilder::new();
+        pb.move_to(0.0, 0.0);
+        pb.line_to(0.0, 0.0);
+        pb.finish().expect("unit placeholder path is non-empty")
+    })
 }
 
 /// Build a [`LogicalColor`] from the dispatcher's view of the active colour:
