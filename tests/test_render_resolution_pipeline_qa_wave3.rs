@@ -1739,3 +1739,169 @@ fn qa_image_mask_separation_none_colorant_parity_pin() {
     );
     assert!(on_ink > 0, "pipeline /None ImageMask fill must paint SOMETHING today");
 }
+
+// ===========================================================================
+// Probes 27-30 — Adversarial / malformed input.
+//
+// `render_image_mask` consumes the raw stream length, checks
+// `row_bytes * height <= raw.len()`, and bails with an `Image` error
+// on short streams. Long streams are silently truncated.
+// Width/Height = 0 short-circuits before allocation. Width or Height
+// of `0xFFFFFF` would attempt a 4 GB allocation; the helper should
+// either bail or be guarded.
+// ===========================================================================
+
+/// Probe 27 — Stream shorter than the declared Width×Height bits.
+/// The helper must NOT panic and must NOT paint a corrupted image.
+/// (Today the helper returns an `Image` error via a `log::warn!` at
+/// the `Do` arm; the page renders as if the mask weren't there.)
+#[test]
+fn qa_image_mask_too_short_stream_no_panic_pin() {
+    // Declare 8x8 but provide only 1 byte (needs 8 bytes for the
+    // 8-row stencil at row_bytes=1).
+    let bytes_short = vec![0u8; 1];
+    let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 8, 8, &bytes_short);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    // Both calls must complete without panicking.
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("toggle-off must not panic on too-short ImageMask stream");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("toggle-on must not panic on too-short ImageMask stream");
+    assert_eq!(off, on, "too-short ImageMask stream must produce identical output off vs on");
+}
+
+/// Probe 28 — Stream longer than declared. The helper indexes into
+/// the buffer using `row_bytes * height`; trailing bytes are ignored.
+/// No panic, no spurious paint of the trailing bytes.
+#[test]
+fn qa_image_mask_too_long_stream_no_panic_pin() {
+    // Declare 8x8 (needs 8 bytes); provide 64.
+    let mut bytes_long = vec![0u8; 8]; // first 8 bytes — all opaque
+    bytes_long.extend_from_slice(&[0xFFu8; 56]); // trailing garbage
+    let content = "q\n0 1 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 8, 8, &bytes_long);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "too-long ImageMask stream must produce identical output off vs on");
+
+    // The first 8 bytes ARE the full 8x8 stencil; they're all opaque,
+    // so the centre must be green.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(g > 200 && r < 60 && b < 60, "centre must be green, got ({r},{g},{b})");
+}
+
+/// Probe 29 — `Width=0` and `Height=0`. The helper short-circuits
+/// these and returns Ok(()) without painting.
+#[test]
+fn qa_image_mask_zero_dimensions_no_paint_no_panic() {
+    for (w, h) in [(0u32, 8u32), (8, 0), (0, 0)] {
+        let mask = vec![0u8; 8]; // some data, ignored when w==0 or h==0
+        let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+        let bytes = build_pdf_image_mask(content, "", w, h, &mask);
+        let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+        let off = render_with_pipeline_allow_fail(&doc, false)
+            .unwrap_or_else(|| panic!("toggle-off must not panic for {}x{}", w, h));
+        let on = render_with_pipeline_allow_fail(&doc, true)
+            .unwrap_or_else(|| panic!("toggle-on must not panic for {}x{}", w, h));
+        assert_eq!(off, on, "{}x{} ImageMask must produce identical output off vs on", w, h);
+        // No paint: page is fully white.
+        let (r, g, b, _a) = center_pixel(&on);
+        assert_eq!(
+            (r, g, b),
+            (255, 255, 255),
+            "{}x{} ImageMask must produce no paint at centre, got ({}, {}, {})",
+            w,
+            h,
+            r,
+            g,
+            b
+        );
+    }
+}
+
+/// Probe 30 — Absurdly-large dimensions. `render_image_mask` allocates
+/// `vec![0u8; (w*h*4) as usize]`; with `width = 0xFFFFFF` and `height = 1`
+/// that's 4 * 16777215 ≈ 64 MB. The helper's expected-size check fires
+/// FIRST (the supplied stream is shorter than the row-byte requirement)
+/// and bails before allocating the destination buffer.
+///
+/// PIN: the renderer must NOT panic on huge declared dimensions when
+/// the supplied stream is short. If a future allocator-tightening pass
+/// adds an upfront size cap, this test still passes (the bail order
+/// shifts but the no-panic invariant holds).
+#[test]
+fn qa_image_mask_huge_dimensions_short_stream_no_panic() {
+    // Width 0xFFFFFF, Height 1 → row_bytes = 2097152, total expected =
+    // 2097152. Supply only 1 byte; the size check rejects.
+    let mask = vec![0u8; 1];
+    let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let bytes = build_pdf_image_mask(content, "", 0xFFFFFF, 1, &mask);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("toggle-off must not panic on huge-dim ImageMask with short stream");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("toggle-on must not panic on huge-dim ImageMask with short stream");
+    assert_eq!(
+        off, on,
+        "huge-dim short-stream ImageMask must produce identical output off vs on"
+    );
+}
+
+/// Probe 30b — Negative dimensions arrive as PDF integers; PDF parses
+/// them as `Object::Integer(i64)` and `as_integer()` returns `i64`.
+/// The wave-3 helper casts via `as u32`, which on a negative integer
+/// wraps to a huge value. Pair with a tiny stream; bail must fire
+/// before allocation. Probe: no panic.
+///
+/// This is a regression pin against a future refactor switching the
+/// cast to a `try_into()` that bails on negatives — the no-panic
+/// invariant must hold across both behaviours.
+#[test]
+fn qa_image_mask_negative_dimension_field_no_panic() {
+    let mask = vec![0u8; 1];
+    // Custom build that writes Width = -1 to the dict.
+    let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /XObject << /IM1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xobj_off = buf.len();
+    let xobj_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
+         /Width -1 /Height 8 /BitsPerComponent 1 /Length {} >>\nstream\n",
+        mask.len()
+    );
+    buf.extend_from_slice(xobj_hdr.as_bytes());
+    buf.extend_from_slice(&mask);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, xobj_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("toggle-off must not panic on negative-dim ImageMask");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("toggle-on must not panic on negative-dim ImageMask");
+    assert_eq!(off, on, "negative-dim ImageMask must produce identical output off vs on");
+}
