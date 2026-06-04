@@ -3,7 +3,9 @@
 //! Implements structure element types according to ISO 32000-1:2008 Section 14.7.2.
 
 use crate::object::Object;
-use std::collections::HashMap;
+use smallvec::SmallVec;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// The root of a PDF structure tree (StructTreeRoot dictionary).
 ///
@@ -425,6 +427,91 @@ impl MarkInfo {
     pub fn is_structure_reliable(&self) -> bool {
         self.marked && !self.suspects
     }
+}
+
+/// Pre-computed index of structure-element `/ActualText` replacements
+/// resolved over the entire structure tree.
+///
+/// Per ISO 32000-1:2008 §14.9.4, a structure element may carry an
+/// `/ActualText` entry that replaces the entire content of its
+/// descendants for text-extraction purposes. The replacement scope is
+/// the subtree rooted at the bearing element. Nested ActualText
+/// declarations override their ancestors for the spans they cover.
+///
+/// This index resolves all those scopes in a single pre-order traversal
+/// so every extraction surface (`extract_text`, `to_markdown`, `to_html`,
+/// `extract_structured`) can apply ActualText consistently and without
+/// duplicating raw glyphs.
+#[derive(Debug, Clone, Default)]
+pub struct ActualTextIndex {
+    /// Map from leaf MCID → its innermost replacement text.
+    ///
+    /// A leaf MCID is one whose marked-content reference appears inside
+    /// the subtree of an ActualText-bearing element. The "innermost"
+    /// resolution honours nesting: when a descendant element redeclares
+    /// `/ActualText`, the descendant's text replaces the ancestor's for
+    /// MCIDs in the inner subtree.
+    pub mcid_to_actual_text: HashMap<u32, Arc<str>>,
+
+    /// MCIDs whose raw glyph spans must be suppressed during assembly.
+    ///
+    /// Every MCID present in [`mcid_to_actual_text`] is also present in
+    /// this set. Suppression is required to prevent duplicate output
+    /// when the replacement text is emitted from an
+    /// [`ActualTextEmission`].
+    pub covered_mcids: HashSet<u32>,
+
+    /// Emission points, in pre-order traversal order of the structure
+    /// tree.
+    ///
+    /// Each entry corresponds to one ActualText-bearing structure
+    /// element and records where the replacement should be placed.
+    /// Multi-page subtrees emit on the first page only — see
+    /// [`ActualTextEmission::first_page`].
+    pub emissions: Vec<ActualTextEmission>,
+}
+
+impl ActualTextIndex {
+    /// Construct an empty index.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true when no ActualText scopes were discovered.
+    pub fn is_empty(&self) -> bool {
+        self.emissions.is_empty()
+    }
+}
+
+/// One ActualText replacement to be emitted into the assembled output.
+///
+/// An emission represents a single structure element that carries
+/// `/ActualText`. The replacement is emitted ONCE, on the first page
+/// where any of its descendant MCIDs appear (per ISO 32000-1:2008
+/// §14.9.4: ActualText replaces a region of content, not per-page
+/// repetition).
+#[derive(Debug, Clone)]
+pub struct ActualTextEmission {
+    /// The replacement text.
+    pub text: Arc<str>,
+
+    /// The first page (in struct-tree reading order) on which
+    /// descendant MCIDs appear. The emission is only produced when
+    /// assembling this page.
+    pub first_page: u32,
+
+    /// The descendant MCIDs covered by this emission, sorted ascending.
+    /// Used to:
+    /// 1. Decide whether the emission should be skipped because every
+    ///    covered MCID has been filtered out by an OCG layer.
+    /// 2. Position the synthesized span at the location of its first
+    ///    available descendant.
+    pub covered_mcids: SmallVec<[u32; 4]>,
+
+    /// The MCID whose ordered-content position determines where the
+    /// emission sits in reading order. Conventionally the first MCID
+    /// encountered in pre-order under the bearing element.
+    pub anchor_mcid: u32,
 }
 
 #[cfg(test)]

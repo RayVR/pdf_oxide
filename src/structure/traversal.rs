@@ -2,8 +2,12 @@
 //!
 //! Implements pre-order traversal of structure trees to determine correct reading order.
 
-use super::types::{StructChild, StructElem, StructTreeRoot, StructType};
+use super::types::{
+    ActualTextEmission, ActualTextIndex, StructChild, StructElem, StructTreeRoot, StructType,
+};
 use crate::error::Error;
+use smallvec::SmallVec;
+use std::sync::Arc;
 
 /// Role this content plays inside a List (PDF spec §14.8.4.3).
 ///
@@ -452,6 +456,135 @@ fn has_content_on_page(elem: &StructElem, target_page: u32) -> bool {
         }
     }
     false
+}
+
+/// Build an [`ActualTextIndex`] resolving every structure-tree
+/// `/ActualText` declaration in a single pre-order traversal.
+///
+/// Per ISO 32000-1:2008 §14.9.4, a structure element may carry an
+/// `/ActualText` entry that replaces all of its descendant content for
+/// text-extraction purposes. The replacement scope is the bearing
+/// element's subtree. When ActualText scopes nest, the inner
+/// replacement wins for the MCIDs the inner element covers.
+///
+/// The returned index lets every extraction surface apply ActualText
+/// consistently:
+///   - `covered_mcids` lists MCIDs whose raw glyph spans must be
+///     suppressed (an ancestor will emit a replacement on their behalf).
+///   - `mcid_to_actual_text` resolves the innermost replacement for any
+///     covered MCID, useful for spot-replacement when the assembler
+///     iterates spans rather than emissions.
+///   - `emissions` records each ActualText-bearing element in pre-order
+///     with the first page on which any descendant MCID appears, so
+///     multi-page subtrees emit ONCE on the first page (§14.9.4
+///     positions ActualText as a region replacement, not a per-page
+///     repetition).
+///
+/// Empty `/ActualText` strings and elements with no descendant MCID
+/// produce no emission.
+pub fn build_actualtext_index(struct_tree: &StructTreeRoot) -> ActualTextIndex {
+    let mut idx = ActualTextIndex::new();
+    // Stack of emission-vec indices for ActualText-bearing ancestors of
+    // the current traversal frontier. Pushed on element entry when the
+    // element carries `/ActualText`, popped on exit.
+    let mut open: Vec<usize> = Vec::new();
+    for root in &struct_tree.root_elements {
+        walk_actualtext(root, None, &mut open, &mut idx);
+    }
+    debug_assert!(open.is_empty(), "open emission stack must drain");
+    idx
+}
+
+/// Pre-order walker for [`build_actualtext_index`].
+///
+/// `inherited_text` carries the innermost active ActualText scope from
+/// our ancestors. `open` is a stack of indices into `idx.emissions` for
+/// emissions whose subtree we're still traversing — each descendant MCID
+/// extends every open ancestor's coverage record.
+fn walk_actualtext(
+    elem: &StructElem,
+    inherited_text: Option<Arc<str>>,
+    open: &mut Vec<usize>,
+    idx: &mut ActualTextIndex,
+) {
+    let own_text = elem
+        .actual_text
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| -> Arc<str> { Arc::from(s) });
+
+    // Push an emission for this element if it starts a new scope. The
+    // emission carries placeholder `first_page` / `anchor_mcid` values
+    // we back-fill as descendants are visited.
+    let pushed_slot = if let Some(text) = own_text.clone() {
+        let slot = idx.emissions.len();
+        idx.emissions.push(ActualTextEmission {
+            text,
+            // u32::MAX = "no descendant MCID seen yet" sentinel; drop
+            // the emission on exit when it stays at this value.
+            first_page: u32::MAX,
+            covered_mcids: SmallVec::new(),
+            anchor_mcid: u32::MAX,
+        });
+        open.push(slot);
+        Some(slot)
+    } else {
+        None
+    };
+
+    let active_text = own_text.or(inherited_text);
+
+    for child in &elem.children {
+        match child {
+            StructChild::MarkedContentRef { mcid, page } => {
+                if active_text.is_some() {
+                    // Inner-wins: innermost active scope sets the leaf's
+                    // replacement text.
+                    if let Some(ref text) = active_text {
+                        idx.mcid_to_actual_text.insert(*mcid, text.clone());
+                    }
+                    idx.covered_mcids.insert(*mcid);
+                    // Extend every still-open ancestor emission's
+                    // coverage with this descendant.
+                    for &slot in open.iter() {
+                        let emission = &mut idx.emissions[slot];
+                        emission.covered_mcids.push(*mcid);
+                        if emission.anchor_mcid == u32::MAX {
+                            emission.anchor_mcid = *mcid;
+                            emission.first_page = *page;
+                        } else if *page < emission.first_page {
+                            emission.first_page = *page;
+                        }
+                    }
+                }
+            },
+            StructChild::StructElem(child_elem) => {
+                walk_actualtext(child_elem, active_text.clone(), open, idx);
+            },
+            StructChild::ObjectRef(_, _) => {
+                // Unresolved external reference — skip, consistent with
+                // every other traversal pass.
+            },
+        }
+    }
+
+    // Pop and finalise our own emission. Drop emissions that saw no
+    // descendant MCID — they have no anchor to attach to and would
+    // never apply to anything.
+    if let Some(slot) = pushed_slot {
+        debug_assert_eq!(open.last().copied(), Some(slot));
+        open.pop();
+        if idx.emissions[slot].anchor_mcid == u32::MAX {
+            // Invariant: if our slot has no anchor, no descendant MCID
+            // exists in our subtree. Any inner emission would have
+            // been pushed at a higher slot AND would also have no
+            // anchor, so its own finalisation already removed it.
+            // Therefore our slot is the tail and `remove(slot)` cannot
+            // shift any kept emission's index.
+            debug_assert_eq!(slot + 1, idx.emissions.len());
+            idx.emissions.remove(slot);
+        }
+    }
 }
 
 /// Extract all marked content IDs in reading order for a page.
@@ -1033,5 +1166,198 @@ mod tests {
 
         assert!(has_content_on_page(&root, 3));
         assert!(!has_content_on_page(&root, 0));
+    }
+
+    // === ActualTextIndex builder tests ===
+    //
+    // The builder must satisfy these invariants per ISO 32000-1:2008 §14.9.4:
+    //   - Every MCID under an ActualText-bearing element is covered by some
+    //     replacement text.
+    //   - When ActualText scopes nest, the inner replacement wins for MCIDs
+    //     it covers.
+    //   - Each emission carries the FIRST page on which any of its
+    //     covered MCIDs appears (multi-page subtrees emit once).
+    //   - An emission's anchor_mcid is the first descendant MCID found in
+    //     pre-order, used by converters to position the synthesized span.
+
+    #[test]
+    fn test_actualtext_index_simple_single_mcid() {
+        // Span /ActualText "fi" /K 0 on page 0.
+        let mut span = StructElem::new(StructType::Span);
+        span.actual_text = Some("fi".to_string());
+        span.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(span);
+
+        let idx = build_actualtext_index(&tree);
+        assert_eq!(idx.emissions.len(), 1);
+        assert_eq!(&*idx.emissions[0].text, "fi");
+        assert_eq!(idx.emissions[0].first_page, 0);
+        assert_eq!(idx.emissions[0].anchor_mcid, 0);
+        assert_eq!(idx.emissions[0].covered_mcids.as_slice(), &[0u32]);
+        assert!(idx.covered_mcids.contains(&0));
+        assert_eq!(idx.mcid_to_actual_text.get(&0).map(|s| &**s), Some("fi"));
+    }
+
+    #[test]
+    fn test_actualtext_index_nested_inner_wins() {
+        // Outer Span /ActualText "outer" wrapping inner Span /ActualText
+        // "inner" wrapping MCID 5. Inner replacement must win for MCID 5.
+        let mut inner = StructElem::new(StructType::Span);
+        inner.actual_text = Some("inner".to_string());
+        inner.add_child(StructChild::MarkedContentRef { mcid: 5, page: 0 });
+
+        let mut outer = StructElem::new(StructType::Span);
+        outer.actual_text = Some("outer".to_string());
+        outer.add_child(StructChild::StructElem(Box::new(inner)));
+
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(outer);
+
+        let idx = build_actualtext_index(&tree);
+        // Two emissions in pre-order: outer then inner.
+        assert_eq!(idx.emissions.len(), 2);
+        assert_eq!(&*idx.emissions[0].text, "outer");
+        assert_eq!(&*idx.emissions[1].text, "inner");
+        // The leaf MCID is covered by the INNER text (inner-wins).
+        assert_eq!(idx.mcid_to_actual_text.get(&5).map(|s| &**s), Some("inner"));
+        // Both emissions list MCID 5 as covered, but only the inner one
+        // should be emitted because the outer's coverage is fully
+        // shadowed by the inner. The inner replaces; the outer becomes a
+        // no-op (its descendants are all covered by the inner emission).
+        // The emit-only-shadowed test below pins this.
+    }
+
+    #[test]
+    fn test_actualtext_index_nested_outer_emission_is_shadowed() {
+        // When the inner ActualText replaces the entire descendant set of
+        // the outer, the outer emission must be marked as fully shadowed
+        // and therefore skipped. The builder records this by populating
+        // the outer's covered_mcids with the descendant MCIDs but the
+        // CONSUMING layer is responsible for the dedup. Today we record
+        // both emissions; assemblers use mcid_to_actual_text for the
+        // leaves and then skip outer emissions whose covered MCIDs are
+        // entirely covered by some descendant emission. Pin the data
+        // shape so consumers can apply that rule.
+        let mut inner = StructElem::new(StructType::Span);
+        inner.actual_text = Some("inner".to_string());
+        inner.add_child(StructChild::MarkedContentRef { mcid: 5, page: 0 });
+        let mut outer = StructElem::new(StructType::Span);
+        outer.actual_text = Some("outer".to_string());
+        outer.add_child(StructChild::StructElem(Box::new(inner)));
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(outer);
+        let idx = build_actualtext_index(&tree);
+        // Inner emission's covered_mcids ⊆ outer emission's covered_mcids,
+        // and they share the MCID. mcid_to_actual_text yields inner.
+        let outer_cov: std::collections::HashSet<u32> =
+            idx.emissions[0].covered_mcids.iter().copied().collect();
+        let inner_cov: std::collections::HashSet<u32> =
+            idx.emissions[1].covered_mcids.iter().copied().collect();
+        assert!(inner_cov.is_subset(&outer_cov));
+        assert!(inner_cov.contains(&5));
+    }
+
+    #[test]
+    fn test_actualtext_index_multi_page_emits_first_page_only() {
+        // /H1 /ActualText "Heading X" covering MCIDs on pages 0 AND 1.
+        // Emission first_page is min(pages) = 0.
+        let mut h1 = StructElem::new(StructType::H1);
+        h1.actual_text = Some("Heading X".to_string());
+        h1.add_child(StructChild::MarkedContentRef { mcid: 0, page: 1 });
+        h1.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(h1);
+        let idx = build_actualtext_index(&tree);
+        assert_eq!(idx.emissions.len(), 1);
+        assert_eq!(&*idx.emissions[0].text, "Heading X");
+        assert_eq!(
+            idx.emissions[0].first_page, 0,
+            "multi-page emission must fire on the first page (min) only"
+        );
+        // Both descendant MCIDs are covered.
+        assert!(idx.covered_mcids.contains(&0));
+        assert!(idx.covered_mcids.contains(&1));
+    }
+
+    #[test]
+    fn test_actualtext_index_multi_mcid_subtree() {
+        // Span /ActualText "expanded" /K [7 8 9]. One emission, all three
+        // MCIDs suppressed.
+        let mut span = StructElem::new(StructType::Span);
+        span.actual_text = Some("expanded".to_string());
+        for m in [7, 8, 9] {
+            span.add_child(StructChild::MarkedContentRef { mcid: m, page: 0 });
+        }
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(span);
+        let idx = build_actualtext_index(&tree);
+        assert_eq!(idx.emissions.len(), 1);
+        let cov = &idx.emissions[0].covered_mcids;
+        assert_eq!(cov.as_slice(), &[7u32, 8, 9]);
+        // anchor_mcid is the first pre-order descendant MCID.
+        assert_eq!(idx.emissions[0].anchor_mcid, 7);
+        for m in [7, 8, 9] {
+            assert!(idx.covered_mcids.contains(&m));
+            assert_eq!(
+                idx.mcid_to_actual_text.get(&m).map(|s| &**s),
+                Some("expanded")
+            );
+        }
+    }
+
+    #[test]
+    fn test_actualtext_index_no_actualtext_yields_empty() {
+        // A plain tree with no /ActualText anywhere builds an empty index.
+        let mut p = StructElem::new(StructType::P);
+        p.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(p);
+        let idx = build_actualtext_index(&tree);
+        assert!(idx.is_empty());
+        assert!(idx.mcid_to_actual_text.is_empty());
+        assert!(idx.covered_mcids.is_empty());
+    }
+
+    #[test]
+    fn test_actualtext_index_empty_actualtext_is_ignored() {
+        // An empty /ActualText string MUST be ignored: a producer that
+        // wrote it likely means "no replacement". This matches the prior
+        // assembler behaviour (`if !actual_text_val.is_empty()`).
+        let mut span = StructElem::new(StructType::Span);
+        span.actual_text = Some(String::new());
+        span.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(span);
+        let idx = build_actualtext_index(&tree);
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_actualtext_index_no_descendant_mcid_drops_emission() {
+        // /ActualText with no descendant MCID has no anchor and would
+        // never apply to anything. Drop the emission to avoid emitting a
+        // ghost replacement.
+        let mut span = StructElem::new(StructType::Span);
+        span.actual_text = Some("ghost".to_string());
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(span);
+        let idx = build_actualtext_index(&tree);
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_actualtext_index_figure_with_actualtext() {
+        // Figure /ActualText "logo text". Same shape as a Span.
+        let mut fig = StructElem::new(StructType::Figure);
+        fig.actual_text = Some("logo text".to_string());
+        fig.add_child(StructChild::MarkedContentRef { mcid: 4, page: 2 });
+        let mut tree = StructTreeRoot::new();
+        tree.add_root_element(fig);
+        let idx = build_actualtext_index(&tree);
+        assert_eq!(idx.emissions.len(), 1);
+        assert_eq!(&*idx.emissions[0].text, "logo text");
+        assert_eq!(idx.emissions[0].first_page, 2);
     }
 }
