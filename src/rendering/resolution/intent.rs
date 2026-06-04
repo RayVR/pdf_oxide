@@ -27,9 +27,32 @@ pub(crate) enum PaintKind<'a> {
         path: &'a tiny_skia::Path,
         fill_rule: tiny_skia::FillRule,
     },
-    /// Glyph painting (`Tj`, `TJ`, `'`, `"`, single-glyph `Tj` inner ops).
-    /// The text rasterizer is shared between backends, but it pulls the
-    /// resolved colour from a [`super::ResolvedPaintCmd`] before painting.
+    /// **Provisional — not yet emitted by any operator dispatcher.**
+    ///
+    /// Reserved for a future per-glyph resolution stage. Today the
+    /// text-showing operators (`Tj`, `TJ`, `'`, `"`) drive one
+    /// resolve-per-`Tj` through [`PaintKind::Path`] (via the
+    /// `pipeline_resolve_text_colors` helper on the operator-walker
+    /// side) and hand the resolved RGBA to the shared text rasteriser;
+    /// the colour stage does not read the glyph payload, so a
+    /// placeholder path satisfies its inputs without committing to a
+    /// per-glyph schema we'd have to extend later. This variant exists
+    /// because subsequent waves are expected to consume it:
+    ///
+    /// * **Per-glyph clip composition** — text rendering modes 4-7
+    ///   add the glyph outline to the clipping path. A per-glyph
+    ///   intent is the natural home for that composition, since the
+    ///   accumulated clip is glyph-shaped rather than path-shaped.
+    /// * **Per-glyph antialias overrides** — `gs.smoothness` and ICC
+    ///   text-rendering rules can flip antialiasing at glyph
+    ///   granularity in some PDF profiles.
+    /// * **Font-specific overprint simulation** — overprint of spot
+    ///   inks against an embedded font's anti-aliased halo wants to
+    ///   key off the glyph outline rather than a generic path.
+    ///
+    /// Until those waves arrive the variant is unused; the
+    /// `kind_copy` pattern in [`super::pipeline`] still has to
+    /// enumerate it, but that's a one-line stub.
     Glyph {
         glyph_id: u16,
         font: &'a Arc<FontInfo>,
