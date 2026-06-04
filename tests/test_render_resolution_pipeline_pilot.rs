@@ -2172,3 +2172,632 @@ fn pilot_image_mask_under_pipeline_preserves_clip() {
         "Type 4 Separation fill must drive a visible difference between toggle-off and toggle-on"
     );
 }
+
+// =====================================================================
+// Wave 4 — shading (`sh`) operator. The pipeline pre-resolves the two
+// endpoint colours `/C0` and `/C1` of an axial (Type 2) or radial
+// (Type 3) gradient through the resolution pipeline, then hands the
+// resolved RGBA pair to the existing tiny-skia gradient builder. The
+// interpolation math (linear / radial) is untouched.
+//
+// The brief lays out four categories of tests:
+//
+//   1. Parity for shading types where both paths agree (DeviceRGB,
+//      DeviceGray Type-2 shading endpoints).
+//   2. Capability gain — Type 4 Separation endpoints that the inline
+//      `evaluate_shading_function` reads raw and the pipeline routes
+//      through the tint transform.
+//   3. State preservation under the splice (CTM, clip).
+//   4. Pass-through proofs for shading types the pipeline does NOT
+//      migrate (Type 1 function-based, Type 4 mesh).
+// =====================================================================
+
+/// Build a one-page PDF whose page resources carry a Type 2 axial
+/// shading dictionary named `/Sh1`. The shading's `/ColorSpace` is
+/// `space`, `/Coords` is `[x0 y0 x1 y1]`, and `/Function` is a Type 2
+/// exponential interpolation with the supplied `c0` / `c1`
+/// component arrays.
+///
+/// `extra_resources` is appended to the page's `/Resources` (e.g. to
+/// declare a Separation colour space the shading references).
+/// `extra_objects` is concatenated after the shading object and the
+/// xref table accounts for it. Object numbering: 1 Catalog, 2 Pages,
+/// 3 Page, 4 Content, 5 Shading, 6+ extra.
+fn build_pdf_axial_shading(
+    content_ops: &str,
+    space_str: &str,
+    coords: &str,
+    c0: &str,
+    c1: &str,
+    extra_resources: &str,
+    extra_objects: &[(usize, String)],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /Shading << /Sh1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
+        extra_resources
+    );
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let shading_off = buf.len();
+    let shading = format!(
+        "5 0 obj\n<< /ShadingType 2 /ColorSpace {} /Coords {} /Domain [0 1] \
+         /Function << /FunctionType 2 /Domain [0 1] /C0 {} /C1 {} /N 1 >> >>\nendobj\n",
+        space_str, coords, c0, c1
+    );
+    buf.extend_from_slice(shading.as_bytes());
+
+    let mut offsets = vec![cat_off, pages_off, page_off, stream_off, shading_off];
+    for (_n, body) in extra_objects {
+        offsets.push(buf.len());
+        buf.extend_from_slice(body.as_bytes());
+    }
+
+    let xref_off = buf.len();
+    let size = offsets.len() + 1;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", size).as_bytes());
+    for off in &offsets {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", size, xref_off)
+            .as_bytes(),
+    );
+    buf
+}
+
+/// Build a one-page PDF carrying a Type 3 radial shading. Same shape
+/// as `build_pdf_axial_shading` but `/ShadingType 3` and `/Coords` is
+/// six numbers (`[x0 y0 r0 x1 y1 r1]`).
+fn build_pdf_radial_shading(
+    content_ops: &str,
+    space_str: &str,
+    coords_6: &str,
+    c0: &str,
+    c1: &str,
+    extra_resources: &str,
+    extra_objects: &[(usize, String)],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /Shading << /Sh1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
+        extra_resources
+    );
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let shading_off = buf.len();
+    let shading = format!(
+        "5 0 obj\n<< /ShadingType 3 /ColorSpace {} /Coords {} /Domain [0 1] \
+         /Function << /FunctionType 2 /Domain [0 1] /C0 {} /C1 {} /N 1 >> >>\nendobj\n",
+        space_str, coords_6, c0, c1
+    );
+    buf.extend_from_slice(shading.as_bytes());
+
+    let mut offsets = vec![cat_off, pages_off, page_off, stream_off, shading_off];
+    for (_n, body) in extra_objects {
+        offsets.push(buf.len());
+        buf.extend_from_slice(body.as_bytes());
+    }
+
+    let xref_off = buf.len();
+    let size = offsets.len() + 1;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", size).as_bytes());
+    for off in &offsets {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", size, xref_off)
+            .as_bytes(),
+    );
+    buf
+}
+
+/// Build a single Type 4 PostScript function object string with the
+/// given object number. Used as an `extra_object` for shadings whose
+/// `/ColorSpace` is a `[/Separation ... funcRef]` array.
+fn type4_function_object(obj_num: usize, program: &str) -> String {
+    let body = format!(
+        "{} 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        obj_num,
+        program.len(),
+        program
+    );
+    body
+}
+
+// ---------- Parity: shading types both paths agree on ----------
+
+#[test]
+fn pilot_shading_type2_axial_device_rgb_parity_pipeline_off_vs_on() {
+    // DeviceRGB axial shading — the inline path reads `/C0` and `/C1`
+    // raw and treats the 3-element arrays as RGB triples; the
+    // pipeline routes them through `LogicalColor::Device(Rgb)` and
+    // returns the same RGB. Result: byte-identical pixmaps.
+    //
+    // Coords run a horizontal gradient across the page: from x=0 to
+    // x=100 (PDF user space), C0=red on the left, C1=blue on the
+    // right. `sh /Sh1` paints the whole pixmap; the centre should
+    // come out roughly halfway between red and blue.
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_axial_shading(
+        content,
+        "/DeviceRGB",
+        "[0 50 100 50]",
+        "[1 0 0]",
+        "[0 0 1]",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "DeviceRGB Type 2 axial shading must be byte-identical off vs on");
+
+    // Sanity: the centre pixel of a left-to-right red-to-blue
+    // gradient should be roughly purple — non-trivial red and blue,
+    // very little green.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        r > 80 && b > 80 && g < 80,
+        "axial gradient centre must be ~purple, got ({r}, {g}, {b})"
+    );
+}
+
+#[test]
+fn pilot_shading_type2_axial_device_gray_parity_pipeline_off_vs_on() {
+    // DeviceGray axial shading. `/C0 [0]` and `/C1 [1]` are 1-element
+    // arrays. The inline `parse_color_array` expands a one-element
+    // array to `(g, g, g)`; the pipeline builds
+    // `LogicalColor::Device(Gray(c))` which the resolver also expands
+    // to `(g, g, g)`. Both must produce byte-identical output.
+    let content = "/Sh1 sh\n";
+    let bytes =
+        build_pdf_axial_shading(content, "/DeviceGray", "[0 50 100 50]", "[0]", "[1]", "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "DeviceGray Type 2 axial shading must be byte-identical off vs on");
+
+    // Sanity: centre pixel of a black-to-white gradient ≈ mid-grey.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        r == g && g == b && (100..=160).contains(&(r as i32)),
+        "axial gray gradient centre must be mid-grey, got ({r}, {g}, {b})"
+    );
+}
+
+#[test]
+fn pilot_shading_type2_axial_device_cmyk_parity_pipeline_off_vs_on() {
+    // DeviceCMYK Type 2 axial shading. The inline path reads `/C0`
+    // (a 4-element CMYK array) raw and silently truncates to the
+    // first three components, treating those as RGB. The pipeline
+    // reads the shading dict's `/ColorSpace /DeviceCMYK` and routes
+    // the 4 components through the spec's additive-clamp CMYK→RGB
+    // conversion. These two evaluations DIVERGE for any non-trivial
+    // CMYK colour — this is a capability gain for the pipeline, not a
+    // parity case.
+    //
+    // To get a true PARITY pin against the inline truncation, we
+    // exploit the fact that the resolver's CMYK→RGB on
+    // `(c, m, y, 0)` produces `(1-c, 1-m, 1-y)`, while the inline
+    // truncation reads the literal `(c, m, y)` triple. They coincide
+    // only when `c = 1-c` (i.e. 0.5), `m = 1-m`, `y = 1-y`. Picking
+    // `/C0 [0.5 0.5 0.5 0]` and `/C1 [0.5 0.5 0.5 0]` gives one
+    // colour both paths agree on — a constant mid-grey gradient. The
+    // resulting parity pin is narrow but unambiguous: any divergence
+    // in how the pipeline maps DeviceCMYK at this specific colour
+    // would surface as a pixel difference.
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_axial_shading(
+        content,
+        "/DeviceCMYK",
+        "[0 50 100 50]",
+        "[0.5 0.5 0.5 0]",
+        "[0.5 0.5 0.5 0]",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "DeviceCMYK Type 2 axial shading must be byte-identical off vs on \
+         at the inline-truncation/pipeline-CMYK fixed point"
+    );
+}
+
+#[test]
+fn pilot_shading_type3_radial_device_rgb_parity_pipeline_off_vs_on() {
+    // DeviceRGB radial shading. Same parity rationale as the axial
+    // case: both paths fold the same 3-element RGB array into the
+    // same `(r, g, b)` triple. Inner colour red, outer blue.
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_radial_shading(
+        content,
+        "/DeviceRGB",
+        "[50 50 0 50 50 50]",
+        "[1 0 0]",
+        "[0 0 1]",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "DeviceRGB Type 3 radial shading must be byte-identical off vs on");
+
+    // Sanity: centre pixel sits at the inner-radius=0 colour (red).
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        r > 200 && g < 60 && b < 60,
+        "radial gradient centre must be red (the C0 endpoint), got ({r}, {g}, {b})"
+    );
+}
+
+// ---------- Capability gain — Type 4 Separation endpoint ----------
+
+#[test]
+fn pilot_shading_type2_axial_type4_separation_pipeline_resolves_correctly() {
+    // The wave-4 capability gain. `/C0` is a 1-element Separation
+    // component (full tint) whose tint transform is a PostScript
+    // Type 4 calculator. The inline `evaluate_shading_function`
+    // reads `/C0 [1]` as a 1-element array and expands it to
+    // `(1, 1, 1)` (white), so the toggle-off gradient runs from white
+    // to white-ish (C1 also white).
+    //
+    // The pipeline routes the component through the shading dict's
+    // `/ColorSpace [/Separation /MagentaSpot /DeviceCMYK funcRef]`,
+    // which evaluates the Type 4 program — at tint=1 the program
+    // leaves CMYK(0, 1, 0, 0) → RGB(1, 0, 1) magenta on the stack.
+    //
+    // Probe location: the gradient runs horizontally across the page
+    // from x=0 (C0 end) to x=100 (C1 end). The pixel at x=5 is well
+    // inside the C0 endpoint region; tiny-skia's interpolation hasn't
+    // moved meaningfully toward C1 yet, so the colour at x=5 should
+    // be nearly pure magenta under the pipeline.
+    let type4 = "{ 0.0 exch 0.0 0.0 }";
+    let content = "/Sh1 sh\n";
+    let space_str = "[/Separation /MagentaSpot /DeviceCMYK 6 0 R]";
+    let func_obj = type4_function_object(6, type4);
+    let bytes = build_pdf_axial_shading(
+        content,
+        space_str,
+        "[0 50 100 50]",
+        "[1]", // full tint
+        "[1]", // C1 also full tint — keeps the endpoint analysis simple
+        "",
+        &[(6, func_obj)],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Inline path: `parse_color_array` on `[1]` returns `(1, 1, 1)`
+    // (white). The whole page should be near-white.
+    let (r_off, g_off, b_off, _a) = pixel_at(&off, 5, 50);
+    assert!(
+        r_off > 240 && g_off > 240 && b_off > 240,
+        "inline path reads /C0 [1] as white; got ({r_off}, {g_off}, {b_off})"
+    );
+
+    // Pipeline path: the Type 4 program turns tint=1 into CMYK→RGB
+    // magenta. Pin the actual channel values near the C0 endpoint
+    // (positive correctness, not "differs from baseline").
+    let (r_on, g_on, b_on, a_on) = pixel_at(&on, 5, 50);
+    assert!(
+        r_on >= 250 && g_on <= 5 && b_on >= 250 && a_on == 255,
+        "pipeline must paint Type-4-evaluated magenta at the gradient C0 stop; \
+         got ({r_on}, {g_on}, {b_on}, {a_on})"
+    );
+
+    // And the pixmaps differ overall — the splice did run.
+    assert_ne!(
+        off, on,
+        "Type 4 Separation shading endpoint must drive a visible \
+         pipeline-vs-inline difference"
+    );
+}
+
+// ---------- State preservation ----------
+
+#[test]
+fn pilot_shading_under_pipeline_preserves_ctm() {
+    // The `sh` arm reads `gs.ctm` and composes it with the page's
+    // base transform to map the shading's `/Coords` into device
+    // space. The pipeline pre-resolves the endpoint colours BEFORE
+    // `render_axial_shading` runs, so it never touches `gs`. To make
+    // the probe meaningful — i.e. to actually run the pipeline path
+    // rather than the trivial Device-family case — we use a Type 4
+    // Separation `/C0` so the helper produces magenta and the
+    // gradient stop changes colour off vs on.
+    //
+    // CTM: scale by 50 and translate to (10, 10). The shading's
+    // `/Coords [0 0 1 0]` maps the unit-x gradient from (10, 10) to
+    // (60, 10) in user space. The pixel at user (30, 10) is roughly
+    // 40% along the gradient — still close enough to C0 that the
+    // resolved magenta dominates the interpolation toward C1=white.
+    //
+    // In pixmap coordinates the renderer flips Y, so user (30, 10)
+    // lands at pixmap (30, 100 - 10) = (30, 90). If the pipeline
+    // perturbed the CTM, the gradient stripe would land elsewhere
+    // and this pixel would carry the page background.
+    let type4 = "{ 0.0 exch 0.0 0.0 }";
+    let content = "q\n50 0 0 50 10 10 cm\n/Sh1 sh\nQ\n";
+    let space_str = "[/Separation /MagentaSpot /DeviceCMYK 6 0 R]";
+    let func_obj = type4_function_object(6, type4);
+    let bytes = build_pdf_axial_shading(
+        content,
+        space_str,
+        "[0 0 1 0]",
+        "[1]", // C0 full tint → magenta under the pipeline
+        "[0]", // C1 zero tint → white (Separation at 0 is the canvas)
+        "",
+        &[(6, func_obj)],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Sample in tiny-skia's `SpreadMode::Pad` region — to the left
+    // of the C0 endpoint, where any pixel projecting to a negative
+    // gradient-t is clamped to pure C0 regardless of how far away
+    // it sits from the axis. The gradient axis maps from user
+    // (10, 10) → (60, 10); pixmap (5, 95) corresponds to user
+    // (5, 5), which projects to t < 0 and lands in the Pad region.
+    // This isolates the C0 value cleanly (no interpolation toward
+    // C1), so we can pin the resolved-magenta vs raw-RGB-white
+    // divergence with tight thresholds. If the splice perturbed
+    // the CTM, the device-space gradient axis would shift and
+    // (5, 5) might no longer project to t < 0 — surfacing as a
+    // contaminated colour at this pixel.
+    let (r_on, g_on, b_on, a_on) = pixel_at(&on, 5, 95);
+    assert!(
+        r_on >= 250 && g_on <= 5 && b_on >= 250 && a_on == 255,
+        "pipeline's spliced clone must preserve the CTM so the gradient \
+         lands C0=magenta in the Pad region; got ({r_on}, {g_on}, {b_on}, {a_on})"
+    );
+
+    // The inline path reads /C0 [1] as `(1, 1, 1)` white, so the
+    // same Pad-region pixel must be pure white.
+    let (r_off, g_off, b_off, _) = pixel_at(&off, 5, 95);
+    assert!(
+        r_off >= 250 && g_off >= 250 && b_off >= 250,
+        "inline path must paint the Pad-clamped C0 region pure white \
+         (inline reads /C0 [1] as RGB white); got ({r_off}, {g_off}, {b_off})"
+    );
+
+    assert_ne!(off, on, "Type 4 Separation shading endpoint must drive a visible difference");
+}
+
+#[test]
+fn pilot_shading_under_pipeline_preserves_clip() {
+    // Active `W n` clipping path. The shading paints across the
+    // whole pixmap; only pixels inside the clip box may be coloured.
+    // The pipeline splice operates on the endpoint colours — never
+    // on the clip stack — but a regression that read the clip from
+    // the wrong slot could leak paint outside.
+    //
+    // Same Type 4 Separation rationale as the CTM test: a Device
+    // `/C0` would short-circuit the resolver and skip the splice we
+    // want to probe.
+    //
+    // Clip: [30 60 70 100] in user space (the upper-right quarter).
+    // Pixmap (top-left origin): x ∈ [30, 70], y ∈ [0, 40].
+    let type4 = "{ 0.0 exch 0.0 0.0 }";
+    let content = "q\n30 60 40 40 re W n\n/Sh1 sh\nQ\n";
+    let space_str = "[/Separation /MagentaSpot /DeviceCMYK 6 0 R]";
+    let func_obj = type4_function_object(6, type4);
+    let bytes = build_pdf_axial_shading(
+        content,
+        space_str,
+        "[0 50 100 50]", // gradient axis runs left-right across page
+        "[1]",
+        "[1]",
+        "",
+        &[(6, func_obj)],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Inside the clip box: pipeline paints magenta. Sample (50, 20).
+    let (r_in, g_in, b_in, a_in) = pixel_at(&on, 50, 20);
+    assert!(
+        r_in >= 250 && g_in <= 5 && b_in >= 250 && a_in == 255,
+        "inside the clip box, the pipeline must paint Type-4-evaluated \
+         magenta; got ({r_in}, {g_in}, {b_in}, {a_in})"
+    );
+
+    // Outside the clip box: page must be the white background. If
+    // the splice had perturbed the clip stack the shading would
+    // have painted this pixel too.
+    let (r_out, g_out, b_out, _) = pixel_at(&on, 10, 90);
+    assert!(
+        r_out >= 250 && g_out >= 250 && b_out >= 250,
+        "outside the clip box, the page must be the white background; \
+         got ({r_out}, {g_out}, {b_out})"
+    );
+
+    // Pipeline must differ from inline for this Type 4 Separation
+    // case — confirms the splice fired at all.
+    assert_ne!(off, on, "Type 4 Separation shading must differ off vs on");
+
+    // Inline path inside the clip: reads C0=[1] as white, so the
+    // gradient runs white-to-white; the clipped patch is near-white.
+    let (r_off, g_off, b_off, _) = pixel_at(&off, 50, 20);
+    assert!(
+        r_off > 240 && g_off > 240 && b_off > 240,
+        "inline path inside the clip must be near-white (C0 read raw as RGB white); \
+         got ({r_off}, {g_off}, {b_off})"
+    );
+}
+
+// ---------- Pass-through proofs (Types 1 and 4 — not migrated) ----------
+
+/// Build a Type 1 (function-based) shading PDF. The shading dict's
+/// `/ColorSpace` is DeviceRGB and a Type 2 function maps `(x, y)` →
+/// RGB. The pipeline does NOT migrate Type 1 — the dispatcher's
+/// `if shading_type == 2 || shading_type == 3` gate keeps it on the
+/// inline path. Even if the inline path can't actually paint a Type 1
+/// shading (`render_shading` falls into the catch-all log-only arm),
+/// the byte-equal pin holds: both toggle states do the same thing.
+fn build_pdf_type1_shading(content_ops: &str) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /Shading << /Sh1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // Type 1: function-based shading. `/Domain` is `[xmin xmax ymin
+    // ymax]`; `/Function` produces N component values per (x, y).
+    let shading_off = buf.len();
+    buf.extend_from_slice(
+        b"5 0 obj\n<< /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] \
+          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 1 0] /N 1 >> >>\nendobj\n",
+    );
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, shading_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a Type 4 (free-form Gouraud-shaded triangle mesh) shading
+/// stream — a minimal shape the parser can accept even if the
+/// dispatcher refuses to paint it. The point isn't to render
+/// triangles; it's to prove the wave-4 dispatcher gate ignores
+/// `/ShadingType 4` and the toggle is byte-identical on or off.
+fn build_pdf_type4_mesh_shading(content_ops: &str) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << /Shading << /Sh1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // Type 4 shading: empty mesh stream — payload length 0. The
+    // parser accepts the dictionary shape; the renderer's
+    // `render_shading` catch-all logs and does nothing for type 4.
+    let shading_off = buf.len();
+    let shading = b"5 0 obj\n<< /ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 \
+                   /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 100 0 100 0 1 0 1 0 1] \
+                   /Length 0 >>\nstream\n\nendstream\nendobj\n";
+    buf.extend_from_slice(shading);
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, shading_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+#[test]
+fn pilot_shading_type1_function_based_pass_through() {
+    // Type 1 shading — pipeline does NOT migrate. The dispatcher's
+    // `shading_type == 2 || shading_type == 3` gate sends Type 1
+    // straight to `render_shading`'s catch-all (which logs and does
+    // nothing). Toggle-off and toggle-on must render the same
+    // page background.
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_type1_shading(content);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "Type 1 function-based shading must be byte-identical under both toggle states"
+    );
+}
+
+#[test]
+fn pilot_shading_type4_mesh_pass_through() {
+    // Type 4 mesh shading — pipeline does NOT migrate. Same pass-
+    // through pin as Type 1: the dispatcher refuses to splice and
+    // the inline render falls through the catch-all.
+    let content = "/Sh1 sh\n";
+    let bytes = build_pdf_type4_mesh_shading(content);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Type 4 mesh shading must be byte-identical under both toggle states");
+}

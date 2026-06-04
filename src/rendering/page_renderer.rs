@@ -1825,9 +1825,50 @@ impl PageRenderer {
             .and_then(|o| o.as_integer())
             .unwrap_or(0);
 
+        // Pre-resolve gradient endpoint colours through the resolution
+        // pipeline when the toggle is on and the shading type is one we
+        // migrate (axial=2, radial=3). For both types the endpoint
+        // colours live in the shading's `/Function` (Type 2 exponential
+        // interpolation puts the endpoints directly in `/C0` and
+        // `/C1`; Type 3 stitching wraps a sub-function whose first /
+        // last sub-functions carry them). The current inline path reads
+        // `/C0` and `/C1` raw and treats them as already-RGB, which
+        // silently truncates DeviceCMYK to its first three components
+        // and drops Separation tint-transform evaluation entirely. The
+        // pipeline-resolved endpoints respect the shading dict's
+        // `/ColorSpace`, so a Type 4 Separation `/C0` becomes the
+        // function's actual output rather than a `1 - tint` fall-back.
+        //
+        // Types 1 (function-based) and 4-7 (mesh) carry per-point /
+        // per-vertex colours, not endpoints; this wave does NOT migrate
+        // them. They fall straight through to the existing inline path,
+        // unmodified.
+        let resolved_endpoints =
+            if self.pipeline_enabled_cache && (shading_type == 2 || shading_type == 3) {
+                self.pipeline_resolve_shading_endpoints(&shading, gs, doc)
+            } else {
+                None
+            };
+
         match shading_type {
-            2 => self.render_axial_shading(pixmap, &shading, transform, gs, doc, clip_mask),
-            3 => self.render_radial_shading(pixmap, &shading, transform, gs, doc, clip_mask),
+            2 => self.render_axial_shading(
+                pixmap,
+                &shading,
+                transform,
+                gs,
+                doc,
+                clip_mask,
+                resolved_endpoints,
+            ),
+            3 => self.render_radial_shading(
+                pixmap,
+                &shading,
+                transform,
+                gs,
+                doc,
+                clip_mask,
+                resolved_endpoints,
+            ),
             _ => {
                 log::debug!("Unsupported shading type {} for '{}'", shading_type, name);
                 Ok(())
@@ -1835,7 +1876,109 @@ impl PageRenderer {
         }
     }
 
+    /// Resolve a Type 2 / Type 3 shading dictionary's `/C0` and `/C1`
+    /// endpoint colours through the resolution pipeline. The shading
+    /// dict's `/ColorSpace` selects the colour space; `/Function` (a
+    /// Type 2 exponential or a Type 3 stitching wrapper) carries the
+    /// endpoint component arrays. Returns `None` when either endpoint
+    /// can't be resolved (toggle off, missing `/Function`, unsupported
+    /// sub-function type, non-RGBA resolver output, etc.) — the caller
+    /// falls back to the existing inline behaviour in that case.
+    ///
+    /// This is the wave-4 hook into the resolution pipeline: it splits
+    /// the "what colour" decision (now pipeline-resolved) from the
+    /// "how to interpolate" decision (still owned by the gradient
+    /// backend). The interpolation math is untouched — only the two
+    /// fixed endpoint colours are routed through the pipeline.
+    fn pipeline_resolve_shading_endpoints(
+        &self,
+        shading: &std::collections::HashMap<String, Object>,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+    ) -> Option<((f32, f32, f32, f32), (f32, f32, f32, f32))> {
+        // The shading dict's `/ColorSpace` can be a Name (DeviceRGB,
+        // CS1, ...) or an inline Array ([/Separation ... funcRef]).
+        // Resolve indirect references so the helper sees the final
+        // shape.
+        let cs_obj = shading.get("ColorSpace")?;
+        let resolved_cs = doc.resolve_object(cs_obj).ok()?;
+
+        // Extract /C0 and /C1 from /Function. Handles Type 2
+        // (exponential) directly and Type 3 (stitching) by reading the
+        // first sub-function's /C0 and the last sub-function's /C1 —
+        // mirroring the layout `evaluate_shading_function` already
+        // understands.
+        let func_obj = shading.get("Function")?;
+        let resolved_func = doc.resolve_object(func_obj).ok()?;
+        let func_dict = resolved_func.as_dict()?;
+        let func_type = func_dict.get("FunctionType").and_then(|o| o.as_integer())?;
+        let (c0_arr, c1_arr) = match func_type {
+            2 => {
+                let c0 = func_dict.get("C0").and_then(|o| o.as_array())?;
+                let c1 = func_dict.get("C1").and_then(|o| o.as_array())?;
+                (c0.clone(), c1.clone())
+            },
+            3 => {
+                let funcs = func_dict.get("Functions").and_then(|o| o.as_array())?;
+                let first = funcs.first()?;
+                let last = funcs.last().unwrap_or(first);
+                let first_resolved = doc.resolve_object(first).ok()?;
+                let last_resolved = doc.resolve_object(last).ok()?;
+                let first_dict = first_resolved.as_dict()?;
+                let last_dict = last_resolved.as_dict()?;
+                let c0 = first_dict.get("C0").and_then(|o| o.as_array())?;
+                let c1 = last_dict.get("C1").and_then(|o| o.as_array())?;
+                (c0.clone(), c1.clone())
+            },
+            // Function types 0 (sampled) and 4 (PostScript Type 4
+            // calculator) used as the shading's own /Function are
+            // out-of-scope for endpoint pre-resolution — they produce
+            // colours at intermediate domain points, not at two fixed
+            // /C0 / /C1 arrays. Caller falls back to inline.
+            _ => return None,
+        };
+
+        let to_components = |arr: &[Object]| -> Vec<f32> {
+            arr.iter()
+                .map(|o| match o {
+                    Object::Real(v) => *v as f32,
+                    Object::Integer(v) => *v as f32,
+                    _ => 0.0,
+                })
+                .collect()
+        };
+        let c0_comps = to_components(&c0_arr);
+        let c1_comps = to_components(&c1_arr);
+
+        // Fold in `gs.fill_alpha` here — it's the alpha the inline
+        // code path multiplies into each gradient stop's RGBA when
+        // building the tiny-skia LinearGradient / RadialGradient.
+        let c0 = self.pipeline_resolve_components(
+            doc,
+            &self.color_spaces,
+            &resolved_cs,
+            &c0_comps,
+            gs.fill_alpha,
+        )?;
+        let c1 = self.pipeline_resolve_components(
+            doc,
+            &self.color_spaces,
+            &resolved_cs,
+            &c1_comps,
+            gs.fill_alpha,
+        )?;
+        Some((c0, c1))
+    }
+
     /// Render axial (linear) gradient shading (Type 2).
+    ///
+    /// `resolved_endpoints`, when `Some`, supplies pre-resolved RGBA
+    /// values for the two gradient stops with `gs.fill_alpha` already
+    /// folded in — the resolution-pipeline route produced by
+    /// [`Self::pipeline_resolve_shading_endpoints`]. When `None`, the
+    /// function falls back to the legacy
+    /// [`Self::evaluate_shading_function`] path, which reads `/C0` and
+    /// `/C1` raw and assumes they are already RGB triples.
     fn render_axial_shading(
         &self,
         pixmap: &mut Pixmap,
@@ -1844,6 +1987,7 @@ impl PageRenderer {
         gs: &GraphicsState,
         doc: &PdfDocument,
         clip_mask: Option<&tiny_skia::Mask>,
+        resolved_endpoints: Option<((f32, f32, f32, f32), (f32, f32, f32, f32))>,
     ) -> Result<()> {
         // Parse Coords [x0 y0 x1 y1]
         let coords = shading.get("Coords").and_then(|o| o.as_array());
@@ -1876,9 +2020,17 @@ impl PageRenderer {
             (false, false)
         };
 
-        // Parse Function to get start and end colors
-        // For simplicity, evaluate at t=0 and t=1 to get endpoint colors
-        let (c0, c1) = self.evaluate_shading_function(shading, doc)?;
+        // Build the two gradient-stop RGBAs. When the resolution
+        // pipeline pre-resolved the endpoints, use those directly
+        // (alpha already folded). Otherwise fall back to the legacy
+        // raw-`/C0`-as-RGB read; in that case alpha is folded here.
+        let (stop0, stop1) = if let Some(((r0, g0, b0, a0), (r1, g1, b1, a1))) = resolved_endpoints
+        {
+            ((r0, g0, b0, a0), (r1, g1, b1, a1))
+        } else {
+            let (c0, c1) = self.evaluate_shading_function(shading, doc)?;
+            ((c0.0, c0.1, c0.2, gs.fill_alpha), (c1.0, c1.1, c1.2, gs.fill_alpha))
+        };
 
         // Transform gradient endpoints
         let mut p0 = tiny_skia::Point { x: x0, y: y0 };
@@ -1899,12 +2051,12 @@ impl PageRenderer {
             vec![
                 tiny_skia::GradientStop::new(
                     0.0,
-                    tiny_skia::Color::from_rgba(c0.0, c0.1, c0.2, gs.fill_alpha)
+                    tiny_skia::Color::from_rgba(stop0.0, stop0.1, stop0.2, stop0.3)
                         .unwrap_or(tiny_skia::Color::BLACK),
                 ),
                 tiny_skia::GradientStop::new(
                     1.0,
-                    tiny_skia::Color::from_rgba(c1.0, c1.1, c1.2, gs.fill_alpha)
+                    tiny_skia::Color::from_rgba(stop1.0, stop1.1, stop1.2, stop1.3)
                         .unwrap_or(tiny_skia::Color::BLACK),
                 ),
             ],
@@ -1942,6 +2094,14 @@ impl PageRenderer {
     }
 
     /// Render radial gradient shading (Type 3).
+    ///
+    /// `resolved_endpoints`, when `Some`, supplies pre-resolved RGBA
+    /// values for the two gradient stops with `gs.fill_alpha` already
+    /// folded in — the resolution-pipeline route produced by
+    /// [`Self::pipeline_resolve_shading_endpoints`]. When `None`, the
+    /// function falls back to the legacy
+    /// [`Self::evaluate_shading_function`] path, which reads `/C0` and
+    /// `/C1` raw and assumes they are already RGB triples.
     fn render_radial_shading(
         &self,
         pixmap: &mut Pixmap,
@@ -1950,6 +2110,7 @@ impl PageRenderer {
         gs: &GraphicsState,
         doc: &PdfDocument,
         clip_mask: Option<&tiny_skia::Mask>,
+        resolved_endpoints: Option<((f32, f32, f32, f32), (f32, f32, f32, f32))>,
     ) -> Result<()> {
         // Parse Coords [x0 y0 r0 x1 y1 r1]
         let coords = shading.get("Coords").and_then(|o| o.as_array());
@@ -1967,7 +2128,15 @@ impl PageRenderer {
         let (_x0, _y0, _r0, x1, y1, r1) =
             (get_f(0), get_f(1), get_f(2), get_f(3), get_f(4), get_f(5));
 
-        let (c0, c1) = self.evaluate_shading_function(shading, doc)?;
+        // Same pipeline-or-fallback dispatch as `render_axial_shading`
+        // — see its docs for the rationale.
+        let (stop0, stop1) = if let Some(((r0, g0, b0, a0), (r1c, g1, b1, a1))) = resolved_endpoints
+        {
+            ((r0, g0, b0, a0), (r1c, g1, b1, a1))
+        } else {
+            let (c0, c1) = self.evaluate_shading_function(shading, doc)?;
+            ((c0.0, c0.1, c0.2, gs.fill_alpha), (c1.0, c1.1, c1.2, gs.fill_alpha))
+        };
 
         let mut center = tiny_skia::Point { x: x1, y: y1 };
         let mut edge = tiny_skia::Point { x: x1 + r1, y: y1 };
@@ -1989,12 +2158,12 @@ impl PageRenderer {
             vec![
                 tiny_skia::GradientStop::new(
                     0.0,
-                    tiny_skia::Color::from_rgba(c0.0, c0.1, c0.2, gs.fill_alpha)
+                    tiny_skia::Color::from_rgba(stop0.0, stop0.1, stop0.2, stop0.3)
                         .unwrap_or(tiny_skia::Color::BLACK),
                 ),
                 tiny_skia::GradientStop::new(
                     1.0,
-                    tiny_skia::Color::from_rgba(c1.0, c1.1, c1.2, gs.fill_alpha)
+                    tiny_skia::Color::from_rgba(stop1.0, stop1.1, stop1.2, stop1.3)
                         .unwrap_or(tiny_skia::Color::BLACK),
                 ),
             ],
@@ -3082,6 +3251,102 @@ impl PageRenderer {
             _ => None,
         }
     }
+
+    /// `gs`-free overload of the colour-resolution path: route an
+    /// explicit colour-space + components tuple through the pipeline and
+    /// return the resolved RGBA.
+    ///
+    /// The path/text/image-mask helpers above read their colour inputs
+    /// from `gs.fill_color_space` / `gs.fill_color_components` (or the
+    /// stroke equivalents). Shading endpoint colours don't live there —
+    /// they sit in the shading dictionary's `/Function /C0` and `/C1`
+    /// arrays, alongside the shading dictionary's own `/ColorSpace`. The
+    /// dispatcher needs to resolve those two endpoints independently
+    /// of `gs` so the gradient backend can hand them to the
+    /// interpolator as fixed stops. This helper is that hook: caller
+    /// supplies the shading's `/ColorSpace` object directly and the
+    /// per-endpoint component list; the helper builds the logical
+    /// colour, runs it through the pipeline against a synthesised
+    /// graphics state carrying only the requested alpha (every other
+    /// `gs` field — blend mode, overprint — is irrelevant for endpoint
+    /// resolution because the gradient is composited as a single Source
+    /// Over fill by the caller), and returns the RGBA.
+    ///
+    /// Returns `None` when the toggle is off or when the resolver
+    /// produces a non-RGBA variant (per-channel outputs reserved for
+    /// future separation backends). The caller is then expected to fall
+    /// back to its inline behaviour.
+    pub(crate) fn pipeline_resolve_components(
+        &self,
+        doc: &PdfDocument,
+        color_spaces: &HashMap<String, Object>,
+        space: &Object,
+        components: &[f32],
+        alpha: f32,
+    ) -> Option<(f32, f32, f32, f32)> {
+        if !self.pipeline_enabled_cache {
+            return None;
+        }
+        // Derive a name + resolved-space pair from the supplied space
+        // object. Two shapes appear in real PDFs for a shading dict's
+        // `/ColorSpace`: a Name (either a Device alias like
+        // `/DeviceRGB` or a per-page resource name like `/CS1`), or an
+        // inline Array (e.g. `[/Separation /MagentaSpot /DeviceCMYK
+        // funcRef]`). `build_logical_color` already handles both via
+        // its name + `Option<&Object>` arguments, so this wrapper just
+        // dispatches into it.
+        let (space_name, resolved_space): (&str, Option<&Object>) = match space {
+            Object::Name(n) => {
+                // Device aliases short-circuit through the name match
+                // inside `build_logical_color`; non-device names look
+                // up the resolved space in the per-page colour-space
+                // map (the dispatcher pre-resolved the name there).
+                let resolved = color_spaces.get(n.as_str());
+                (n.as_str(), resolved)
+            },
+            other => {
+                // Inline array (or any other shape — Stream, etc.):
+                // hand the resolved space object through directly and
+                // use a sentinel name so the Device-family fast-path in
+                // `build_logical_color` doesn't fire. The actual
+                // colour-space dispatch keys off the resolved space
+                // object, not the name, for non-Device families.
+                ("", Some(other))
+            },
+        };
+        let logical = build_logical_color(space_name, components, resolved_space);
+
+        // The pipeline reads `gs.fill_alpha` for fill-side alpha fold.
+        // A default `GraphicsState` carries `fill_alpha = 1.0`; we patch
+        // it to the caller's `alpha` so the resolver folds the correct
+        // alpha into the returned RGBA. Every other field is left at
+        // its default — overprint and blend stages run on this fake gs
+        // too, but their outputs (`OverprintPlan`, `BlendPlan`) are
+        // discarded: the caller only consumes the RGBA. The default
+        // `GraphicsState` has overprint disabled and blend Normal, so
+        // even though the resolved-paint-cmd carries these plans they
+        // never surface as observable behaviour.
+        let mut synth_gs = GraphicsState::new();
+        synth_gs.fill_alpha = alpha;
+
+        let pipeline = ResolutionPipeline::new();
+        let ctx = ResolutionContext::new(doc, color_spaces);
+        let intent = PaintIntent {
+            kind: PaintKind::ColorOnly,
+            side: PaintSide::Fill,
+            gs: &synth_gs,
+            color: logical,
+            ctm: synth_gs.ctm,
+        };
+        let cmd = pipeline.resolve(&intent, &ctx, None).ok()?;
+        match cmd.color {
+            ResolvedColor::Rgba { r, g, b, a } => Some((r, g, b, a)),
+            // Non-RGBA outputs (per-channel for separation backends)
+            // can't be fed to the composite gradient backend; the
+            // caller's inline behaviour stays in force for those.
+            _ => None,
+        }
+    }
 }
 
 /// Read `PDF_OXIDE_RESOLUTION_PIPELINE` and parse it as a boolean toggle.
@@ -3706,5 +3971,131 @@ mod tests {
         let doc = fixture_doc();
         let result = renderer.pipeline_resolve_text_colors(&doc, &gs);
         assert!(result.is_none(), "helper must return None when the toggle is off; got Some(_)");
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 4 — `pipeline_resolve_components` helper unit pins.
+    //
+    // The shading integration tests in
+    // `tests/test_render_resolution_pipeline_pilot.rs` probe the helper
+    // through the renderer. These unit pins probe the helper's own
+    // contract directly, so a regression in routing (e.g. Device-family
+    // short-circuit vs Spaced dispatch) shows up at the helper level
+    // before any pixel-comparison machinery is involved.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn pipeline_resolve_components_resolves_type4_separation_to_correct_rgba() {
+        // Capability pin. The Separation/DeviceCMYK/Type-4 space at
+        // full tint must come out as magenta after the pipeline runs
+        // the PostScript program — the same regression case the
+        // colour-stage and full-pipeline unit tests pin at lower
+        // levels, here verified via the wave-4 shading-endpoint
+        // overload.
+        let mut renderer = PageRenderer::new(RenderOptions::default());
+        renderer.pipeline_enabled_cache = true;
+
+        let space = type4_magenta_separation_space();
+        let doc = fixture_doc();
+        let color_spaces: HashMap<String, Object> = HashMap::new();
+
+        let rgba = renderer
+            .pipeline_resolve_components(&doc, &color_spaces, &space, &[1.0], 1.0)
+            .expect("Type 4 Separation full-tint must resolve to Some(rgba)");
+        let (r, g, b, a) = rgba;
+        assert!(
+            (r - 1.0).abs() < 1.0e-3
+                && g.abs() < 1.0e-3
+                && (b - 1.0).abs() < 1.0e-3
+                && (a - 1.0).abs() < 1.0e-3,
+            "Type 4 Separation at tint=1 must produce magenta RGBA (≈1, 0, 1, 1); got ({r}, {g}, {b}, {a})"
+        );
+    }
+
+    #[test]
+    fn pipeline_resolve_components_short_circuits_for_device_families() {
+        // Parity pin. For DeviceRGB / DeviceGray / DeviceCMYK the
+        // pipeline must produce the same RGBA the inline shading
+        // path would compute (modulo the inline path's
+        // long-standing DeviceCMYK truncation bug, which is the
+        // entire reason wave 4 exists). The pin here is on the
+        // resolver's behaviour, not on the inline path: for each
+        // device family the resolved RGBA must equal the
+        // mathematically-correct device→RGB conversion.
+        let mut renderer = PageRenderer::new(RenderOptions::default());
+        renderer.pipeline_enabled_cache = true;
+        let doc = fixture_doc();
+        let color_spaces: HashMap<String, Object> = HashMap::new();
+
+        // DeviceRGB: components pass through verbatim.
+        let rgb_space = Object::Name("DeviceRGB".to_string());
+        let rgba = renderer
+            .pipeline_resolve_components(&doc, &color_spaces, &rgb_space, &[0.5, 0.25, 0.75], 0.8)
+            .expect("DeviceRGB must resolve");
+        let (r, g, b, a) = rgba;
+        assert!(
+            (r - 0.5).abs() < 1.0e-6
+                && (g - 0.25).abs() < 1.0e-6
+                && (b - 0.75).abs() < 1.0e-6
+                && (a - 0.8).abs() < 1.0e-6,
+            "DeviceRGB must pass components through verbatim with alpha folded; got ({r}, {g}, {b}, {a})"
+        );
+
+        // DeviceGray: single component expanded to (g, g, g).
+        let gray_space = Object::Name("DeviceGray".to_string());
+        let rgba = renderer
+            .pipeline_resolve_components(&doc, &color_spaces, &gray_space, &[0.42], 1.0)
+            .expect("DeviceGray must resolve");
+        let (r, g, b, _a) = rgba;
+        assert!(
+            (r - 0.42).abs() < 1.0e-6 && (g - 0.42).abs() < 1.0e-6 && (b - 0.42).abs() < 1.0e-6,
+            "DeviceGray must expand the single component to (g, g, g); got ({r}, {g}, {b})"
+        );
+
+        // DeviceCMYK: additive-clamp conversion `(1-c-k, 1-m-k,
+        // 1-y-k)` with clamping to [0, 1]. Pure cyan (1, 0, 0, 0)
+        // → RGB(0, 1, 1).
+        let cmyk_space = Object::Name("DeviceCMYK".to_string());
+        let rgba = renderer
+            .pipeline_resolve_components(
+                &doc,
+                &color_spaces,
+                &cmyk_space,
+                &[1.0, 0.0, 0.0, 0.0],
+                1.0,
+            )
+            .expect("DeviceCMYK must resolve");
+        let (r, g, b, _a) = rgba;
+        assert!(
+            r.abs() < 1.0e-3 && (g - 1.0).abs() < 1.0e-3 && (b - 1.0).abs() < 1.0e-3,
+            "DeviceCMYK pure cyan must map to (0, 1, 1) under additive clamp; got ({r}, {g}, {b})"
+        );
+    }
+
+    #[test]
+    fn pipeline_resolve_components_returns_none_when_toggle_off() {
+        // The toggle is the gate the dispatcher relies on. With the
+        // cached toggle off, the helper must return None even when
+        // the inputs would otherwise resolve cleanly.
+        let renderer = PageRenderer::new(RenderOptions::default());
+        // Default-constructed renderer has the toggle off; pin that.
+        assert!(
+            !renderer.pipeline_enabled_cache,
+            "default-constructed renderer must have the pipeline toggle off"
+        );
+        let doc = fixture_doc();
+        let color_spaces: HashMap<String, Object> = HashMap::new();
+        let space = Object::Name("DeviceRGB".to_string());
+        let result = renderer.pipeline_resolve_components(
+            &doc,
+            &color_spaces,
+            &space,
+            &[1.0, 0.0, 0.0],
+            1.0,
+        );
+        assert!(
+            result.is_none(),
+            "helper must return None when toggle is off, even for valid DeviceRGB input"
+        );
     }
 }
