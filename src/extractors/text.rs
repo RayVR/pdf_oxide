@@ -2303,6 +2303,14 @@ struct MarkedContentContext {
     /// Used to replace extracted text with correct representation
     /// e.g., ligatures (fi, fl, ffi, ffl), decorated glyphs
     actual_text: Option<String>,
+    /// True once an ActualText replacement has been emitted from this
+    /// MC scope. Per ISO 32000-1:2008 §14.9.4 the `/ActualText` of a
+    /// marked-content sequence is the replacement for the ENTIRE
+    /// sequence — even if it contains multiple `Tj` / `TJ` operators
+    /// the replacement is emitted ONCE. The first Tj inside a scope
+    /// flips this flag; subsequent Tj operators see it and skip the
+    /// replacement path.
+    actual_text_emitted: bool,
     /// Expansion text for abbreviations (PDF Spec Section 14.9.5)
     /// The /E entry provides the expansion of an abbreviation or acronym.
     /// e.g., "PDF" might expand to "Portable Document Format"
@@ -2311,6 +2319,14 @@ struct MarkedContentContext {
     ///
     /// Set when tag is "OC" and the OCG /Name matches one of the excluded layers.
     is_excluded_layer: bool,
+    /// MCID declared by this BDC (only BDC; BMC carries no /MCID).
+    ///
+    /// Stored here so EMC can restore the outer scope's MCID instead
+    /// of blanking `current_mcid` unconditionally. A `Tj` issued
+    /// AFTER an inner EMC must still attribute to its enclosing
+    /// MCID-bearing scope (the PDF spec specifies marked-content
+    /// nesting at §14.6).
+    own_mcid: Option<u32>,
 }
 
 /// Text extractor that processes content streams.
@@ -3021,11 +3037,51 @@ impl<'doc> TextExtractor<'doc> {
     /// ActualText provides the exact text representation for content that's
     /// represented non-standardly, such as ligatures (fi, fl, ffi, ffl) or
     /// decorated glyphs.
+    #[cfg(test)]
     fn get_current_actual_text(&self) -> Option<String> {
         self.marked_content_stack
             .iter()
-            .rev()  // Search from innermost (most recent) context
+            .rev() // Search from innermost (most recent) context
             .find_map(|ctx| ctx.actual_text.clone())
+    }
+
+    /// Return the innermost active `/ActualText`, alongside a flag
+    /// indicating whether it has ALREADY been emitted in the current
+    /// MC scope.
+    ///
+    /// Per ISO 32000-1:2008 §14.9.4 the `/ActualText` of a marked-
+    /// content sequence replaces the ENTIRE sequence — even if the
+    /// sequence contains multiple `Tj` / `TJ` operators the replacement
+    /// is emitted ONCE.
+    ///
+    /// Returns `(text, already_emitted)`:
+    /// - `(Some(text), false)` on the FIRST show-text inside a scope
+    ///   that carries `/ActualText` — the caller should emit `text`
+    ///   AND mark the scope's `actual_text_emitted` via
+    ///   [`Self::mark_actual_text_emitted`].
+    /// - `(Some(text), true)` on subsequent show-text operators inside
+    ///   the same scope — the caller must suppress emission entirely
+    ///   (no raw glyphs, no replacement). The text matrix advance
+    ///   still runs so positioning stays consistent.
+    /// - `(None, _)` when no `/ActualText` is active.
+    fn peek_current_actual_text(&self) -> (Option<String>, bool) {
+        for ctx in self.marked_content_stack.iter().rev() {
+            if let Some(ref text) = ctx.actual_text {
+                return (Some(text.clone()), ctx.actual_text_emitted);
+            }
+        }
+        (None, false)
+    }
+
+    /// Mark the innermost scope's `/ActualText` as emitted. See
+    /// [`Self::peek_current_actual_text`].
+    fn mark_actual_text_emitted(&mut self) {
+        for ctx in self.marked_content_stack.iter_mut().rev() {
+            if ctx.actual_text.is_some() {
+                ctx.actual_text_emitted = true;
+                return;
+            }
+        }
     }
 
     /// Calculate the average glyph width for a font.
@@ -4616,36 +4672,50 @@ impl<'doc> TextExtractor<'doc> {
 
                 // ActualText override
                 // Per PDF Spec ISO 32000-1:2008, Section 14.9.4:
-                // ActualText provides replacement text for content that cannot be
-                // automatically extracted (e.g., figures, symbols, decorative text).
-                if let Some(actual_text) = self.get_current_actual_text() {
-                    log::debug!("Tj operator: Using ActualText override: '{}'", actual_text);
-
-                    if self.extract_spans {
-                        // Use ActualText in span mode — push pre-decoded Unicode directly
-                        // into the buffer, bypassing font character mapping (the text is
-                        // already decoded from the BDC /ActualText property).
-                        if self.tj_span_buffer.is_none() {
-                            self.tj_span_buffer = Some(TjBuffer::new(
-                                self.state_stack.current(),
-                                self.current_mcid,
-                                self.cached_current_font.clone(),
-                            ));
-                        }
-
+                // ActualText provides replacement text for the marked-content
+                // SEQUENCE — emitted ONCE, no matter how many Tj operators
+                // sit inside. The peek/mark pair below handles both first-Tj
+                // (emit replacement) and subsequent-Tj (suppress entirely,
+                // advance only) cases.
+                let (current_at, already_emitted) = self.peek_current_actual_text();
+                if let Some(actual_text) = current_at {
+                    if already_emitted {
+                        // Subsequent show-text inside the same MC scope:
+                        // glyphs are already covered by the one replacement
+                        // that fired on the first Tj. Advance positioning so
+                        // any later, OUTER-scope show-text lands correctly,
+                        // but emit nothing.
+                        let w = self.advance_position_for_string(&text)?;
                         if let Some(ref mut buffer) = self.tj_span_buffer {
-                            buffer.unicode.push_str(&actual_text);
+                            buffer.accumulated_width += w;
                         }
                     } else {
-                        // Character mode: show_text maps through font, but ActualText
-                        // is already decoded. Fall back to show_text for positioning.
-                        self.show_text(actual_text.as_bytes())?;
-                    }
-
-                    // Advance position for the original text (to maintain layout)
-                    let w = self.advance_position_for_string(&text)?;
-                    if let Some(ref mut buffer) = self.tj_span_buffer {
-                        buffer.accumulated_width += w;
+                        log::debug!("Tj operator: emitting MC-scope ActualText '{}'", actual_text);
+                        self.mark_actual_text_emitted();
+                        if self.extract_spans {
+                            // Use ActualText in span mode — push pre-decoded
+                            // Unicode directly into the buffer, bypassing
+                            // font character mapping.
+                            if self.tj_span_buffer.is_none() {
+                                self.tj_span_buffer = Some(TjBuffer::new(
+                                    self.state_stack.current(),
+                                    self.current_mcid,
+                                    self.cached_current_font.clone(),
+                                ));
+                            }
+                            if let Some(ref mut buffer) = self.tj_span_buffer {
+                                buffer.unicode.push_str(&actual_text);
+                            }
+                        } else {
+                            // Character mode: show_text maps through font, but ActualText
+                            // is already decoded. Fall back to show_text for positioning.
+                            self.show_text(actual_text.as_bytes())?;
+                        }
+                        // Advance position for the original text (to maintain layout)
+                        let w = self.advance_position_for_string(&text)?;
+                        if let Some(ref mut buffer) = self.tj_span_buffer {
+                            buffer.accumulated_width += w;
+                        }
                     }
                 } else {
                     // No ActualText - use standard text extraction
@@ -4678,31 +4748,33 @@ impl<'doc> TextExtractor<'doc> {
 
                 // ActualText override
                 // Per PDF Spec ISO 32000-1:2008, Section 14.9.4:
-                // When ActualText is present, use it instead of the TJ array contents.
-                // The entire TJ array is replaced with the ActualText string.
-                if let Some(actual_text) = self.get_current_actual_text() {
-                    log::debug!(
-                        "TJ operator: Using ActualText override: '{}' (replacing {} elements)",
-                        actual_text,
-                        array.len()
-                    );
-
-                    if self.extract_spans {
-                        // Use ActualText in span mode — push pre-decoded Unicode directly
-                        let mut buffer = TjBuffer::new(
-                            self.state_stack.current(),
-                            self.current_mcid,
-                            self.cached_current_font.clone(),
+                // The MC-scope `/ActualText` replaces the ENTIRE sequence
+                // exactly once — see the Tj path above for the per-scope
+                // peek/mark protocol that handles both first and
+                // subsequent show-text operators inside the same scope.
+                let (current_at, already_emitted) = self.peek_current_actual_text();
+                if let Some(actual_text) = current_at {
+                    if !already_emitted {
+                        log::debug!(
+                            "TJ operator: emitting MC-scope ActualText '{}' (replacing {} elements)",
+                            actual_text,
+                            array.len()
                         );
-                        buffer.unicode.push_str(&actual_text);
-                        self.flush_tj_buffer(buffer)?;
-                    } else {
-                        // Character mode: fall back to show_text for positioning
-                        self.show_text(actual_text.as_bytes())?;
+                        self.mark_actual_text_emitted();
+                        if self.extract_spans {
+                            let mut buffer = TjBuffer::new(
+                                self.state_stack.current(),
+                                self.current_mcid,
+                                self.cached_current_font.clone(),
+                            );
+                            buffer.unicode.push_str(&actual_text);
+                            self.flush_tj_buffer(buffer)?;
+                        } else {
+                            self.show_text(actual_text.as_bytes())?;
+                        }
                     }
-
-                    // Advance position for the entire TJ array (to maintain layout)
-                    // Calculate the total displacement the array would have caused
+                    // First or subsequent: advance position for the
+                    // entire TJ array so layout stays consistent.
                     for element in array {
                         match element {
                             TextElement::String(s) => {
@@ -5606,8 +5678,10 @@ impl<'doc> TextExtractor<'doc> {
                     is_artifact,
                     artifact_type: None, // No artifact classification; None for backward compatibility
                     actual_text: None,   // BMC doesn't have ActualText
-                    expansion: None,     // BMC doesn't have expansion
+                    actual_text_emitted: false,
+                    expansion: None,          // BMC doesn't have expansion
                     is_excluded_layer: false, // BMC cannot carry OCG properties
+                    own_mcid: None,           // BMC carries no MCID
                 });
                 self.update_artifact_state();
 
@@ -5625,12 +5699,14 @@ impl<'doc> TextExtractor<'doc> {
                 let mut actual_text = None;
                 let mut artifact_type = None;
                 let mut expansion = None;
+                let mut own_mcid: Option<u32> = None;
 
                 let mut is_excluded_layer = false;
 
                 if let Some(props_dict) = self.resolve_bdc_properties(&properties) {
                     if let Some(mcid_obj) = props_dict.get("MCID") {
                         if let Some(mcid) = mcid_obj.as_integer() {
+                            own_mcid = Some(mcid as u32);
                             self.current_mcid = Some(mcid as u32);
                             log::debug!("Entered marked content with MCID: {}", mcid);
                         }
@@ -5678,8 +5754,10 @@ impl<'doc> TextExtractor<'doc> {
                     is_artifact,
                     artifact_type: artifact_type.clone(),
                     actual_text,
+                    actual_text_emitted: false,
                     expansion,
                     is_excluded_layer,
+                    own_mcid,
                 });
                 self.update_artifact_state();
                 self.update_layer_state();
@@ -5698,18 +5776,32 @@ impl<'doc> TextExtractor<'doc> {
                 // boundary; see `BeginMarkedContent` for the
                 // rationale.
                 self.flush_tj_span_buffer()?;
-                // EMC ends the current marked content sequence
-                if let Some(mcid) = self.current_mcid {
-                    log::debug!("Exited marked content with MCID: {}", mcid);
-                }
-                self.current_mcid = None;
-
-                // Pop from marked content stack and update artifact/layer state
+                // EMC ends the current marked content sequence.
+                // Pop the stack THEN restore `current_mcid` from the
+                // nearest enclosing BDC that carried `/MCID` — per
+                // ISO 32000-1:2008 §14.6, marked-content sequences
+                // nest, and a `Tj` issued after an inner EMC must
+                // attribute to its enclosing scope. Blanking
+                // `current_mcid` here would orphan that `Tj`'s span
+                // (MAJOR-1 regression #...).
                 if !self.marked_content_stack.is_empty() {
                     self.marked_content_stack.pop();
                     self.update_artifact_state();
                     self.update_layer_state();
                 }
+                let restored = self
+                    .marked_content_stack
+                    .iter()
+                    .rev()
+                    .find_map(|ctx| ctx.own_mcid);
+                if let Some(prev) = self.current_mcid {
+                    log::debug!(
+                        "Exited marked content with MCID: {} -> restoring to {:?}",
+                        prev,
+                        restored
+                    );
+                }
+                self.current_mcid = restored;
             },
 
             // XObject operator - Process Form XObjects for text extraction
@@ -9466,6 +9558,8 @@ mod tests {
             actual_text: None,
             expansion: None,
             is_excluded_layer: false,
+            actual_text_emitted: false,
+            own_mcid: None,
         });
         extractor.update_artifact_state();
         assert!(extractor.inside_artifact);
@@ -9481,6 +9575,8 @@ mod tests {
             actual_text: None,
             expansion: None,
             is_excluded_layer: false,
+            actual_text_emitted: false,
+            own_mcid: None,
         });
         extractor.marked_content_stack.push(MarkedContentContext {
             artifact_type: None,
@@ -9489,6 +9585,8 @@ mod tests {
             actual_text: None,
             expansion: None,
             is_excluded_layer: false,
+            actual_text_emitted: false,
+            own_mcid: None,
         });
         extractor.update_artifact_state();
         // Should still be inside artifact because parent is artifact
@@ -13715,6 +13813,8 @@ mod tests {
             actual_text: None,
             expansion: None,
             is_excluded_layer: false,
+            actual_text_emitted: false,
+            own_mcid: None,
         });
 
         extractor
@@ -14251,6 +14351,8 @@ fn test_marked_content_context_with_actual_text() {
         actual_text: Some("fi".to_string()), // Ligature expansion
         expansion: None,
         is_excluded_layer: false,
+        actual_text_emitted: false,
+        own_mcid: None,
     };
 
     assert_eq!(ctx.actual_text, Some("fi".to_string()));
@@ -14267,6 +14369,8 @@ fn test_marked_content_context_with_expansion() {
         actual_text: None,
         expansion: Some("Portable Document Format".to_string()),
         is_excluded_layer: false,
+        actual_text_emitted: false,
+        own_mcid: None,
     };
 
     assert_eq!(ctx.expansion, Some("Portable Document Format".to_string()));
@@ -14282,6 +14386,8 @@ fn test_marked_content_context_artifact_with_actual_text() {
         actual_text: Some("Header text".to_string()),
         expansion: None,
         is_excluded_layer: false,
+        actual_text_emitted: false,
+        own_mcid: None,
     };
 
     assert!(ctx.is_artifact);
@@ -14301,6 +14407,8 @@ fn test_get_current_actual_text_finds_first() {
         actual_text: Some("outer text".to_string()),
         expansion: None,
         is_excluded_layer: false,
+        actual_text_emitted: false,
+        own_mcid: None,
     });
 
     extractor.marked_content_stack.push(MarkedContentContext {
@@ -14310,6 +14418,8 @@ fn test_get_current_actual_text_finds_first() {
         actual_text: Some("inner text".to_string()),
         expansion: None,
         is_excluded_layer: false,
+        actual_text_emitted: false,
+        own_mcid: None,
     });
 
     // Should return innermost (most recent) ActualText
@@ -14330,6 +14440,8 @@ fn test_get_current_actual_text_skips_none() {
         actual_text: Some("replacement text".to_string()),
         expansion: None,
         is_excluded_layer: false,
+        actual_text_emitted: false,
+        own_mcid: None,
     });
 
     // Push context without ActualText
@@ -14340,6 +14452,8 @@ fn test_get_current_actual_text_skips_none() {
         actual_text: None,
         expansion: None,
         is_excluded_layer: false,
+        actual_text_emitted: false,
+        own_mcid: None,
     });
 
     // Should find the ActualText from outer context
