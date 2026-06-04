@@ -33,6 +33,7 @@
 pub(crate) mod ext_gstate;
 pub(crate) mod page_renderer;
 mod path_rasterizer;
+pub(crate) mod resolution;
 mod separation_renderer;
 mod text_rasterizer;
 
