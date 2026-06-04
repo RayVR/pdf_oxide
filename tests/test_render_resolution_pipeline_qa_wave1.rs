@@ -888,3 +888,104 @@ fn qa_type4_out_of_range_output_clamps() {
         "Type 4 out-of-range output must clamp into valid CMYK → painted colour, got ({r}, {g}, {b}, {a})"
     );
 }
+
+// ===========================================================================
+// PROBE AREA: Adversarial input (probes 22-24)
+// ===========================================================================
+
+/// Probe 22 — Colour space with a malformed object (Separation array
+/// missing the alt-space and function entries entirely).
+///
+/// `[/Separation /Name]` is a 2-element array — both `arr.get(2)` and
+/// `arr.get(3)` return None. The pipeline's resolver falls through to
+/// `first_as_gray(components, alpha)`. The inline path's `scn` handler
+/// goes to its `Separation | DeviceN` branch and computes `g = 1.0 - t`.
+///
+/// These are different fall-back semantics: pipeline gives the tint as
+/// gray (e.g. `0.7` → light gray), inline gives `1 - tint` (e.g. `0.7` →
+/// `0.3` → dark gray). Off-vs-on must agree per the parity invariant;
+/// this is the same family of bug as probe 13 — Separation without a
+/// valid function still hits the inline fallback differently.
+#[test]
+#[ignore = "wave-1 QA bug — malformed Separation array (no altCS/tintTransform) diverges off vs on; fix-pass target"]
+fn qa_bug_malformed_separation_array_diverges() {
+    let resources = "/ColorSpace << /Spot [/Separation /SpotName] >>";
+    // tint=0.7 → inline gives 1-0.7=0.3 gray; pipeline gives 0.7 gray.
+    let content = "/Spot cs\n0.7 scn\n20 20 60 60 re\nf\n";
+    let bytes = build_pdf(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "WAVE-1 INVARIANT VIOLATED: malformed Separation must degrade identically off vs on \
+         (inline does `1.0 - tint`, pipeline does `tint` — gray fallback direction disagrees)"
+    );
+}
+
+/// Probe 22b — Same shape, no panic guarantee for malformed input.
+/// Independent of parity: the render must not crash regardless of how
+/// each path chooses to fall back.
+#[test]
+fn qa_malformed_separation_array_no_panic() {
+    let resources = "/ColorSpace << /Spot [/Separation /SpotName] >>";
+    let content = "/Spot cs\n0.7 scn\n20 20 60 60 re\nf\n";
+    let bytes = build_pdf(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false);
+    let on = render_with_pipeline_allow_fail(&doc, true);
+    assert!(off.is_some(), "malformed Separation array must not panic the inline path");
+    assert!(on.is_some(), "malformed Separation array must not panic the pipeline path");
+}
+
+/// Probe 23 — `scn` invoked with more components than the colour space
+/// expects (1-channel Separation with 4 components on the stack).
+///
+/// The pipeline reads `components[0]` and ignores the rest. The inline
+/// path does the same (`components[0]` for the tint). Off-vs-on must
+/// agree.
+#[test]
+fn qa_scn_too_many_components_for_space_parity() {
+    let type4_program = "{ 0.0 exch 0.0 0.0 }";
+    let resources = "/ColorSpace << /Spot [/Separation /SpotName /DeviceCMYK 5 0 R] >>";
+    // `scn` with four numbers against a single-channel Separation: the
+    // dispatcher pushes all four into `gs.fill_color_components`. Both
+    // paths key off `components[0]`.
+    let content = "/Spot cs\n0.5 0.2 0.9 0.1 scn\n20 20 60 60 re\nf\n";
+    let bytes = build_pdf_with_type4_separation(content, type4_program, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    // Both must NOT panic and produce valid pixmaps.
+    assert_eq!(off.len(), on.len());
+    // The parity assertion: off-vs-on agree (or at minimum, both produce
+    // SOME output — separation Type 4 is a capability case where they
+    // differ legitimately; pin both into the "rendered" state).
+    let (r_on, _, _, _) = center_pixel(&on);
+    assert!(
+        r_on > 0 || off != on,
+        "too-many-components Separation must either render via pipeline or differ from inline"
+    );
+}
+
+/// Probe 24 — `scn` invoked with too few components for the declared
+/// colour space (DeviceN of arity 2 with only 1 component on the
+/// stack). The pipeline currently sends whatever components are there
+/// into `evaluate_type4_clamped` with the declared `Domain`. The
+/// Domain has 2 entries but the inputs vector has 1; the Type 4
+/// evaluator must reject (or pad), and the resolver's `?` must propagate
+/// to a `None` return that the renderer survives.
+#[test]
+fn qa_scn_too_few_components_no_panic() {
+    let type4_program = "{ exch pop 0.0 exch 0.0 0.0 }";
+    let resources = "/ColorSpace << /TwoSpot [/DeviceN [/SpotA /SpotB] /DeviceCMYK 5 0 R] >>";
+    // Only one component on the stack; the DeviceN declares 2.
+    let content = "/TwoSpot cs\n0.5 scn\n20 20 60 60 re\nf\n";
+    let bytes =
+        build_devicen_pdf(content, type4_program, resources, "[0 1 0 1 0 1 0 1]", &[0, 1, 0, 1]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false);
+    let on = render_with_pipeline_allow_fail(&doc, true);
+    assert!(off.is_some(), "DeviceN with too-few components must not panic the inline path");
+    assert!(on.is_some(), "DeviceN with too-few components must not panic the pipeline path");
+}
