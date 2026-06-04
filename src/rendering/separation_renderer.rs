@@ -27,7 +27,7 @@
 //! - **DeviceCMYK** and **ICCBased N=4** images: per-pixel C / M / Y / K
 //!   samples route to the Cyan / Magenta / Yellow / Black plates. JPEG-
 //!   encoded streams decode through
-//!   [`crate::extractors::images::decode_cmyk_jpeg_to_raw_cmyk`] which
+//!   `crate::extractors::images::decode_cmyk_jpeg_to_raw_cmyk` which
 //!   preserves the Adobe APP14 inversion semantics so plate values are
 //!   physical ink coverage (0 = no ink, 255 = full).
 //! - **Separation /\<spot-ink\>**: the single sample channel routes to

@@ -1476,7 +1476,7 @@ pub(crate) fn decode_cmyk_jpeg_to_raw_cmyk(jpeg_data: &[u8]) -> Result<Vec<u8>> 
 /// colour space (or when the document's `OutputIntents` supplied a
 /// default CMYK profile).
 ///
-/// APP14 handling matches [`decode_cmyk_jpeg_to_raw_cmyk`]: plain CMYK
+/// APP14 handling matches `decode_cmyk_jpeg_to_raw_cmyk`: plain CMYK
 /// passes through, YCCK is inverted on all four channels to recover
 /// straight CMYK before the colour-space conversion.
 pub fn decode_cmyk_jpeg_to_rgb_with_profile(
