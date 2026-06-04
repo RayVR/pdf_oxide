@@ -1416,3 +1416,177 @@ fn qa_type7_tensor_patch_mesh_shading_pass_through_no_panic_parity() {
         .expect("Type-7 tensor patch must not panic toggle-on");
     assert_eq!(off, on, "Type-7 tensor patch must produce identical output off vs on");
 }
+
+// ===========================================================================
+// Probes 26-29 — Adversarial input.
+//
+// The wave-4 helper uses `?` on every dict-lookup, so missing fields
+// drop the helper into `None` and the caller falls back to the
+// inline path. The inline path uses `unwrap_or` defaults so it also
+// stays panic-free. Pin the invariant: every malformed shading must
+// produce a defined result (Ok or Err — either is fine) and the
+// renderer must not panic. Pilot doesn't cover these.
+// ===========================================================================
+
+/// Probe 26 — Shading dict missing `/ColorSpace`. The pre-resolve
+/// helper's `shading.get("ColorSpace")?` returns None → helper
+/// returns None → caller falls back to inline which uses `/C0` raw
+/// as RGB. No panic.
+#[test]
+fn qa_adversarial_missing_color_space_no_panic_parity() {
+    let shading_body = "<< /ShadingType 2 /Coords [0 50 100 50] /Domain [0 1] \
+         /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("missing /ColorSpace must not panic toggle-off");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("missing /ColorSpace must not panic toggle-on");
+    assert_eq!(
+        off, on,
+        "missing /ColorSpace must produce identical output off vs on (helper returns None, \
+         caller falls back to inline)"
+    );
+}
+
+/// Probe 27 — Shading dict missing `/Function`. The helper's
+/// `shading.get("Function")?` returns None → helper returns None →
+/// caller falls back to inline which then reads None and returns
+/// the default `((0,0,0), (1,1,1))` endpoint pair. No panic.
+#[test]
+fn qa_adversarial_missing_function_no_panic_parity() {
+    let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
+                          /Coords [0 50 100 50] /Domain [0 1] >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("missing /Function must not panic toggle-off");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("missing /Function must not panic toggle-on");
+    assert_eq!(off, on, "missing /Function must produce identical output off vs on");
+}
+
+/// Probe 28 — Type 2 function missing `/C0` (or `/C1`). The helper's
+/// `func_dict.get("C0")?` returns None → helper returns None →
+/// caller falls back to inline which uses the `unwrap_or((0,0,0))`
+/// default. No panic.
+#[test]
+fn qa_adversarial_missing_c0_no_panic_parity() {
+    let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
+                          /Coords [0 50 100 50] /Domain [0 1] \
+                          /Function << /FunctionType 2 /Domain [0 1] /C1 [0 0 1] /N 1 >> >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("missing /C0 must not panic toggle-off");
+    let on =
+        render_with_pipeline_allow_fail(&doc, true).expect("missing /C0 must not panic toggle-on");
+    assert_eq!(off, on, "missing /C0 must produce identical output off vs on");
+}
+
+/// Probe 28b — Same shape but missing `/C1`. Symmetric to the
+/// missing-/C0 case.
+#[test]
+fn qa_adversarial_missing_c1_no_panic_parity() {
+    let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
+                          /Coords [0 50 100 50] /Domain [0 1] \
+                          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /N 1 >> >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("missing /C1 must not panic toggle-off");
+    let on =
+        render_with_pipeline_allow_fail(&doc, true).expect("missing /C1 must not panic toggle-on");
+    assert_eq!(off, on, "missing /C1 must produce identical output off vs on");
+}
+
+/// Probe 29 — Type 3 stitching function with empty `/Functions`
+/// array. The helper's `funcs.first()?` returns None → helper
+/// returns None → caller falls back to inline. No panic.
+#[test]
+fn qa_adversarial_empty_stitching_functions_no_panic_parity() {
+    let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
+                          /Coords [0 50 100 50] /Domain [0 1] \
+                          /Function << /FunctionType 3 /Domain [0 1] \
+                          /Functions [] /Bounds [] /Encode [] >> >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("empty /Functions must not panic toggle-off");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("empty /Functions must not panic toggle-on");
+    assert_eq!(off, on, "empty /Functions must produce identical output off vs on");
+}
+
+/// Probe 29b — Type 2 axial shading missing `/Coords` entirely. The
+/// renderer's `render_axial_shading` short-circuits with `return
+/// Ok(())` when `Coords` isn't a 4+-element array; the wave-4
+/// helper still runs but its endpoint resolution is moot because
+/// nothing paints. Pin no-panic + parity.
+#[test]
+fn qa_adversarial_missing_coords_no_panic_parity() {
+    let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB /Domain [0 1] \
+                          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("missing /Coords must not panic toggle-off");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("missing /Coords must not panic toggle-on");
+    assert_eq!(off, on, "missing /Coords must produce identical output off vs on");
+}
+
+/// Probe 29c — Shading whose `/ColorSpace` is itself a malformed
+/// indirect reference (dangling). The pre-resolve helper calls
+/// `doc.resolve_object(cs_obj).ok()?`. Whether `resolve_object`
+/// returns Err (and propagates None via `?`) or returns Ok with an
+/// `Object::Null` (which is neither a Name nor an Array, so
+/// `pipeline_resolve_components` falls into the catch-all gray
+/// fallback) determines the toggle-on behaviour.
+///
+/// No-panic invariant pinned. No-parity invariant pinned with an
+/// `#[ignore]` — the wave-4 pipeline path produces a grayscale
+/// gradient (gray = C0[0]) while the inline path produces the raw
+/// RGB triple (1, 0, 0) → red. Toggle-on vs toggle-off diverges
+/// visibly under this specific malformed input.
+///
+/// Bug name: WAVE4-DANGLING-CS-REF-PIPELINE-FALLS-TO-GRAY.
+#[test]
+fn qa_adversarial_dangling_color_space_ref_no_panic_pin() {
+    let shading_body = "<< /ShadingType 2 /ColorSpace 99 0 R /Coords [0 50 100 50] /Domain [0 1] \
+                          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let _ = render_with_pipeline_allow_fail(&doc, false)
+        .expect("dangling /ColorSpace ref must not panic toggle-off");
+    let _ = render_with_pipeline_allow_fail(&doc, true)
+        .expect("dangling /ColorSpace ref must not panic toggle-on");
+}
+
+/// Probe 29d — Capability-divergence pin for the dangling-/ColorSpace
+/// case. Pipeline produces grayscale; inline produces raw RGB. This
+/// is a documented MINOR divergence under malformed input — neither
+/// path matches a spec-compliant renderer (which would either reject
+/// the PDF or fall back to a defined default), but the divergence
+/// is observable and worth documenting.
+///
+/// **#[ignore]** — pinned for documentation; flipping the ignore
+/// requires deciding whether the pipeline should match inline (raw)
+/// or vice versa.
+#[test]
+#[ignore = "WAVE4-DANGLING-CS-REF-PIPELINE-FALLS-TO-GRAY: pipeline path treats dangling /ColorSpace ref as gray, inline reads C0 raw as RGB"]
+fn qa_adversarial_dangling_color_space_ref_pipeline_diverges_from_inline() {
+    let shading_body = "<< /ShadingType 2 /ColorSpace 99 0 R /Coords [0 50 100 50] /Domain [0 1] \
+                          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>";
+    let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false).expect("off must not panic");
+    let on = render_with_pipeline_allow_fail(&doc, true).expect("on must not panic");
+    // Aspirational pin: when this divergence is resolved (one side
+    // adopts the other's behaviour), the equality should hold.
+    assert_eq!(
+        off, on,
+        "after the divergence is resolved, dangling /ColorSpace ref \
+         output should match off vs on"
+    );
+}
