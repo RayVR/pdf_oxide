@@ -121,53 +121,6 @@ fn build_pdf_with_type4_separation_range(
     buf
 }
 
-/// Build a one-page PDF with a Type 2 (exponential interpolation) function
-/// as the tint transform. Object 5 holds the function dict. Domain is the
-/// natural `[0 1]`; C0/C1/N are caller-supplied so probes can target
-/// boundary cases the inline path's hand-rolled Type 2 doesn't reach.
-fn build_pdf_with_type2_separation(
-    content_ops: &str,
-    c0_array: &str,
-    c1_array: &str,
-    n_value: &str,
-    alt_cs: &str,
-    page_resources_extra: &str,
-) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"%PDF-1.4\n");
-    let cat_off = buf.len();
-    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-    let pages_off = buf.len();
-    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-    let page_off = buf.len();
-    let _ = alt_cs;
-    let page = format!(
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << {} >> /Contents 4 0 R >>\nendobj\n",
-        page_resources_extra
-    );
-    buf.extend_from_slice(page.as_bytes());
-    let stream_off = buf.len();
-    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
-    buf.extend_from_slice(stream_hdr.as_bytes());
-    buf.extend_from_slice(content_ops.as_bytes());
-    buf.extend_from_slice(b"\nendstream\nendobj\n");
-    let func_off = buf.len();
-    let func_body = format!(
-        "5 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 {} /C1 {} /N {} >>\nendobj\n",
-        c0_array, c1_array, n_value
-    );
-    buf.extend_from_slice(func_body.as_bytes());
-    let xref_off = buf.len();
-    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
-    for off in [cat_off, pages_off, page_off, stream_off, func_off] {
-        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
-    }
-    buf.extend_from_slice(
-        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
-    );
-    buf
-}
-
 /// Render holding the toggle to `enabled` for the call's duration; shared
 /// mutex serialises env-var manipulation across parallel tests.
 fn render_with_pipeline(doc: &PdfDocument, enabled: bool) -> Vec<u8> {
@@ -1065,6 +1018,7 @@ fn qa_perf_thousand_fills_toggle_on_within_bound() {
 ///   - one `LogicalColor` (with a `Vec<f32>` of the components)
 ///   - one `PathBuilder` plus a finished `Path`
 ///   - one `PaintIntent`
+///
 /// Per combo, that's two of each — 10 allocations per combo (roughly).
 ///
 /// We can't measure heap activity in a stable way from inside `cargo
