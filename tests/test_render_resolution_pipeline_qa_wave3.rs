@@ -125,45 +125,24 @@ fn build_pdf_image_mask(
     build_pdf_image_mask_ex(content_ops, resources_extra, width, height, mask_data, "")
 }
 
-/// Render holding the toggle to `enabled` for the call's duration; shared
-/// mutex serialises env-var manipulation across parallel tests.
-fn render_with_pipeline(doc: &PdfDocument, enabled: bool) -> Vec<u8> {
+/// Render the first page. The `_enabled` argument is retained so existing
+/// test bodies keep compiling after wave 5 collapsed the off/on split; the
+/// pipeline is the only path now.
+fn render_with_pipeline(doc: &PdfDocument, _enabled: bool) -> Vec<u8> {
     let _guard = PIPELINE_TOGGLE_LOCK.lock().unwrap();
-    let prev = std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE").ok();
-    if enabled {
-        std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", "1");
-    } else {
-        std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE");
-    }
     let opts = RenderOptions::with_dpi(72).as_raw();
     let img = render_page(doc, 0, &opts).expect("render_page succeeds");
     assert_eq!(img.format, ImageFormat::RawRgba8);
-    let data = img.data;
-    match prev {
-        Some(v) => std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", v),
-        None => std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE"),
-    }
-    data
+    img.data
 }
 
-/// Render under pipeline-`enabled`, allowing the call to fail without
-/// panicking. Used by adversarial-input probes — the invariant is
-/// "no panic", not "render succeeds".
-fn render_with_pipeline_allow_fail(doc: &PdfDocument, enabled: bool) -> Option<Vec<u8>> {
+/// Render the first page, allowing failure without panicking. Used by
+/// adversarial-input probes whose invariant is "no panic", not "render
+/// succeeds".
+fn render_with_pipeline_allow_fail(doc: &PdfDocument, _enabled: bool) -> Option<Vec<u8>> {
     let _guard = PIPELINE_TOGGLE_LOCK.lock().unwrap();
-    let prev = std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE").ok();
-    if enabled {
-        std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", "1");
-    } else {
-        std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE");
-    }
     let opts = RenderOptions::with_dpi(72).as_raw();
-    let result = render_page(doc, 0, &opts).ok().map(|img| img.data);
-    match prev {
-        Some(v) => std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", v),
-        None => std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE"),
-    }
-    result
+    render_page(doc, 0, &opts).ok().map(|img| img.data)
 }
 
 /// Sample a pixel at (x, y) on the 100×100 page.
@@ -1100,22 +1079,14 @@ fn qa_form_xobject_with_inner_image_mask_type4_separation_capability_gain() {
 
     let bytes = build_pdf_form_with_imagemask_and_type4_separation(page, form, type4, 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
 
-    // Inline (off): Type 4 falls back to 1 - tint → solid black.
-    let (r_off, g_off, b_off, _a) = center_pixel(&off);
-    assert!(
-        r_off < 50 && g_off < 50 && b_off < 50,
-        "inline Form-nested Type 4 Separation ImageMask must paint ~black, got ({r_off}, {g_off}, {b_off})"
-    );
-    // Pipeline (on): Type 4 program executes → magenta.
+    // Pipeline runs the Type 4 program → magenta.
     let (r_on, g_on, b_on, _a) = center_pixel(&on);
     assert!(
         r_on >= 250 && g_on <= 5 && b_on >= 250,
-        "pipeline-on Form-nested Type 4 Separation ImageMask must paint magenta, got ({r_on}, {g_on}, {b_on})"
+        "Form-nested Type 4 Separation ImageMask must paint magenta, got ({r_on}, {g_on}, {b_on})"
     );
-    assert_ne!(off, on, "Form-nested capability gain must be visible");
 }
 
 /// Probe 16 — Two-level Form recursion (Form-in-Form), where the
@@ -1618,22 +1589,15 @@ fn qa_image_mask_100_paints_type4_separation_capability_at_scale() {
     );
 
     let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
 
     // Pick a representative tile centre (col 5, row 5): tile starts at
     // (50, 50), 8x8, so centre ≈ (54, 54).
-    let (r_off, g_off, b_off, _a) = pixel_at(&off, 54, 54);
-    assert!(
-        r_off < 50 && g_off < 50 && b_off < 50,
-        "inline 100-paint: tile centre must be black, got ({r_off},{g_off},{b_off})"
-    );
     let (r_on, g_on, b_on, _a) = pixel_at(&on, 54, 54);
     assert!(
         r_on > 200 && g_on < 60 && b_on > 200,
         "pipeline 100-paint: tile centre must be magenta, got ({r_on},{g_on},{b_on})"
     );
-    assert_ne!(off, on, "100-paint capability gain must be visible");
 }
 
 /// Probe 24 — DeviceN multi-colorant Type 4 applied to an ImageMask.
@@ -1666,8 +1630,6 @@ fn qa_image_mask_devicen_multi_colorant_type4_capability() {
         r_on > 200 && g_on < 60 && b_on > 200,
         "pipeline DeviceN Type-4 ImageMask must paint magenta, got ({r_on},{g_on},{b_on})"
     );
-    let off = render_with_pipeline(&doc, false);
-    assert_ne!(off, on, "pipeline must differ from inline for DeviceN Type-4 ImageMask");
 }
 
 /// Probe 25 — Separation `/All` colorant applied to an ImageMask. The
@@ -1700,8 +1662,6 @@ fn qa_image_mask_separation_all_colorant_pipeline_paints_type4_output() {
         r_on > g_on && b_on > g_on,
         "pipeline /All Separation Type-4 ImageMask must trend magenta (R>G, B>G), got ({r_on},{g_on},{b_on})"
     );
-    let off = render_with_pipeline(&doc, false);
-    assert_ne!(off, on, "pipeline must differ from inline for /All Separation Type-4 ImageMask");
 }
 
 /// Probe 26 — Separation `/None` colorant applied to an ImageMask.

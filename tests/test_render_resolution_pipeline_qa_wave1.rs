@@ -121,45 +121,24 @@ fn build_pdf_with_type4_separation_range(
     buf
 }
 
-/// Render holding the toggle to `enabled` for the call's duration; shared
-/// mutex serialises env-var manipulation across parallel tests.
-fn render_with_pipeline(doc: &PdfDocument, enabled: bool) -> Vec<u8> {
+/// Render the first page. The `_enabled` argument is retained so existing
+/// test bodies keep compiling after wave 5 collapsed the off/on split; the
+/// pipeline is the only path now.
+fn render_with_pipeline(doc: &PdfDocument, _enabled: bool) -> Vec<u8> {
     let _guard = PIPELINE_TOGGLE_LOCK.lock().unwrap();
-    let prev = std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE").ok();
-    if enabled {
-        std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", "1");
-    } else {
-        std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE");
-    }
     let opts = RenderOptions::with_dpi(72).as_raw();
     let img = render_page(doc, 0, &opts).expect("render_page succeeds");
     assert_eq!(img.format, ImageFormat::RawRgba8);
-    let data = img.data;
-    match prev {
-        Some(v) => std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", v),
-        None => std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE"),
-    }
-    data
+    img.data
 }
 
-/// Render under pipeline-on, allowing the call to fail without panicking.
-/// Used by adversarial-input probes that exercise malformed PDFs — the
-/// invariant is "no panic", not "render succeeds".
-fn render_with_pipeline_allow_fail(doc: &PdfDocument, enabled: bool) -> Option<Vec<u8>> {
+/// Render the first page, allowing failure without panicking. Used by
+/// adversarial-input probes whose invariant is "no panic", not "render
+/// succeeds".
+fn render_with_pipeline_allow_fail(doc: &PdfDocument, _enabled: bool) -> Option<Vec<u8>> {
     let _guard = PIPELINE_TOGGLE_LOCK.lock().unwrap();
-    let prev = std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE").ok();
-    if enabled {
-        std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", "1");
-    } else {
-        std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE");
-    }
     let opts = RenderOptions::with_dpi(72).as_raw();
-    let result = render_page(doc, 0, &opts).ok().map(|img| img.data);
-    match prev {
-        Some(v) => std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", v),
-        None => std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE"),
-    }
-    result
+    render_page(doc, 0, &opts).ok().map(|img| img.data)
 }
 
 #[allow(dead_code)]
@@ -612,13 +591,6 @@ fn qa_devicen_multi_colorant_type4_pipeline_resolves() {
         r > 200 && g < 60 && b > 200,
         "pipeline DeviceN Type-4 must resolve to magenta, got ({r}, {g}, {b})"
     );
-
-    // Pipeline must produce a different image than inline for this case.
-    let off = render_with_pipeline(&doc, false);
-    assert_ne!(
-        off, on,
-        "pipeline must differ from inline for DeviceN with Type 4 (capability gain)"
-    );
 }
 
 /// Build a one-page PDF with a Type 4 function whose Domain accommodates a
@@ -671,65 +643,23 @@ fn build_devicen_pdf(
     buf
 }
 
-/// Probe 16 — Separation with the `/All` colorant name.
+/// Probe 16 — Separation with the `/All` colorant name (capability).
 ///
-/// The pipeline doesn't special-case the colorant name; it evaluates the
-/// tint transform like any Separation. The inline path treats `/All` the
-/// same. Off-vs-on parity is the assertion.
+/// The pipeline evaluates the tint transform regardless of colorant name;
+/// the test pins the resolved colour goes toward magenta for a
+/// Type 4 program that emits `CMYK(0, 0.5, 0, 0)`.
 #[test]
-fn qa_separation_all_colorant_parity() {
+fn qa_separation_all_colorant() {
     let type4_program = "{ 0.0 exch 0.0 0.0 }";
     let content = "/All_CS cs\n0.5 scn\n20 20 60 60 re\nf\n";
     let resources = "/ColorSpace << /All_CS [/Separation /All /DeviceCMYK 5 0 R] >>";
     let bytes = build_pdf_with_type4_separation(content, type4_program, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
-    // Pipeline resolves Type 4 — magenta-ish (CMYK(0, 0.5, 0, 0) → light
-    // magenta). The assertion is the *outcome of the pipeline path*, not
-    // a parity match — the inline path's `1.0 - tint` fallback gives
-    // gray ~127, so they actively differ. Pin both.
     let (r_on, g_on, b_on, _) = center_pixel(&on);
     assert!(
         r_on > g_on && b_on > g_on,
         "pipeline /All Separation Type-4 must resolve toward magenta (R>G, B>G), got ({r_on}, {g_on}, {b_on})"
-    );
-    let off = render_with_pipeline(&doc, false);
-    assert_ne!(
-        off, on,
-        "pipeline must differ from inline for Separation /All with Type 4 (capability gain)"
-    );
-}
-
-/// Probe 17 — Separation with the `/None` colorant name.
-///
-/// ISO 32000-1 §8.6.6.4: when colorant name is `/None`, the colour should
-/// produce no marks. The inline path does NOT honour this (paints
-/// `1.0 - tint`). The pipeline does NOT honour this either (paints what
-/// the Type 4 evaluates to). Off-vs-on parity is the assertion the
-/// pipeline preserves — neither path is spec-conformant here, but they
-/// must agree until both fix together.
-#[test]
-fn qa_separation_none_colorant_parity_pin() {
-    let type4_program = "{ 0.0 exch 0.0 0.0 }";
-    let content = "/None_CS cs\n0.5 scn\n20 20 60 60 re\nf\n";
-    let resources = "/ColorSpace << /None_CS [/Separation /None /DeviceCMYK 5 0 R] >>";
-    let bytes = build_pdf_with_type4_separation(content, type4_program, resources);
-    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
-    let on = render_with_pipeline(&doc, true);
-    // Neither path honours /None today — pin the divergence direction so
-    // the spec fix lands in one place and is detected here.
-    let (_, _, _, _) = center_pixel(&off);
-    let (_, _, _, _) = center_pixel(&on);
-    // Today, both paths paint (each in its own way). Off-vs-on differ
-    // because the pipeline reads the Type 4 program; once /None handling
-    // is added, both should produce the unpainted page. Until then, the
-    // pin records that off-vs-on differ — flipping toggle MUST NOT mute
-    // the divergence quietly.
-    assert_ne!(
-        off, on,
-        "today both paths paint /None; pipeline differs from inline because Type 4 evaluates; \
-         when /None is honoured, both pixmaps must become equal to the unpainted background"
     );
 }
 

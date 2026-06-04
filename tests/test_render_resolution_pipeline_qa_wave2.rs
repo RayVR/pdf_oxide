@@ -260,45 +260,24 @@ fn build_pdf_text_with_devicen_type4(
     buf
 }
 
-/// Render holding the toggle to `enabled` for the call's duration; shared
-/// mutex serialises env-var manipulation across parallel tests.
-fn render_with_pipeline(doc: &PdfDocument, enabled: bool) -> Vec<u8> {
+/// Render the first page. The `_enabled` argument is retained so existing
+/// test bodies keep compiling after wave 5 collapsed the off/on split; the
+/// pipeline is the only path now.
+fn render_with_pipeline(doc: &PdfDocument, _enabled: bool) -> Vec<u8> {
     let _guard = PIPELINE_TOGGLE_LOCK.lock().unwrap();
-    let prev = std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE").ok();
-    if enabled {
-        std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", "1");
-    } else {
-        std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE");
-    }
     let opts = RenderOptions::with_dpi(72).as_raw();
     let img = render_page(doc, 0, &opts).expect("render_page succeeds");
     assert_eq!(img.format, ImageFormat::RawRgba8);
-    let data = img.data;
-    match prev {
-        Some(v) => std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", v),
-        None => std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE"),
-    }
-    data
+    img.data
 }
 
-/// Render under pipeline-on, allowing the call to fail without panicking.
-/// Used by adversarial-input probes — the invariant is "no panic", not
-/// "render succeeds".
-fn render_with_pipeline_allow_fail(doc: &PdfDocument, enabled: bool) -> Option<Vec<u8>> {
+/// Render the first page, allowing failure without panicking. Used by
+/// adversarial-input probes whose invariant is "no panic", not "render
+/// succeeds".
+fn render_with_pipeline_allow_fail(doc: &PdfDocument, _enabled: bool) -> Option<Vec<u8>> {
     let _guard = PIPELINE_TOGGLE_LOCK.lock().unwrap();
-    let prev = std::env::var("PDF_OXIDE_RESOLUTION_PIPELINE").ok();
-    if enabled {
-        std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", "1");
-    } else {
-        std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE");
-    }
     let opts = RenderOptions::with_dpi(72).as_raw();
-    let result = render_page(doc, 0, &opts).ok().map(|img| img.data);
-    match prev {
-        Some(v) => std::env::set_var("PDF_OXIDE_RESOLUTION_PIPELINE", v),
-        None => std::env::remove_var("PDF_OXIDE_RESOLUTION_PIPELINE"),
-    }
-    result
+    render_page(doc, 0, &opts).ok().map(|img| img.data)
 }
 
 /// Count pixels in `[x0, x1) × [y0, y1)` whose RGB is materially below the
@@ -667,25 +646,7 @@ fn qa_text_three_consecutive_tj_type4_separation_capability() {
     let bytes = build_pdf_text_with_type4_separation(content, type4_program, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
 
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-
-    // Inline path: fallback paints achromatic ink (1-tint=0 fill blended
-    // with white halo around small glyphs → flat gray average). Pin the
-    // SHAPE: equal channels, no magenta tint.
-    let avg_off = average_ink_rgb(&off, 0, 30, 100, 95).expect("inline: some ink");
-    let max_dev = (avg_off.0 - avg_off.1)
-        .abs()
-        .max((avg_off.0 - avg_off.2).abs());
-    assert!(
-        max_dev < 8.0,
-        "inline: all three Tj glyphs must be achromatic (R=G=B) under Type 4 fallback, \
-         got ({:.1}, {:.1}, {:.1}) with channel deviation {:.1}",
-        avg_off.0,
-        avg_off.1,
-        avg_off.2,
-        max_dev
-    );
 
     // Pipeline: magenta. Anti-aliased halo around small glyphs blends
     // magenta with white background — pure-magenta pixels are R=255,B=255
@@ -699,9 +660,6 @@ fn qa_text_three_consecutive_tj_type4_separation_capability() {
         avg_on.1,
         avg_on.2
     );
-
-    // Capability gain: the toggle changes the output.
-    assert_ne!(off, on);
 }
 
 /// Probe 8 — DeviceN multi-colorant Type 4 on text fill. Wave-1 already
@@ -734,9 +692,6 @@ fn qa_text_tj_devicen_multi_colorant_type4_capability() {
         avg_on.1,
         avg_on.2
     );
-
-    let off = render_with_pipeline(&doc, false);
-    assert_ne!(off, on, "pipeline must differ from inline for DeviceN Type-4 text (capability)");
 }
 
 /// Probe 9 — Separation with `/All` colorant name on text fill. The
@@ -765,12 +720,6 @@ fn qa_text_tj_separation_all_colorant() {
         avg_on.1,
         avg_on.2
     );
-
-    let off = render_with_pipeline(&doc, false);
-    assert_ne!(
-        off, on,
-        "pipeline must differ from inline for Separation /All Type-4 text (capability)"
-    );
 }
 
 /// Probe 10 — Separation `/None` colorant on text fill. Per ISO 32000-1
@@ -787,21 +736,12 @@ fn qa_text_tj_separation_none_colorant_parity_pin() {
     let resources = "/ColorSpace << /None_CS [/Separation /None /DeviceCMYK 6 0 R] >>";
     let bytes = build_pdf_text_with_type4_separation(content, type4_program, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    // Parity pin — the assertion is that the toggle doesn't introduce
-    // any divergence on `/None`. Subject to fix when /None is honoured.
-    let off_ink = count_ink_pixels(&off, 0, 0, 100, 100);
+    // /None is not honoured today — the pipeline runs the Type 4
+    // program (CMYK(0, 0.5, 0, 0) → light magenta). Pin that the
+    // renderer paints SOMETHING; when /None handling lands the
+    // assertion can flip to "no ink".
     let on_ink = count_ink_pixels(&on, 0, 0, 100, 100);
-    // Allow both paths to paint something (the current shared
-    // non-conformant behaviour); they must paint EQUIVALENTLY.
-    // Inline goes through `1.0 - tint` → flat tint; pipeline runs the
-    // Type 4 program → CMYK(0,0.5,0,0) → light magenta. They DIFFER
-    // because pipeline gains capability even for /None (no special
-    // case). This is the existing behaviour wave-1 already documents
-    // in the path-fill /None sibling; pin both ink-counts as non-zero
-    // and accept the divergence.
-    assert!(off_ink > 0, "inline /None text fill must paint SOMETHING (no spec honor today)");
     assert!(
         on_ink > 0,
         "pipeline /None text fill must paint SOMETHING (no spec honor today)"
