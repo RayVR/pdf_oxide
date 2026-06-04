@@ -691,6 +691,10 @@ fn extract_sections<'a>(content: &'a str, begin: &str, end: &str) -> Vec<&'a str
 ///
 /// Only matches values `0` or `1`; any other integer is treated as a malformed
 /// directive and ignored (returns `None`).
+pub(crate) fn parse_wmode_directive_public(content: &str) -> Option<u8> {
+    parse_wmode_directive(content)
+}
+
 fn parse_wmode_directive(content: &str) -> Option<u8> {
     static RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"/WMode\s+([0-9]+)\s+def").unwrap());
