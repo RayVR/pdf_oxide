@@ -321,3 +321,106 @@ fn qa_interleaved_graphics_state_changes_byte_identical() {
         "graphics-state changes interleaved with migrated operators must keep parity"
     );
 }
+
+// ===========================================================================
+// PROBE AREA: Stroke-specific edge cases (probes 4-9)
+// ===========================================================================
+
+/// Probe 4 — Hairline stroke (line width well under 1 device pixel).
+///
+/// The pipeline clones `gs` and overwrites only `stroke_color_rgb` and
+/// `stroke_alpha`; line width must round-trip exactly. At a 0.25-px width
+/// the rasteriser produces a faint anti-aliased line; if the pipeline
+/// accidentally promoted the width (e.g. via a default-init clone) the
+/// off and on pixmaps would diverge.
+#[test]
+fn qa_stroke_hairline_width_parity() {
+    let content = "1 0 0 RG\n0.25 w\n20 50 m\n80 50 l\nS\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "hairline stroke must be byte-identical");
+}
+
+/// Probe 5 — Zero-width stroke. PDF spec ISO 32000-1 §8.4.3.2 says width 0
+/// means "thinnest line the device can render"; the renderer's existing
+/// behaviour is what we pin. Either way, off-vs-on must match.
+#[test]
+fn qa_stroke_zero_width_parity() {
+    let content = "1 0 0 RG\n0 w\n20 50 m\n80 50 l\nS\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "zero-width stroke must be byte-identical");
+}
+
+/// Probe 6 — Negative line width (malformed PDF).
+///
+/// The spec says width must be non-negative; some PDFs in the wild carry
+/// negative values from broken producers. Both paths must degrade
+/// identically — no panic, no divergence between off and on.
+#[test]
+fn qa_stroke_negative_width_parity_no_panic() {
+    let content = "1 0 0 RG\n-3 w\n20 50 m\n80 50 l\nS\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    // First invariant: no panic on either side.
+    let off = render_with_pipeline_allow_fail(&doc, false);
+    let on = render_with_pipeline_allow_fail(&doc, true);
+    // Second invariant: same outcome shape.
+    match (off, on) {
+        (Some(a), Some(b)) => assert_eq!(a, b, "negative line width must render identically"),
+        (None, None) => {},
+        (None, Some(_)) | (Some(_), None) => {
+            panic!("toggle changed render-success vs render-failure outcome on malformed input");
+        },
+    }
+}
+
+/// Probe 7 — Stroke alpha (`/CA`) sourced from an ExtGState dict.
+///
+/// The pipeline reads `gs.stroke_alpha` after the `gs` operator has applied
+/// `/CA` to the graphics state. The fold into `ResolvedColor::Rgba.a`
+/// happens inside `device_to_rgba`. Off-vs-on parity confirms the alpha
+/// is sourced from the same place and folded identically.
+#[test]
+fn qa_stroke_alpha_ca_extgstate_parity() {
+    let content = "/Half gs\n1 0 0 RG\n10 w\n20 20 60 60 re\nS\n";
+    let resources = "/ExtGState << /Half << /Type /ExtGState /CA 0.5 >> >>";
+    let bytes = build_pdf(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "stroke alpha via /CA ExtGState must be byte-identical");
+}
+
+/// Probe 8 — Stroke with a dash pattern set via `d`.
+///
+/// Dash pattern is part of `gs` and must survive the splice. Drawing a
+/// long horizontal stroke with a clear dash pattern surfaces any pipeline
+/// path that would forget the dashing.
+#[test]
+fn qa_stroke_dash_pattern_parity() {
+    let content = "1 0 0 RG\n4 w\n[6 3] 0 d\n10 50 m\n90 50 l\nS\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "dashed stroke must be byte-identical");
+}
+
+/// Probe 9 — Miter limit at an extreme value, applied to a sharp corner.
+///
+/// `M 100` allows long miter spikes; at a sharp join the spike length is
+/// observable. Pipeline must round-trip the miter limit.
+#[test]
+fn qa_stroke_extreme_miter_limit_parity() {
+    let content = "1 0 0 RG\n6 w\n0 J\n0 j\n100 M\n20 80 m\n50 50 l\n20 20 l\nS\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "extreme miter-limit stroke must be byte-identical");
+}
