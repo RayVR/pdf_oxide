@@ -1110,3 +1110,207 @@ fn qa_type4_as_shading_function_helper_returns_none_falls_back() {
          (helper returns None, caller falls back to inline)"
     );
 }
+
+// ===========================================================================
+// Probes 17-20 — State interaction.
+//
+// The wave-4 splice runs BEFORE render_axial / render_radial; it never
+// touches `gs` directly (a synthetic GraphicsState is built carrying
+// only fill_alpha). The graphics-state stack, SMask, clip mask, and
+// blend mode all flow through `render_shading` and downstream
+// tiny-skia paint helpers unmodified. Toggle parity is the invariant
+// for every probe in this group.
+// ===========================================================================
+
+/// Probe 17 — Shading drawn inside `q ... Q`. The save/restore around
+/// the shading call must not perturb the splice; toggle parity is
+/// the invariant. Because the gradient fills the whole pixmap, the
+/// most reliable cross-check is whole-pixmap parity off vs on.
+#[test]
+fn qa_shading_inside_q_q_toggle_parity() {
+    // `q 0.8 g /Sh1 sh Q` — the inner `0.8 g` would leak fill state
+    // forward if Q didn't restore. A regression in the splice that
+    // perturbed the gs stack (e.g. mutated `gs` instead of the
+    // synthetic clone) would surface as a pixel delta between the
+    // two render calls.
+    let content = "q\n0.8 g\n/Sh1 sh\nQ\n";
+    let bytes = build_pdf_axial_shading(
+        content,
+        "/DeviceRGB",
+        "[0 50 100 50]",
+        "[1 0 0]",
+        "[0 0 1]",
+        "",
+        "",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "shading inside q/Q must keep off-vs-on parity (gs save/restore + splice independence)"
+    );
+}
+
+/// Build a PDF where the shading is masked by a soft-mask Form XObject.
+/// The Form is a 100×100 grayscale-filled rectangle whose alpha is
+/// the gray value. Object numbering: 1 Catalog, 2 Pages, 3 Page, 4
+/// Content, 5 Shading, 6 SMask Form, 7 ExtGState (carrying /SMask
+/// 6 0 R), 8 Form Resources.
+fn build_pdf_shading_under_smask(space_str: &str, c0: &str, c1: &str, smask_gray: f32) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    // /Resources carries the shading + the ExtGState `/GS1` for SMask.
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                /Resources << /Shading << /Sh1 5 0 R >> \
+                /ExtGState << /GS1 7 0 R >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let content_ops = "/GS1 gs\n/Sh1 sh\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let shading_off = buf.len();
+    let shading = format!(
+        "5 0 obj\n<< /ShadingType 2 /ColorSpace {} /Coords [0 50 100 50] /Domain [0 1] \
+         /Function << /FunctionType 2 /Domain [0 1] /C0 {} /C1 {} /N 1 >> >>\nendobj\n",
+        space_str, c0, c1
+    );
+    buf.extend_from_slice(shading.as_bytes());
+
+    // SMask Form: a /Group transparency Form rendering the supplied
+    // gray fill across the full page. The Form's alpha is the gray's
+    // luminosity (per /S /Luminosity below).
+    let smask_form_ops = format!("{} g\n0 0 100 100 re f\n", smask_gray);
+    let smask_form_off = buf.len();
+    let smask_form = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /FormType 1 \
+         /BBox [0 0 100 100] /Resources << >> \
+         /Group << /Type /Group /S /Transparency /CS /DeviceGray >> \
+         /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form_ops.len(),
+        smask_form_ops
+    );
+    buf.extend_from_slice(smask_form.as_bytes());
+
+    // ExtGState carrying /SMask referring to the Form.
+    let extgs_off = buf.len();
+    buf.extend_from_slice(
+        b"7 0 obj\n<< /Type /ExtGState \
+          /SMask << /Type /Mask /S /Luminosity /G 6 0 R /BC [0] >> >>\nendobj\n",
+    );
+
+    let offsets = [
+        cat_off,
+        pages_off,
+        page_off,
+        stream_off,
+        shading_off,
+        smask_form_off,
+        extgs_off,
+    ];
+    let xref_off = buf.len();
+    let size = offsets.len() + 1;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", size).as_bytes());
+    for off in &offsets {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", size, xref_off)
+            .as_bytes(),
+    );
+    buf
+}
+
+/// Probe 18 — Shading under an active SMask. The SMask is a luminosity
+/// mask whose gray value sets the alpha. Toggle parity is the
+/// invariant — the splice must not perturb SMask state.
+#[test]
+fn qa_shading_under_smask_toggle_parity() {
+    // Mid-gray SMask → alpha ≈ 0.5 across the page. The DeviceRGB
+    // shading paints C0 red → C1 blue underneath.
+    let bytes = build_pdf_shading_under_smask("/DeviceRGB", "[1 0 0]", "[0 0 1]", 0.5);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "DeviceRGB shading under active SMask must keep off-vs-on parity");
+}
+
+/// Probe 19 — Shading drawn under an active clip path. Pilot covers
+/// the basic case via Type-4 Separation; this probe pins DeviceRGB
+/// parity with a non-rectangular clip (triangle) to stretch the path
+/// state.
+#[test]
+fn qa_shading_under_triangular_clip_toggle_parity() {
+    // Triangle clip: corners at (10, 10), (90, 10), (50, 90).
+    let content = "q\n10 10 m\n90 10 l\n50 90 l\nh\nW n\n/Sh1 sh\nQ\n";
+    let bytes = build_pdf_axial_shading(
+        content,
+        "/DeviceRGB",
+        "[0 50 100 50]",
+        "[1 0 0]",
+        "[0 0 1]",
+        "",
+        "",
+        "",
+        &[],
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "DeviceRGB shading under triangular clip must keep off-vs-on parity");
+
+    // Outside the triangle the page must be the white background. A
+    // corner pixel at (5, 5) is outside the triangle and outside the
+    // gradient axis projection; it must be white.
+    let (r, g, b, _) = pixel_at(&on, 5, 5);
+    assert!(
+        r > 230 && g > 230 && b > 230,
+        "outside the triangle clip, page must be white; got ({r}, {g}, {b})"
+    );
+}
+
+/// Probe 20 — Shading drawn under an active Multiply blend mode via
+/// `/CA` / `/ca` ExtGState. Multiply darkens the layer below; the
+/// splice doesn't touch the blend mode but the resolver synthesises
+/// a default GraphicsState with `blend_mode = Normal` — so a
+/// regression that leaked the synthetic gs's Normal blend mode into
+/// the caller's gs would surface as a pixel delta here.
+#[test]
+fn qa_shading_under_multiply_blend_mode_toggle_parity() {
+    // ExtGState: /BM /Multiply. Page first paints a yellow background
+    // rectangle, then sets /BM and renders the shading — Multiply
+    // combines the gradient with the yellow underneath.
+    let extra_resources = "/ExtGState << /GS1 6 0 R >>";
+    let extra_objects =
+        vec![(6, "6 0 obj\n<< /Type /ExtGState /BM /Multiply >>\nendobj\n".to_string())];
+    let content = "1 1 0 rg\n0 0 100 100 re f\n/GS1 gs\n/Sh1 sh\n";
+    let bytes = build_pdf_axial_shading(
+        content,
+        "/DeviceRGB",
+        "[0 50 100 50]",
+        "[1 0 0]",
+        "[0 0 1]",
+        "",
+        "",
+        extra_resources,
+        &extra_objects,
+    );
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "DeviceRGB shading under /BM /Multiply must keep off-vs-on parity");
+}
