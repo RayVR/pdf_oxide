@@ -1253,3 +1253,130 @@ fn qa_text_unicode_via_tounicode_cmap_parity() {
          (rendering ignores ToUnicode; pipeline routes colour)"
     );
 }
+
+// ============================================================================
+// Tj-with-other-operators probes — text painting alongside path / save-restore
+// / smask / blend / clip operators. Pipeline migration must not perturb any
+// of these.
+// ============================================================================
+
+/// Probe 21 — `Tj` followed by `re` + `f` of the same colour. The text
+/// runs through the wave-2 pipeline (fill side); the rectangle fill runs
+/// through the wave-1 pipeline. Both arms must agree off vs on, AND the
+/// page must contain both the glyph ink AND the rectangle ink.
+#[test]
+fn qa_text_tj_followed_by_path_fill_byte_identical() {
+    let content = "BT 1 0 0 rg /F1 30 Tf 5 70 Td (T) Tj ET\n\
+                   60 5 30 30 re f\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj + immediate path fill must be byte-identical off vs on");
+    // Both the glyph (upper-left) and the rectangle (lower-right) should
+    // have red ink.
+    let glyph_ink = count_ink_pixels(&on, 0, 0, 50, 50);
+    let rect_ink = count_ink_pixels(&on, 50, 50, 100, 100);
+    assert!(glyph_ink > 5, "glyph region must have ink, got {glyph_ink}");
+    assert!(rect_ink > 100, "rectangle region must be heavily inked, got {rect_ink}");
+}
+
+/// Probe 22 — `Tj` inside `q ... Q` save/restore. The save pushes the
+/// current `GraphicsState` onto the stack and restores it on `Q`. The
+/// pipeline's spliced GS clone is transient — it's owned locally by the
+/// operator arm and dropped at end-of-statement, so `q/Q` shouldn't see
+/// it at all. Toggle parity must hold.
+#[test]
+fn qa_text_tj_inside_q_Q_byte_identical() {
+    let content = "1 0 0 rg \
+                   q \
+                   0 0 1 rg \
+                   BT /F1 30 Tf 5 70 Td (Q) Tj ET \
+                   Q \
+                   BT /F1 30 Tf 5 30 Td (R) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj inside q/Q with restored colour must be byte-identical off vs on");
+    // The top glyph (inside q…Q) should be BLUE (fill set after q).
+    // The bottom glyph (after Q) should be RED (fill restored).
+    let top_avg = average_ink_rgb(&on, 0, 0, 100, 50);
+    let bot_avg = average_ink_rgb(&on, 0, 50, 100, 100);
+    if let Some((r_t, g_t, b_t)) = top_avg {
+        assert!(
+            b_t > r_t,
+            "top glyph (inside q/Q) must be bluer than red, got ({r_t:.1}, {g_t:.1}, {b_t:.1})"
+        );
+    }
+    if let Some((r_b, g_b, b_b)) = bot_avg {
+        assert!(
+            r_b > b_b,
+            "bottom glyph (after Q restore) must be redder than blue, got ({r_b:.1}, {g_b:.1}, {b_b:.1})"
+        );
+    }
+}
+
+/// Probe 23 — `Tj` with an active SMask through ExtGState. The smask
+/// modulates alpha; the pipeline migration must not perturb the smask
+/// path. Use a `/SMask /None` (no soft mask) since shipping an actual
+/// soft-mask form XObject is beyond the scope of the fixture builder.
+/// Even with /None, the ExtGState operator runs and exercises the
+/// dispatch path.
+#[test]
+fn qa_text_tj_with_extgstate_smask_none_parity() {
+    let resources = "/ExtGState << /Sm << /Type /ExtGState /SMask /None >> >>";
+    let content = "/Sm gs BT 1 0 0 rg /F1 40 Tf 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj under SMask=/None ExtGState must be byte-identical off vs on");
+}
+
+/// Probe 24 — `Tj` with a blend mode set on the active GS via ExtGState.
+/// Multiply blends the painted colour with the destination. On a white
+/// background `(c) * (1)` is `c`, so the painted colour is preserved;
+/// what matters is that the blend-mode field round-trips through the
+/// spliced GS clone unperturbed.
+#[test]
+fn qa_text_tj_with_blend_mode_multiply_parity() {
+    let resources = "/ExtGState << /Mul << /Type /ExtGState /BM /Multiply >> >>";
+    let content = "/Mul gs BT 1 0 0 rg /F1 40 Tf 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj under blend mode Multiply must be byte-identical off vs on");
+}
+
+/// Probe 25 — `Tj` with an active clip path. Clip is set via `re W n`,
+/// limiting paint to the clipped region; subsequent text must only paint
+/// inside the clip. The pipeline migration must not perturb the clip
+/// state passed to the text rasteriser.
+#[test]
+fn qa_text_tj_with_active_clip_path_parity() {
+    // Clip to a 60×60 rectangle centred on the page, then paint a large
+    // glyph. The clip restricts the glyph ink to the inner region. Parity
+    // off vs on is the invariant.
+    let content = "20 20 60 60 re W n \
+                   BT 1 0 0 rg /F1 60 Tf 0 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj under active clip path must be byte-identical off vs on");
+    // Sanity: ink lands INSIDE the clip region (20..80 × 20..80).
+    let inside = count_ink_pixels(&on, 20, 20, 80, 80);
+    assert!(inside > 0, "clipped Tj must paint inside the clip, got {inside}");
+    // Outside the clip the page must remain white.
+    let outside_left = count_ink_pixels(&on, 0, 0, 20, 100);
+    let outside_right = count_ink_pixels(&on, 80, 0, 100, 100);
+    let outside_top = count_ink_pixels(&on, 0, 0, 100, 20);
+    let outside_bot = count_ink_pixels(&on, 0, 80, 100, 100);
+    let total_outside = outside_left + outside_right + outside_top + outside_bot;
+    assert_eq!(
+        total_outside, 0,
+        "clip must prevent ink outside the clipped region, got {total_outside}"
+    );
+}
