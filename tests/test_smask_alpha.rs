@@ -1102,6 +1102,172 @@ fn tr_type2_invalid_n_falls_through_to_identity() {
     );
 }
 
+/// Cache CTM invalidation: a single content stream invokes the SAME
+/// `/GS1` twice at two different CTMs. The first invocation populates the
+/// cache at the identity CTM; the second must re-rasterise the group
+/// because the CTM has changed. A cache that skipped the install-transform
+/// check (or compared on something other than the transform) would serve
+/// the stale identity-CTM mask on the second invocation, leaving the
+/// scaled-CTM paint mostly unmasked.
+///
+/// Fixture: `/GS1` carries an SMask whose `/G` paints the top half of a
+/// 5×5 BBox. Identity CTM puts that mask in the top 5 PNG rows (a tiny
+/// blocking strip); a 20× scale CTM grows the mask to cover the top half
+/// of the full 100×100 device pixmap. The second paint (full black at
+/// the scaled CTM) tests which mask is actually applied: under the
+/// correctly-invalidated cache the top half of the page paints black and
+/// the bottom stays white; under a poisoned cache (identity-CTM mask
+/// reused) most of the top stays white because the tiny identity mask
+/// doesn't cover the scaled paint region.
+fn build_pdf_with_smask_invoked_at_two_ctms() -> Vec<u8> {
+    // First invocation at identity (no paint, just install + drop).
+    // Second invocation at 20× scale, paint 5×5 unit square (= 100×100 device).
+    let page_content = b"q\n/GS1 gs\nQ\n\
+                         q\n20 0 0 20 0 0 cm\n/GS1 gs\n0 g\n0 0 5 5 re\nf\nQ\n";
+    // /G paints top half of its 5×5 BBox.
+    let group_content = b"0 2.5 5 2.5 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Alpha /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 5 5] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn smask_cache_invalidates_when_ctm_changes() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_smask_invoked_at_two_ctms()).expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    // Under correct cache invalidation: scaled mask covers the top half
+    // of the device pixmap → top is painted black, bottom is white
+    // background.
+    let top = rgba.get_pixel(50, 25);
+    let bottom = rgba.get_pixel(50, 75);
+    assert!(
+        top[0] < 60,
+        "Cache must re-rasterise at the new CTM: top half should be painted; \
+         got {top:?}. Stale identity-CTM mask would leave most of the top white."
+    );
+    assert!(
+        bottom[0] > 200,
+        "Bottom half should stay white (blocked by the scaled mask); got {bottom:?}"
+    );
+}
+
+/// SMask installed *inside* a Form XObject invoked via `Do`. Real-world
+/// PDFs (Acrobat, Illustrator, InDesign output) commonly nest content
+/// like this: the page's content stream invokes a master Form, and the
+/// Form's own content stream sets ExtGStates. The mask must rasterise
+/// against the *page-sized* pixmap (so subsequent paints on the page
+/// align), not the form's local coordinate buffer.
+fn build_pdf_with_smask_inside_nested_form() -> Vec<u8> {
+    let page_content = b"/F1 Do\n";
+    // Form F1's content sets /GS1 (SMask) and paints full-page black.
+    let form_content = b"/GS1 gs\n0 g\n0 0 100 100 re\nf\n";
+    // /G paints opaque top half of its BBox.
+    let group_content = b"0 50 100 50 re\nf\n";
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /XObject << /F1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    // F1 declares its own ExtGState dict referencing the SMask.
+    let form_hdr = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /ExtGState << /GS1 6 0 R >> >> /Length {} >>\nstream\n",
+        form_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(form_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /ExtGState /SMask 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"7 0 obj\n<< /Type /Mask /S /Alpha /G 8 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let smask_form_hdr = format!(
+        "8 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(smask_form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+#[test]
+fn smask_applies_to_paint_inside_nested_do() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_smask_inside_nested_form()).expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let rgba = decode_png(&img.data);
+
+    // Mask covers PDF y = 50..100 (top half in user space → PNG rows 0..50).
+    let top = rgba.get_pixel(50, 25);
+    let bottom = rgba.get_pixel(50, 75);
+    assert!(
+        top[0] < 60,
+        "SMask installed inside a nested form's content stream must clip \
+         that form's paints; top should be black, got {top:?}"
+    );
+    assert!(
+        bottom[0] > 200,
+        "Bottom half should be background white (blocked by mask); got {bottom:?}"
+    );
+}
+
 #[test]
 fn ext_gstate_alpha_smask_blocks_paint_under_transparent_mask() {
     let pdf = build_pdf_with_alpha_smask();
