@@ -2010,44 +2010,122 @@ fn pilot_form_xobject_pass_through_byte_identical() {
 
 #[test]
 fn pilot_image_mask_under_pipeline_preserves_ctm() {
-    // The Do arm reads `gs.ctm` to position the image. The pipeline's
-    // splice clones `gs` but must not perturb `ctm`; if it did, the
-    // image would land in the wrong place between toggle states.
+    // The `Do` arm reads `gs.ctm` to position the stencil. The pipeline's
+    // splice clones `gs` to override `fill_color_rgb`; if it perturbed
+    // `ctm` while cloning, the stencil would land at a different pixel
+    // under the toggle.
     //
-    // Build a rotated-and-scaled CTM that places the mask in a
-    // distinctive position. Parity off-vs-on means the spliced clone's
-    // CTM equals the original's exactly.
+    // To make this probe meaningful, the fill must take the splice
+    // branch — `pipeline_resolve_paint_gs(ImageMask)` short-circuits and
+    // returns `None` for Device-family fills whose resolved RGBA already
+    // matches `gs.fill_color_rgb` (D-3). We use a Type 4 Separation fill
+    // so the resolver returns a *different* colour (magenta) than the
+    // legacy `1 - tint = 0` black `gs` field, forcing the helper to
+    // build and return `Some(spliced)`. The spliced clone is what
+    // `render_image_mask` then reads `ctm` from.
+    //
+    // CTM: rotate ~30° around the origin, scale by 60, translate to
+    // (50, 25). The unit square's centre (0.5, 0.5) lands in user space
+    // at (50 + 51.96*0.5 + (-30)*0.5, 25 + 30*0.5 + 51.96*0.5) ≈
+    // (60.98, 65.98). At 72 dpi and the renderer's top-left origin, the
+    // pixmap coordinate is (61, 100 - 66) = (61, 34).
     let mask = solid_image_mask_bytes(8, 8);
-    // Rotate ~30° around centre, scale 60, translate.
-    let content = "q\n1 0 0 rg\n51.96 30 -30 51.96 50 25 cm\n/IM1 Do\nQ\n";
-    let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
+    let type4 = "{ 0.0 exch 0.0 0.0 }"; // CMYK(0, tint, 0, 0) → magenta at tint=1.
+    let resources = "/ColorSpace << /SpotMagenta [/Separation /MagentaSpot /DeviceCMYK 6 0 R] >>";
+    let content = "q\n/SpotMagenta cs\n1 scn\n51.96 30 -30 51.96 50 25 cm\n/IM1 Do\nQ\n";
+
+    let bytes = build_pdf_image_mask_with_type4(content, resources, 8, 8, &mask, type4);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
+
+    // Inline path: full-tint Type 4 fallback paints the stencil black.
+    // Pin a body pixel that the rotated-scaled stencil covers — this is
+    // the same target the pipeline branch hits, so a CTM divergence in
+    // the splice would shift the magenta off this pixel.
+    let (r_off, g_off, b_off, _a_off) = pixel_at(&off, 61, 34);
+    assert!(
+        r_off < 50 && g_off < 50 && b_off < 50,
+        "inline path must paint rotated/scaled stencil black under full-tint Type 4, got ({r_off}, {g_off}, {b_off})"
+    );
+
+    // Pipeline path: same pixel, but magenta. Same-pixel hit proves the
+    // spliced clone's CTM equals the original's — if the splice
+    // perturbed `ctm`, the magenta would have landed somewhere else and
+    // this pixel would be untouched (alpha 0 / background).
+    let (r_on, g_on, b_on, a_on) = pixel_at(&on, 61, 34);
+    assert!(
+        r_on >= 250 && g_on <= 5 && b_on >= 250 && a_on == 255,
+        "spliced clone's CTM must land the magenta stencil at the same rotated/scaled position the inline path painted black; got ({r_on}, {g_on}, {b_on}, {a_on})"
+    );
+
+    // And the pixmaps must differ overall — the splice did run.
+    assert_ne!(
         off, on,
-        "ImageMask under a rotated/scaled CTM must round-trip through the pipeline byte-identically"
+        "Type 4 Separation fill must drive a visible difference between toggle-off and toggle-on"
     );
 }
 
 #[test]
 fn pilot_image_mask_under_pipeline_preserves_clip() {
     // An active `W n` clipping path constrains where the stencil can
-    // paint. The pipeline splice must not drop the clip (the spliced
-    // clone is `gs` only — clip state lives on the operator walker's
-    // clip stack, not on `gs`). Parity off-vs-on covers this: if the
-    // clip leaked, the rendered footprint would differ.
+    // paint. The pipeline splice must not drop the clip — the spliced
+    // clone is `gs` only; the clip state lives on the operator walker's
+    // clip stack, not on `gs`. If the splice somehow leaked into the
+    // clip stack, pixels outside the clip box would also receive paint.
     //
-    // Clip to a 40×40 box in the upper half of the page, then paint a
-    // full-page stencil; only the clipped region carries colour.
+    // As with the CTM probe above, the splice branch only runs when the
+    // resolved fill differs from `gs.fill_color_rgb`, so we use a
+    // Type 4 Separation fill — Device-family fills would short-circuit
+    // out of the splice and skip the very code path under test.
+    //
+    // Clip to a 40×40 box at (30, 60)-(70, 100) in PDF user space —
+    // that's the upper-right region of the page. Then paint a full-page
+    // (100×100 cm) stencil. Only the clipped region must carry colour.
+    // In pixmap coordinates (top-left origin), the clip box maps to
+    // x ∈ [30, 70], pixmap_y ∈ [0, 40].
     let mask = solid_image_mask_bytes(8, 8);
-    let content = "q\n30 60 40 40 re W n\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
-    let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
+    let type4 = "{ 0.0 exch 0.0 0.0 }";
+    let resources = "/ColorSpace << /SpotMagenta [/Separation /MagentaSpot /DeviceCMYK 6 0 R] >>";
+    let content = "q\n30 60 40 40 re W n\n/SpotMagenta cs\n1 scn\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+
+    let bytes = build_pdf_image_mask_with_type4(content, resources, 8, 8, &mask, type4);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
+
+    // Inside the clip box: pipeline paints magenta from the Type 4
+    // program (50, 20) lands well inside the [30..70] × [0..40] region.
+    let (r_in, g_in, b_in, a_in) = pixel_at(&on, 50, 20);
+    assert!(
+        r_in >= 250 && g_in <= 5 && b_in >= 250 && a_in == 255,
+        "inside the clip box, pipeline must paint Type-4-evaluated magenta; got ({r_in}, {g_in}, {b_in}, {a_in})"
+    );
+
+    // Outside the clip box: pixel must be the white page background.
+    // If the splice had leaked into the clip stack, the full-page
+    // stencil would have painted this pixel magenta on top of the
+    // background. Sample (10, 90) — far outside both axes of the clip
+    // box.
+    let (r_out, g_out, b_out, _a_out) = pixel_at(&on, 10, 90);
+    assert!(
+        r_out >= 250 && g_out >= 250 && b_out >= 250,
+        "outside the clip box, the page must be the white background — splice must not perturb the clip stack; got ({r_out}, {g_out}, {b_out})"
+    );
+
+    // Inline path under the same clip: stencil paints black inside the
+    // clip box (full-tint Type 4 fallback).
+    let (r_off, g_off, b_off, a_off) = pixel_at(&off, 50, 20);
+    assert!(
+        r_off < 50 && g_off < 50 && b_off < 50 && a_off == 255,
+        "inline path must paint the clipped stencil black under full-tint Type 4, got ({r_off}, {g_off}, {b_off}, {a_off})"
+    );
+
+    // And the pixmaps differ overall — the splice did run.
+    assert_ne!(
         off, on,
-        "ImageMask under an active clip must round-trip through the pipeline byte-identically"
+        "Type 4 Separation fill must drive a visible difference between toggle-off and toggle-on"
     );
 }
