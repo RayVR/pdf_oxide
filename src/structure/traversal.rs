@@ -242,27 +242,14 @@ fn traverse_element_all_pages(
     let is_block = elem.struct_type.is_block();
     let is_word_break = elem.struct_type.is_word_break();
 
-    // If /ActualText is present, it replaces all descendant content (PDF spec 14.9.4)
-    if let Some(ref actual_text) = elem.actual_text {
-        // Collect all pages this element has content on
-        let pages = collect_pages(elem);
-        for page in pages {
-            result.entry(page).or_default().push(OrderedContent {
-                page,
-                mcid: None,
-                struct_type: struct_type_str.clone(),
-                parsed_type: parsed_type.clone(),
-                is_heading: is_heading_inherited,
-                heading_level: descended.heading_level,
-                list_role: descended.list_role,
-                is_block,
-                is_word_break: false,
-                block_id: descended.block_id,
-                actual_text: Some(actual_text.clone()),
-            });
-        }
-        return;
-    }
+    // /ActualText is resolved separately via `build_actualtext_index`
+    // — assemblers consult the index to position the replacement and to
+    // suppress descendant MCIDs (per ISO 32000-1:2008 §14.9.4 the
+    // replacement covers the entire subtree, but emitting it has to
+    // respect the multi-page emit-once rule which a per-page traversal
+    // cannot enforce). The traversal therefore continues to record
+    // descendant MCIDs so the structure-order MCID list stays complete;
+    // the assembler drops the suppressed ones at emit time.
 
     // Process children in order
     for child in &elem.children {
@@ -359,25 +346,8 @@ fn traverse_element(
     let is_block = elem.struct_type.is_block();
     let is_word_break = elem.struct_type.is_word_break();
 
-    // If /ActualText is present, it replaces all descendant content (PDF spec 14.9.4)
-    if let Some(ref actual_text) = elem.actual_text {
-        if has_content_on_page(elem, target_page) {
-            result.push(OrderedContent {
-                page: target_page,
-                mcid: None,
-                struct_type: struct_type_str,
-                parsed_type,
-                is_heading: is_heading_inherited,
-                heading_level: descended.heading_level,
-                list_role: descended.list_role,
-                is_block,
-                is_word_break: false,
-                block_id: descended.block_id,
-                actual_text: Some(actual_text.clone()),
-            });
-            return Ok(());
-        }
-    }
+    // /ActualText is resolved separately via `build_actualtext_index`;
+    // see `traverse_element_all_pages` for the rationale.
 
     // If this is a WB (word break) element, emit a word break marker
     if is_word_break {
@@ -436,6 +406,10 @@ fn traverse_element(
 }
 
 /// Check if a structure element has any content on the target page.
+///
+/// Used only by tests since per-element ActualText gating moved into
+/// the [`ActualTextIndex`] (which records per-emission `first_page`).
+#[cfg(test)]
 fn has_content_on_page(elem: &StructElem, target_page: u32) -> bool {
     if elem.page == Some(target_page) {
         return true;
@@ -1024,22 +998,33 @@ mod tests {
     }
 
     #[test]
-    fn test_actual_text_replaces_descendants() {
+    fn test_actual_text_descendants_recorded_for_assembler_suppression() {
+        // The per-page traversal continues to record descendant MCIDs
+        // when their ancestor carries /ActualText. The replacement
+        // itself is resolved separately via `build_actualtext_index`
+        // (so multi-page emit-once stays consistent across paths). The
+        // assembler then suppresses the descendant MCID and emits the
+        // replacement at the anchor's position.
         let mut root = StructElem::new(StructType::Document);
-
         let mut elem = StructElem::new(StructType::Span);
         elem.actual_text = Some("Replacement text".to_string());
         elem.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
-
         root.add_child(StructChild::StructElem(Box::new(elem)));
-
         let mut struct_tree = StructTreeRoot::new();
         struct_tree.add_root_element(root);
 
         let ordered = traverse_structure_tree(&struct_tree, 0).unwrap();
+        // Descendant MCID still present and uncoated; assembler drops
+        // it via covered_mcids from the index.
         assert_eq!(ordered.len(), 1);
-        assert_eq!(ordered[0].actual_text, Some("Replacement text".to_string()));
-        assert_eq!(ordered[0].mcid, None); // No MCID when actual_text is used
+        assert_eq!(ordered[0].mcid, Some(0));
+        assert_eq!(ordered[0].actual_text, None);
+
+        // The replacement is resolved separately.
+        let idx = build_actualtext_index(&struct_tree);
+        assert_eq!(idx.emissions.len(), 1);
+        assert_eq!(&*idx.emissions[0].text, "Replacement text");
+        assert!(idx.covered_mcids.contains(&0));
     }
 
     #[test]
@@ -1055,9 +1040,13 @@ mod tests {
         let mut struct_tree = StructTreeRoot::new();
         struct_tree.add_root_element(root);
 
-        // Page 0 has no content (actual_text elem is on page 1)
+        // Page 0 has no descendant MCID, so per-page traversal returns
+        // empty. The index records the emission for page 1.
         let ordered = traverse_structure_tree(&struct_tree, 0).unwrap();
         assert!(ordered.is_empty());
+        let idx = build_actualtext_index(&struct_tree);
+        assert_eq!(idx.emissions.len(), 1);
+        assert_eq!(idx.emissions[0].first_page, 1);
     }
 
     #[test]
@@ -1100,24 +1089,35 @@ mod tests {
     }
 
     #[test]
-    fn test_traverse_all_pages_with_actual_text() {
+    fn test_traverse_all_pages_with_actual_text_does_not_repeat_per_page() {
+        // Per the multi-page emit-once rule (PDF spec §14.9.4 positions
+        // ActualText as a region replacement, not a per-page
+        // repetition), the per-page traversal no longer carries
+        // actual_text — instead it surfaces every descendant MCID so
+        // the assembler can suppress them. The index records ONE
+        // emission with first_page = 0.
         let mut root = StructElem::new(StructType::Document);
-
         let mut elem = StructElem::new(StructType::Span);
         elem.actual_text = Some("Hello".to_string());
         elem.add_child(StructChild::MarkedContentRef { mcid: 0, page: 0 });
         elem.add_child(StructChild::MarkedContentRef { mcid: 1, page: 1 });
-
         root.add_child(StructChild::StructElem(Box::new(elem)));
-
         let mut struct_tree = StructTreeRoot::new();
         struct_tree.add_root_element(root);
 
         let all_pages = traverse_structure_tree_all_pages(&struct_tree);
-        // Actual text should appear on both pages
         assert!(all_pages.contains_key(&0));
         assert!(all_pages.contains_key(&1));
-        assert_eq!(all_pages[&0][0].actual_text, Some("Hello".to_string()));
+        // Descendant MCIDs surface on their own page, with no
+        // actual_text on the OrderedContent itself.
+        for items in all_pages.values() {
+            for item in items {
+                assert!(item.actual_text.is_none());
+            }
+        }
+        let idx = build_actualtext_index(&struct_tree);
+        assert_eq!(idx.emissions.len(), 1);
+        assert_eq!(idx.emissions[0].first_page, 0);
     }
 
     #[test]

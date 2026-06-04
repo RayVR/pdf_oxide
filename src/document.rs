@@ -380,6 +380,19 @@ pub struct PdfDocument {
     /// Built once from the structure tree, then O(1) lookup per page.
     /// Mutex provides interior mutability for `&self` read-path methods (#398).
     structure_content_cache: Mutex<Option<HashMap<u32, Vec<crate::structure::OrderedContent>>>>,
+    /// Cached resolved structure-tree `/ActualText` scopes.
+    ///
+    /// `None` = not yet built, `Some(None)` = built and the document has
+    /// no resolvable ActualText (untagged, or every bearing element
+    /// dropped during finalisation), `Some(Some(idx))` = built.
+    ///
+    /// Mirrors `structure_tree_cache` so every extraction surface
+    /// applies tree-scope ActualText consistently without re-walking the
+    /// structure tree. Decoupled from `/MarkInfo /Suspects`: producer-
+    /// supplied ActualText is trusted regardless of Suspects (it is
+    /// content replacement, not reading order — see
+    /// `actualtext_index`).
+    actualtext_index_cache: Mutex<Option<Option<Arc<crate::structure::ActualTextIndex>>>>,
     /// `Table` structure elements bucketed by page, built once via
     /// `find_table_elements_all_pages` (one tree walk) so the converter table
     /// path does an O(1) lookup instead of walking the tree per page.
@@ -923,6 +936,7 @@ impl PdfDocument {
             font_id_hash_cache: Mutex::new(HashMap::new()),
             structure_tree_cache: Mutex::new(None),
             structure_content_cache: Mutex::new(None),
+            actualtext_index_cache: Mutex::new(None),
             table_elements_cache: Mutex::new(None),
             page_cache: Mutex::new(HashMap::new()),
             page_cache_populated: AtomicBool::new(false),
@@ -3572,6 +3586,68 @@ impl PdfDocument {
                 tree
             },
         }
+    }
+
+    /// Returns the document's structure tree whenever it is **available**,
+    /// independent of `/MarkInfo /Suspects`.
+    ///
+    /// The `/Suspects` flag (§14.7.1) signals that the producer's *reading
+    /// order* may be unreliable, so `struct_tree_trustworthy` rejects the
+    /// tree for ordering. `/ActualText`, however, is content replacement
+    /// (§14.9.4) and remains trustworthy: a producer that bothered to
+    /// supply the replacement text for a glyph run is asserting what
+    /// that run is *meant* to read as, regardless of whether sibling
+    /// reading-order tags are reliable. This accessor lets the
+    /// ActualText pipeline honour the producer's intent on Suspects=true
+    /// documents while geometric reading order takes over the ordering
+    /// problem.
+    ///
+    /// Shares `structure_tree_cache` with `struct_tree_trustworthy`, so
+    /// both predicates cost a single cached parse.
+    pub(crate) fn struct_tree_marked(&self) -> Option<Arc<crate::structure::StructTreeRoot>> {
+        let cached = self.structure_tree_cache.lock_or_recover().clone();
+        match cached {
+            Some(tree) => tree,
+            None => {
+                let mark = self.mark_info().unwrap_or_default();
+                let has_struct_tree_root = self
+                    .catalog()
+                    .ok()
+                    .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
+                    .unwrap_or(false);
+                let tree = if mark.marked || has_struct_tree_root {
+                    self.structure_tree().ok().flatten().map(Arc::new)
+                } else {
+                    None
+                };
+                *self.structure_tree_cache.lock_or_recover() = Some(tree.clone());
+                tree
+            },
+        }
+    }
+
+    /// Returns the cached [`ActualTextIndex`] for this document.
+    ///
+    /// Builds the index lazily on first call, then serves cached copies.
+    /// Returns `None` for untagged documents and for tagged documents
+    /// whose structure tree carries no `/ActualText`.
+    ///
+    /// Decoupled from `/MarkInfo /Suspects` — see [`struct_tree_marked`].
+    pub(crate) fn actualtext_index(&self) -> Option<Arc<crate::structure::ActualTextIndex>> {
+        if let Some(cached) = self.actualtext_index_cache.lock_or_recover().clone() {
+            return cached;
+        }
+        let tree = self.struct_tree_marked();
+        let built = tree.and_then(|t| {
+            let idx = crate::structure::traversal::build_actualtext_index(&t);
+            if idx.is_empty() {
+                None
+            } else {
+                Some(Arc::new(idx))
+            }
+        });
+        *self.actualtext_index_cache.lock_or_recover() = Some(built.clone());
+        built
     }
 
     /// Whether text extraction uses the Tagged-PDF *logical structure order* (a
@@ -8329,6 +8405,15 @@ impl PdfDocument {
             ordered_content.len()
         );
 
+        // Resolve struct-tree-scope `/ActualText` via the per-document
+        // index; see `extract_text_structure_order_cached_with_spans`.
+        let at_index = self.actualtext_index();
+        let page_emissions = Self::actualtext_emissions_for_page(
+            at_index.as_deref(),
+            page_index as u32,
+            &mcid_map,
+        );
+
         // Step 4: Assemble text in structure order
         let mut text = String::with_capacity(mcid_map.len() * 50); // estimate
         let mut prev_span: Option<&TextSpan> = None;
@@ -8343,21 +8428,31 @@ impl PdfDocument {
                 continue;
             }
 
-            // If the structure element has ActualText, use it instead of the extracted spans
-            if let Some(ref actual_text_val) = content.actual_text {
-                if !actual_text_val.is_empty() {
-                    if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('\n') {
-                        text.push('\n');
-                    }
-                    text.push_str(actual_text_val);
-                    continue;
-                }
-            }
-
             // For regular content with MCID
             let Some(mcid) = content.mcid else {
                 continue;
             };
+
+            // If this MCID is covered by an ActualText emission, the
+            // raw glyphs are suppressed; emit the replacement at the
+            // emission's anchor instead.
+            if let Some(ref idx) = at_index {
+                if idx.covered_mcids.contains(&mcid) {
+                    consumed_mcids.insert(mcid);
+                    for emission in &page_emissions {
+                        if emission.anchor_mcid == mcid {
+                            if !text.is_empty()
+                                && !text.ends_with(' ')
+                                && !text.ends_with('\n')
+                            {
+                                text.push('\n');
+                            }
+                            text.push_str(&emission.text);
+                        }
+                    }
+                    continue;
+                }
+            }
 
             if let Some(spans) = mcid_map.get(&mcid) {
                 consumed_mcids.insert(mcid);
@@ -8469,6 +8564,68 @@ impl PdfDocument {
         ordered
     }
 
+    /// Select the [`crate::structure::ActualTextEmission`]s that should
+    /// actually fire on the given page.
+    ///
+    /// Three filters per ISO 32000-1:2008 §14.9.4:
+    ///   1. The emission's `first_page` must match the requested page
+    ///      (multi-page subtrees emit on their first page only).
+    ///   2. The emission must not be **shadowed** by an inner emission
+    ///      whose coverage is a superset of its own — when the
+    ///      descendant declares its own `/ActualText`, the inner
+    ///      replacement supersedes the outer for every MCID the outer
+    ///      tried to cover, so the outer becomes a no-op.
+    ///   3. The emission must have at least one **visible** covered
+    ///      MCID — i.e. some MCID present in `mcid_map`. When every
+    ///      covered MCID has been filtered out (e.g. by an excluded
+    ///      OCG layer), the entire bearing element is invisible and
+    ///      its replacement must not be emitted; emitting it would
+    ///      surface content the caller asked to hide.
+    fn actualtext_emissions_for_page<'a>(
+        idx: Option<&'a crate::structure::ActualTextIndex>,
+        page: u32,
+        mcid_map: &HashMap<u32, Vec<TextSpan>>,
+    ) -> Vec<&'a crate::structure::ActualTextEmission> {
+        let Some(idx) = idx else {
+            return Vec::new();
+        };
+
+        // First-pass: keep emissions on this page that have at least
+        // one visible covered MCID. Track the original index in
+        // `idx.emissions` so we can use it to break shadowing ties
+        // (later = deeper in the pre-order walk).
+        let candidates: Vec<(usize, &crate::structure::ActualTextEmission)> = idx
+            .emissions
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.first_page == page)
+            .filter(|(_, e)| e.covered_mcids.iter().any(|m| mcid_map.contains_key(m)))
+            .collect();
+
+        // Second-pass: drop shadowed emissions. A candidate `outer` is
+        // shadowed by `inner` when the inner's coverage is a subset of
+        // the outer's AND the inner appears strictly later in
+        // `idx.emissions` (pre-order: a deeper nested element is
+        // visited after its ancestor). Equal-coverage chains resolve
+        // by "innermost wins" — the later one's text replaces the
+        // outer's for the same MCID set.
+        candidates
+            .iter()
+            .copied()
+            .filter(|(outer_i, outer)| {
+                let outer_set: HashSet<u32> = outer.covered_mcids.iter().copied().collect();
+                !candidates.iter().any(|(inner_i, inner)| {
+                    if *inner_i <= *outer_i {
+                        return false;
+                    }
+                    let inner_set: HashSet<u32> = inner.covered_mcids.iter().copied().collect();
+                    inner_set.is_subset(&outer_set)
+                })
+            })
+            .map(|(_, e)| e)
+            .collect()
+    }
+
     /// Page's MCID reading order from the all-pages traversal cache
     /// (`structure_content_cache`, populated once). `build_context` previously
     /// re-walked the whole tree per page (≈ O(pages²) on a tagged document);
@@ -8532,11 +8689,22 @@ impl PdfDocument {
             &ordered_content_owned as &[crate::structure::OrderedContent]
         };
 
+        // Resolve struct-tree-scope `/ActualText`. The index is built
+        // once per document (cached). For untagged documents this is
+        // None and the assembler behaves exactly as before.
+        let at_index = self.actualtext_index();
+        let page_emissions = Self::actualtext_emissions_for_page(
+            at_index.as_deref(),
+            page_index as u32,
+            &mcid_map,
+        );
+
         log::debug!(
-            "Cached structure content: {} items for page {}, {} MCIDs with spans",
+            "Cached structure content: {} items for page {}, {} MCIDs with spans, {} ActualText emissions on this page",
             ordered_content.len(),
             page_index,
-            mcid_map.len()
+            mcid_map.len(),
+            page_emissions.len()
         );
 
         // Step 4: Assemble text in structure order
@@ -8552,19 +8720,31 @@ impl PdfDocument {
                 continue;
             }
 
-            if let Some(ref actual_text_val) = content.actual_text {
-                if !actual_text_val.is_empty() {
-                    if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('\n') {
-                        text.push('\n');
-                    }
-                    text.push_str(actual_text_val);
-                    continue;
-                }
-            }
-
             let Some(mcid) = content.mcid else {
                 continue;
             };
+
+            // If this MCID is covered by an ActualText emission, the
+            // raw glyphs are suppressed (the replacement is emitted
+            // when we reach its anchor MCID — see below).
+            if let Some(ref idx) = at_index {
+                if idx.covered_mcids.contains(&mcid) {
+                    consumed_mcids.insert(mcid);
+                    // Find emission(s) anchored on this MCID.
+                    for emission in &page_emissions {
+                        if emission.anchor_mcid == mcid {
+                            if !text.is_empty()
+                                && !text.ends_with(' ')
+                                && !text.ends_with('\n')
+                            {
+                                text.push('\n');
+                            }
+                            text.push_str(&emission.text);
+                        }
+                    }
+                    continue;
+                }
+            }
 
             if let Some(spans) = mcid_map.get(&mcid) {
                 consumed_mcids.insert(mcid);

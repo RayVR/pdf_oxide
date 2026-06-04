@@ -3991,6 +3991,18 @@ impl<'doc> TextExtractor<'doc> {
                 && current.font_weight == span.font_weight
                 && current.is_italic == span.is_italic;
 
+            // MCID identity: per ISO 32000-1:2008 §14.6, two adjacent
+            // Tj operators that sit in different marked-content
+            // sequences belong to different *structure elements*.
+            // Merging them would silently fuse their identities (the
+            // merged span keeps `current.mcid`) and lose the
+            // boundary that downstream consumers — structure-tree
+            // reading order, tree-scope ActualText suppression,
+            // table-cell membership — rely on. Adjacent spans whose
+            // MCIDs differ (including one `None` ↔ one `Some(_)`)
+            // are kept separate.
+            let same_mcid = current.mcid == span.mcid;
+
             // Cross-font word glue: same-baseline spans in different
             // fonts/weights, tight gap (<0.25em), both sides alphabetic,
             // and one side is a single character. Targets the drop-cap /
@@ -4082,14 +4094,15 @@ impl<'doc> TextExtractor<'doc> {
                 0.5
             };
 
-            let should_merge = same_line
+            let should_merge = (same_line
                 && is_same_font
+                && same_mcid
                 && (self.merging_config.severe_overlap_threshold_pt..merge_threshold_pt)
                     .contains(&gap)
-                && !large_gap_indicates_column
-                || (same_line && has_split_boundary)
-                || cross_font_word_glue
-                || small_caps_glue;
+                && !large_gap_indicates_column)
+                || (same_line && has_split_boundary && same_mcid)
+                || (cross_font_word_glue && same_mcid)
+                || (small_caps_glue && same_mcid);
 
             // DECIMAL VALUE MERGE: Some forms place integer and decimal parts
             // of dollar amounts in separate fixed-width boxes.
@@ -4107,6 +4120,7 @@ impl<'doc> TextExtractor<'doc> {
             // a gap > ~half the font size; tight letter spacing is < 0.1 em.
             let min_decimal_gap = current.font_size * 0.4;
             let decimal_merge = same_line
+                && same_mcid
                 && gap > min_decimal_gap
                 && gap < current.font_size * 2.0
                 && !current.text.is_empty()
@@ -5552,6 +5566,16 @@ impl<'doc> TextExtractor<'doc> {
             // Per PDF Spec Section 14.6, we track artifact status to filter out
             // non-text content (headers, footers, watermarks, resource paths).
             Operator::BeginMarkedContent { tag } => {
+                // Flush the Tj span buffer at the marked-content boundary
+                // (ISO 32000-1:2008 §14.6). Without this, consecutive Tj
+                // operators that straddle a BMC/BDC/EMC boundary get
+                // glued into a single span whose `mcid` reflects only
+                // the FIRST Tj — fusing two structurally-distinct
+                // elements and breaking every downstream consumer that
+                // relies on MCID identity (structure-tree reading
+                // order, tree-scope ActualText suppression,
+                // table-cell membership).
+                self.flush_tj_span_buffer()?;
                 // BMC doesn't have properties, but the tag can indicate artifacts
                 let is_artifact = tag == "Artifact";
                 self.marked_content_stack.push(MarkedContentContext {
@@ -5570,6 +5594,9 @@ impl<'doc> TextExtractor<'doc> {
             },
 
             Operator::BeginMarkedContentDict { tag, properties } => {
+                // See `BeginMarkedContent` for the rationale; same
+                // reasoning applies to BDC.
+                self.flush_tj_span_buffer()?;
                 // BDC can have properties including MCID, artifact indicators, ActualText, and expansion
                 // Properties can be an inline dictionary or a name referencing /Properties resource
                 let mut actual_text = None;
@@ -5636,6 +5663,10 @@ impl<'doc> TextExtractor<'doc> {
             },
 
             Operator::EndMarkedContent => {
+                // Flush the Tj span buffer at the marked-content
+                // boundary; see `BeginMarkedContent` for the
+                // rationale.
+                self.flush_tj_span_buffer()?;
                 // EMC ends the current marked content sequence
                 if let Some(mcid) = self.current_mcid {
                     log::debug!("Exited marked content with MCID: {}", mcid);
