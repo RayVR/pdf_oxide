@@ -2945,12 +2945,14 @@ impl PageRenderer {
             return None;
         }
         let (fills, strokes) = match kind {
-            PipelinePaintKind::PathFill => (true, false),
+            // ImageMask paints the stencil with the current fill colour
+            // and never reads the stroke side; at this helper layer it
+            // is semantically equivalent to PathFill. The variant is
+            // kept distinct so the wave-5 separation-backend split can
+            // dispatch on it without churning callers.
+            PipelinePaintKind::PathFill | PipelinePaintKind::ImageMask => (true, false),
             PipelinePaintKind::PathStroke => (false, true),
             PipelinePaintKind::PathFillStroke => (true, true),
-            // ImageMask paints the stencil with the current fill colour;
-            // the stroke side is never read by the mask compositor.
-            PipelinePaintKind::ImageMask => (true, false),
         };
         // Resolve, then short-circuit when the resolved RGBA already
         // equals the GS field that would supply it inline. For
