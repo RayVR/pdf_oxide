@@ -2125,36 +2125,48 @@ impl PageRenderer {
                 _ => 0.0,
             }
         };
-        let (_x0, _y0, _r0, x1, y1, r1) =
-            (get_f(0), get_f(1), get_f(2), get_f(3), get_f(4), get_f(5));
+        let (x0, y0, r0, x1, y1, r1) = (get_f(0), get_f(1), get_f(2), get_f(3), get_f(4), get_f(5));
 
         // Same pipeline-or-fallback dispatch as `render_axial_shading`
         // — see its docs for the rationale.
-        let (stop0, stop1) = if let Some(((r0, g0, b0, a0), (r1c, g1, b1, a1))) = resolved_endpoints
-        {
-            ((r0, g0, b0, a0), (r1c, g1, b1, a1))
-        } else {
-            let (c0, c1) = self.evaluate_shading_function(shading, doc)?;
-            ((c0.0, c0.1, c0.2, gs.fill_alpha), (c1.0, c1.1, c1.2, gs.fill_alpha))
-        };
+        let (stop0, stop1) =
+            if let Some(((r0c, g0, b0, a0), (r1c, g1, b1, a1))) = resolved_endpoints {
+                ((r0c, g0, b0, a0), (r1c, g1, b1, a1))
+            } else {
+                let (c0, c1) = self.evaluate_shading_function(shading, doc)?;
+                ((c0.0, c0.1, c0.2, gs.fill_alpha), (c1.0, c1.1, c1.2, gs.fill_alpha))
+            };
 
-        let mut center = tiny_skia::Point { x: x1, y: y1 };
-        let mut edge = tiny_skia::Point { x: x1 + r1, y: y1 };
-        transform.map_point(&mut center);
-        transform.map_point(&mut edge);
-        let radius = ((edge.x - center.x).powi(2) + (edge.y - center.y).powi(2)).sqrt();
+        // Per ISO 32000-1 §8.7.4.5.4, the radial gradient interpolates
+        // between two circles `(x0, y0, r0)` (the inner / start circle,
+        // mapped to the function value at the gradient's `Domain[0]`)
+        // and `(x1, y1, r1)` (the outer / end circle, mapped to
+        // `Domain[1]`). When `(x0, y0) == (x1, y1)` and `r0 == 0` the
+        // result is a familiar centred radial; non-concentric inputs
+        // produce off-centre / cone gradients that real PDFs use for
+        // highlight, spotlight, and lens effects.
+        let mut center0 = tiny_skia::Point { x: x0, y: y0 };
+        let mut edge0 = tiny_skia::Point { x: x0 + r0, y: y0 };
+        let mut center1 = tiny_skia::Point { x: x1, y: y1 };
+        let mut edge1 = tiny_skia::Point { x: x1 + r1, y: y1 };
+        transform.map_point(&mut center0);
+        transform.map_point(&mut edge0);
+        transform.map_point(&mut center1);
+        transform.map_point(&mut edge1);
+        let radius0 = ((edge0.x - center0.x).powi(2) + (edge0.y - center0.y).powi(2)).sqrt();
+        let radius1 = ((edge1.x - center1.x).powi(2) + (edge1.y - center1.y).powi(2)).sqrt();
 
         let gradient = tiny_skia::RadialGradient::new(
             tiny_skia::Point {
-                x: center.x,
-                y: center.y,
+                x: center0.x,
+                y: center0.y,
             },
-            0.0, // start_radius (inner circle)
+            radius0, // start_radius (inner circle, in device space)
             tiny_skia::Point {
-                x: center.x,
-                y: center.y,
+                x: center1.x,
+                y: center1.y,
             },
-            radius, // end_radius
+            radius1, // end_radius (outer circle, in device space)
             vec![
                 tiny_skia::GradientStop::new(
                     0.0,
@@ -2187,10 +2199,13 @@ impl PageRenderer {
                 clip_mask,
             );
             log::debug!(
-                "Rendered radial gradient at ({:.1},{:.1}) r={:.1}",
-                center.x,
-                center.y,
-                radius
+                "Rendered radial gradient from ({:.1},{:.1}) r={:.1} to ({:.1},{:.1}) r={:.1}",
+                center0.x,
+                center0.y,
+                radius0,
+                center1.x,
+                center1.y,
+                radius1,
             );
         }
 

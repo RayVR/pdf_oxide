@@ -547,18 +547,12 @@ fn qa_axial_extend_false_false_toggle_parity() {
 // ===========================================================================
 
 /// Probe 6 — Non-concentric circles. `/Coords [x0 y0 r0 x1 y1 r1]`
-/// where (x0, y0) != (x1, y1). The PDF spec defines the gradient as
-/// a family of circles interpolating between the two, but
-/// `render_radial_shading` ignores x0/y0/r0 and centres both
-/// start and end on (x1, y1). Pin the toggle parity (the splice
-/// doesn't perturb the geometry) and the visible bug.
-///
-/// **#[ignore]** for the geometric probe — the visible result with
-/// non-concentric input matches concentric input around (x1, y1).
-///
-/// Bug name: WAVE4-RADIAL-NON-CONCENTRIC-COORDS-IGNORED.
+/// where (x0, y0) != (x1, y1). The PDF spec (ISO 32000-1 §8.7.4.5.4)
+/// defines the gradient as a family of circles interpolating between
+/// `(x0, y0, r0)` and `(x1, y1, r1)`. `render_radial_shading` now
+/// honours all six coordinates, so the inner-circle centre carries
+/// C0 and the outer-circle centre carries C1.
 #[test]
-#[ignore = "WAVE4-RADIAL-NON-CONCENTRIC-COORDS-IGNORED: render_radial_shading discards x0/y0/r0 from /Coords"]
 fn qa_radial_non_concentric_circles_uses_x0_y0() {
     // Inner circle at (20, 50) r=5; outer at (80, 50) r=30. A
     // spec-compliant renderer would paint C0 red around (20, 50) and
@@ -611,13 +605,9 @@ fn qa_radial_non_concentric_circles_toggle_parity() {
 /// [x0 y0 0 x1 y1 r1]` defines a gradient growing from a point at
 /// (x0, y0) outward to a circle at (x1, y1) of radius r1. This is
 /// the most common radial-shading shape in real PDFs (highlight
-/// gradients, spotlight effects). The current renderer ignores
-/// (x0, y0, r0) and paints centred on (x1, y1) — the parity pin
-/// holds, the geometric correctness probe doesn't.
-///
-/// **#[ignore]** for the geometric pin.
+/// gradients, spotlight effects). `render_radial_shading` now honours
+/// the inner-circle origin, so the C0 endpoint lands at (x0, y0).
 #[test]
-#[ignore = "WAVE4-RADIAL-NON-CONCENTRIC-COORDS-IGNORED: zero-radius inner circle at distinct (x0, y0) is dropped"]
 fn qa_radial_zero_radius_inner_at_distinct_point() {
     // Inner point at (30, 30); outer circle at (60, 60) r=40. A
     // correct renderer paints C0 only at (30, 30) and lerps outward.
@@ -634,13 +624,40 @@ fn qa_radial_zero_radius_inner_at_distinct_point() {
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
-    // Pixel close to the inner-circle origin should be near-C0 red
-    // under correct rendering. In pixmap coords y is flipped, so
-    // user (30, 30) maps to pixmap (30, 70).
-    let (r, g, b, _) = pixel_at(&on, 30, 70);
+    // The C0 endpoint is the zero-radius inner point at user
+    // (30, 30); along the cone surface t increases away from that
+    // point toward the outer circle (60, 60) r=40. The probe must
+    // distinguish "honours x0/y0" from "still centres on x1/y1":
+    //
+    // * `near_apex` — a pixmap pixel close to user (30, 30) (the
+    //   inner-point side). Under correct rendering this lies near
+    //   t=0 and reads strongly C0-tinted (red dominant).
+    // * `near_outer` — a pixmap pixel close to user (60, 60) (the
+    //   outer-circle centre). Under the old behaviour both ends
+    //   were collapsed to (x1, y1) so this pixel also read strongly
+    //   C0; under the fix it reads near-C1 (white).
+    //
+    // The pin: `near_apex` is more red than `near_outer`. That
+    // ordering can only hold when the inner-point coordinates are
+    // honoured.
+    let (r_apex, g_apex, b_apex, _) = pixel_at(&on, 31, 69); // near user (30, 30)
+    let (r_far, g_far, b_far, _) = pixel_at(&on, 60, 40); // near user (60, 60)
     assert!(
-        r > 200 && g < 80 && b < 80,
-        "zero-r0 radial: pixel at the inner point should be ~C0; got ({r}, {g}, {b})"
+        r_apex > g_apex && r_apex > b_apex,
+        "near the inner point the C0 (red) channel must dominate; \
+         got ({r_apex}, {g_apex}, {b_apex})"
+    );
+    // Under the fix, the far pixel is the C1 white endpoint; under
+    // the old (buggy) renderer it would have been pure C0 red.
+    assert!(
+        r_far > 230 && g_far > 230 && b_far > 230,
+        "near the outer-circle centre the C1 (white) endpoint must paint, \
+         not the (x0, y0)-collapsed C0; got ({r_far}, {g_far}, {b_far})"
+    );
+    assert!(
+        b_apex < b_far,
+        "the apex side must be more C0-tinted (less blue) than the C1 side; \
+         apex=({r_apex}, {g_apex}, {b_apex}) far=({r_far}, {g_far}, {b_far})"
     );
 }
 
