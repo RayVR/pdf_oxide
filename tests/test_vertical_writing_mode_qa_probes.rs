@@ -22,7 +22,6 @@
 //! are required.
 
 use pdf_oxide::document::PdfDocument;
-use pdf_oxide::fonts::global_cache::clear_global_font_cache;
 use pdf_oxide::geometry::Rect;
 use pdf_oxide::layout::TextSpan;
 use pdf_oxide::pipeline::{ReadingOrderContext, TextPipeline};
