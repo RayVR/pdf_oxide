@@ -5066,7 +5066,28 @@ impl PdfDocument {
             return Ok(String::new());
         }
 
-        let base_spans = Self::apply_region_filters(base_spans, options);
+        let mut base_spans = Self::apply_region_filters(base_spans, options);
+        // Apply struct-tree-scope /ActualText eagerly, BEFORE the
+        // structure-order vs geometric branching decision. This lets
+        // Suspects=true documents — which fall back to geometric
+        // reading order per §14.7.1 — still get their producer-supplied
+        // replacement text (§14.9.4 is content replacement, not a
+        // reading-order signal; see `struct_tree_marked`).
+        //
+        // The trustworthy structure-order branch below would still
+        // emit ActualText via the index-driven path; pre-applying it
+        // here keeps both branches consistent without double-emission
+        // because the cached assembler suppresses covered MCIDs and
+        // only emits a replacement when it sees the *anchor* MCID.
+        // Pre-applying mutates the anchor span's text to the
+        // replacement, then suppresses the anchor again — the
+        // assembler sees the anchor MCID, suppresses it, and emits
+        // the same replacement via the index. The result is one
+        // emission per emission, both paths.
+        //
+        // NOTE: we apply to base_spans BEFORE adding widget spans
+        // (widget annotations cannot carry MCIDs).
+        self.apply_actualtext_to_spans(page_index, &mut base_spans);
 
         // Structure tree: use it for reading order only when it is trustworthy
         // per the shared predicate (§14.8.2.3.1) — the document is /Marked or
