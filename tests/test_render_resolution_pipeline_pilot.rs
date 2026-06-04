@@ -917,3 +917,671 @@ fn pilot_b_star_even_odd_fill_rule_actually_evenodd() {
         "inline: `b*` ring pixel must be the fill colour, got ({r_ro}, {g_ro}, {b_ro})"
     );
 }
+
+// =====================================================================
+// Wave 2 — text operators (`Tj`, `TJ`, `'`, `"`) through the pipeline.
+// =====================================================================
+//
+// Same env-var gating as wave 1. Text uses the embedded Helvetica Type 1
+// standard font (no font file shipped — the rasteriser falls back to a
+// system font for outline data; pixel coverage is enough for the tests
+// to discriminate background from glyph ink and to compare RGB tint
+// between two renders).
+//
+// Page coordinate sanity check: a 100×100 MediaBox renders to 100×100
+// pixels at 72 dpi. The renderer flips Y so PDF y=0 is the BOTTOM of
+// the image. Text positioned at PDF (x=10, y=30) with a big font size
+// paints a glyph whose ink covers a wide horizontal band centred near
+// output y=70..40 (PDF y=30 → image y=70, font extends upward in PDF
+// space → image rows decrease). Tests probe a region rather than a
+// single pixel so the exact ascent/descent of the system fallback font
+// can't flake the assertion.
+
+/// Build a one-page text-fixture PDF with a Helvetica Type 1 Font at
+/// object 5 referenced as `/F1` in the page resources. Extra resources
+/// (colour spaces, etc.) are appended inside the page's `/Resources`
+/// dictionary via `resources_extra`.
+fn build_pdf_text(content_ops: &str, resources_extra: &str) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /Font << /F1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
+        resources_extra
+    );
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let font_off = buf.len();
+    buf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+          /Encoding /WinAnsiEncoding >>\nendobj\n",
+    );
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, font_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Build a one-page text-fixture PDF with a Helvetica Type 1 Font at
+/// object 5 AND an indirect Type 4 tint-transform function at object 6.
+/// Use this for the spot-colour pipeline-gain tests.
+fn build_pdf_text_with_type4_separation(
+    content_ops: &str,
+    type4_program: &str,
+    resources_extra: &str,
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /Font << /F1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
+        resources_extra
+    );
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let font_off = buf.len();
+    buf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+          /Encoding /WinAnsiEncoding >>\nendobj\n",
+    );
+
+    let func_off = buf.len();
+    let func_hdr = format!(
+        "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+        type4_program.len()
+    );
+    buf.extend_from_slice(func_hdr.as_bytes());
+    buf.extend_from_slice(type4_program.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, font_off, func_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Count pixels in a region whose RGB is materially below the white
+/// background. Used as a "did any glyph ink land here" probe that's
+/// font-fallback-resilient — a Helvetica fallback that paints a slightly
+/// different shape than the real font is still a single connected band of
+/// non-white pixels, so the count is non-zero whenever the rasteriser ran.
+fn count_ink_pixels(rgba: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> u32 {
+    let w = 100u32;
+    let h = 100u32;
+    assert_eq!(rgba.len() as u32, w * h * 4);
+    let mut n = 0u32;
+    for y in y0..y1.min(h) {
+        for x in x0..x1.min(w) {
+            let off = ((y * w + x) * 4) as usize;
+            let r = rgba[off];
+            let g = rgba[off + 1];
+            let b = rgba[off + 2];
+            if r < 240 || g < 240 || b < 240 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Average (r, g, b) over the non-background pixels in the search region.
+/// Returns `None` when no ink was found. Used to pin the *colour* of the
+/// painted text without requiring an exact-pixel match — different system
+/// fallback fonts hit slightly different anti-aliased subpixels but the
+/// average colour of the rendered ink is invariant.
+fn average_ink_rgb(rgba: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> Option<(f32, f32, f32)> {
+    let w = 100u32;
+    let h = 100u32;
+    assert_eq!(rgba.len() as u32, w * h * 4);
+    let mut n = 0u64;
+    let mut sr = 0u64;
+    let mut sg = 0u64;
+    let mut sb = 0u64;
+    for y in y0..y1.min(h) {
+        for x in x0..x1.min(w) {
+            let off = ((y * w + x) * 4) as usize;
+            let r = rgba[off];
+            let g = rgba[off + 1];
+            let b = rgba[off + 2];
+            // Skip background-ish pixels so the average reflects the painted
+            // colour only — the AA halo around glyphs would otherwise drag
+            // every channel toward white.
+            if r < 220 || g < 220 || b < 220 {
+                sr += r as u64;
+                sg += g as u64;
+                sb += b as u64;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some((sr as f32 / n as f32, sg as f32 / n as f32, sb as f32 / n as f32))
+}
+
+// ---------- Tj parity tests ----------
+
+#[test]
+fn pilot_tj_device_rgb_parity_pipeline_off_vs_on() {
+    // DeviceRGB fill via `rg`. Big font, single 'M' glyph painted left-ish
+    // of centre so its bounding box lands clearly inside the page. Parity:
+    // pipeline output is byte-identical to inline output.
+    let content = "BT 1 0 0 rg /F1 60 Tf 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj DeviceRGB must be byte-identical off vs on");
+
+    // Sanity: somewhere in the glyph search band, red ink actually painted.
+    let avg = average_ink_rgb(&on, 5, 30, 55, 95);
+    assert!(avg.is_some(), "expected red glyph ink to be painted somewhere");
+    let (r, g, b) = avg.unwrap();
+    assert!(
+        r > 180.0 && g < 80.0 && b < 80.0,
+        "Tj glyph ink must be red, got avg=({r:.1}, {g:.1}, {b:.1})"
+    );
+}
+
+#[test]
+fn pilot_tj_device_gray_parity_pipeline_off_vs_on() {
+    // 0.5 g → mid-grey fill. Parity invariant.
+    let content = "BT 0.5 g /F1 60 Tf 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj DeviceGray must be byte-identical off vs on");
+}
+
+#[test]
+fn pilot_tj_device_cmyk_parity_pipeline_off_vs_on() {
+    // CMYK pure magenta (0, 1, 0, 0) → both paths use the same
+    // additive-clamp fallback → byte-identical output.
+    let content = "BT 0 1 0 0 k /F1 60 Tf 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj DeviceCMYK must be byte-identical off vs on");
+}
+
+#[test]
+fn pilot_tj_tr1_stroke_only_parity_pipeline_off_vs_on() {
+    // Tr=1 strokes glyph outlines. The current text rasteriser doesn't
+    // emit per-glyph strokes yet — render_mode is consulted only to skip
+    // invisible (Tr=3) text. The pipeline migration must still be a
+    // no-op on Tr=1 (no fill happens, the page stays blank), and the
+    // off-vs-on output must be byte-identical so the toggle doesn't
+    // introduce any spurious paint.
+    let content = "BT 1 0 0 RG /F1 60 Tf 1 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj Tr=1 stroke-only must be byte-identical off vs on");
+}
+
+#[test]
+fn pilot_tj_tr2_fill_and_stroke_parity_pipeline_off_vs_on() {
+    // Tr=2 fills AND strokes glyphs. Today's text rasteriser only paints
+    // the fill side (the stroke side is a future-wave migration). The
+    // pipeline migration must remain byte-identical to the inline path —
+    // both fill and stroke colours route through the pipeline but only
+    // the fill is observable.
+    let content = "BT 1 0 0 rg 0 0 1 RG /F1 60 Tf 2 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj Tr=2 fill+stroke must be byte-identical off vs on");
+
+    // The fill colour wins on the rendered glyph. Pin it explicitly so a
+    // regression that swapped fill/stroke would be caught.
+    let avg = average_ink_rgb(&on, 5, 30, 55, 95);
+    assert!(avg.is_some(), "expected fill-coloured glyph ink under Tr=2");
+    let (r, g, b) = avg.unwrap();
+    assert!(
+        r > 180.0 && g < 80.0 && b < 80.0,
+        "Tr=2: glyph ink must be the FILL colour (red), not the stroke colour (blue), \
+         got avg=({r:.1}, {g:.1}, {b:.1})"
+    );
+}
+
+#[test]
+fn pilot_tj_tr3_invisible_parity_pipeline_off_vs_on() {
+    // Tr=3 paints nothing — the text rasteriser zeroes the alpha and the
+    // glyph is invisible. Pipeline migration must remain byte-identical
+    // and the page must stay at the white background.
+    let content = "BT 1 0 0 rg /F1 60 Tf 3 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tj Tr=3 invisible must be byte-identical off vs on");
+
+    // No ink anywhere on the page — Tr=3 makes glyphs invisible.
+    let ink = count_ink_pixels(&on, 0, 0, 100, 100);
+    assert_eq!(ink, 0, "Tr=3 invisible must paint zero pixels, got {ink} non-background pixels");
+}
+
+#[test]
+fn pilot_tj_advances_text_matrix_under_tr3() {
+    // Negative state-preservation pin: Tr=3 must still advance the text
+    // matrix (the OCR-overlay pattern depends on this — the invisible
+    // glyphs reserve space the visible run beside them paints into). A
+    // regression that early-returned out of the operator arm because
+    // the pipeline resolver returned `None` for Tr=3 would break this.
+    //
+    // Fixture: two Tj calls, the first Tr=3 invisible, the second Tr=0
+    // visible. The visible glyph must paint to the RIGHT of the
+    // invisible run's slot, not on top of it.
+    let content = "BT /F1 24 Tf 5 50 Td 3 Tr (HHHHH) Tj 0 Tr 1 0 0 rg (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline(&doc, true);
+
+    // Region of the suppressed Tr=3 run, x ∈ [5, 50] roughly — must be
+    // background.
+    let ink_left = count_ink_pixels(&on, 5, 30, 55, 70);
+    assert_eq!(
+        ink_left, 0,
+        "Tr=3 region must stay background (no glyph ink), got {ink_left} pixels"
+    );
+
+    // Region to the right where the visible M must paint after the
+    // advance of 5×H widths. With Helvetica /WinAnsi at size 24, 5 H's
+    // span ≈ 35 pt → the M lands at x ≈ 40..55. Probe x ∈ [50, 95].
+    let ink_right = count_ink_pixels(&on, 50, 30, 95, 70);
+    assert!(
+        ink_right > 0,
+        "visible M after Tr=3 advance must paint somewhere right of x=50, got 0 pixels"
+    );
+}
+
+// ---------- TJ parity test ----------
+
+#[test]
+fn pilot_tj_array_device_rgb_parity_pipeline_off_vs_on() {
+    // Numeric kerning offsets in the array must not change the colour
+    // routing — only the X advance between glyphs. Parity invariant
+    // holds.
+    let content = "BT 0 0 1 rg /F1 50 Tf 5 30 Td [(H) -200 (i)] TJ ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "TJ array DeviceRGB must be byte-identical off vs on");
+
+    // Blue glyph ink somewhere on the page.
+    let avg = average_ink_rgb(&on, 0, 20, 100, 95);
+    assert!(avg.is_some(), "expected blue glyph ink from TJ array");
+    let (r, g, b) = avg.unwrap();
+    assert!(
+        r < 80.0 && g < 80.0 && b > 180.0,
+        "TJ glyph ink must be blue, got avg=({r:.1}, {g:.1}, {b:.1})"
+    );
+}
+
+// ---------- Quote (') and DoubleQuote (") parity tests ----------
+
+#[test]
+fn pilot_quote_device_rgb_parity_pipeline_off_vs_on() {
+    // `'` is `T* Tj`. Establish a leading via TL=30 so the line-advance
+    // moves to a known PDF y; emit the `'` against DeviceRGB fill green.
+    // Parity is byte-identical and the painted ink is green.
+    let content = "BT 0 1 0 rg /F1 40 Tf 30 TL 10 80 Td (X) ' ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Quote (`'`) DeviceRGB must be byte-identical off vs on");
+
+    let avg = average_ink_rgb(&on, 0, 0, 100, 100);
+    assert!(avg.is_some(), "expected green glyph ink from Quote");
+    let (r, g, b) = avg.unwrap();
+    assert!(
+        r < 80.0 && g > 180.0 && b < 80.0,
+        "Quote glyph ink must be green, got avg=({r:.1}, {g:.1}, {b:.1})"
+    );
+}
+
+#[test]
+fn pilot_double_quote_device_rgb_parity_pipeline_off_vs_on() {
+    // `"` is `aw Tw ac Tc T* Tj`. The two numeric parameters (Tw, Tc) are
+    // state-only — they don't perturb the colour routing. Parity is
+    // byte-identical and the painted ink is red.
+    let content = "BT 1 0 0 rg /F1 40 Tf 30 TL 10 80 Td 0 0 (X) \" ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "DoubleQuote (`\"`) DeviceRGB must be byte-identical off vs on");
+
+    let avg = average_ink_rgb(&on, 0, 0, 100, 100);
+    assert!(avg.is_some(), "expected red glyph ink from DoubleQuote");
+    let (r, g, b) = avg.unwrap();
+    assert!(
+        r > 180.0 && g < 80.0 && b < 80.0,
+        "DoubleQuote glyph ink must be red, got avg=({r:.1}, {g:.1}, {b:.1})"
+    );
+}
+
+// ---------- Capability tests — Type 4 Separation text fill ----------
+
+#[test]
+fn pilot_text_tj_type4_separation_fill_pipeline_resolves_correctly() {
+    // The text-side mirror of the wave-1 Type 4 fill pilot. With a Type 4
+    // Separation colour space on the fill side at full tint, the inline
+    // text path inherits the same `1.0 - tint` fallback the path-fill arm
+    // had before wave 1 (`fill_color_rgb` is populated by the `scn` op,
+    // which uses the same fallback). At tint=1 the fallback resolves to
+    // black; the pipeline runs the Type 4 program and the glyph paints
+    // in the program's actual colour — magenta.
+    let type4_program = "{ 0.0 exch 0.0 0.0 }";
+    let content = "/SpotMagenta cs 1 scn \
+                   BT /F1 60 Tf 10 30 Td (M) Tj ET\n";
+    let resources = "/ColorSpace << /SpotMagenta [/Separation /MagentaSpot /DeviceCMYK 6 0 R] >>";
+    let bytes = build_pdf_text_with_type4_separation(content, type4_program, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // Inline path: glyph paints near-black (`1.0 - tint = 0` fallback).
+    let avg_off = average_ink_rgb(&off, 0, 20, 100, 95);
+    assert!(avg_off.is_some(), "inline path: expected SOME glyph ink (fallback colour)");
+    let (r_o, g_o, b_o) = avg_off.unwrap();
+    assert!(
+        r_o < 60.0 && g_o < 60.0 && b_o < 60.0,
+        "inline path: full-tint Type 4 Separation text fill must fall back to near-black, \
+         got avg=({r_o:.1}, {g_o:.1}, {b_o:.1})"
+    );
+
+    // Pipeline: glyph paints in magenta (high R, low G, high B).
+    let avg_on = average_ink_rgb(&on, 0, 20, 100, 95);
+    assert!(avg_on.is_some(), "pipeline: expected magenta glyph ink");
+    let (r_n, g_n, b_n) = avg_on.unwrap();
+    assert!(
+        r_n > 180.0 && g_n < 80.0 && b_n > 180.0,
+        "pipeline: Type 4 Separation text fill must resolve to magenta, got avg=({r_n:.1}, {g_n:.1}, {b_n:.1})"
+    );
+
+    // And the pixmaps must differ — the toggle has a visible effect.
+    assert_ne!(
+        off, on,
+        "pipeline output must differ from inline output for Type 4 Separation text fill"
+    );
+}
+
+#[test]
+fn pilot_text_tj_type4_separation_stroke_pipeline_resolves_correctly() {
+    // Tr=1 puts the stroke side in charge of the painted ink. Today's text
+    // rasteriser does not yet emit per-glyph strokes (a follow-up wave),
+    // so neither the inline nor the pipeline path produces visible ink
+    // under Tr=1. What we CAN verify today is that:
+    //   - The toggle remains parity-safe under Tr=1 (no spurious paint
+    //     from the pipeline).
+    //   - The stroke-side pipeline resolution is in the call graph: the
+    //     spliced graphics state carries the resolved stroke colour. We
+    //     do that by combining Tr=1 stroke-only with a follow-up Tr=0
+    //     fill from the same Separation — the fill side proves the
+    //     resolver ran, and the parity-on-Tr=1 proves stroke routing
+    //     does not perturb the no-paint behaviour.
+    let type4_program = "{ 0.0 exch 0.0 0.0 }";
+    let content = "/SpotMagenta CS 1 SCN \
+                   /SpotMagenta cs 1 scn \
+                   BT /F1 50 Tf 1 Tr 10 30 Td (M) Tj 0 Tr (M) Tj ET\n";
+    let resources = "/ColorSpace << /SpotMagenta [/Separation /MagentaSpot /DeviceCMYK 6 0 R] >>";
+    let bytes = build_pdf_text_with_type4_separation(content, type4_program, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+
+    // The Tr=0 follow-up glyph paints — inline = black fallback, pipeline
+    // = magenta. This proves the stroke-side intent didn't accidentally
+    // overwrite the fill-side resolution.
+    let avg_off = average_ink_rgb(&off, 0, 20, 100, 95);
+    assert!(avg_off.is_some(), "inline path: expected glyph ink from the Tr=0 follow-up");
+    let (r_o, g_o, b_o) = avg_off.unwrap();
+    assert!(
+        r_o < 60.0 && g_o < 60.0 && b_o < 60.0,
+        "inline path: Tr=0 follow-up must be near-black (Type 4 fallback), got avg=({r_o:.1}, {g_o:.1}, {b_o:.1})"
+    );
+
+    let avg_on = average_ink_rgb(&on, 0, 20, 100, 95);
+    assert!(avg_on.is_some(), "pipeline: expected magenta glyph ink");
+    let (r_n, g_n, b_n) = avg_on.unwrap();
+    // The glyph average includes anti-aliased halo pixels (whose RGB is a
+    // blend of the painted ink and the white background), so the magenta
+    // average reads lower than the pure-fill `(255, 0, 255)`. What we pin
+    // is the channel SHAPE — R and B materially above G — which only
+    // holds for a magenta paint, not for the inline-fallback black
+    // (which averages near zero on all channels) and not for white
+    // background (which would defeat the avg-ink filter entirely).
+    assert!(
+        r_n > 100.0 && g_n < 80.0 && b_n > 100.0 && r_n > g_n + 50.0 && b_n > g_n + 50.0,
+        "pipeline: Type 4 Separation text fill (Tr=0 follow-up) must resolve to magenta, \
+         got avg=({r_n:.1}, {g_n:.1}, {b_n:.1})"
+    );
+}
+
+// ---------- Distinct fill/stroke under Tr=2 ----------
+
+#[test]
+fn pilot_text_tj_distinct_fill_and_stroke_colors_under_tr2() {
+    // Under Tr=2 the dispatcher resolves BOTH sides through the pipeline
+    // and splices them into a single transient `GraphicsState`. The text
+    // rasteriser paints the fill side; the spliced stroke colour is along
+    // for the ride (visible in a future wave). What we assert today:
+    //   - The painted ink is the FILL colour, not the stroke colour —
+    //     so the two resolutions don't contaminate each other.
+    //   - Off-vs-on remains byte-identical (parity invariant: stroke side
+    //     is unobservable on the rasteriser today, so the splice is a
+    //     no-op on output).
+    //
+    // Fill DeviceRGB red, stroke DeviceRGB blue, Tr=2. Parity holds and
+    // the rendered ink is unambiguously red — a regression that swapped
+    // sides under Tr=2 would paint blue and fail the colour assertion.
+    let content = "BT 1 0 0 rg 0 0 1 RG /F1 60 Tf 2 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=2 distinct fill/stroke must be byte-identical off vs on");
+
+    let avg = average_ink_rgb(&on, 0, 20, 100, 95);
+    assert!(avg.is_some(), "expected glyph ink under Tr=2");
+    let (r, g, b) = avg.unwrap();
+    // Strict colour pin: must be red (R high, G/B low). A swap to the
+    // stroke colour would surface as B high.
+    assert!(
+        r > 180.0 && g < 80.0 && b < 80.0,
+        "Tr=2: painted ink must be the FILL colour (red), not the stroke colour. \
+         got avg=({r:.1}, {g:.1}, {b:.1})"
+    );
+}
+
+// ---------- State-preservation pins ----------
+
+#[test]
+fn pilot_text_under_pipeline_preserves_font_size_and_matrix() {
+    // Font size is a graphics-state field the pipeline must not perturb —
+    // we splice only colour. Render the same glyph at two different sizes
+    // through the pipeline path; the larger glyph must produce more ink
+    // pixels than the smaller. Parity off-vs-on confirms the splice was
+    // a no-op for the size dial.
+    let big_content = "BT 1 0 0 rg /F1 80 Tf 5 10 Td (M) Tj ET\n";
+    let small_content = "BT 1 0 0 rg /F1 20 Tf 5 10 Td (M) Tj ET\n";
+    let big = PdfDocument::from_bytes(build_pdf_text(big_content, "")).unwrap();
+    let small = PdfDocument::from_bytes(build_pdf_text(small_content, "")).unwrap();
+
+    let big_on = render_with_pipeline(&big, true);
+    let small_on = render_with_pipeline(&small, true);
+
+    let big_ink = count_ink_pixels(&big_on, 0, 0, 100, 100);
+    let small_ink = count_ink_pixels(&small_on, 0, 0, 100, 100);
+    assert!(
+        big_ink > small_ink * 2,
+        "font size 80 should paint substantially more ink than size 20, got big={big_ink}, small={small_ink}"
+    );
+
+    // Parity invariant.
+    let big_off = render_with_pipeline(&big, false);
+    let small_off = render_with_pipeline(&small, false);
+    assert_eq!(big_off, big_on, "font size 80 must round-trip through pipeline path");
+    assert_eq!(small_off, small_on, "font size 20 must round-trip through pipeline path");
+}
+
+#[test]
+fn pilot_text_under_pipeline_preserves_character_and_word_spacing() {
+    // Tc and Tw widen the horizontal gap between glyphs. The pipeline
+    // must leave them untouched. Render the same text at default
+    // spacing vs. wide spacing through the pipeline; the wide-spaced
+    // run must cover more horizontal extent than the tight one.
+    let tight = "BT 1 0 0 rg /F1 24 Tf 5 50 Td (HHH HHH) Tj ET\n";
+    let wide = "BT 1 0 0 rg /F1 24 Tf 5 Tc 2 Tw 5 50 Td (HHH HHH) Tj ET\n";
+    let tight_doc = PdfDocument::from_bytes(build_pdf_text(tight, "")).unwrap();
+    let wide_doc = PdfDocument::from_bytes(build_pdf_text(wide, "")).unwrap();
+
+    let tight_on = render_with_pipeline(&tight_doc, true);
+    let wide_on = render_with_pipeline(&wide_doc, true);
+
+    // Find the rightmost ink pixel in each render. With wider spacing the
+    // last glyph lands further right.
+    let rightmost = |rgba: &[u8]| -> Option<u32> {
+        for x in (0u32..100).rev() {
+            for y in 30u32..70 {
+                let off = ((y * 100 + x) * 4) as usize;
+                let r = rgba[off];
+                let g = rgba[off + 1];
+                let b = rgba[off + 2];
+                if r < 240 || g < 240 || b < 240 {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    };
+    let tight_right = rightmost(&tight_on).expect("tight render: glyph ink present");
+    let wide_right = rightmost(&wide_on).expect("wide render: glyph ink present");
+    assert!(
+        wide_right > tight_right,
+        "wider Tc/Tw must push the rightmost glyph further right; tight={tight_right}, wide={wide_right}"
+    );
+
+    // Parity off-vs-on.
+    let tight_off = render_with_pipeline(&tight_doc, false);
+    let wide_off = render_with_pipeline(&wide_doc, false);
+    assert_eq!(tight_off, tight_on, "tight Tc/Tw must round-trip through pipeline path");
+    assert_eq!(wide_off, wide_on, "wide Tc/Tw must round-trip through pipeline path");
+}
+
+#[test]
+fn pilot_text_under_pipeline_preserves_horizontal_scaling() {
+    // Tz (horizontal scaling) scales the glyph advance horizontally — at
+    // 50 % the cluster's rightmost pixel lands further LEFT than at 100 %.
+    // The pipeline must not stamp Tz out. Probe by measuring the rightmost
+    // ink column and asserting it shifts left when Tz is reduced; parity
+    // off-vs-on covers the negative direction.
+    //
+    // Use a font size small enough that Tz=100 % comfortably fits on the
+    // 100-pt-wide page (Helvetica /F1 16 → "HHH" ≈ 33 pt) so the only
+    // reason the right edge can move is the Tz advance dial itself.
+    let normal = "BT 1 0 0 rg /F1 16 Tf 5 50 Td (HHH) Tj ET\n";
+    let narrow = "BT 1 0 0 rg /F1 16 Tf 50 Tz 5 50 Td (HHH) Tj ET\n";
+    let normal_doc = PdfDocument::from_bytes(build_pdf_text(normal, "")).unwrap();
+    let narrow_doc = PdfDocument::from_bytes(build_pdf_text(narrow, "")).unwrap();
+
+    let normal_on = render_with_pipeline(&normal_doc, true);
+    let narrow_on = render_with_pipeline(&narrow_doc, true);
+
+    // Rightmost ink column, restricted to the glyph band.
+    let rightmost = |rgba: &[u8]| -> Option<u32> {
+        for x in (0u32..100).rev() {
+            for y in 30u32..70 {
+                let off = ((y * 100 + x) * 4) as usize;
+                let r = rgba[off];
+                let g = rgba[off + 1];
+                let b = rgba[off + 2];
+                if r < 240 || g < 240 || b < 240 {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    };
+    let normal_right = rightmost(&normal_on).expect("Tz=100 render: glyph ink present");
+    let narrow_right = rightmost(&narrow_on).expect("Tz=50 render: glyph ink present");
+    assert!(
+        narrow_right < normal_right,
+        "Tz=50 must place the rightmost glyph LEFT of Tz=100; normal={normal_right}, narrow={narrow_right}"
+    );
+
+    let normal_off = render_with_pipeline(&normal_doc, false);
+    let narrow_off = render_with_pipeline(&narrow_doc, false);
+    assert_eq!(normal_off, normal_on, "Tz=100 must round-trip through pipeline path");
+    assert_eq!(narrow_off, narrow_on, "Tz=50 must round-trip through pipeline path");
+}
+
+#[test]
+fn pilot_text_helper_returns_none_when_pipeline_disabled() {
+    // The off-toggle path must NOT clone `gs` for text painting — the
+    // wave-1 invariant. We can't probe the helper directly, but we can
+    // assert the byte-identical parity invariant against the inline
+    // path for a Tr=2 case where the helper would otherwise clone
+    // (both fill and stroke get resolved). If parity holds, no
+    // observable clone happened (on the off path) AND the on path
+    // splice was a no-op for fill+stroke.
+    let content = "BT 0.5 g 0.2 G /F1 50 Tf 2 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "off-path must not be perturbed by Tr=2 gating; on-path Device colours must splice to no visible change"
+    );
+}

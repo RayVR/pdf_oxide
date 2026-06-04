@@ -1405,11 +1405,22 @@ impl PageRenderer {
                         let advance = if excluded_layer_depth == 0 {
                             let clip = clip_stack.last().and_then(|c| c.as_ref());
                             let transform = combine_transforms(base_transform, &gs.ctm);
+                            // Pilot routing for text-showing operators: when the
+                            // resolution-pipeline toggle is on, resolve the fill
+                            // and/or stroke colour (per Tr mode) through the
+                            // pipeline once for the whole `Tj` call and splice
+                            // the result into a transient `GraphicsState` clone
+                            // the rasteriser consumes. The clone happens at the
+                            // operator-arm level — not per glyph — so the cost
+                            // is amortised across the whole string. Off → no
+                            // behaviour change, gs borrowed directly.
+                            let spliced = self.pipeline_resolve_text_gs(doc, gs);
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
                                 text,
                                 transform,
-                                gs,
+                                render_gs,
                                 resources,
                                 doc,
                                 clip,
@@ -1446,11 +1457,17 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
+                            // Pilot routing — same shape as `Tj`. `'` is
+                            // `T* Tj` per ISO 32000-1; the resolved colour
+                            // depends only on the prior colour-setting ops,
+                            // so the resolve happens here, not inside `T*`.
+                            let spliced = self.pipeline_resolve_text_gs(doc, gs);
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
                                 text,
                                 transform,
-                                gs,
+                                render_gs,
                                 resources,
                                 doc,
                                 clip,
@@ -1480,11 +1497,20 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
+                            // Pilot routing for `TJ`. Resolve once for the
+                            // whole array — the numeric offsets inside `array`
+                            // only adjust positioning; they cannot alter the
+                            // active colour mid-string. `render_tj_array`
+                            // clones its own `current_gs` from the value it
+                            // receives, so the spliced colour propagates to
+                            // every glyph element automatically.
+                            let spliced = self.pipeline_resolve_text_gs(doc, gs);
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.text_rasterizer.render_tj_array(
                                 pixmap,
                                 array,
                                 transform,
-                                gs,
+                                render_gs,
                                 resources,
                                 doc,
                                 clip,
@@ -1529,11 +1555,18 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
+                            // Pilot routing — `"` is equivalent to setting Tw,
+                            // Tc, then `T* Tj`. Tw/Tc are state-only and don't
+                            // influence the resolved colour, so the resolve
+                            // happens immediately before painting just like in
+                            // `Tj` / `'`.
+                            let spliced = self.pipeline_resolve_text_gs(doc, gs);
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
                                 text,
                                 transform,
-                                gs,
+                                render_gs,
                                 resources,
                                 doc,
                                 clip,
@@ -2678,6 +2711,66 @@ impl PageRenderer {
         gs: &GraphicsState,
     ) -> Option<(f32, f32, f32, f32)> {
         self.pipeline_resolve_rgba(doc, gs, PaintSide::Stroke)
+    }
+
+    /// Resolve the text-painting colours through the resolution pipeline
+    /// and return a `GraphicsState` clone with the resolved RGBA spliced
+    /// into the fill / stroke fields the text rasteriser reads. Returns
+    /// `None` when the toggle is off, when the active Tr mode does not
+    /// require any resolved side, or when neither side has a resolvable
+    /// non-Device colour to route — letting the caller borrow the
+    /// original `gs` directly and keep the off-path allocation-free.
+    ///
+    /// Tr-mode handling (ISO 32000-1 §9.3.6 Table 106):
+    /// * `0`, `2`, `4`, `6` fill the glyph → resolve fill side.
+    /// * `1`, `2`, `5`, `6` stroke the glyph → resolve stroke side.
+    /// * `3` is invisible (no painting); skip resolution entirely so
+    ///   PDFs that emit text-as-OCR-overlay don't pay the per-`Tj`
+    ///   pipeline-clone cost.
+    ///
+    /// Both sides resolve independently — the pipeline keys all of its
+    /// side-specific behaviour off `intent.side`, so a Type 4 Separation
+    /// on the fill side and a plain DeviceRGB on the stroke side route
+    /// correctly without contaminating each other.
+    fn pipeline_resolve_text_gs(
+        &self,
+        doc: &PdfDocument,
+        gs: &GraphicsState,
+    ) -> Option<GraphicsState> {
+        if !self.pipeline_enabled_cache {
+            return None;
+        }
+        // Tr=3 → invisible text. No glyph paint happens, so neither side
+        // needs resolving. The text matrix still advances; that's handled
+        // unconditionally outside the resolve helper.
+        if gs.render_mode == 3 {
+            return None;
+        }
+        let fills = matches!(gs.render_mode, 0 | 2 | 4 | 6);
+        let strokes = matches!(gs.render_mode, 1 | 2 | 5 | 6);
+        let fill_rgba = if fills {
+            self.pipeline_resolve_rgba(doc, gs, PaintSide::Fill)
+        } else {
+            None
+        };
+        let stroke_rgba = if strokes {
+            self.pipeline_resolve_rgba(doc, gs, PaintSide::Stroke)
+        } else {
+            None
+        };
+        if fill_rgba.is_none() && stroke_rgba.is_none() {
+            return None;
+        }
+        let mut spliced = gs.clone();
+        if let Some((r, g, b, a)) = fill_rgba {
+            spliced.fill_color_rgb = (r, g, b);
+            spliced.fill_alpha = a;
+        }
+        if let Some((r, g, b, a)) = stroke_rgba {
+            spliced.stroke_color_rgb = (r, g, b);
+            spliced.stroke_alpha = a;
+        }
+        Some(spliced)
     }
 
     /// Resolve the active colour for `side` through the resolution pipeline
