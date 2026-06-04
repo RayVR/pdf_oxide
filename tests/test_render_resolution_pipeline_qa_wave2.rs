@@ -416,3 +416,163 @@ fn qa_text_multi_font_run_byte_identical() {
         "multi-font Tj run must paint red, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
+
+// ============================================================================
+// Text rendering mode probes — Tr=0..7.
+// ============================================================================
+//
+// `pipeline_resolve_text_gs` short-circuits Tr=3 to None, resolves fill for
+// 0/2/4/6 and stroke for 1/2/5/6. Tr=4-7 add to the current clipping path
+// in the spec; the current text rasteriser does NOT implement clip-add for
+// text, so today both paths paint just like 0-2 and don't accumulate clip
+// state. These tests assert PARITY across the toggle — any divergence
+// flags either a pipeline bug or a clip-handling regression.
+//
+// If the implementation later adds clip-from-text support, these tests'
+// assertions will still hold (parity invariant) but the *inline* path
+// would have to do the clip add as well; otherwise toggle-on would
+// diverge.
+
+/// Probe 5a — Tr=0 (fill-only): pipeline parity on a plain DeviceRGB fill.
+/// Already covered by the pilot's `pilot_tj_device_rgb_parity` — this is
+/// just the QA-suite anchor making sure the suite's wider Tr coverage has
+/// the trivial mode pinned too.
+#[test]
+fn qa_text_tr0_fill_only_parity() {
+    let content = "BT 1 0 0 rg /F1 40 Tf 0 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=0 fill-only must be byte-identical off vs on");
+}
+
+/// Probe 5b — Tr=1 (stroke-only). Pipeline resolves the stroke side only.
+/// The current text rasteriser doesn't emit per-glyph strokes, so the
+/// painted page is blank either way; the invariant is byte-identical
+/// parity (no spurious paint introduced by the pipeline path).
+#[test]
+fn qa_text_tr1_stroke_only_parity() {
+    let content = "BT 1 0 0 RG /F1 40 Tf 1 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=1 stroke-only must be byte-identical off vs on");
+}
+
+/// Probe 5c — Tr=2 (fill+stroke). Pipeline resolves BOTH sides; the
+/// rasteriser today only paints the fill side. Parity invariant holds.
+#[test]
+fn qa_text_tr2_fill_and_stroke_parity() {
+    let content = "BT 1 0 0 rg 0 0 1 RG /F1 40 Tf 2 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=2 fill+stroke must be byte-identical off vs on");
+}
+
+/// Probe 5d — Tr=3 (invisible). Pipeline short-circuits to None — no
+/// clone of `gs` happens. Parity invariant must hold AND the page must
+/// stay at the white background (the rasteriser zeroes alpha for Tr=3).
+#[test]
+fn qa_text_tr3_invisible_parity_and_no_ink() {
+    let content = "BT 1 0 0 rg /F1 40 Tf 3 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=3 invisible must be byte-identical off vs on");
+    assert_eq!(
+        count_ink_pixels(&on, 0, 0, 100, 100),
+        0,
+        "Tr=3 invisible text must paint zero pixels"
+    );
+}
+
+/// Probe 5e — Tr=4 (fill + add to clip path). Pipeline resolves the fill
+/// side. The rasteriser today doesn't implement clip-from-text, so the
+/// painted output is the same as Tr=0; the parity invariant must hold.
+///
+/// This pins the CURRENT behaviour. When clip-from-text lands, this test's
+/// parity assertion still holds — what would change is the assertion on
+/// where ink appears (clip would suppress subsequent paints outside the
+/// glyph silhouette).
+#[test]
+fn qa_text_tr4_fill_plus_clip_parity_pin() {
+    let content = "BT 1 0 0 rg /F1 40 Tf 4 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=4 fill+clip parity invariant must hold");
+    // Sanity: fill side painted (red ink lands somewhere).
+    let avg = average_ink_rgb(&on, 0, 0, 100, 100);
+    assert!(avg.is_some(), "Tr=4 must paint the fill side (red glyph)");
+}
+
+/// Probe 5f — Tr=5 (stroke + add to clip path). Pipeline resolves the
+/// stroke side. Rasteriser doesn't paint strokes for text; parity
+/// invariant must hold; no spurious paint.
+#[test]
+fn qa_text_tr5_stroke_plus_clip_parity_pin() {
+    let content = "BT 1 0 0 RG /F1 40 Tf 5 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=5 stroke+clip parity invariant must hold");
+}
+
+/// Probe 5g — Tr=6 (fill + stroke + add to clip path). Pipeline resolves
+/// BOTH sides; rasteriser paints fill only. Parity invariant must hold;
+/// painted ink is the fill colour.
+#[test]
+fn qa_text_tr6_fill_stroke_plus_clip_parity_pin() {
+    let content = "BT 1 0 0 rg 0 0 1 RG /F1 40 Tf 6 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=6 fill+stroke+clip parity invariant must hold");
+    // Painted ink must be FILL colour (red), not stroke (blue).
+    let avg = average_ink_rgb(&on, 0, 0, 100, 100);
+    assert!(avg.is_some(), "Tr=6 must paint the fill side");
+    let (r, g, b) = avg.unwrap();
+    assert!(
+        r > 180.0 && g < 80.0 && b < 80.0,
+        "Tr=6 painted ink must be FILL red, not stroke blue, got ({r:.1}, {g:.1}, {b:.1})"
+    );
+}
+
+/// Probe 5h — Tr=7 (add to clip path only). Per the spec Tr=7 is a
+/// clip-only mode that paints nothing. The pipeline helper's `matches!`
+/// rules don't include 7 for either fills or strokes — so the helper
+/// returns None and no GS clone happens. Parity invariant must hold;
+/// no ink should appear.
+#[test]
+fn qa_text_tr7_clip_only_parity_pin() {
+    let content = "BT 1 0 0 rg /F1 40 Tf 7 Tr 10 30 Td (M) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr=7 clip-only parity invariant must hold");
+}
+
+/// Probe 6 — Tr changes mid-stream. Sequence: Tr=0 Tj, `Tr 2`, Tr=2 Tj.
+/// Each call gets its own pipeline-resolve; the previous call's spliced
+/// GS clone must not leak into the next call's borrowed `gs`.
+#[test]
+fn qa_text_tr_change_mid_stream_parity() {
+    let content = "BT 1 0 0 rg 0 0 1 RG /F1 20 Tf 5 60 Td \
+                   0 Tr (A) Tj \
+                   2 Tr (B) Tj \
+                   0 Tr (C) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "Tr change mid-stream must be byte-identical off vs on");
+}
