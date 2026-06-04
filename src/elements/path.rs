@@ -373,8 +373,14 @@ impl PathContent {
     /// own closed 5-point subpath, and `ClosePath` appends the subpath's start
     /// point. A new subpath begins at every `MoveTo` (and every `Rectangle`).
     ///
-    /// `tolerance` is in the path's own coordinate units — PDF points for paths
-    /// returned by [`crate::document::PdfDocument::extract_paths`]. Smaller
+    /// `tolerance` is expressed in the same coordinate space as the path's own
+    /// points, and the returned points are in that space verbatim. For paths
+    /// from [`crate::document::PdfDocument::extract_paths`] that is the page's
+    /// default user space (PDF points, y-up), with any content-stream `cm` and
+    /// Form-XObject `/Matrix` transforms already folded in — so a path drawn
+    /// under a scaling transform is returned (and flattened) at its final
+    /// on-page size, and no tolerance rescaling is needed. It is *not* device or
+    /// pixel space: page `/Rotate` and rendering DPI are not applied. Smaller
     /// values yield more, finer points. A non-positive or non-finite tolerance
     /// is floored to a small epsilon so subdivision always terminates.
     ///
