@@ -802,3 +802,89 @@ fn qa_pattern_colour_space_falls_back_to_inline_parity() {
     let on = render_with_pipeline(&doc, true);
     assert_eq!(off, on, "Pattern colour space must fall back to inline path identically");
 }
+
+// ===========================================================================
+// PROBE AREA: Type 4 stress (probes 19-21)
+// ===========================================================================
+
+/// Probe 19 — Type 4 program that divides by zero.
+///
+/// `crate::functions::evaluate_type4_clamped` honours the IEEE semantics
+/// inherited from how popular PDF viewers behave: `n/0 → ±inf` and `0/0
+/// → NaN` rather than `undefinedresult`. The `Range`-array clamp then
+/// pins the result back into the alt-space domain. The invariant is **no
+/// panic** — the renderer should produce a page, not crash.
+#[test]
+fn qa_type4_division_by_zero_no_panic() {
+    // Program leaves CMYK [n/0, 0/0, 0, 0] on the stack. Range clamps
+    // each to [0, 1]. With Range clamping in place the painted colour
+    // becomes (0, 0, 0, 0) clamped or (1, NaN, 0, 0) clamped. The
+    // assertion is just that the render returns Ok and we get a
+    // sensible 100×100 pixmap.
+    let type4_program = "{ 1.0 0.0 div 0.0 0.0 div 0.0 0.0 }";
+    let content = "/Spot cs\n0.5 scn\n20 20 60 60 re\nf\n";
+    let resources = "/ColorSpace << /Spot [/Separation /SpotName /DeviceCMYK 5 0 R] >>";
+    let bytes = build_pdf_with_type4_separation(content, type4_program, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline_allow_fail(&doc, true);
+    assert!(
+        on.is_some(),
+        "Type 4 division-by-zero must not panic; renderer must produce a pixmap"
+    );
+    // And it must be 100×100×4 bytes — i.e. a real render, not a stub.
+    assert_eq!(on.unwrap().len(), 100 * 100 * 4);
+}
+
+/// Probe 20 — Type 4 program designed to provoke stack overflow.
+///
+/// `MAX_STACK` and `MAX_INSTRUCTIONS` in the Type 4 evaluator both bound
+/// runtime growth. A program with a deep literal stack should hit one or
+/// the other and return an Error; the resolver converts that to
+/// `first_as_gray` and the renderer paints SOMETHING. Invariant: no
+/// panic, render succeeds.
+#[test]
+fn qa_type4_stack_overflow_no_panic() {
+    // 2048 number literals in a row exceeds the implementation's
+    // MAX_STACK (currently 100 by inspection). The evaluator returns
+    // Err; the pipeline catches it with `?` → bubbles to `.ok()?` in
+    // `pipeline_resolve_rgba` → returns None → renderer falls back to
+    // the inline path's per-`SetFillColorN` colour (whatever it was).
+    let mut body = String::from("{ ");
+    for _ in 0..2048 {
+        body.push_str("0.5 ");
+    }
+    body.push_str(" 0.0 0.0 0.0 0.0 }"); // dummy CMYK at the end
+    let content = "/Spot cs\n0.5 scn\n20 20 60 60 re\nf\n";
+    let resources = "/ColorSpace << /Spot [/Separation /SpotName /DeviceCMYK 5 0 R] >>";
+    let bytes = build_pdf_with_type4_separation(content, &body, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline_allow_fail(&doc, true);
+    assert!(on.is_some(), "Type 4 deep stack must not panic");
+    assert_eq!(on.unwrap().len(), 100 * 100 * 4);
+}
+
+/// Probe 21 — Type 4 program that emits out-of-range output (negative
+/// values and values > 1.0). `Range`-array clamping in the evaluator
+/// must constrain each output before it reaches the alt-space
+/// projection. The pipeline must render normally — no NaN propagation,
+/// no panics, output in [0, 1].
+#[test]
+fn qa_type4_out_of_range_output_clamps() {
+    // Program leaves [-0.5, 2.0, -10.0, 99.0] (all out of [0, 1]). With
+    // Range = [0 1] for each output the clamp gives [0, 1, 0, 1] →
+    // CMYK(0, 1, 0, 1) = magenta+black, projected to RGB at alpha 1.
+    let type4_program = "{ pop -0.5 2.0 -10.0 99.0 }";
+    let content = "/Spot cs\n0.5 scn\n20 20 60 60 re\nf\n";
+    let resources = "/ColorSpace << /Spot [/Separation /SpotName /DeviceCMYK 5 0 R] >>";
+    let bytes = build_pdf_with_type4_separation(content, type4_program, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let on = render_with_pipeline(&doc, true);
+    // Centre pixel must be valid u8 RGBA — implicit by reaching this
+    // point, but pin the colour shape too. CMYK(0, 1, 0, 1) → R = 0,
+    // G = 0, B = 0 (black; the K plate dominates). All channels low.
+    let (r, g, b, a) = center_pixel(&on);
+    assert!(
+        r < 60 && g < 60 && b < 60 && a == 255,
+        "Type 4 out-of-range output must clamp into valid CMYK → painted colour, got ({r}, {g}, {b}, {a})"
+    );
+}
