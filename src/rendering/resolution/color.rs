@@ -178,23 +178,42 @@ impl ColorResolver {
         // Determine alternate colour space and tint-transform function.
         // Separation: [/Separation name altCS tintTransform]
         // DeviceN: [/DeviceN names altCS tintTransform attrs?]
+        //
+        // When the array is malformed (no altCS or no tintTransform), or
+        // the function dict is missing / unrecognised, we fall back to
+        // `g = 1.0 - tint`. This mirrors the long-standing inline `scn`
+        // and `SCN` behaviour: callers exist that rely on it as a
+        // "darker = more ink" heuristic for spot inks that never wired
+        // up a proper tint transform. Off-vs-on toggle parity holds
+        // until the broader §8.6.6.4 fix lands.
+        let invert_tint_fallback = |components: &[f32], alpha: f32| -> ResolvedColor {
+            let t = components.first().copied().unwrap_or(0.0);
+            let g = (1.0 - t).clamp(0.0, 1.0);
+            ResolvedColor::Rgba {
+                r: g,
+                g,
+                b: g,
+                a: alpha,
+            }
+        };
+
         let alt_cs_obj = match arr.get(2) {
             Some(o) => o,
-            None => return Ok(first_as_gray(components, alpha)),
+            None => return Ok(invert_tint_fallback(components, alpha)),
         };
         let func_obj = match arr.get(3) {
             Some(o) => o,
-            None => return Ok(first_as_gray(components, alpha)),
+            None => return Ok(invert_tint_fallback(components, alpha)),
         };
 
         let func_resolved = match ctx.doc.resolve_object(func_obj) {
             Ok(o) => o,
-            Err(_) => return Ok(first_as_gray(components, alpha)),
+            Err(_) => return Ok(invert_tint_fallback(components, alpha)),
         };
         // FunctionType may be in the dict directly (Type 2/3) or in the
         // stream dict (Type 0/4). `as_dict` handles both.
         let Some(func_dict) = func_resolved.as_dict() else {
-            return Ok(first_as_gray(components, alpha));
+            return Ok(invert_tint_fallback(components, alpha));
         };
         let func_type = func_dict
             .get("FunctionType")
@@ -206,7 +225,7 @@ impl ColorResolver {
         let altspace_values: Vec<f32> = match func_type {
             2 => evaluate_type2(func_dict, components[0]),
             4 => evaluate_type4(&func_resolved, components)?,
-            _ => return Ok(first_as_gray(components, alpha)),
+            _ => return Ok(invert_tint_fallback(components, alpha)),
         };
 
         // Project the alternate-space values through their colour space.

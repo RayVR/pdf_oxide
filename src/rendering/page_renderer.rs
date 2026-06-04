@@ -898,6 +898,31 @@ impl PageRenderer {
                                                     handled = true;
                                                 }
                                             },
+                                            "Indexed" => {
+                                                // Indexed: the component is
+                                                // a palette index 0..hival.
+                                                // Until the full palette
+                                                // lookup is wired (planned
+                                                // alongside the pipeline's
+                                                // resolve_indexed at
+                                                // src/rendering/resolution/
+                                                // color.rs:237), match the
+                                                // pipeline's index/255 gray
+                                                // fallback so the off/on
+                                                // toggle agrees. Without
+                                                // this branch the generic
+                                                // fallback below would
+                                                // forward the raw index
+                                                // (e.g. 1.0) as the gray
+                                                // value, producing white
+                                                // where the pipeline gives
+                                                // near-black.
+                                                if !components.is_empty() {
+                                                    let g = (components[0] / 255.0).clamp(0.0, 1.0);
+                                                    gs.fill_color_rgb = (g, g, g);
+                                                    handled = true;
+                                                }
+                                            },
                                             _ => {},
                                         }
                                     }
@@ -977,6 +1002,34 @@ impl PageRenderer {
                                                             _ => {},
                                                         }
                                                     }
+                                                }
+                                            },
+                                            "Separation" | "DeviceN" => {
+                                                // Mirror the fill-side
+                                                // `1.0 - tint` fallback so
+                                                // off-vs-on parity holds
+                                                // for legacy spot inks the
+                                                // pipeline hasn't fully
+                                                // wired yet. The toggled
+                                                // pipeline path still
+                                                // honours Type 2/4 tint
+                                                // transforms when present.
+                                                if !components.is_empty() {
+                                                    let g = 1.0 - components[0];
+                                                    gs.stroke_color_rgb = (g, g, g);
+                                                    handled = true;
+                                                }
+                                            },
+                                            "Indexed" => {
+                                                // Indexed stroke: match the
+                                                // pipeline's index/255 gray
+                                                // fallback. See the matching
+                                                // fill-side branch for the
+                                                // rationale.
+                                                if !components.is_empty() {
+                                                    let g = (components[0] / 255.0).clamp(0.0, 1.0);
+                                                    gs.stroke_color_rgb = (g, g, g);
+                                                    handled = true;
                                                 }
                                             },
                                             _ => {},

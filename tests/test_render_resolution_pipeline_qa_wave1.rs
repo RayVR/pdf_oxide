@@ -479,30 +479,25 @@ fn qa_combo_under_active_clip_parity() {
 /// agreed direction is up to the design pass; the divergence today is
 /// the bug.
 #[test]
-#[ignore = "wave-1 QA bug — Indexed `scn` (fill) diverges between toggle off and on; fix-pass target"]
 fn qa_bug_indexed_scn_fill_pipeline_diverges() {
+    // Wave-1 fix: the inline `scn` Indexed branch now mirrors the
+    // pipeline's `g = index / 255` fallback (until the full palette
+    // lookup is wired). Off-vs-on toggle parity is restored.
     let resources = "/ColorSpace << /Pal [/Indexed /DeviceRGB 1 <FF0000 0000FF>] >>";
     let content = "/Pal cs\n1 scn\n20 20 60 60 re\nf\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    // Document the bug shape before the equality assertion so the
-    // failure mode is self-describing.
-    let (r_off, g_off, b_off, _) = center_pixel(&off);
+    // Both paths now render index/255 — for index 1 that is near-black.
     let (r_on, g_on, b_on, _) = center_pixel(&on);
     assert!(
-        r_off > 200 && g_off > 200 && b_off > 200,
-        "inline (off): Indexed `scn` paints near-white via raw-component fallback, got ({r_off}, {g_off}, {b_off})"
-    );
-    assert!(
         r_on < 50 && g_on < 50 && b_on < 50,
-        "pipeline (on): Indexed `scn` paints near-black via index/255, got ({r_on}, {g_on}, {b_on})"
+        "Indexed `scn`: index/255 fallback must produce near-black, got ({r_on}, {g_on}, {b_on})"
     );
     assert_eq!(
         off, on,
-        "WAVE-1 INVARIANT VIOLATED: Indexed `scn` must render identically off vs on \
-         (inline path uses raw component, pipeline divides by 255)"
+        "Indexed `scn` must render identically off vs on (both paths use index/255)"
     );
 }
 
@@ -513,19 +508,16 @@ fn qa_bug_indexed_scn_fill_pipeline_diverges() {
 /// Same divergence pattern, stroke side. Inline `SetStrokeColorN` has no
 /// `Indexed` branch; pipeline's `resolve_indexed` divides by 255.
 #[test]
-#[ignore = "wave-1 QA bug — Indexed `SCN` (stroke) diverges between toggle off and on; fix-pass target"]
 fn qa_bug_indexed_scn_stroke_pipeline_diverges() {
+    // Wave-1 fix: symmetric to the fill-side QA test above. The inline
+    // `SCN` Indexed branch now matches the pipeline.
     let resources = "/ColorSpace << /Pal [/Indexed /DeviceRGB 1 <FF0000 0000FF>] >>";
     let content = "/Pal CS\n1 SCN\n10 w\n20 20 60 60 re\nS\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "WAVE-1 INVARIANT VIOLATED: Indexed `SCN` (stroke) must render identically off vs on \
-         (inline path uses raw component, pipeline divides by 255)"
-    );
+    assert_eq!(off, on, "Indexed `SCN` (stroke) must render identically off vs on");
 }
 
 /// Probe 14 — ICCBased colour space with 4 components (CMYK profile).
@@ -865,10 +857,13 @@ fn qa_type4_out_of_range_output_clamps() {
 /// this is the same family of bug as probe 13 — Separation without a
 /// valid function still hits the inline fallback differently.
 #[test]
-#[ignore = "wave-1 QA bug — malformed Separation array (no altCS/tintTransform) diverges off vs on; fix-pass target"]
 fn qa_bug_malformed_separation_array_diverges() {
+    // Wave-1 fix: the pipeline's `resolve_separation_or_devicen` now
+    // falls back to `g = 1.0 - tint` whenever the array is malformed or
+    // the function dict is missing / unrecognised, matching the
+    // long-standing inline `scn`/`SCN` behaviour. Off-vs-on parity is
+    // restored.
     let resources = "/ColorSpace << /Spot [/Separation /SpotName] >>";
-    // tint=0.7 → inline gives 1-0.7=0.3 gray; pipeline gives 0.7 gray.
     let content = "/Spot cs\n0.7 scn\n20 20 60 60 re\nf\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
@@ -876,8 +871,7 @@ fn qa_bug_malformed_separation_array_diverges() {
     let on = render_with_pipeline(&doc, true);
     assert_eq!(
         off, on,
-        "WAVE-1 INVARIANT VIOLATED: malformed Separation must degrade identically off vs on \
-         (inline does `1.0 - tint`, pipeline does `tint` — gray fallback direction disagrees)"
+        "malformed Separation must degrade identically off vs on (both paths use `1.0 - tint`)"
     );
 }
 
