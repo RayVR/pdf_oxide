@@ -741,3 +741,120 @@ fn qa_standard_image_iccbased_n4_pass_through_byte_identical() {
         "ICCBased N=4 standard image must pass through pipeline byte-identically"
     );
 }
+
+// ===========================================================================
+// Probes 13-14 — Inline images (`BI ... ID ... EI`).
+//
+// Inline images are an entirely separate parse path. The wave-3 commit
+// only touches the `Operator::Do` arm; inline images flow through
+// `Operator::InlineImage` which the renderer DOES NOT IMPLEMENT —
+// `page_renderer.rs` has no `Operator::InlineImage` arm. So:
+//
+//   - inline images render as nothing (transparent / unchanged page);
+//   - inline ImageMasks therefore can't be filled via the pipeline
+//     (capability gap, not a regression).
+//
+// These probes PIN the current behaviour. If a future wave wires up
+// `Operator::InlineImage`, both should start failing — at which point
+// the new arm needs its own pipeline routing for `/IM true`.
+// ===========================================================================
+
+/// Build a one-page PDF whose content stream is a literal byte slice
+/// (so callers can embed non-ASCII inline-image data). The renderer
+/// doesn't dispatch `Operator::InlineImage` today; this is a gap pin.
+fn build_pdf_inline_image_bytes(content_ops: &[u8]) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+          /Resources << >> /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Probe 13 — Inline ImageMask via `BI ... ID ... EI`. Pin the current
+/// behaviour: the renderer does NOT dispatch `Operator::InlineImage`,
+/// so the page is blank regardless of the toggle.
+///
+/// If a future wave adds inline-image support, this test will fail —
+/// at which point the new arm needs its own pipeline routing for
+/// `/IM true` to match the `Do` arm's behaviour. Tracked as
+/// **WAVE-3-GAP-INLINE**.
+#[test]
+fn qa_inline_image_mask_renderer_gap_pin() {
+    // Inline ImageMask: 1x1, /BPC 1, /IM true, one zero byte (opaque
+    // under default Decode). Surround with a fill colour set first.
+    //
+    // Per PDF §8.9.7 the syntax for an inline image is:
+    //   BI <dict-entries> ID <data> EI
+    let mut content: Vec<u8> = Vec::new();
+    content.extend_from_slice(b"q\n1 0 0 rg\n80 0 0 80 10 10 cm\n");
+    content.extend_from_slice(b"BI /W 1 /H 1 /BPC 1 /IM true ID ");
+    content.push(0x00);
+    content.extend_from_slice(b" EI\nQ\n");
+    let bytes = build_pdf_inline_image_bytes(&content);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "renderer-gap pin: inline ImageMask renders identically (as nothing) off vs on"
+    );
+    // Pin the gap: the page must be all white. If a future wave wires
+    // up InlineImage rendering and forgets to route the fill through
+    // the pipeline, this stops being all-white at the centre and the
+    // pin fires.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert_eq!(
+        (r, g, b),
+        (255, 255, 255),
+        "inline ImageMask currently goes unrendered (renderer gap); \
+         WAVE-3-GAP-INLINE must remain until InlineImage is wired up"
+    );
+}
+
+/// Probe 14 — Inline standard (non-mask) image. Same gap: the renderer
+/// doesn't dispatch `Operator::InlineImage`. Pin all-white centre.
+#[test]
+fn qa_inline_standard_image_renderer_gap_pin() {
+    // 1x1 DeviceGray, BPC 8, single byte 0x80 → mid-grey. Without
+    // dispatch, the page is blank.
+    let mut content: Vec<u8> = Vec::new();
+    content.extend_from_slice(b"q\n80 0 0 80 10 10 cm\n");
+    content.extend_from_slice(b"BI /W 1 /H 1 /BPC 8 /CS /G ID ");
+    content.push(0x80);
+    content.extend_from_slice(b" EI\nQ\n");
+    let bytes = build_pdf_inline_image_bytes(&content);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "renderer-gap pin: inline standard image renders identically (as nothing) off vs on"
+    );
+    let (r, g, b, _a) = center_pixel(&on);
+    assert_eq!(
+        (r, g, b),
+        (255, 255, 255),
+        "inline standard image currently goes unrendered (renderer gap)"
+    );
+}
