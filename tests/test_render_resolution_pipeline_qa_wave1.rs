@@ -424,3 +424,72 @@ fn qa_stroke_extreme_miter_limit_parity() {
     let on = render_with_pipeline(&doc, true);
     assert_eq!(off, on, "extreme miter-limit stroke must be byte-identical");
 }
+
+// ===========================================================================
+// PROBE AREA: Fill/stroke graphics-state propagation through combos
+// (probes 10-12)
+// ===========================================================================
+
+/// Probe 10 — `B` with an active rotated and scaled CTM. Each combo
+/// operator builds two `PaintIntent`s and clones `gs` twice (once for
+/// fill, once for stroke). Both clones must inherit the same CTM; if
+/// either resets it to identity, the rotated rectangle won't paint at
+/// the right place.
+#[test]
+fn qa_combo_under_rotated_scaled_ctm_parity() {
+    // CTM: rotate 30°, scale 0.8, translate (10, 10). Then paint a
+    // rectangle through `B`. The fill side and stroke side must both
+    // honour the same CTM under the toggle.
+    let content = "\
+        0.6928 0.4 -0.4 0.6928 10 10 cm\n\
+        0 1 0 rg\n1 0 0 RG\n5 w\n\
+        0 0 40 40 re\nB\n\
+    ";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "`B` under a rotated + scaled CTM must be byte-identical");
+}
+
+/// Probe 11 — Soft-mask `/SMask` set via ExtGState; while not always
+/// implemented end-to-end, the pipeline must at minimum not diverge from
+/// the inline path when the graphics state carries an `/SMask` entry.
+/// This pins the off-vs-on parity for that case.
+#[test]
+fn qa_stroke_under_extgstate_with_smask_no_divergence() {
+    // We don't fully wire an SMask (the bytes are deliberately simple);
+    // the assertion is only that toggle-flip doesn't perturb whatever
+    // both paths produce. If the inline path ignores `/SMask` today and
+    // the pipeline does too, off == on. If they ever diverge, this test
+    // will catch it.
+    let content = "/Sm gs\n1 0 0 RG\n10 w\n20 20 60 60 re\nS\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState /SMask /None >> >>";
+    let bytes = build_pdf(content, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "/SMask entry on stroke must not introduce off-vs-on divergence");
+}
+
+/// Probe 12 — Independent clip paths active when fill and stroke happen
+/// inside the same `B` combo. The pipeline must use the same clip mask
+/// for both sub-operations; a path that tracked one clip on the inline
+/// route and another on the pipeline route would diverge.
+#[test]
+fn qa_combo_under_active_clip_parity() {
+    // Set up a clip that's a small horizontal band across the page, then
+    // do `B` of a rectangle that extends well past the band on top and
+    // bottom. Only the in-band fraction of the fill and stroke is
+    // painted. Off-vs-on parity confirms both sides see the same clip.
+    let content = "\
+        0 40 100 20 re\nW\nn\n\
+        0 1 0 rg\n1 0 0 RG\n6 w\n\
+        20 10 60 80 re\nB\n\
+    ";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "`B` under an active clip path must be byte-identical");
+}
