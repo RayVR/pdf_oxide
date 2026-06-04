@@ -29,8 +29,8 @@ use crate::rendering::text_rasterizer::TextRasterizer;
 
 use crate::fonts::FontInfo;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
-use tiny_skia::{Color, Path, PathBuilder, Pixmap, PixmapPaint, Transform};
+use std::sync::Arc;
+use tiny_skia::{Color, PathBuilder, Pixmap, PixmapPaint, Transform};
 
 /// Which path-paint side(s) [`PageRenderer::pipeline_resolve_paint_gs`]
 /// should resolve for the current operator.
@@ -3061,18 +3061,12 @@ impl PageRenderer {
         let resolved_space_obj = color_spaces.get(space_name);
         let logical = build_logical_color(space_name, components, resolved_space_obj);
 
-        // Placeholder path-fill intent. The colour stage doesn't read the
-        // path geometry — only `color`, `gs`, and `side` — but `PaintKind`
-        // requires a `Path` to construct. Materialise a unit segment once
-        // per process and re-borrow it; the previous per-call allocation
-        // showed up in the wave-1 hot path.
-        let path = placeholder_path();
-
+        // No geometry is needed here: the dispatcher only consumes the
+        // resolved RGBA to splice into the graphics state, then paints
+        // through its own (non-pipeline) rasteriser. `ColorOnly` lets
+        // the intent express that without conjuring a placeholder path.
         let intent = PaintIntent {
-            kind: PaintKind::Path {
-                path,
-                fill_rule: tiny_skia::FillRule::Winding,
-            },
+            kind: PaintKind::ColorOnly,
             side,
             gs,
             color: logical,
@@ -3128,20 +3122,6 @@ fn rgba_matches(resolved: (f32, f32, f32, f32), rgb: (f32, f32, f32), alpha: f32
         && (g - gg).abs() <= RGBA_MATCH_EPSILON
         && (b - gb).abs() <= RGBA_MATCH_EPSILON
         && (a - alpha).abs() <= RGBA_MATCH_EPSILON
-}
-
-/// A unit-length placeholder path used by `pipeline_resolve_rgba` to
-/// satisfy `PaintKind::Path`'s lifetime — the colour stage does not read
-/// path geometry, but the type system requires a `&Path` either way.
-/// Building the path once per process avoids the per-paint allocation.
-fn placeholder_path() -> &'static Path {
-    static PATH: OnceLock<Path> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let mut pb = PathBuilder::new();
-        pb.move_to(0.0, 0.0);
-        pb.line_to(0.0, 0.0);
-        pb.finish().expect("unit placeholder path is non-empty")
-    })
 }
 
 /// Build a [`LogicalColor`] from the dispatcher's view of the active colour:

@@ -28,6 +28,19 @@ use smallvec::SmallVec;
 /// match.
 #[derive(Clone, Copy)]
 pub(crate) enum PaintKind<'a> {
+    /// Colour resolution with no associated geometry. Used by callers
+    /// that only need the resolver's colour output — e.g. the page
+    /// renderer's fill / stroke / image-mask dispatcher, which paints
+    /// geometry through its own (non-pipeline) rasteriser after
+    /// splicing the resolved colour into the graphics state.
+    ///
+    /// Carries no fields because the colour stage reads only `color`,
+    /// `gs`, and `side` from the [`PaintIntent`]; emitting a fake path
+    /// to satisfy [`PaintKind::Path`] just to drive the colour stage
+    /// pollutes both the type and the hot path with allocations the
+    /// pipeline can't even observe. `ColorOnly` lets that caller
+    /// express what it actually means.
+    ColorOnly,
     /// Path fill / stroke (`f`, `F`, `S`, `B`, `b`, `f*`, `B*`, `b*`).
     /// `fill_rule` is meaningful only for fill sides; stroke sides ignore it.
     Path {
@@ -38,13 +51,12 @@ pub(crate) enum PaintKind<'a> {
     ///
     /// Reserved for a future per-glyph resolution stage. Today the
     /// text-showing operators (`Tj`, `TJ`, `'`, `"`) drive one
-    /// resolve-per-`Tj` through [`PaintKind::Path`] (via the
+    /// resolve-per-`Tj` through [`PaintKind::ColorOnly`] (via the
     /// `pipeline_resolve_text_colors` helper on the operator-walker
     /// side) and hand the resolved RGBA to the shared text rasteriser;
-    /// the colour stage does not read the glyph payload, so a
-    /// placeholder path satisfies its inputs without committing to a
-    /// per-glyph schema we'd have to extend later. This variant exists
-    /// because subsequent waves are expected to consume it:
+    /// the colour stage does not read the glyph payload, so no
+    /// per-glyph schema needs to be committed to here. This variant
+    /// exists because subsequent waves are expected to consume it:
     ///
     /// * **Per-glyph clip composition** — text rendering modes 4-7
     ///   add the glyph outline to the clipping path. A per-glyph
@@ -57,9 +69,9 @@ pub(crate) enum PaintKind<'a> {
     ///   inks against an embedded font's anti-aliased halo wants to
     ///   key off the glyph outline rather than a generic path.
     ///
-    /// Until those waves arrive the variant is unused; the
-    /// `kind_copy` pattern in [`super::pipeline`] still has to
-    /// enumerate it, but that's a one-line stub.
+    /// Until those waves arrive the variant is unused; the pipeline
+    /// composer copies it through verbatim alongside every other
+    /// variant.
     Glyph {
         glyph_id: u16,
         font: &'a Arc<FontInfo>,
