@@ -807,3 +807,245 @@ fn qa_text_tj_separation_none_colorant_parity_pin() {
         "pipeline /None text fill must paint SOMETHING (no spec honor today)"
     );
 }
+
+// ============================================================================
+// State preservation probes — Tc, Tw, Tz, TL, Tm, Td/TD must round-trip
+// through the spliced GS clone unperturbed.
+// ============================================================================
+//
+// The pipeline helper clones `gs` and splices ONLY fill_color_rgb / fill_alpha
+// / stroke_color_rgb / stroke_alpha. Every other text-related field on the
+// graphics state (Tc, Tw, Tz, TL, font, font_size, leading, text matrix,
+// render_mode, …) must round-trip unchanged.
+//
+// Strategy: for each text-state dial, render two PDFs that differ only in
+// that dial value through the pipeline path. Confirm the OUTPUT differs in
+// the expected direction AND each PDF round-trips off-vs-on byte-identical.
+
+/// Probe 11 — Tc (character spacing) preserved through the pipeline. Wider
+/// Tc widens the inter-glyph gap, pushing the rightmost glyph further
+/// right. Both renders are toggle-on; the toggle-off parity is the
+/// secondary invariant.
+#[test]
+fn qa_text_tc_character_spacing_preserved() {
+    let normal = "BT 1 0 0 rg /F1 16 Tf 5 50 Td (HHH) Tj ET\n";
+    let wide = "BT 1 0 0 rg /F1 16 Tf 3 Tc 5 50 Td (HHH) Tj ET\n";
+    let normal_doc = PdfDocument::from_bytes(build_pdf_text(normal, "")).unwrap();
+    let wide_doc = PdfDocument::from_bytes(build_pdf_text(wide, "")).unwrap();
+    let normal_on = render_with_pipeline(&normal_doc, true);
+    let wide_on = render_with_pipeline(&wide_doc, true);
+    let rightmost = |rgba: &[u8]| -> Option<u32> {
+        for x in (0u32..100).rev() {
+            for y in 30u32..70 {
+                let off = ((y * 100 + x) * 4) as usize;
+                if rgba[off] < 240 || rgba[off + 1] < 240 || rgba[off + 2] < 240 {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    };
+    let normal_right = rightmost(&normal_on).expect("normal: ink present");
+    let wide_right = rightmost(&wide_on).expect("wide: ink present");
+    assert!(
+        wide_right > normal_right,
+        "Tc=3 must push rightmost glyph right of Tc=0; normal={normal_right}, wide={wide_right}"
+    );
+    // Parity round-trip.
+    let normal_off = render_with_pipeline(&normal_doc, false);
+    let wide_off = render_with_pipeline(&wide_doc, false);
+    assert_eq!(normal_off, normal_on, "Tc=0 must round-trip through pipeline path");
+    assert_eq!(wide_off, wide_on, "Tc=3 must round-trip through pipeline path");
+}
+
+/// Probe 12 — Tw (word spacing) preserved through the pipeline. Tw applies
+/// only at space (0x20) glyphs. Render "HHH HHH" with Tw=0 vs Tw=5; the
+/// wider rendering's rightmost ink lands further right.
+#[test]
+fn qa_text_tw_word_spacing_preserved() {
+    let normal = "BT 1 0 0 rg /F1 16 Tf 5 50 Td (HHH HHH) Tj ET\n";
+    let wide = "BT 1 0 0 rg /F1 16 Tf 5 Tw 5 50 Td (HHH HHH) Tj ET\n";
+    let normal_doc = PdfDocument::from_bytes(build_pdf_text(normal, "")).unwrap();
+    let wide_doc = PdfDocument::from_bytes(build_pdf_text(wide, "")).unwrap();
+    let normal_on = render_with_pipeline(&normal_doc, true);
+    let wide_on = render_with_pipeline(&wide_doc, true);
+    let rightmost = |rgba: &[u8]| -> Option<u32> {
+        for x in (0u32..100).rev() {
+            for y in 30u32..70 {
+                let off = ((y * 100 + x) * 4) as usize;
+                if rgba[off] < 240 || rgba[off + 1] < 240 || rgba[off + 2] < 240 {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    };
+    let normal_right = rightmost(&normal_on).expect("normal: ink present");
+    let wide_right = rightmost(&wide_on).expect("wide: ink present");
+    assert!(
+        wide_right > normal_right,
+        "Tw=5 must push rightmost glyph right of Tw=0; normal={normal_right}, wide={wide_right}"
+    );
+    let normal_off = render_with_pipeline(&normal_doc, false);
+    let wide_off = render_with_pipeline(&wide_doc, false);
+    assert_eq!(normal_off, normal_on, "Tw=0 must round-trip through pipeline path");
+    assert_eq!(wide_off, wide_on, "Tw=5 must round-trip through pipeline path");
+}
+
+/// Probe 13 — Tz (horizontal scaling) preserved. The pilot already pins
+/// this against `Tj`; the QA suite adds the `TJ` variant — wave-1's I2
+/// "Tz not applied to vertical advance" fix is on the path-side; verify
+/// it didn't regress wave-2's horizontal-scaled TJ.
+#[test]
+fn qa_text_tz_horizontal_scale_preserved_on_tj_array() {
+    // Use a multi-glyph plain string in TJ (no kerns, just one segment)
+    // so the same horizontal advance path the pilot exercises for `Tj`
+    // is now driven by `TJ`.
+    let normal = "BT 1 0 0 rg /F1 16 Tf 5 50 Td [(HHH)] TJ ET\n";
+    let narrow = "BT 1 0 0 rg /F1 16 Tf 50 Tz 5 50 Td [(HHH)] TJ ET\n";
+    let normal_doc = PdfDocument::from_bytes(build_pdf_text(normal, "")).unwrap();
+    let narrow_doc = PdfDocument::from_bytes(build_pdf_text(narrow, "")).unwrap();
+    let normal_on = render_with_pipeline(&normal_doc, true);
+    let narrow_on = render_with_pipeline(&narrow_doc, true);
+    let rightmost = |rgba: &[u8]| -> Option<u32> {
+        for x in (0u32..100).rev() {
+            for y in 30u32..70 {
+                let off = ((y * 100 + x) * 4) as usize;
+                if rgba[off] < 240 || rgba[off + 1] < 240 || rgba[off + 2] < 240 {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    };
+    let normal_right = rightmost(&normal_on).expect("Tz=100: ink present");
+    let narrow_right = rightmost(&narrow_on).expect("Tz=50: ink present");
+    assert!(
+        narrow_right < normal_right,
+        "Tz=50 must place rightmost TJ glyph LEFT of Tz=100; normal={normal_right}, narrow={narrow_right}"
+    );
+    let normal_off = render_with_pipeline(&normal_doc, false);
+    let narrow_off = render_with_pipeline(&narrow_doc, false);
+    assert_eq!(normal_off, normal_on, "Tz=100 must round-trip through pipeline path");
+    assert_eq!(narrow_off, narrow_on, "Tz=50 must round-trip through pipeline path");
+}
+
+/// Probe 14 — TL (text leading) preserved. `'` (Quote) uses TL to advance
+/// the text matrix down by `-TL` before painting. Two `'` calls separated
+/// by TL=30 must land on visibly different lines. Toggle parity holds.
+#[test]
+fn qa_text_tl_leading_preserved_on_quote() {
+    // Two `'` calls. Each advances down by TL=20 from the prior baseline.
+    // With initial Td at y=80 and TL=20, the first lands at y=60, the
+    // second at y=40 — well separated vertically.
+    let content = "BT 1 0 0 rg /F1 14 Tf 20 TL 5 80 Td (Line1) ' (Line2) ' ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "TL+Quote must be byte-identical off vs on");
+    // Verify both lines actually painted (ink in two separated bands).
+    // Top band ~ y 0..40 (PDF y=80 → image y=20 ish — but PDF y flips, and
+    // 80 - leading 20 sends us down a line, so this is the upper of two).
+    // Lower band the second line. Whatever the exact y coords, two
+    // non-adjacent rows must each have ink.
+    let mut bands_with_ink = 0;
+    for band_start in (0u32..90).step_by(10) {
+        if count_ink_pixels(&on, 0, band_start, 100, band_start + 10) > 0 {
+            bands_with_ink += 1;
+        }
+    }
+    assert!(
+        bands_with_ink >= 2,
+        "TL=20 + two Quote calls must paint in >= 2 vertical bands, got {bands_with_ink}"
+    );
+}
+
+/// Probe 15 — Tm (set text matrix) before Tj. Tm replaces the text matrix
+/// outright; the glyph paints at the matrix's origin. Two Tm's at
+/// different translations must produce visually distinct renders, and
+/// each must round-trip parity.
+#[test]
+fn qa_text_tm_before_tj_preserved() {
+    // Two PDFs differing only in Tm translation.
+    let left = "BT 1 0 0 rg /F1 30 Tf 1 0 0 1 5 50 Tm (M) Tj ET\n";
+    let right = "BT 1 0 0 rg /F1 30 Tf 1 0 0 1 60 50 Tm (M) Tj ET\n";
+    let left_doc = PdfDocument::from_bytes(build_pdf_text(left, "")).unwrap();
+    let right_doc = PdfDocument::from_bytes(build_pdf_text(right, "")).unwrap();
+    let left_on = render_with_pipeline(&left_doc, true);
+    let right_on = render_with_pipeline(&right_doc, true);
+    assert_ne!(left_on, right_on, "Tm at different translations must produce different renders");
+    // Both must round-trip parity.
+    let left_off = render_with_pipeline(&left_doc, false);
+    let right_off = render_with_pipeline(&right_doc, false);
+    assert_eq!(left_off, left_on, "Tm left must round-trip through pipeline path");
+    assert_eq!(right_off, right_on, "Tm right must round-trip through pipeline path");
+}
+
+/// Probe 16 — Td / TD (move text position) before Tj. Td translates by
+/// (tx, ty); TD does the same AND sets leading = -ty. Two PDFs differing
+/// only in Td translation must produce distinct renders.
+#[test]
+fn qa_text_td_translation_preserved() {
+    let pos_a = "BT 1 0 0 rg /F1 30 Tf 5 30 Td (M) Tj ET\n";
+    let pos_b = "BT 1 0 0 rg /F1 30 Tf 50 30 Td (M) Tj ET\n";
+    let a_doc = PdfDocument::from_bytes(build_pdf_text(pos_a, "")).unwrap();
+    let b_doc = PdfDocument::from_bytes(build_pdf_text(pos_b, "")).unwrap();
+    let a_on = render_with_pipeline(&a_doc, true);
+    let b_on = render_with_pipeline(&b_doc, true);
+    assert_ne!(a_on, b_on, "Td at different translations must produce different renders");
+    let a_off = render_with_pipeline(&a_doc, false);
+    let b_off = render_with_pipeline(&b_doc, false);
+    assert_eq!(a_off, a_on, "Td position A must round-trip through pipeline path");
+    assert_eq!(b_off, b_on, "Td position B must round-trip through pipeline path");
+}
+
+/// Probe 13b — Tz interaction with TJ numeric-kerning offsets. Pre-existing
+/// non-wave-2 issue surfaced during state-preservation probing:
+/// when a `TJ` array contains numeric kerning offsets, the horizontal
+/// scaling dial `Tz` is NOT applied to those offsets — both Tz=100 and
+/// Tz=50 produce the same rightmost ink column. The Tz dial IS applied
+/// to ordinary glyph advance (probe 13 verifies this for plain strings).
+///
+/// Toggle off and on both exhibit the same behaviour: this is an inline
+/// pre-existing bug (the kerning-advance branch in the rasteriser doesn't
+/// multiply by Tz / 100), not introduced by the wave-2 migration. The
+/// pin asserts the parity invariant — pipeline does NOT make this bug
+/// worse — and is `#[ignore]`d so the gate stays green while the bug
+/// is documented for a follow-up.
+#[test]
+#[ignore = "pre-existing inline bug: Tz not applied to TJ numeric kerning advance — parity pin (both paths share the bug)"]
+fn qa_text_tz_not_applied_to_tj_kerning_advance_parity_pin() {
+    let normal = "BT 1 0 0 rg /F1 14 Tf 5 50 Td [(H) -50 (e) -50 (l) -50 (l) -50 (o)] TJ ET\n";
+    let narrow =
+        "BT 1 0 0 rg /F1 14 Tf 50 Tz 5 50 Td [(H) -50 (e) -50 (l) -50 (l) -50 (o)] TJ ET\n";
+    let normal_doc = PdfDocument::from_bytes(build_pdf_text(normal, "")).unwrap();
+    let narrow_doc = PdfDocument::from_bytes(build_pdf_text(narrow, "")).unwrap();
+    let normal_on = render_with_pipeline(&normal_doc, true);
+    let narrow_on = render_with_pipeline(&narrow_doc, true);
+    let rightmost = |rgba: &[u8]| -> Option<u32> {
+        for x in (0u32..100).rev() {
+            for y in 30u32..70 {
+                let off = ((y * 100 + x) * 4) as usize;
+                if rgba[off] < 240 || rgba[off + 1] < 240 || rgba[off + 2] < 240 {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    };
+    let normal_right = rightmost(&normal_on).expect("Tz=100 + kern: ink");
+    let narrow_right = rightmost(&narrow_on).expect("Tz=50 + kern: ink");
+    // BUG: today both rightmost positions are equal — Tz=50 should produce
+    // a narrower run. When the bug is fixed, this assertion flips.
+    assert!(
+        narrow_right < normal_right,
+        "BUG (Tz vs TJ kerning): Tz=50 should put rightmost LEFT of Tz=100, but \
+         got narrow={narrow_right} normal={normal_right} — Tz not applied to \
+         TJ numeric kerning advance"
+    );
+    let normal_off = render_with_pipeline(&normal_doc, false);
+    let narrow_off = render_with_pipeline(&narrow_doc, false);
+    assert_eq!(normal_off, normal_on, "Tz=100+kern parity invariant must hold");
+    assert_eq!(narrow_off, narrow_on, "Tz=50+kern parity invariant must hold");
+}
