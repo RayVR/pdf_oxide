@@ -1835,13 +1835,26 @@ fn solid_image_mask_bytes(width: u32, height: u32) -> Vec<u8> {
     vec![0x00u8; row_bytes * height as usize]
 }
 
-// ---------- ImageMask parity tests (Device* fills) ----------
+// ---------- ImageMask rendering-correctness tests (Device* fills) ----------
+//
+// These probe `render_image_mask` for each Device-family fill colour
+// space. They are NOT pipeline off-vs-on parity tests despite the
+// surrounding test file's theme — the wave-3 routing makes
+// `pipeline_resolve_paint_gs(ImageMask)` short-circuit on Device-family
+// fills (D-3: resolved RGBA equals `gs.fill_color_rgb`, helper returns
+// `None`), so both toggle states pass the same `gs` to
+// `render_image_mask` and execute byte-identical code. The `assert_eq!`
+// between the two renders pins that byte-identical output (a regression
+// for `render_image_mask` itself, not for the pipeline machinery; the
+// path-fill pilot at the top of the file is what proves the operator
+// pipeline machinery byte-identity). The centre-pixel assertions pin
+// the correctness of each Device-family fill's pixel output.
 
 #[test]
-fn pilot_image_mask_device_rgb_parity_pipeline_off_vs_on() {
-    // DeviceRGB fill on an ImageMask. Both inline and pipeline paths
-    // read the fill colour from `gs.fill_color_rgb` (set by `rg`); the
-    // resolved colour is the same, so pixmaps must match byte-for-byte.
+fn pilot_image_mask_render_device_rgb_byte_identical() {
+    // DeviceRGB fill on an ImageMask. `rg` writes `gs.fill_color_rgb`
+    // directly; `render_image_mask` consumes that. Both toggle states
+    // exercise the same path and produce a byte-identical pixmap.
     //
     // CTM: place a 100×100 stencil over the whole page (`100 0 0 100 0 0
     // cm`). Solid stencil → the page is fully painted red.
@@ -1851,7 +1864,7 @@ fn pilot_image_mask_device_rgb_parity_pipeline_off_vs_on() {
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ImageMask DeviceRGB fill must be byte-identical off vs on");
+    assert_eq!(off, on, "ImageMask DeviceRGB fill must produce a byte-identical pixmap");
 
     // Sanity: the centre pixel is red.
     let (r, g, b, _a) = center_pixel(&on);
@@ -1859,14 +1872,17 @@ fn pilot_image_mask_device_rgb_parity_pipeline_off_vs_on() {
 }
 
 #[test]
-fn pilot_image_mask_device_gray_parity_pipeline_off_vs_on() {
+fn pilot_image_mask_render_device_gray_byte_identical() {
+    // DeviceGray fill on an ImageMask. `g` writes `gs.fill_color_rgb`
+    // via the gray-to-RGB expansion (`(g, g, g)`); `render_image_mask`
+    // consumes that. Both toggle states are byte-identical.
     let mask = solid_image_mask_bytes(8, 8);
     let content = "q\n0.25 g\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ImageMask DeviceGray fill must be byte-identical off vs on");
+    assert_eq!(off, on, "ImageMask DeviceGray fill must produce a byte-identical pixmap");
 
     let (r, g, b, _a) = center_pixel(&on);
     // 0.25 g → grey ≈ 64. Allow a generous tolerance for resampling/blend.
@@ -1877,26 +1893,28 @@ fn pilot_image_mask_device_gray_parity_pipeline_off_vs_on() {
 }
 
 #[test]
-fn pilot_image_mask_device_cmyk_parity_pipeline_off_vs_on() {
-    // Pure magenta (CMYK 0,1,0,0). Additive-clamp fallback → RGB(1,0,1).
+fn pilot_image_mask_render_device_cmyk_byte_identical() {
+    // DeviceCMYK fill on an ImageMask. `k` writes `gs.fill_color_rgb`
+    // via the additive-clamp `cmyk_to_rgb`. Both toggle states are
+    // byte-identical. Pure magenta (CMYK 0,1,0,0) → RGB(1,0,1).
     let mask = solid_image_mask_bytes(8, 8);
     let content = "q\n0 1 0 0 k\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ImageMask DeviceCMYK fill must be byte-identical off vs on");
+    assert_eq!(off, on, "ImageMask DeviceCMYK fill must produce a byte-identical pixmap");
 }
 
 #[test]
-fn pilot_image_mask_indexed_parity_pipeline_off_vs_on() {
+fn pilot_image_mask_render_indexed_byte_identical() {
     // Indexed colour space — palette of 4 RGB triplets at indices 0..3.
-    // Wave-3 reality: neither the inline path (page_renderer.rs ~:974)
-    // nor the pipeline performs the palette lookup yet — both fall back
-    // to `index / 255` as a gray value (the inline branch was wired to
-    // match the pipeline's `resolve_indexed` gray fallback so the
-    // toggle agrees). Parity off-vs-on covers the gray-fallback
-    // agreement.
+    // Wave-3 reality: neither the inline `sc` branch (page_renderer.rs
+    // ~:974) nor the pipeline performs the palette lookup yet — both
+    // fall back to `index / 255` as a gray value (the inline branch was
+    // wired to match the pipeline's `resolve_indexed` gray fallback so
+    // the toggle agrees). Byte-identical output covers the
+    // gray-fallback agreement.
     //
     // We pick a non-zero index (128) so the fallback produces a
     // distinctive mid-gray instead of near-black — that lets us pin
@@ -1911,7 +1929,7 @@ fn pilot_image_mask_indexed_parity_pipeline_off_vs_on() {
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ImageMask Indexed fill must be byte-identical off vs on");
+    assert_eq!(off, on, "ImageMask Indexed fill must produce a byte-identical pixmap");
 
     // Pin the gray-fallback value. `128 / 255 ≈ 0.502 → ≈128`. If real
     // palette lookup ever lands, index 128 is out of range for the
