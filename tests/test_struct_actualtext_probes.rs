@@ -1217,7 +1217,6 @@ fn probe32_actualtext_with_line_breaks_pin_behaviour() {
 /// the buffered Tj-span path and exposed by ActualText, not
 /// introduced by it.
 #[test]
-#[ignore = "BUG: MC-scope ActualText inside /Artifact leaks (see flush_tj_span_buffer hardcoded artifact_type)"]
 fn probe34_actualtext_on_artifact_mc_does_not_leak() {
     // BDC tag = Artifact, properties include /ActualText.
     let content = b"BT\n/F1 12 Tf\n50 700 Td\n\
@@ -1289,7 +1288,6 @@ fn probe34_actualtext_on_artifact_mc_does_not_leak() {
 /// `flush_tj_span_buffer` reads `self.current_artifact_type()`
 /// like `flush_tj_buffer` does (see `src/extractors/text.rs:6363`).
 #[test]
-#[ignore = "BUG: flush_tj_span_buffer hardcodes artifact_type: None — raw /Artifact glyphs leak"]
 fn probe34b_vanilla_artifact_raw_glyph_pin_behaviour() {
     let content = b"BT\n/F1 12 Tf\n50 700 Td\n\
                     /Artifact << /Type /Pagination >> BDC\n\

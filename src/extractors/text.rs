@@ -7650,7 +7650,7 @@ impl<'doc> TextExtractor<'doc> {
                     is_italic: is_italic_buf,
                     is_monospace: buffer.is_monospace,
                     primary_detected: false,
-                    artifact_type: None,
+                    artifact_type: self.current_artifact_type(),
                     char_widths: {
                         let mut cw = std::mem::take(&mut buffer.char_widths);
                         let h = buffer.user_h_scale;

@@ -8927,6 +8927,19 @@ impl PdfDocument {
             return Ok(text);
         }
 
+        // Drop content marked /Artifact (PDF Spec ISO 32000-1:2008
+        // §14.8.2.2 — headers, footers, page numbers, decorations).
+        // The geometric branch in `assemble_text_from_spans` applies
+        // the same filter; tagged PDFs taking the structure-order path
+        // must honour it too, otherwise artifact spans (including any
+        // MC-scope `/ActualText` replacements inside an `/Artifact`
+        // BDC) leak into output. Untagged-PDF running-header
+        // detection runs at document level and feeds the same flag.
+        let all_spans: Vec<TextSpan> = all_spans
+            .into_iter()
+            .filter(|s| s.artifact_type.is_none())
+            .collect();
+
         // Step 2: Build MCID → Vec<TextSpan> map
         let mut mcid_map: HashMap<u32, Vec<TextSpan>> = HashMap::new();
         let mut spans_without_mcid: Vec<TextSpan> = Vec::new();
