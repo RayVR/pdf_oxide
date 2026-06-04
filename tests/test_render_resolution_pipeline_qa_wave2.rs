@@ -1049,3 +1049,207 @@ fn qa_text_tz_not_applied_to_tj_kerning_advance_parity_pin() {
     assert_eq!(normal_off, normal_on, "Tz=100+kern parity invariant must hold");
     assert_eq!(narrow_off, narrow_on, "Tz=50+kern parity invariant must hold");
 }
+
+// ============================================================================
+// Font-system interaction probes — different font subtypes must remain
+// byte-identical off vs on (the pipeline routes colour, not font data).
+// ============================================================================
+
+/// Build a one-page text-fixture PDF with a CID Type 0 font tree at object
+/// 5 (Type 0 wraps a CIDFontType2 descendant, using `/Identity-H`
+/// encoding). No embedded font program — the rasteriser falls back to a
+/// system font; correctness of the system fallback isn't probed here,
+/// only parity off vs on under the pipeline migration.
+fn build_pdf_cid_type0(content_ops: &str) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // Object 5: Type 0 font wrapping descendant CIDFontType2 at obj 6, with
+    // /Identity-H encoding and a /CIDSystemInfo at obj 7. No /ToUnicode.
+    let type0_off = buf.len();
+    buf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /Helvetica \
+          /Encoding /Identity-H /DescendantFonts [6 0 R] >>\nendobj\n",
+    );
+
+    let cidfont_off = buf.len();
+    buf.extend_from_slice(
+        b"6 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica \
+          /CIDSystemInfo 7 0 R /FontDescriptor 8 0 R /DW 500 >>\nendobj\n",
+    );
+
+    let csi_off = buf.len();
+    buf.extend_from_slice(
+        b"7 0 obj\n<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\nendobj\n",
+    );
+
+    let fd_off = buf.len();
+    buf.extend_from_slice(
+        b"8 0 obj\n<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 \
+          /FontBBox [-166 -225 1000 931] /ItalicAngle 0 /Ascent 718 \
+          /Descent -207 /CapHeight 718 /StemV 88 >>\nendobj\n",
+    );
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+    for off in [
+        cat_off,
+        pages_off,
+        page_off,
+        stream_off,
+        type0_off,
+        cidfont_off,
+        csi_off,
+        fd_off,
+    ] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Probe 17 — CID Type 0 font on `Tj`. Identity-H encoding means each
+/// pair of source bytes is a 16-bit CID. Whether the rasteriser falls
+/// back to a system font or paints glyphs correctly is out of scope;
+/// what we pin is the toggle-parity invariant — the pipeline migration
+/// must not perturb the byte-identical output for Type 0 fonts.
+#[test]
+fn qa_text_cid_type0_font_parity() {
+    // Identity-H two-byte CIDs. (\x00\x48) = CID 72 (typically 'H' if the
+    // descendant font is identity-mapped to Latin glyphs). Whatever glyph
+    // the system fallback paints, parity is the invariant.
+    let content = "BT 1 0 0 rg /F1 40 Tf 10 30 Td <0048> Tj ET\n";
+    let bytes = build_pdf_cid_type0(content);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "CID Type 0 font Tj must be byte-identical off vs on (pipeline routes colour, not font)"
+    );
+}
+
+/// Probe 18 — "Embedded subset" stand-in: simple Type 1 font with no
+/// /FontFile / FontFile2 / FontFile3 reference (the rasteriser treats it
+/// as a non-embedded standard font). The actual embedded-subset code path
+/// requires shipping binary font data; the wave-2 migration's parity
+/// invariant doesn't depend on the *kind* of font data the rasteriser
+/// loads, so the proxy here is sufficient to pin parity. A future suite
+/// shipping an embedded subset can tighten this to byte-identical pixels
+/// on a known subset font.
+#[test]
+fn qa_text_embedded_subset_stand_in_parity() {
+    // Simple Type 1 with no FontFile reference — rasteriser routes
+    // through its standard-font fallback. Parity is the invariant.
+    let content = "BT 0 0 1 rg /F1 30 Tf 10 30 Td (Helvetica) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "embedded-subset stand-in Tj must be byte-identical off vs on");
+}
+
+/// Probe 19 — Built-in Helvetica fallback. Most tests use this implicitly;
+/// this is the explicit pin so the QA suite has a named anchor: the
+/// standard-14 Helvetica path is the most common rendering path and must
+/// be byte-identical under the toggle.
+#[test]
+fn qa_text_built_in_helvetica_fallback_parity() {
+    let content = "BT 0.2 0.4 0.8 rg /F1 24 Tf 10 50 Td (Built-in font!) Tj ET\n";
+    let bytes = build_pdf_text(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(off, on, "built-in Helvetica Tj must be byte-identical off vs on");
+}
+
+/// Probe 20 — Unicode mapping via a ToUnicode CMap stream. We don't ship a
+/// binary font with a ToUnicode here; the more important parity invariant
+/// is that adding a /ToUnicode entry to the font dict doesn't perturb
+/// rendering under the pipeline migration. ToUnicode affects extraction,
+/// not rendering — the assertion is byte-equal pixels.
+fn build_pdf_text_with_tounicode(content_ops: &str) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content_ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let font_off = buf.len();
+    buf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+          /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>\nendobj\n",
+    );
+
+    // Minimal valid ToUnicode CMap mapping byte 0x48 ('H') to U+0048.
+    let cmap_body = "/CIDInit /ProcSet findresource begin\n\
+12 dict begin\nbegincmap\n\
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+1 beginbfchar\n<48> <0048>\nendbfchar\n\
+endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n";
+    let cmap_off = buf.len();
+    let cmap_hdr = format!("6 0 obj\n<< /Length {} >>\nstream\n", cmap_body.len());
+    buf.extend_from_slice(cmap_hdr.as_bytes());
+    buf.extend_from_slice(cmap_body.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, font_off, cmap_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+#[test]
+fn qa_text_unicode_via_tounicode_cmap_parity() {
+    // The text is "H" so the simple CMap above is exercised.
+    let content = "BT 1 0 0 rg /F1 50 Tf 10 30 Td (H) Tj ET\n";
+    let bytes = build_pdf_text_with_tounicode(content);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline(&doc, false);
+    let on = render_with_pipeline(&doc, true);
+    assert_eq!(
+        off, on,
+        "Tj with ToUnicode CMap-bearing font must be byte-identical off vs on \
+         (rendering ignores ToUnicode; pipeline routes colour)"
+    );
+}
