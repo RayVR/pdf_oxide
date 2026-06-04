@@ -2445,22 +2445,15 @@ impl PageRenderer {
         let src_w = rgba_image.width();
         let src_h = rgba_image.height();
 
-        // PDF images occupy a unit square in user space; image rows are top-to-bottom
-        // (opposite of PDF's bottom-to-top y axis), so the pre_scale flips them.
-        let image_transform = transform
-            .pre_translate(0.0, 1.0)
-            .pre_scale(1.0 / src_w as f32, -1.0 / src_h as f32);
-
-        let mut paint = PixmapPaint::default();
-        paint.opacity = gs.fill_alpha;
-        paint.blend_mode = crate::rendering::pdf_blend_mode_to_skia(&gs.blend_mode);
+        let image_transform = image_unit_square_transform(transform, src_w, src_h);
+        let mut paint = pixmap_paint_for_image_blit(image_transform, gs.fill_alpha, &gs.blend_mode);
 
         // Fast path: SIMD pre-resize when the transform is a pure scale+translate and
         // the image is being downscaled.  fast_image_resize (AVX2/SSE4.1/NEON) resizes
         // to exact output dimensions; we then blit the already-correct pixels at the
         // right position with a translate-only transform and Nearest quality (no second
         // resampling pass).  For rotated/sheared transforms or upscaling, fall through
-        // to the tiny-skia bilinear/bicubic path.
+        // to the tiny-skia bilinear/bicubic path (already selected by the helper above).
         let use_fast = image_transform.kx.abs() <= 1e-4
             && image_transform.ky.abs() <= 1e-4
             && image_transform.sx > 0.0
@@ -2472,27 +2465,20 @@ impl PageRenderer {
             let dst_h = ((image_transform.sy * src_h as f32).round() as u32).max(1);
             let resized = resize_rgba(rgba_image.as_raw(), src_w, src_h, dst_w, dst_h);
             if let Some(pixels) = resized {
+                // SIMD pre-resize produced the exact output dimensions —
+                // the subsequent blit is 1:1, so override to Nearest to
+                // skip a second resampling pass.
                 paint.quality = tiny_skia::FilterQuality::Nearest;
                 let t = Transform::from_translate(image_transform.tx, image_transform.ty);
                 (dst_w, dst_h, pixels, t)
             } else {
-                // fast_image_resize failed; fall back to bilinear via tiny_skia
-                let (xs, ys) = image_transform.get_scale();
-                paint.quality = if xs >= 1.0 || ys >= 1.0 {
-                    tiny_skia::FilterQuality::Bicubic
-                } else {
-                    tiny_skia::FilterQuality::Bilinear
-                };
+                // fast_image_resize failed; fall back to tiny_skia
+                // resampling with the helper's chosen quality.
                 (src_w, src_h, rgba_image.into_raw(), image_transform)
             }
         } else {
-            // Rotated / sheared / upscaling path: let tiny_skia resample.
-            let (xs, ys) = image_transform.get_scale();
-            paint.quality = if xs >= 1.0 || ys >= 1.0 {
-                tiny_skia::FilterQuality::Bicubic
-            } else {
-                tiny_skia::FilterQuality::Bilinear
-            };
+            // Rotated / sheared / upscaling path: let tiny_skia resample
+            // with the helper's chosen quality.
             (src_w, src_h, rgba_image.into_raw(), image_transform)
         };
 
@@ -2632,20 +2618,11 @@ impl PageRenderer {
             }
         }
 
-        // PDF image space → user space: same flip as in `render_image`.
-        let image_transform = transform
-            .pre_translate(0.0, 1.0)
-            .pre_scale(1.0 / width as f32, -1.0 / height as f32);
-
-        let mut paint = PixmapPaint::default();
-        paint.opacity = 1.0; // fill_alpha already baked into the stencil pixels.
-        paint.blend_mode = crate::rendering::pdf_blend_mode_to_skia(&gs.blend_mode);
-        let (xs, ys) = image_transform.get_scale();
-        paint.quality = if xs >= 1.0 || ys >= 1.0 {
-            tiny_skia::FilterQuality::Bicubic
-        } else {
-            tiny_skia::FilterQuality::Bilinear
-        };
+        let image_transform = image_unit_square_transform(transform, width, height);
+        // Opacity is 1.0 because fill_alpha is already baked into the
+        // stencil pixels by the loop above; blend mode + scale-driven
+        // quality come from the shared helper.
+        let paint = pixmap_paint_for_image_blit(image_transform, 1.0, &gs.blend_mode);
 
         if let Some(stencil_pixmap) = Pixmap::from_vec(
             rgba,
@@ -3303,6 +3280,54 @@ fn encode_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
 /// Combine two transformations.
 fn combine_transforms(base: Transform, ctm: &Matrix) -> Transform {
     base.pre_concat(Transform::from_row(ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f))
+}
+
+/// Build the image-space → user-space transform for a PDF image blit.
+///
+/// Per ISO 32000-1 §8.9.5, PDF images live in a unit square in the user
+/// coordinate system; image rows are top-to-bottom (opposite of PDF's
+/// bottom-to-top y axis). The pre-translate-by-1-in-y + pre-scale-by
+/// `1/src_w, -1/src_h` flips the rows AND normalises the source-pixel
+/// extent to the unit square, so the caller's `parent` CTM places the
+/// image where the PDF demands.
+///
+/// Shared by `render_image` and `render_image_mask`.
+fn image_unit_square_transform(parent: Transform, src_w: u32, src_h: u32) -> Transform {
+    parent
+        .pre_translate(0.0, 1.0)
+        .pre_scale(1.0 / src_w as f32, -1.0 / src_h as f32)
+}
+
+/// Build the `PixmapPaint` used to blit an already-flipped image into
+/// the page pixmap.
+///
+/// `image_transform` must already be the output of
+/// [`image_unit_square_transform`] (or the SIMD fast path's
+/// translate-only equivalent); the helper reads its scale to pick
+/// Bicubic when the blit is an upscale or 1:1 and Bilinear when it is a
+/// downscale — the same heuristic both `render_image` and
+/// `render_image_mask` used independently before this consolidation.
+/// `opacity` is the source's alpha (the std-image path passes
+/// `gs.fill_alpha`; the ImageMask path bakes alpha into the stencil
+/// pixels and passes `1.0`). `blend_mode_pdf` is the PDF blend-mode
+/// name from `gs.blend_mode`.
+///
+/// Shared by `render_image` and `render_image_mask`.
+fn pixmap_paint_for_image_blit(
+    image_transform: Transform,
+    opacity: f32,
+    blend_mode_pdf: &str,
+) -> PixmapPaint {
+    let mut paint = PixmapPaint::default();
+    paint.opacity = opacity;
+    paint.blend_mode = crate::rendering::pdf_blend_mode_to_skia(blend_mode_pdf);
+    let (xs, ys) = image_transform.get_scale();
+    paint.quality = if xs >= 1.0 || ys >= 1.0 {
+        tiny_skia::FilterQuality::Bicubic
+    } else {
+        tiny_skia::FilterQuality::Bilinear
+    };
+    paint
 }
 
 /// Convert DeviceCMYK (0.0–1.0) to DeviceRGB (0.0–1.0) per ISO 32000-1:2008
