@@ -598,10 +598,10 @@ impl PageRenderer {
         let mut current_path = PathBuilder::new();
         let mut pending_clip: Option<(tiny_skia::Path, tiny_skia::FillRule)> = None;
         let mut clip_stack: Vec<Option<tiny_skia::Mask>> = vec![None]; // Start with no clip at depth 0
-        // §11.6.5.2 soft-mask stack — mirrors `clip_stack` so q/Q save/restore
-        // the active mask along with the rest of the graphics state. The
-        // `Option<Mask>` is a pre-rendered alpha buffer (subtype `/Alpha`);
-        // see `materialise_soft_mask_alpha` for how it is built.
+                                                                       // §11.6.5.2 soft-mask stack — mirrors `clip_stack` so q/Q save/restore
+                                                                       // the active mask along with the rest of the graphics state. The
+                                                                       // `Option<Mask>` is a pre-rendered alpha buffer (subtype `/Alpha`);
+                                                                       // see `materialise_soft_mask_alpha` for how it is built.
         let mut soft_mask_stack: Vec<Option<tiny_skia::Mask>> = vec![None];
         // §11.6.6.2 knockout backdrop. When the enclosing transparency group
         // has /K true the parent calls us with a snapshot of the group's
@@ -1508,7 +1508,7 @@ impl PageRenderer {
                         let gs = gs_stack.current();
                         let advance = if excluded_layer_depth == 0 {
                             let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
-                        let clip = clip_owned.as_deref();
+                            let clip = clip_owned.as_deref();
                             let transform = combine_transforms(base_transform, &gs.ctm);
                             log::debug!(
                                 "TJ: rendering array at Tm=[{}, {}, {}, {}, {}, {}]",
@@ -1713,10 +1713,8 @@ impl PageRenderer {
                                 // §11.6.5.2: the SMask group is rendered at the
                                 // CTM that was current at install time, not the
                                 // page-level base transform alone.
-                                let install_transform = combine_transforms(
-                                    base_transform,
-                                    &gs_stack.current().ctm,
-                                );
+                                let install_transform =
+                                    combine_transforms(base_transform, &gs_stack.current().ctm);
                                 // Cache reuse: only when the install CTM
                                 // matches bitwise. A different CTM produces a
                                 // different mask, so falling through to the
@@ -1741,8 +1739,7 @@ impl PageRenderer {
                                         resources,
                                     ) {
                                         Ok(mask) => {
-                                            entry.cached_soft_mask_alpha =
-                                                Some(mask.clone());
+                                            entry.cached_soft_mask_alpha = Some(mask.clone());
                                             entry.cached_install_transform =
                                                 Some(install_transform);
                                             if let Some(slot) = soft_mask_stack.last_mut() {
@@ -1750,10 +1747,7 @@ impl PageRenderer {
                                             }
                                         },
                                         Err(e) => {
-                                            log::warn!(
-                                                "Skipping SMask on /{}: {}",
-                                                dict_name, e
-                                            );
+                                            log::warn!("Skipping SMask on /{}: {}", dict_name, e);
                                         },
                                     }
                                 }
@@ -2531,7 +2525,6 @@ impl PageRenderer {
 
         Ok(())
     }
-
 }
 
 /// Which channel of the rendered SMask group becomes the alpha mask buffer
@@ -2589,10 +2582,7 @@ fn parse_soft_mask_transfer(
             let c1_arr = dict.get("C1").and_then(|o| o.as_array());
             let c0 = if let Some(arr) = c0_arr {
                 if arr.len() != 1 {
-                    log::debug!(
-                        "SMask /TR Type 2 has {}-component /C0; expected 1",
-                        arr.len()
-                    );
+                    log::debug!("SMask /TR Type 2 has {}-component /C0; expected 1", arr.len());
                     return None;
                 }
                 as_f64(arr.first()?).unwrap_or(0.0)
@@ -2601,10 +2591,7 @@ fn parse_soft_mask_transfer(
             };
             let c1 = if let Some(arr) = c1_arr {
                 if arr.len() != 1 {
-                    log::debug!(
-                        "SMask /TR Type 2 has {}-component /C1; expected 1",
-                        arr.len()
-                    );
+                    log::debug!("SMask /TR Type 2 has {}-component /C1; expected 1", arr.len());
                     return None;
                 }
                 as_f64(arr.first()?).unwrap_or(1.0)
@@ -2748,11 +2735,14 @@ impl PageRenderer {
         // occasionally omit it; rather than picking a wrong default and
         // mis-rasterising the group, skip-with-debug. The outer
         // SetExtGState handler logs a `warn` for the skip itself.
-        let subtype = smask_dict.get("S").and_then(|o| o.as_name()).ok_or_else(|| {
-            crate::error::Error::InvalidPdf(
-                "SMask dict missing required /S (subtype) — skipping".to_string(),
-            )
-        })?;
+        let subtype = smask_dict
+            .get("S")
+            .and_then(|o| o.as_name())
+            .ok_or_else(|| {
+                crate::error::Error::InvalidPdf(
+                    "SMask dict missing required /S (subtype) — skipping".to_string(),
+                )
+            })?;
         let smask_kind = match subtype {
             "Alpha" => SoftMaskKind::Alpha,
             "Luminosity" => SoftMaskKind::Luminosity,
@@ -2775,9 +2765,7 @@ impl PageRenderer {
         let group_dict = match &group_resolved {
             Object::Stream { dict, .. } => dict.clone(),
             _ => {
-                return Err(crate::error::Error::InvalidPdf(
-                    "SMask /G is not a stream".to_string(),
-                ))
+                return Err(crate::error::Error::InvalidPdf("SMask /G is not a stream".to_string()))
             },
         };
         let group_data = if let Some(stream_ref) = group_obj.as_reference() {
@@ -2791,9 +2779,7 @@ impl PageRenderer {
         // Areas outside the group's painted region keep their initial alpha = 0,
         // which is the correct subtractive default for `/S /Alpha`.
         let mut group_pixmap = Pixmap::new(width, height).ok_or_else(|| {
-            crate::error::Error::InvalidPdf(
-                "Failed to allocate SMask group pixmap".to_string(),
-            )
+            crate::error::Error::InvalidPdf("Failed to allocate SMask group pixmap".to_string())
         })?;
 
         // §7.8.3: /Resources may be an indirect reference. The previous code
@@ -2929,9 +2915,7 @@ impl PageRenderer {
         // Check for transparency group (PDF spec section 11.6.6). /Group may be
         // an indirect reference (`/Group 12 0 R`) in real-world output; resolve
         // it before reading its fields.
-        let group_obj = dict
-            .get("Group")
-            .and_then(|g| doc.resolve_object(g).ok());
+        let group_obj = dict.get("Group").and_then(|g| doc.resolve_object(g).ok());
         let group_dict = group_obj.as_ref().and_then(|g| g.as_dict());
         let is_transparency_group = group_dict
             .map(|gd| gd.get("S").and_then(|s| s.as_name()) == Some("Transparency"))

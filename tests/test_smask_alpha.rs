@@ -107,8 +107,7 @@ fn decode_png(bytes: &[u8]) -> image::RgbaImage {
 /// second is painted after `/SMask /None` clears the mask — so the second
 /// fill should land everywhere regardless of what the first mask blocked.
 fn build_pdf_with_smask_then_none() -> Vec<u8> {
-    let page_content =
-        b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\n/GS2 gs\n0 0 100 50 re\nf\nQ\n";
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\n/GS2 gs\n0 0 100 50 re\nf\nQ\n";
     let group_content = b"0 50 100 50 re\nf\n";
 
     let mut buf = Vec::new();
@@ -168,7 +167,10 @@ fn ext_gstate_smask_none_clears_active_soft_mask() {
         top[0] < 60,
         "first fill under /GS1 must still land on the top half; \
          got R={} G={} B={} A={}",
-        top[0], top[1], top[2], top[3]
+        top[0],
+        top[1],
+        top[2],
+        top[3]
     );
 
     // After `/SMask /None`, the second fill (PDF y = 0..50, the bottom half
@@ -179,7 +181,10 @@ fn ext_gstate_smask_none_clears_active_soft_mask() {
         bottom[0] < 60,
         "after /SMask /None, second fill should paint the bottom half; \
          got R={} G={} B={} A={}",
-        bottom[0], bottom[1], bottom[2], bottom[3]
+        bottom[0],
+        bottom[1],
+        bottom[2],
+        bottom[3]
     );
 }
 
@@ -233,7 +238,8 @@ fn build_pdf_with_smask_through_q_save_restore() -> Vec<u8> {
 
 #[test]
 fn ext_gstate_smask_survives_q_save_restore() {
-    let doc = PdfDocument::from_bytes(build_pdf_with_smask_through_q_save_restore()).expect("parse");
+    let doc =
+        PdfDocument::from_bytes(build_pdf_with_smask_through_q_save_restore()).expect("parse");
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let rgba = decode_png(&img.data);
 
@@ -368,10 +374,7 @@ fn ext_gstate_alpha_smask_honours_install_time_ctm() {
     // the bottom stays white.
     let top = rgba.get_pixel(50, 25);
     let bottom = rgba.get_pixel(50, 75);
-    assert!(
-        top[0] < 60,
-        "scaled-CTM SMask: top of paint area should be black; got {top:?}"
-    );
+    assert!(top[0] < 60, "scaled-CTM SMask: top of paint area should be black; got {top:?}");
     assert!(
         bottom[0] > 200,
         "scaled-CTM SMask: bottom of paint area should be background white; \
@@ -448,14 +451,20 @@ fn ext_gstate_luminosity_smask_modulates_paint_by_group_luma() {
     assert!(
         top[0] > 80 && top[0] < 200,
         "Luminosity SMask top should composite mid-grey; got R={} (G={} B={} A={})",
-        top[0], top[1], top[2], top[3]
+        top[0],
+        top[1],
+        top[2],
+        top[3]
     );
 
     // Bottom half: unpainted /G → luminance 0 → paint blocked → background white.
     assert!(
         bottom[0] > 200,
         "Luminosity SMask bottom should be the white background; got R={} (G={} B={} A={})",
-        bottom[0], bottom[1], bottom[2], bottom[3]
+        bottom[0],
+        bottom[1],
+        bottom[2],
+        bottom[3]
     );
 }
 
@@ -510,8 +519,8 @@ fn build_pdf_with_luminosity_smask_backdrop_white() -> Vec<u8> {
 
 #[test]
 fn ext_gstate_luminosity_smask_bc_white_backdrop_passes_paint() {
-    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_smask_backdrop_white())
-        .expect("parse");
+    let doc =
+        PdfDocument::from_bytes(build_pdf_with_luminosity_smask_backdrop_white()).expect("parse");
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let rgba = decode_png(&img.data);
 
@@ -520,7 +529,10 @@ fn ext_gstate_luminosity_smask_bc_white_backdrop_passes_paint() {
         centre[0] < 60,
         "/BC [1 1 1] backdrop should give luma 255 → paint passes (black); \
          got R={} (G={} B={} A={})",
-        centre[0], centre[1], centre[2], centre[3]
+        centre[0],
+        centre[1],
+        centre[2],
+        centre[3]
     );
 }
 
@@ -558,7 +570,9 @@ fn build_pdf_with_luminosity_smask_squared_transfer() -> Vec<u8> {
     offsets.push(buf.len());
     // /TR is an indirect reference to a Type 2 exponential function:
     //   Domain [0 1], Range [0 1], C0 [0], C1 [1], N 2  →  y = x²
-    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R /TR 8 0 R >>\nendobj\n");
+    buf.extend_from_slice(
+        b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R /TR 8 0 R >>\nendobj\n",
+    );
     offsets.push(buf.len());
     let form_hdr = format!(
         "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
@@ -580,8 +594,8 @@ fn build_pdf_with_luminosity_smask_squared_transfer() -> Vec<u8> {
 
 #[test]
 fn ext_gstate_luminosity_smask_tr_type2_squared_attenuates_paint() {
-    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_smask_squared_transfer())
-        .expect("parse");
+    let doc =
+        PdfDocument::from_bytes(build_pdf_with_luminosity_smask_squared_transfer()).expect("parse");
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let rgba = decode_png(&img.data);
 
@@ -704,8 +718,8 @@ fn build_pdf_with_devicegray_group_painting_red() -> Vec<u8> {
 
 #[test]
 fn ext_gstate_luminosity_smask_malformed_devicegray_with_rgb_paint_uses_bt601() {
-    let doc = PdfDocument::from_bytes(build_pdf_with_devicegray_group_painting_red())
-        .expect("parse");
+    let doc =
+        PdfDocument::from_bytes(build_pdf_with_devicegray_group_painting_red()).expect("parse");
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let rgba = decode_png(&img.data);
 
@@ -724,8 +738,7 @@ fn ext_gstate_luminosity_smask_malformed_devicegray_with_rgb_paint_uses_bt601() 
 
 #[test]
 fn ext_gstate_luminosity_smask_group_cs_devicegray_yields_50pct_paint() {
-    let doc =
-        PdfDocument::from_bytes(build_pdf_with_luminosity_smask_gray_cs()).expect("parse");
+    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_smask_gray_cs()).expect("parse");
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let rgba = decode_png(&img.data);
 
@@ -903,10 +916,7 @@ fn smask_clips_image_paint() {
     //   - PNG row 70 (bottom, mask blocks): white background visible.
     let top = rgba.get_pixel(50, 30);
     let bottom = rgba.get_pixel(50, 70);
-    assert!(
-        top[0] < 60,
-        "SMask should let image black through in the top half; got {top:?}"
-    );
+    assert!(top[0] < 60, "SMask should let image black through in the top half; got {top:?}");
     assert!(
         bottom[0] > 200,
         "SMask should block image paint in the bottom half; got {bottom:?}"
@@ -976,10 +986,7 @@ fn bt601_luma_pure_red_yields_r_approx_179() {
         .expect("parse");
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let r = decode_png(&img.data).get_pixel(50, 50)[0] as i32;
-    assert!(
-        (r - 179).abs() <= 6,
-        "Pure red under BT.601 luma must give R ≈ 179; got {r}"
-    );
+    assert!((r - 179).abs() <= 6, "Pure red under BT.601 luma must give R ≈ 179; got {r}");
 }
 
 /// BT.601 weight pinning — pure green. Luma = 0.587·255 ≈ 150; composite
@@ -990,10 +997,7 @@ fn bt601_luma_pure_green_yields_r_approx_105() {
         .expect("parse");
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let r = decode_png(&img.data).get_pixel(50, 50)[0] as i32;
-    assert!(
-        (r - 105).abs() <= 6,
-        "Pure green under BT.601 luma must give R ≈ 105; got {r}"
-    );
+    assert!((r - 105).abs() <= 6, "Pure green under BT.601 luma must give R ≈ 105; got {r}");
 }
 
 /// BT.601 weight pinning — pure blue. Luma = 0.114·255 ≈ 29; composite
@@ -1004,10 +1008,7 @@ fn bt601_luma_pure_blue_yields_r_approx_226() {
         .expect("parse");
     let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
     let r = decode_png(&img.data).get_pixel(50, 50)[0] as i32;
-    assert!(
-        (r - 226).abs() <= 6,
-        "Pure blue under BT.601 luma must give R ≈ 226; got {r}"
-    );
+    assert!((r - 226).abs() <= 6, "Pure blue under BT.601 luma must give R ≈ 226; got {r}");
 }
 
 /// Build a Luminosity-SMask fixture where `/G` paints uniform gray at the
@@ -1041,7 +1042,9 @@ fn build_pdf_with_luminosity_smask_tr_type2(gray: f32, n: f32) -> Vec<u8> {
     offsets.push(buf.len());
     buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
     offsets.push(buf.len());
-    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R /TR 8 0 R >>\nendobj\n");
+    buf.extend_from_slice(
+        b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R /TR 8 0 R >>\nendobj\n",
+    );
     offsets.push(buf.len());
     let form_hdr = format!(
         "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
@@ -1287,7 +1290,10 @@ fn ext_gstate_alpha_smask_blocks_paint_under_transparent_mask() {
     assert!(
         top[0] < 60,
         "top-half pixel should be black under opaque mask region; got R={} G={} B={} A={}",
-        top[0], top[1], top[2], top[3]
+        top[0],
+        top[1],
+        top[2],
+        top[3]
     );
 
     // Bottom half: mask α = 0 → the fill should be blocked, leaving the
@@ -1296,6 +1302,9 @@ fn ext_gstate_alpha_smask_blocks_paint_under_transparent_mask() {
         bottom[0] > 200,
         "bottom-half pixel should be white where the mask is transparent; \
          got R={} G={} B={} A={}",
-        bottom[0], bottom[1], bottom[2], bottom[3]
+        bottom[0],
+        bottom[1],
+        bottom[2],
+        bottom[3]
     );
 }

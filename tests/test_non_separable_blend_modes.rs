@@ -44,8 +44,7 @@ fn finalize_pdf(mut buf: Vec<u8>, offsets: Vec<usize>) -> Vec<u8> {
 /// red — high R relative to G/B, but each channel small enough that the
 /// SourceOver outcome (huge B, zero R) is impossible.
 fn build_pdf_with_luminosity_blend() -> Vec<u8> {
-    let page_content =
-        b"q\n1 0 0 rg\n0 0 100 100 re\nf\n/GS1 gs\n0 0 1 rg\n0 0 100 100 re\nf\nQ\n";
+    let page_content = b"q\n1 0 0 rg\n0 0 100 100 re\nf\n/GS1 gs\n0 0 1 rg\n0 0 100 100 re\nf\nQ\n";
 
     let mut buf = Vec::new();
     let mut offsets = Vec::new();
@@ -94,6 +93,9 @@ fn luminosity_blend_mode_does_not_overwrite_with_source() {
         centre[2] < 200,
         "Luminosity blend collapsed to SourceOver (blue overwrote red); \
          got R={} G={} B={} A={}",
-        centre[0], centre[1], centre[2], centre[3]
+        centre[0],
+        centre[1],
+        centre[2],
+        centre[3]
     );
 }

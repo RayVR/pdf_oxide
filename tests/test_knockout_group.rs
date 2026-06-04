@@ -52,8 +52,7 @@ fn decode_png(bytes: &[u8]) -> image::RgbaImage {
 /// so the same fixture can produce both the "with" and "without" cases.
 fn build_pdf_with_overlapping_translucent_rects(knockout: bool) -> Vec<u8> {
     let page_content = b"/F1 Do\n";
-    let form_content =
-        b"/GS1 gs\n1 0 0 rg\n0 0 100 100 re\nf\n0 0 1 rg\n0 0 100 100 re\nf\n";
+    let form_content = b"/GS1 gs\n1 0 0 rg\n0 0 100 100 re\nf\n0 0 1 rg\n0 0 100 100 re\nf\n";
 
     let mut buf = Vec::new();
     let mut offsets = Vec::new();
@@ -112,8 +111,7 @@ fn build_pdf_with_overlapping_translucent_rects(knockout: bool) -> Vec<u8> {
 fn build_pdf_with_opaque_multiply_in_group(knockout: bool) -> Vec<u8> {
     let page_content = b"/F1 Do\n";
     // /GS1 sets BM=Multiply only on the second fill; first fill is normal.
-    let form_content =
-        b"1 0 0 rg\n0 0 100 100 re\nf\n/GS1 gs\n0 0 1 rg\n0 0 100 100 re\nf\n";
+    let form_content = b"1 0 0 rg\n0 0 100 100 re\nf\n/GS1 gs\n0 0 1 rg\n0 0 100 100 re\nf\n";
 
     let mut buf = Vec::new();
     let mut offsets = Vec::new();
@@ -158,8 +156,7 @@ fn build_pdf_with_opaque_multiply_in_group(knockout: bool) -> Vec<u8> {
 fn knockout_group_opaque_non_normal_blend_redirects_to_backdrop() {
     let ko = decode_png(
         &render_page(
-            &PdfDocument::from_bytes(build_pdf_with_opaque_multiply_in_group(true))
-                .expect("parse"),
+            &PdfDocument::from_bytes(build_pdf_with_opaque_multiply_in_group(true)).expect("parse"),
             0,
             &RenderOptions::with_dpi(72),
         )
@@ -204,10 +201,8 @@ fn knockout_group_opaque_non_normal_blend_redirects_to_backdrop() {
 /// covers.
 fn build_pdf_knockout_extra_then_blue(extra_setup: &str) -> Vec<u8> {
     let page_content = b"/F1 Do\n";
-    let form_content = format!(
-        "/GS1 gs\n{extra_setup}0 0 1 rg\n0 0 100 100 re\nf\n",
-        extra_setup = extra_setup,
-    );
+    let form_content =
+        format!("/GS1 gs\n{extra_setup}0 0 1 rg\n0 0 100 100 re\nf\n", extra_setup = extra_setup,);
     let form_content = form_content.as_bytes();
 
     let mut buf = Vec::new();
@@ -294,7 +289,8 @@ fn knockout_group_pixel_exact_replacement() {
         }
     }
     assert_eq!(
-        mismatches, 0,
+        mismatches,
+        0,
         "Knockout must replace covered prior shapes pixel-exactly; \
          {mismatches} pixels differ between with-red and only-blue scenes. \
          Sample at (50, 50): with_red={:?}, only_blue={:?}",
@@ -311,8 +307,7 @@ fn knockout_group_pixel_exact_replacement() {
 /// "Multiply" but missing "Hue" — fails closed here.
 fn build_pdf_with_opaque_blend_in_knockout(blend_mode: &str, knockout: bool) -> Vec<u8> {
     let page_content = b"/F1 Do\n";
-    let form_content =
-        b"1 0 0 rg\n0 0 100 100 re\nf\n/GS1 gs\n0 0 1 rg\n0 0 100 100 re\nf\n";
+    let form_content = b"1 0 0 rg\n0 0 100 100 re\nf\n/GS1 gs\n0 0 1 rg\n0 0 100 100 re\nf\n";
 
     let mut buf = Vec::new();
     let mut offsets = Vec::new();
