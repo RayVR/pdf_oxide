@@ -1079,9 +1079,25 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
+                            // Pilot routing: stroke side mirrors the path-fill
+                            // routing — toggle on routes through the pipeline
+                            // so Type 4 Separation strokes resolve correctly;
+                            // toggle off keeps the existing behaviour
+                            // byte-for-byte. Line width / cap / join / dash
+                            // come from the cloned `gs` unchanged, so the
+                            // stroke geometry is identical either way.
+                            let pipeline_rgba = self.pipeline_resolve_stroke_rgba(doc, gs);
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            self.path_rasterizer
-                                .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                            if let Some((r, g, b, a)) = pipeline_rgba {
+                                let mut spliced = gs.clone();
+                                spliced.stroke_color_rgb = (r, g, b);
+                                spliced.stroke_alpha = a;
+                                self.path_rasterizer
+                                    .stroke_path_clipped(pixmap, &path, transform, &spliced, clip);
+                            } else {
+                                self.path_rasterizer
+                                    .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                            }
                         }
                     } else {
                         let _ = current_path.finish();
@@ -1156,10 +1172,38 @@ impl PageRenderer {
                             } else {
                                 tiny_skia::FillRule::Winding
                             };
+                            // Combos resolve fill and stroke independently
+                            // through the pipeline (two `PaintIntent`s per
+                            // operator). Each side falls back to the inline
+                            // path if its colour can't be resolved to RGBA,
+                            // so a Type 4 Separation on the fill side and a
+                            // plain DeviceRGB on the stroke side route
+                            // correctly without entangling the two.
+                            //
+                            // Off-toggle keeps `gs` borrowed directly (no
+                            // clone) so the parity invariant is preserved
+                            // and the off-path stays alloc-free.
+                            let fill_rgba = self.pipeline_resolve_fill_rgba(doc, gs);
+                            let stroke_rgba = self.pipeline_resolve_stroke_rgba(doc, gs);
+                            let fill_spliced = fill_rgba.map(|(r, g, b, a)| {
+                                let mut s = gs.clone();
+                                s.fill_color_rgb = (r, g, b);
+                                s.fill_alpha = a;
+                                s
+                            });
+                            let stroke_spliced = stroke_rgba.map(|(r, g, b, a)| {
+                                let mut s = gs.clone();
+                                s.stroke_color_rgb = (r, g, b);
+                                s.stroke_alpha = a;
+                                s
+                            });
+                            let fill_gs: &GraphicsState = fill_spliced.as_ref().unwrap_or(gs);
+                            let stroke_gs: &GraphicsState = stroke_spliced.as_ref().unwrap_or(gs);
+                            self.path_rasterizer.fill_path_clipped(
+                                pixmap, &path, transform, fill_gs, fill_rule, clip,
+                            );
                             self.path_rasterizer
-                                .fill_path_clipped(pixmap, &path, transform, gs, fill_rule, clip);
-                            self.path_rasterizer
-                                .stroke_path_clipped(pixmap, &path, transform, gs, clip);
+                                .stroke_path_clipped(pixmap, &path, transform, stroke_gs, clip);
                         }
                     } else {
                         let _ = current_path.finish();
@@ -1178,40 +1222,39 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
-                            let pipeline_rgba = self.pipeline_resolve_fill_rgba(doc, gs);
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            if let Some((r, g, b, a)) = pipeline_rgba {
-                                let mut spliced = gs.clone();
-                                spliced.fill_color_rgb = (r, g, b);
-                                spliced.fill_alpha = a;
-                                self.path_rasterizer.fill_path_clipped(
-                                    pixmap,
-                                    &path,
-                                    transform,
-                                    &spliced,
-                                    tiny_skia::FillRule::EvenOdd,
-                                    clip,
-                                );
-                                if matches!(op, Operator::FillStrokeEvenOdd) {
-                                    // Stroke side is out of scope for the
-                                    // pilot — fall back to the existing
-                                    // colour.
-                                    self.path_rasterizer
-                                        .stroke_path_clipped(pixmap, &path, transform, gs, clip);
-                                }
-                            } else {
-                                self.path_rasterizer.fill_path_clipped(
-                                    pixmap,
-                                    &path,
-                                    transform,
-                                    gs,
-                                    tiny_skia::FillRule::EvenOdd,
-                                    clip,
-                                );
-                                if matches!(op, Operator::FillStrokeEvenOdd) {
-                                    self.path_rasterizer
-                                        .stroke_path_clipped(pixmap, &path, transform, gs, clip);
-                                }
+                            // Fill side — same routing as `Fill`/`Fill*`.
+                            let fill_rgba = self.pipeline_resolve_fill_rgba(doc, gs);
+                            let fill_spliced = fill_rgba.map(|(r, g, b, a)| {
+                                let mut s = gs.clone();
+                                s.fill_color_rgb = (r, g, b);
+                                s.fill_alpha = a;
+                                s
+                            });
+                            let fill_gs: &GraphicsState = fill_spliced.as_ref().unwrap_or(gs);
+                            self.path_rasterizer.fill_path_clipped(
+                                pixmap,
+                                &path,
+                                transform,
+                                fill_gs,
+                                tiny_skia::FillRule::EvenOdd,
+                                clip,
+                            );
+                            if matches!(op, Operator::FillStrokeEvenOdd) {
+                                // Stroke side independently routed — Type 4
+                                // Separation on the stroke colour is now
+                                // honoured when the pilot toggle is on.
+                                let stroke_rgba = self.pipeline_resolve_stroke_rgba(doc, gs);
+                                let stroke_spliced = stroke_rgba.map(|(r, g, b, a)| {
+                                    let mut s = gs.clone();
+                                    s.stroke_color_rgb = (r, g, b);
+                                    s.stroke_alpha = a;
+                                    s
+                                });
+                                let stroke_gs: &GraphicsState =
+                                    stroke_spliced.as_ref().unwrap_or(gs);
+                                self.path_rasterizer
+                                    .stroke_path_clipped(pixmap, &path, transform, stroke_gs, clip);
                             }
                         }
                     } else {
@@ -2535,23 +2578,51 @@ impl PageRenderer {
     /// Resolve the current fill colour through the resolution pipeline if it
     /// is enabled, returning a final RGBA the caller can install on a paint.
     ///
-    /// When `PDF_OXIDE_RESOLUTION_PIPELINE` is unset or equal to "0", the
-    /// caller's existing path (read `gs.fill_color_rgb` directly) is the
-    /// answer and this returns `None`. When the toggle is on we route the
-    /// current colour through [`ResolutionPipeline`], which handles
-    /// `Separation`/`DeviceN` colour spaces backed by PostScript Type 4
-    /// tint transforms — the case the inline match arm a few hundred lines
-    /// up evaluates as `1.0 - tint`.
-    ///
-    /// Returns `None` (caller falls back to the inline result) whenever the
-    /// pipeline disagrees with the operator dispatcher about what to do —
-    /// e.g. the current fill components are empty (operator path hasn't
-    /// stamped anything yet), or the resolver returns a non-RGBA variant
-    /// that the composite backend cannot consume directly.
+    /// Thin wrapper around [`Self::pipeline_resolve_rgba`] specialised to
+    /// [`PaintSide::Fill`]; kept as a named entry point because it reads
+    /// cleanly at the path-fill call sites.
     fn pipeline_resolve_fill_rgba(
         &self,
         doc: &PdfDocument,
         gs: &GraphicsState,
+    ) -> Option<(f32, f32, f32, f32)> {
+        self.pipeline_resolve_rgba(doc, gs, PaintSide::Fill)
+    }
+
+    /// Resolve the current stroke colour through the resolution pipeline if
+    /// it is enabled. Symmetric to [`Self::pipeline_resolve_fill_rgba`].
+    fn pipeline_resolve_stroke_rgba(
+        &self,
+        doc: &PdfDocument,
+        gs: &GraphicsState,
+    ) -> Option<(f32, f32, f32, f32)> {
+        self.pipeline_resolve_rgba(doc, gs, PaintSide::Stroke)
+    }
+
+    /// Resolve the active colour for `side` through the resolution pipeline
+    /// when it is enabled. Returns `None` when the toggle is off (caller
+    /// keeps its inline behaviour) or when the resolver produces a non-RGBA
+    /// variant the composite backend cannot consume directly.
+    ///
+    /// When `PDF_OXIDE_RESOLUTION_PIPELINE` is unset or equal to "0", the
+    /// caller's existing path (read `gs.fill_color_rgb` /
+    /// `gs.stroke_color_rgb` directly) is the answer and this returns `None`.
+    /// When the toggle is on we route the current colour through
+    /// [`ResolutionPipeline`], which handles `Separation`/`DeviceN` colour
+    /// spaces backed by PostScript Type 4 tint transforms — the case the
+    /// inline match arms a few hundred lines up evaluate as `1.0 - tint`.
+    ///
+    /// Fill and stroke share one helper because the only differences are
+    /// which `gs` fields supply the colour and which `PaintSide` the
+    /// pipeline routes against. Splitting these into one helper per side
+    /// would mean duplicating the entire context build for no behavioural
+    /// reason; the pipeline's colour stage already keys all of its
+    /// side-specific behaviour (e.g. alpha fold) off `intent.side`.
+    fn pipeline_resolve_rgba(
+        &self,
+        doc: &PdfDocument,
+        gs: &GraphicsState,
+        side: PaintSide,
     ) -> Option<(f32, f32, f32, f32)> {
         if !pipeline_is_enabled() {
             return None;
@@ -2565,10 +2636,12 @@ impl PageRenderer {
             output_intent_cmyk.as_ref(),
             crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent),
         );
-        let space_name = gs.fill_color_space.as_str();
+        let (space_name, components) = match side {
+            PaintSide::Fill => (gs.fill_color_space.as_str(), &gs.fill_color_components),
+            PaintSide::Stroke => (gs.stroke_color_space.as_str(), &gs.stroke_color_components),
+        };
         let resolved_space_obj = color_spaces.get(space_name);
-        let logical =
-            build_logical_color(space_name, &gs.fill_color_components, resolved_space_obj);
+        let logical = build_logical_color(space_name, components, resolved_space_obj);
 
         // Build a placeholder path-fill intent. The pipeline doesn't actually
         // need the path geometry for colour resolution; passing an empty
@@ -2587,7 +2660,7 @@ impl PageRenderer {
                 path: &path,
                 fill_rule: tiny_skia::FillRule::Winding,
             },
-            side: PaintSide::Fill,
+            side,
             gs,
             color: logical,
             ctm: gs.ctm,
