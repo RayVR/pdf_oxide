@@ -4608,10 +4608,19 @@ impl<'doc> TextExtractor<'doc> {
 
                     // Cache font reference for advance_position_for_string
                     self.cached_current_font = self.fonts.get(&font).cloned();
+                    // Cache wmode on the graphics state so the advance hot
+                    // path branches on a single primitive read instead of
+                    // dereferencing the FontInfo every glyph.
+                    let new_wmode = self
+                        .cached_current_font
+                        .as_deref()
+                        .map(|f| f.wmode)
+                        .unwrap_or(0);
 
                     let state = self.state_stack.current_mut();
                     state.font_name = Some(font);
                     state.font_size = size;
+                    state.text_wmode = new_wmode;
                 }
             },
 
@@ -7081,6 +7090,7 @@ impl<'doc> TextExtractor<'doc> {
         let horizontal_scaling = state.horizontal_scaling;
         let char_space = state.char_space;
         let word_space = state.word_space;
+        let wmode = state.text_wmode;
 
         let font = self.cached_current_font.as_deref();
 
@@ -7110,15 +7120,33 @@ impl<'doc> TextExtractor<'doc> {
                     w_sum += w;
                 }
                 w_sum
-            } else {
-                // Type0/CID font: use TextCharIter so that the byte-width (1 or 2)
-                // is determined by the font's encoding / ToUnicode CMap codespace,
-                // not hardcoded to 2. Per ISO 32000-1:2008 §9.7.6.2.
+            } else if wmode == 0 {
+                // Type0/CID font, horizontal: use TextCharIter so that the byte-width
+                // (1 or 2) is determined by the font's encoding / ToUnicode CMap
+                // codespace, not hardcoded to 2. Per ISO 32000-1:2008 §9.7.6.2.
                 let mut w_sum = 0.0f32;
                 for (cid, _) in TextCharIter::new(text, Some(font)) {
                     let mut w = font.get_glyph_width(cid) * fs_factor * hs_factor;
                     w += cs_hs;
                     // Per ISO 32000-1:2008 Section 9.3.3: Tw applied when CID == 32
+                    if cid == 32 {
+                        w += ws_hs;
+                    }
+                    w_sum += w;
+                }
+                w_sum
+            } else {
+                // Type0/CID font, vertical (WMode 1): the per-glyph displacement
+                // is `w1y` from /W2 (or the /DW2 default), in 1000ths-of-em. Per
+                // ISO 32000-1 §9.7.4.3 and §9.4.4 the displacement scales with
+                // font size exactly like horizontal w0. Horizontal scaling (Tz)
+                // still applies — it is defined as scaling along the writing
+                // direction (§9.3.4).
+                let mut w_sum = 0.0f32;
+                for (cid, _) in TextCharIter::new(text, Some(font)) {
+                    let w1y = font.get_vertical_metrics(cid).w1y;
+                    let mut w = w1y * fs_factor * hs_factor;
+                    w += cs_hs;
                     if cid == 32 {
                         w += ws_hs;
                     }
@@ -7137,12 +7165,12 @@ impl<'doc> TextExtractor<'doc> {
             w_sum
         };
 
-        // Update text matrix position per ISO 32000-1:2008 §9.4.4:
-        // Tm_new = [1 0 0 1 tx 0] × Tm_old, where tx = total_width (text-space displacement)
-        let state = self.state_stack.current_mut();
-        let text_matrix = state.text_matrix;
-        state.text_matrix.e += total_width * text_matrix.a;
-        state.text_matrix.f += total_width * text_matrix.b;
+        // Update text matrix position per ISO 32000-1:2008 §9.4.4. The
+        // axis-swap (horizontal vs vertical) is encapsulated in
+        // GraphicsState::advance_text_matrix so this site does not branch.
+        self.state_stack
+            .current_mut()
+            .advance_text_matrix(total_width);
 
         Ok(total_width)
     }
@@ -7162,6 +7190,7 @@ impl<'doc> TextExtractor<'doc> {
         let horizontal_scaling = state.horizontal_scaling;
         let char_space = state.char_space;
         let word_space = state.word_space;
+        let wmode = state.text_wmode;
 
         // Disjoint field borrows: cached_current_font (immutable) + tj_span_buffer (mutable)
         let font = self.cached_current_font.as_deref();
@@ -7215,11 +7244,9 @@ impl<'doc> TextExtractor<'doc> {
                                     }
                                 }
                                 // Fall through to the matrix update at the
-                                // bottom of the function via `w_sum`.
-                                let state = self.state_stack.current_mut();
-                                let text_matrix = state.text_matrix;
-                                state.text_matrix.e += w_sum * text_matrix.a;
-                                state.text_matrix.f += w_sum * text_matrix.b;
+                                // bottom of the function via `w_sum`. Vertical
+                                // mode flips the axis inside the helper.
+                                self.state_stack.current_mut().advance_text_matrix(w_sum);
                                 return Ok(());
                             }
                         }
@@ -7276,14 +7303,32 @@ impl<'doc> TextExtractor<'doc> {
                     }
                 }
                 w_sum
-            } else {
-                // Type0/CID font: use unified iterator for robust multi-byte decoding and widths
+            } else if wmode == 0 {
+                // Type0/CID font, horizontal: unified iterator handles 1- or
+                // 2-byte codes per ToUnicode codespace.
                 buffer.append(text)?;
                 let mut w_sum = 0.0f32;
                 for (char_code, _) in TextCharIter::new(text, Some(font)) {
                     let mut w = font.get_glyph_width(char_code) * fs_factor * hs_factor;
                     w += cs_hs;
                     // Standard PDF space character (code 32) triggers word spacing
+                    if char_code == 32 {
+                        w += ws_hs;
+                    }
+                    w_sum += w;
+                    buffer.char_widths.push(w);
+                }
+                w_sum
+            } else {
+                // Type0/CID font, vertical (WMode 1): per-glyph displacement
+                // is `w1y` (from /W2 or /DW2), in 1000ths-of-em. ISO 32000-1
+                // §9.7.4.3 + §9.4.4.
+                buffer.append(text)?;
+                let mut w_sum = 0.0f32;
+                for (char_code, _) in TextCharIter::new(text, Some(font)) {
+                    let w1y = font.get_vertical_metrics(char_code).w1y;
+                    let mut w = w1y * fs_factor * hs_factor;
+                    w += cs_hs;
                     if char_code == 32 {
                         w += ws_hs;
                     }
@@ -7308,11 +7353,11 @@ impl<'doc> TextExtractor<'doc> {
 
         buffer.accumulated_width += total_width;
 
-        // Update text matrix position per ISO 32000-1:2008 §9.4.4
-        let state = self.state_stack.current_mut();
-        let text_matrix = state.text_matrix;
-        state.text_matrix.e += total_width * text_matrix.a;
-        state.text_matrix.f += total_width * text_matrix.b;
+        // Update text matrix position per ISO 32000-1:2008 §9.4.4. The
+        // axis-swap (H vs V) is encapsulated in advance_text_matrix.
+        self.state_stack
+            .current_mut()
+            .advance_text_matrix(total_width);
 
         Ok(())
     }
@@ -7332,6 +7377,7 @@ impl<'doc> TextExtractor<'doc> {
         let horizontal_scaling = state.horizontal_scaling;
         let char_space = state.char_space;
         let word_space = state.word_space;
+        let wmode = state.text_wmode;
 
         let font = self.cached_current_font.as_deref();
         // font_matrix_a converts glyph-space widths to text-space units.
@@ -7408,10 +7454,7 @@ impl<'doc> TextExtractor<'doc> {
                 };
                 if let Some(w) = utf8_width {
                     buffer.accumulated_width += w;
-                    let state = self.state_stack.current_mut();
-                    let text_matrix = state.text_matrix;
-                    state.text_matrix.e += w * text_matrix.a;
-                    state.text_matrix.f += w * text_matrix.b;
+                    self.state_stack.current_mut().advance_text_matrix(w);
                     return Ok(());
                 }
 
@@ -7458,7 +7501,7 @@ impl<'doc> TextExtractor<'doc> {
                     }
                 }
                 w_sum
-            } else {
+            } else if wmode == 0 {
                 buffer.append(text)?;
                 // Width calculation: use TextCharIter so byte-width respects the
                 // CMap codespace (1 or 2 bytes per character). Fixes CJK fonts
@@ -7468,6 +7511,22 @@ impl<'doc> TextExtractor<'doc> {
                 let mut w_sum = 0.0f32;
                 for (cid, _) in TextCharIter::new(text, Some(font)) {
                     let mut w = font.get_glyph_width(cid) * fs_factor * hs_factor;
+                    w += cs_hs;
+                    if cid == 32 {
+                        w += ws_hs;
+                    }
+                    w_sum += w;
+                    buffer.char_widths.push(w);
+                }
+                w_sum
+            } else {
+                // Type0/CID font, vertical mode: per-glyph displacement is
+                // /W2 `w1y` (or /DW2 default), in 1000ths-of-em.
+                buffer.append(text)?;
+                let mut w_sum = 0.0f32;
+                for (cid, _) in TextCharIter::new(text, Some(font)) {
+                    let w1y = font.get_vertical_metrics(cid).w1y;
+                    let mut w = w1y * fs_factor * hs_factor;
                     w += cs_hs;
                     if cid == 32 {
                         w += ws_hs;
@@ -7492,10 +7551,9 @@ impl<'doc> TextExtractor<'doc> {
 
         buffer.accumulated_width += total_width;
 
-        let state = self.state_stack.current_mut();
-        let text_matrix = state.text_matrix;
-        state.text_matrix.e += total_width * text_matrix.a;
-        state.text_matrix.f += total_width * text_matrix.b;
+        self.state_stack
+            .current_mut()
+            .advance_text_matrix(total_width);
 
         Ok(())
     }
@@ -7589,20 +7647,22 @@ impl<'doc> TextExtractor<'doc> {
     }
 
     /// Advance text position for a TJ offset value.
+    ///
+    /// Per ISO 32000-1:2008 §9.4.4 a number element in a TJ array shifts the
+    /// position by `-offset/1000 × font_size × Th` along the **active**
+    /// writing axis. In horizontal mode that is x; in vertical mode it is y.
+    /// The axis-swap lives in `advance_text_matrix`.
     fn advance_position_for_offset(&mut self, offset: f32) -> Result<()> {
         let state = self.state_stack.current();
         let font_size = state.font_size;
         let horizontal_scaling = state.horizontal_scaling;
 
-        // Calculate horizontal displacement per PDF spec §9.4.4
-        // tx = -offset / 1000.0 * font_size * horizontal_scaling / 100.0
+        // §9.4.4: tx = -offset / 1000 * font_size * (Th/100). Symbol stays
+        // `tx` for continuity with the spec; under vertical mode the helper
+        // routes it to ty.
         let tx = -offset / 1000.0 * font_size * horizontal_scaling / 100.0;
 
-        // Update text matrix: Tm_new = [1 0 0 1 tx 0] × Tm_old
-        let state = self.state_stack.current_mut();
-        let text_matrix = state.text_matrix;
-        state.text_matrix.e += tx * text_matrix.a;
-        state.text_matrix.f += tx * text_matrix.b;
+        self.state_stack.current_mut().advance_text_matrix(tx);
 
         Ok(())
     }

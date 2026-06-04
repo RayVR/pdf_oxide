@@ -1575,9 +1575,15 @@ impl PageRenderer {
                     }
                 },
                 Operator::Tf { font, size } => {
+                    // Cache the font's writing mode on the graphics state so
+                    // the rasterizer hot path can branch on a single
+                    // primitive read instead of dereferencing the FontInfo
+                    // through the cache for every glyph.
+                    let wmode = self.fonts.get(font).map(|f| f.wmode).unwrap_or(0);
                     let gs = gs_stack.current_mut();
                     gs.font_name = Some(font.clone());
                     gs.font_size = *size;
+                    gs.text_wmode = wmode;
                 },
 
                 // Extended graphics state

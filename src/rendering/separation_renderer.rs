@@ -1889,9 +1889,11 @@ fn execute_separation_operators(
                 gs_stack.current_mut().render_mode = *render;
             },
             Operator::Tf { font, size } => {
+                let wmode = ctx.fonts.get(font).map(|f| f.wmode).unwrap_or(0);
                 let gs = gs_stack.current_mut();
                 gs.font_name = Some(font.clone());
                 gs.font_size = *size;
+                gs.text_wmode = wmode;
             },
 
             // Text positioning
