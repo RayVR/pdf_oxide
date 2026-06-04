@@ -1287,7 +1287,7 @@ fn qa_text_tj_followed_by_path_fill_byte_identical() {
 /// operator arm and dropped at end-of-statement, so `q/Q` shouldn't see
 /// it at all. Toggle parity must hold.
 #[test]
-fn qa_text_tj_inside_q_Q_byte_identical() {
+fn qa_text_tj_inside_q_q_byte_identical() {
     let content = "1 0 0 rg \
                    q \
                    0 0 1 rg \
@@ -1449,5 +1449,87 @@ fn qa_text_tj_all_numeric_array_parity_and_no_ink() {
         count_ink_pixels(&on.unwrap(), 0, 0, 100, 100),
         0,
         "all-numeric TJ must paint zero pixels"
+    );
+}
+
+// ============================================================================
+// Performance probes — pipeline-on must not blow up vs pipeline-off, AND the
+// claimed "one resolve per Tj" invariant must hold (1000 glyphs spread across
+// 10 Tj calls should see ~10× the resolve cost, not 1000×).
+// ============================================================================
+
+/// Probe 30 — 1000-glyph render under both toggle states. Wall-clock
+/// comparison ensures the pipeline path stays within a sane multiplier
+/// of the inline path (we pick 6× as the bound: the toggle introduces
+/// one resolver-construction + one GS clone per Tj call; with 10 Tj
+/// calls each painting 100 glyphs, that's 10 resolver calls and 10
+/// clones, dwarfed by 1000 glyph rasterisations).
+///
+/// This is a sanity bound, not a tight benchmark — runner schedule
+/// jitter would make a tight bound flake. The bound catches the
+/// "pipeline accidentally resolves per glyph" regression.
+#[test]
+fn qa_text_perf_thousand_glyphs_under_six_x_inline_bound() {
+    // 10 Tj calls × 100 glyphs = 1000 glyphs total. Same fontSize so no
+    // font-reload cost dominates.
+    let mut content = String::from("BT 1 0 0 rg /F1 6 Tf 5 90 Td ");
+    let row = "ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJ\
+               ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJ";
+    for _ in 0..10 {
+        content.push_str(&format!("({}) Tj 0 -7 Td ", row));
+    }
+    content.push_str("ET\n");
+    let bytes = build_pdf_text(&content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    // Warm-up.
+    let _ = render_with_pipeline(&doc, false);
+    let _ = render_with_pipeline(&doc, true);
+
+    let t_off = Instant::now();
+    for _ in 0..3 {
+        let _ = render_with_pipeline(&doc, false);
+    }
+    let dt_off = t_off.elapsed();
+
+    let t_on = Instant::now();
+    for _ in 0..3 {
+        let _ = render_with_pipeline(&doc, true);
+    }
+    let dt_on = t_on.elapsed();
+
+    let ratio = dt_on.as_secs_f64() / dt_off.as_secs_f64().max(1e-9);
+    assert!(
+        ratio < 6.0,
+        "1000-glyph pipeline-on render must stay within 6× pipeline-off cost; \
+         off={:.3} ms, on={:.3} ms, ratio={:.2}",
+        dt_off.as_secs_f64() * 1000.0,
+        dt_on.as_secs_f64() * 1000.0,
+        ratio
+    );
+}
+
+/// Probe 31 — Allocation pressure pin: a 1000-glyph pipeline-on render
+/// must complete within a generous wall-clock budget. Coarse check that
+/// catches O(N) per-glyph allocation spirals without flaking on
+/// shared CI runners.
+#[test]
+fn qa_text_perf_thousand_glyphs_completes_within_five_seconds() {
+    let mut content = String::from("BT 0 0 1 rg /F1 6 Tf 5 90 Td ");
+    let row = "ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJ\
+               ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJ";
+    for _ in 0..10 {
+        content.push_str(&format!("({}) Tj 0 -7 Td ", row));
+    }
+    content.push_str("ET\n");
+    let bytes = build_pdf_text(&content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let t = Instant::now();
+    let _ = render_with_pipeline(&doc, true);
+    let dt = t.elapsed();
+    assert!(
+        dt.as_secs_f64() < 5.0,
+        "1000-glyph pipeline-on render must complete within 5 s, took {:.3} s",
+        dt.as_secs_f64()
     );
 }
