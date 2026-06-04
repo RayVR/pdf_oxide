@@ -1314,3 +1314,105 @@ fn qa_shading_under_multiply_blend_mode_toggle_parity() {
     let on = render_with_pipeline(&doc, true);
     assert_eq!(off, on, "DeviceRGB shading under /BM /Multiply must keep off-vs-on parity");
 }
+
+// ===========================================================================
+// Probes 21-25 — Type 1 and mesh-type pass-through.
+//
+// The dispatcher gate (`shading_type == 2 || shading_type == 3`) keeps
+// every non-axial/non-radial shading on the legacy inline path
+// verbatim. For Types 1, 4, 5, 6, 7 the wave-4 splice does NOT fire
+// at all — the pre-resolve helper short-circuits because the gate
+// is false. Pin byte-identical output for both toggle states; pilot
+// already covers Type 1 (function-based) and Type 4 (free-form
+// Gouraud triangle mesh) — this group adds Type 5 (lattice mesh),
+// Type 6 (Coons patch mesh), and Type 7 (tensor patch mesh).
+//
+// On the current renderer, types 4-7 fall through to a `log::debug!`
+// catch-all in `render_shading` (page_renderer.rs:1834) — no paint
+// emitted, no error returned. The probe pins this behaviour: both
+// toggles produce the same blank page; no panic.
+// ===========================================================================
+
+/// Build a PDF carrying a raw shading dict of arbitrary `/ShadingType`.
+/// Used for pass-through probes where the shading type is unsupported
+/// — both paths should reach the same `unsupported` arm.
+fn build_pdf_raw_shading_type(shading_type: i32) -> Vec<u8> {
+    // Minimum-viable shading dict for the unsupported types: declare
+    // ShadingType, a ColorSpace, and a tiny stream-shaped dict so the
+    // parser sees something well-formed. Mesh shadings are streams in
+    // real PDFs; using a dict with /Length 0 is enough to exercise
+    // the dispatcher's type check.
+    let shading_body = format!(
+        "<< /ShadingType {} /ColorSpace /DeviceRGB \
+         /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 \
+         /Decode [0 100 0 100 0 1 0 1 0 1] /Length 0 >>\nstream\n\nendstream",
+        shading_type
+    );
+    build_pdf_shading_raw("/Sh1 sh\n", &shading_body, "", &[])
+}
+
+/// Probe 21 — Type 1 (function-based) shading. Pilot covers this with
+/// a concrete content fixture; here we pin the unsupported-arm path
+/// for completeness (no /Function entry).
+#[test]
+fn qa_type1_function_based_shading_pass_through_no_panic_parity() {
+    let bytes = build_pdf_raw_shading_type(1);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("Type-1 shading must not panic toggle-off");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("Type-1 shading must not panic toggle-on");
+    assert_eq!(off, on, "Type-1 shading must produce identical output off vs on");
+}
+
+/// Probe 22 — Type 4 (free-form Gouraud triangle mesh) shading.
+/// Pilot already covers this with a richer fixture; the parity
+/// invariant under the simpler unsupported-arm shape pins that
+/// the dispatcher gate keeps Type 4 on the inline path regardless
+/// of the toggle.
+#[test]
+fn qa_type4_mesh_shading_pass_through_no_panic_parity() {
+    let bytes = build_pdf_raw_shading_type(4);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("Type-4 mesh must not panic toggle-off");
+    let on =
+        render_with_pipeline_allow_fail(&doc, true).expect("Type-4 mesh must not panic toggle-on");
+    assert_eq!(off, on, "Type-4 mesh shading must produce identical output off vs on");
+}
+
+/// Probe 23 — Type 5 (lattice-form Gouraud mesh) shading.
+#[test]
+fn qa_type5_lattice_mesh_shading_pass_through_no_panic_parity() {
+    let bytes = build_pdf_raw_shading_type(5);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("Type-5 lattice mesh must not panic toggle-off");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("Type-5 lattice mesh must not panic toggle-on");
+    assert_eq!(off, on, "Type-5 lattice mesh must produce identical output off vs on");
+}
+
+/// Probe 24 — Type 6 (Coons patch mesh) shading.
+#[test]
+fn qa_type6_coons_patch_mesh_shading_pass_through_no_panic_parity() {
+    let bytes = build_pdf_raw_shading_type(6);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("Type-6 Coons patch must not panic toggle-off");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("Type-6 Coons patch must not panic toggle-on");
+    assert_eq!(off, on, "Type-6 Coons patch must produce identical output off vs on");
+}
+
+/// Probe 25 — Type 7 (tensor patch mesh) shading.
+#[test]
+fn qa_type7_tensor_patch_mesh_shading_pass_through_no_panic_parity() {
+    let bytes = build_pdf_raw_shading_type(7);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let off = render_with_pipeline_allow_fail(&doc, false)
+        .expect("Type-7 tensor patch must not panic toggle-off");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("Type-7 tensor patch must not panic toggle-on");
+    assert_eq!(off, on, "Type-7 tensor patch must produce identical output off vs on");
+}
