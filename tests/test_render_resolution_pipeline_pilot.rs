@@ -562,14 +562,19 @@ fn pilot_stroke_type4_separation_pipeline_resolves_correctly() {
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
 
-    // Inline stroke path falls back to the SCN gray clamp (no Separation
-    // handling on the stroke side at all today). The point is the
-    // declared magenta is NOT what gets painted.
+    // Inline stroke path: the SCN dispatcher routes Separation/DeviceN
+    // through the `g = 1.0 - tint` fallback (mirroring the long-standing
+    // `scn` fill behaviour). At full tint that is g = 0 → solid black
+    // stroke band. The Type 4 program never runs on this path.
+    //
+    // Pin the actual fallback colour, not just "not magenta" — a
+    // regression that painted any non-magenta non-black colour (e.g. the
+    // old SCN white-clamp) would slip past a bare negation.
     let (r_off, g_off, b_off, _a) = pixel_at(&off, 50, 80);
-    let inline_is_magenta = r_off > 200 && g_off < 60 && b_off > 200;
     assert!(
-        !inline_is_magenta,
-        "inline stroke path must NOT render the declared magenta for a Type 4 Separation, got ({r_off}, {g_off}, {b_off})"
+        r_off < 30 && g_off < 30 && b_off < 30,
+        "inline stroke path: full-tint Type 4 Separation must hit the SCN `1.0 - tint` \
+         fallback (g=0 → near-black stroke band), got ({r_off}, {g_off}, {b_off})"
     );
 
     // Pipeline: the Type 4 program is evaluated → magenta lands on the
@@ -753,4 +758,162 @@ fn pilot_fill_stroke_two_type4_separations_both_resolved_independently() {
     // the inline path — neither side's mishandling is silently masked by
     // the other.
     assert_ne!(off, on, "pipeline output must differ from inline for two-Type-4 combo");
+}
+
+// ---------- `b` / `b*` close-edge positive tests ----------
+//
+// ISO 32000-1 §8.5.3.1 Table 60: the `b` and `b*` operators must close the
+// active subpath before fill+stroke. The parser does NOT decompose these
+// (only `s` is emitted as ClosePath + Stroke), so the dispatcher arm must
+// perform the close itself. Before the fix, the closing edge of an open
+// subpath was omitted from the stroke — a visible gap.
+//
+// These tests draw an open four-segment path (a square missing the left
+// edge) using `b` / `b*`, then sample a pixel on the closing edge. Stroke
+// is wide enough that the sampled pixel lies firmly inside the painted
+// band when the close happens, and stays at the background colour when it
+// doesn't. The fixture deliberately uses a thick (width 8) pure-blue
+// stroke against a clear background so the discriminator is unambiguous.
+//
+// Coordinate note: the open path goes (30,30) → (70,30) → (70,70) →
+// (30,70). The missing segment is the left edge at x=30, between y=30
+// and y=70 in PDF user space. The renderer flips Y, so the output band
+// remains centred at output x=30, output y∈[30, 70]. Sample (30, 50).
+
+#[test]
+fn pilot_b_operator_paints_close_edge_under_pipeline() {
+    // Open four-segment subpath finished with `b`. With the spec-required
+    // close in place the missing left edge gets painted blue; without it
+    // the pixel at (30, 50) stays background-white.
+    let content = "0 0 1 RG\n0 0 1 rg\n8 w\n30 30 m\n70 30 l\n70 70 l\n30 70 l\nb\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    // Pipeline ON — close-edge must be blue (B high, R low, G low).
+    let on = render_with_pipeline(&doc, true);
+    let (r_on, g_on, b_on, _a) = pixel_at(&on, 30, 50);
+    assert!(
+        r_on < 60 && g_on < 60 && b_on > 200,
+        "pipeline: `b` close-edge pixel (30, 50) must be blue (the spec-required close \
+         segment of the stroke was painted), got ({r_on}, {g_on}, {b_on})"
+    );
+
+    // Pipeline OFF — same close arm in the dispatcher, same assertion.
+    let off = render_with_pipeline(&doc, false);
+    let (r_off, g_off, b_off, _a) = pixel_at(&off, 30, 50);
+    assert!(
+        r_off < 60 && g_off < 60 && b_off > 200,
+        "inline path: `b` close-edge pixel (30, 50) must be blue, got ({r_off}, {g_off}, {b_off})"
+    );
+}
+
+#[test]
+fn pilot_b_star_operator_paints_close_edge_under_pipeline() {
+    // Same fixture as the `b` test but with `b*` (even-odd fill rule). The
+    // close-edge geometry is path-rule-independent — the stroke side
+    // paints it either way once the dispatcher calls `.close()`.
+    let content = "0 0 1 RG\n0 0 1 rg\n8 w\n30 30 m\n70 30 l\n70 70 l\n30 70 l\nb*\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let on = render_with_pipeline(&doc, true);
+    let (r_on, g_on, b_on, _a) = pixel_at(&on, 30, 50);
+    assert!(
+        r_on < 60 && g_on < 60 && b_on > 200,
+        "pipeline: `b*` close-edge pixel (30, 50) must be blue (the spec-required close \
+         segment of the stroke was painted), got ({r_on}, {g_on}, {b_on})"
+    );
+
+    let off = render_with_pipeline(&doc, false);
+    let (r_off, g_off, b_off, _a) = pixel_at(&off, 30, 50);
+    assert!(
+        r_off < 60 && g_off < 60 && b_off > 200,
+        "inline path: `b*` close-edge pixel (30, 50) must be blue, got ({r_off}, {g_off}, {b_off})"
+    );
+}
+
+// ---------- `B*` / `b*` even-odd fill-rule fixture ----------
+//
+// Review MAJOR-2: the existing `B*`/`b*` parity tests use a convex
+// rectangle, where even-odd and nonzero produce identical fills. A
+// regression that silently routed `B*` through `FillRule::Winding` would
+// not be caught.
+//
+// This test renders a self-intersecting bowtie (two triangles crossing
+// at the centre), where the two rules disagree:
+//   - Winding: the centre interior is filled.
+//   - EvenOdd: the centre interior is NOT filled — the path winds the
+//     same region twice with opposite orientations, so the parity is
+//     even and the pixel is hollow.
+//
+// Constructing the bowtie: triangle ABC where A=(20,20), B=(80,80), and
+// the path goes A → B → (80,20) → A (one closed triangle), continued
+// by A → (20,80) → B → A (a second closed triangle that shares the
+// AB diagonal). The two triangles overlap in the central diamond
+// region; even-odd rule cancels the overlap, nonzero rule does not.
+//
+// We don't need that level of complexity; a simpler self-intersecting
+// quad does the job. The classic figure-of-eight: trace a quad whose
+// edges cross. (20,20) → (80,80) → (20,80) → (80,20) → back to (20,20).
+// The two triangles formed share the central crossing; even-odd leaves
+// the centre filled actually because the crossing parity is odd. Use a
+// different shape — the standard test fixture is the star-of-david /
+// two overlapping triangles with the SAME winding direction. Even
+// simpler: two overlapping rectangles in the same subpath.
+//
+// Path: a 60×60 outer square plus a smaller 30×30 inner square, both
+// closed. Under Winding (same orientation) both are filled solid.
+// Under EvenOdd the inner square cancels — the centre pixel becomes a
+// hole.
+
+#[test]
+fn pilot_b_star_even_odd_fill_rule_actually_evenodd() {
+    // Outer square (50×50 centred) + inner square (20×20 centred),
+    // both wound the same direction. EvenOdd → the inner square is a
+    // hole; Winding → it's filled solid. Sample the centre pixel and
+    // a pixel inside the outer-but-outside-inner ring to confirm.
+    //
+    // Fill = red, stroke = blue, thin stroke so the centre pixel reads
+    // the FILL not the stroke colour.
+    let content = "1 0 0 rg\n0 0 1 RG\n1 w\n\
+                   25 25 m\n75 25 l\n75 75 l\n25 75 l\n25 25 l\n\
+                   40 40 m\n60 40 l\n60 60 l\n40 60 l\n40 40 l\n\
+                   b*\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+
+    let on = render_with_pipeline(&doc, true);
+
+    // Centre pixel sits inside the INNER square. Under EvenOdd it must
+    // be the page background (white), NOT red. If `B*` regressed to
+    // `FillRule::Winding`, this pixel would be red.
+    let (r_c, g_c, b_c, _) = center_pixel(&on);
+    assert!(
+        r_c > 240 && g_c > 240 && b_c > 240,
+        "pipeline: `b*` centre pixel must be the background (even-odd cancels the inner \
+         square), got ({r_c}, {g_c}, {b_c})"
+    );
+
+    // Ring pixel — inside outer, outside inner. Must be red (the fill
+    // colour). Sample (32, 50): x=32 is between the outer-left at x=25
+    // and the inner-left at x=40.
+    let (r_r, g_r, b_r, _) = pixel_at(&on, 32, 50);
+    assert!(
+        r_r > 200 && g_r < 60 && b_r < 60,
+        "pipeline: `b*` ring pixel must be the fill colour, got ({r_r}, {g_r}, {b_r})"
+    );
+
+    // Off-toggle must agree (both paths share the dispatcher arm for the
+    // fill rule, this is a regression net for both).
+    let off = render_with_pipeline(&doc, false);
+    let (r_co, g_co, b_co, _) = center_pixel(&off);
+    assert!(
+        r_co > 240 && g_co > 240 && b_co > 240,
+        "inline: `b*` centre pixel must be the background, got ({r_co}, {g_co}, {b_co})"
+    );
+    let (r_ro, g_ro, b_ro, _) = pixel_at(&off, 32, 50);
+    assert!(
+        r_ro > 200 && g_ro < 60 && b_ro < 60,
+        "inline: `b*` ring pixel must be the fill colour, got ({r_ro}, {g_ro}, {b_ro})"
+    );
 }
