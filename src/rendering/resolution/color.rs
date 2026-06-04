@@ -421,32 +421,14 @@ fn object_to_f64(o: &Object) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::RenderingIntent;
+    use crate::rendering::resolution::test_support::fixture_doc;
     use std::collections::HashMap;
-
-    fn fixture_doc() -> crate::document::PdfDocument {
-        let mut buf: Vec<u8> = Vec::new();
-        buf.extend_from_slice(b"%PDF-1.4\n");
-        let cat_off = buf.len();
-        buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-        let pages_off = buf.len();
-        buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
-        let xref_off = buf.len();
-        buf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
-        buf.extend_from_slice(format!("{:010} 00000 n \n", cat_off).as_bytes());
-        buf.extend_from_slice(format!("{:010} 00000 n \n", pages_off).as_bytes());
-        buf.extend_from_slice(
-            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off)
-                .as_bytes(),
-        );
-        crate::document::PdfDocument::from_bytes(buf).expect("fixture PDF parses")
-    }
 
     fn ctx<'a>(
         doc: &'a crate::document::PdfDocument,
         spaces: &'a HashMap<String, Object>,
     ) -> ResolutionContext<'a> {
-        ResolutionContext::new(doc, spaces, None, RenderingIntent::RelativeColorimetric)
+        ResolutionContext::new(doc, spaces)
     }
 
     fn assert_rgba(c: ResolvedColor, r: f32, g: f32, b: f32, a: f32) {

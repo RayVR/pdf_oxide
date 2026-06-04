@@ -2710,13 +2710,7 @@ impl PageRenderer {
         }
         let pipeline = ResolutionPipeline::new();
         let color_spaces = &self.color_spaces;
-        let output_intent_cmyk = doc.output_intent_cmyk_profile();
-        let ctx = ResolutionContext::new(
-            doc,
-            color_spaces,
-            output_intent_cmyk.as_ref(),
-            crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent),
-        );
+        let ctx = ResolutionContext::new(doc, color_spaces);
         let (space_name, components) = match side {
             PaintSide::Fill => (gs.fill_color_space.as_str(), &gs.fill_color_components),
             PaintSide::Stroke => (gs.stroke_color_space.as_str(), &gs.stroke_color_components),

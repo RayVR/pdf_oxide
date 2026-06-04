@@ -118,7 +118,6 @@ fn kind_copy<'a>(k: &super::intent::PaintKind<'a>) -> super::intent::PaintKind<'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::RenderingIntent;
     use crate::content::graphics_state::{GraphicsState, Matrix};
     use crate::object::Object;
     use smallvec::smallvec;
@@ -126,24 +125,7 @@ mod tests {
 
     use super::super::intent::{DeviceColor, LogicalColor, PaintKind};
     use super::super::resolved::{BlendPlan, ClipPlan, ResolvedColor};
-
-    fn fixture_doc() -> crate::document::PdfDocument {
-        let mut buf: Vec<u8> = Vec::new();
-        buf.extend_from_slice(b"%PDF-1.4\n");
-        let cat_off = buf.len();
-        buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-        let pages_off = buf.len();
-        buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
-        let xref_off = buf.len();
-        buf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
-        buf.extend_from_slice(format!("{:010} 00000 n \n", cat_off).as_bytes());
-        buf.extend_from_slice(format!("{:010} 00000 n \n", pages_off).as_bytes());
-        buf.extend_from_slice(
-            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off)
-                .as_bytes(),
-        );
-        crate::document::PdfDocument::from_bytes(buf).expect("fixture PDF parses")
-    }
+    use super::super::test_support::fixture_doc;
 
     fn rectangle_path() -> tiny_skia::Path {
         let mut pb = tiny_skia::PathBuilder::new();
@@ -159,7 +141,7 @@ mod tests {
     fn pipeline_resolves_device_gray_path_fill() {
         let doc = fixture_doc();
         let spaces = HashMap::new();
-        let ctx = ResolutionContext::new(&doc, &spaces, None, RenderingIntent::default());
+        let ctx = ResolutionContext::new(&doc, &spaces);
         let pipeline = ResolutionPipeline::new();
 
         let path = rectangle_path();
@@ -210,7 +192,7 @@ mod tests {
     fn pipeline_passes_through_clip_mask_arc() {
         let doc = fixture_doc();
         let spaces = HashMap::new();
-        let ctx = ResolutionContext::new(&doc, &spaces, None, RenderingIntent::default());
+        let ctx = ResolutionContext::new(&doc, &spaces);
         let pipeline = ResolutionPipeline::new();
         let path = rectangle_path();
         let gs = GraphicsState::new();
@@ -237,7 +219,7 @@ mod tests {
     fn pipeline_picks_stroke_alpha_for_stroke_side() {
         let doc = fixture_doc();
         let spaces = HashMap::new();
-        let ctx = ResolutionContext::new(&doc, &spaces, None, RenderingIntent::default());
+        let ctx = ResolutionContext::new(&doc, &spaces);
         let pipeline = ResolutionPipeline::new();
         let path = rectangle_path();
         let mut gs = GraphicsState::new();
@@ -286,7 +268,7 @@ mod tests {
 
         let doc = fixture_doc();
         let spaces = HashMap::new();
-        let ctx = ResolutionContext::new(&doc, &spaces, None, RenderingIntent::default());
+        let ctx = ResolutionContext::new(&doc, &spaces);
         let pipeline = ResolutionPipeline::new();
         let path = rectangle_path();
         let gs = GraphicsState::new();

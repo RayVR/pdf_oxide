@@ -43,27 +43,29 @@
 //!
 //! # Status (this branch)
 //!
-//! The module is **dead code at landing**: no existing renderer calls into it.
-//! That is deliberate — it isolates the foundation from migration risk. A pilot
-//! operator (path fill, `Operator::Fill` / `Operator::FillEvenOdd`) is wired
-//! through the pipeline in [`super::page_renderer`] behind an env-var toggle
-//! (`PDF_OXIDE_RESOLUTION_PIPELINE=1`) so existing users see no behaviour
-//! change. Follow-up branches migrate the remaining operators incrementally,
-//! validating parity at each step.
+//! The pipeline is wired behind an env-var toggle in the page renderer
+//! (`PDF_OXIDE_RESOLUTION_PIPELINE=1`) and used for the path fill /
+//! stroke / combo operators (`f`, `f*`, `S`, `s`, `B`, `B*`, `b`, `b*`).
+//! With the toggle off, behaviour is byte-identical to the inline
+//! dispatcher arms; toggle on, capabilities the inline arms can't reach
+//! (PostScript Type 4 tint transforms on Separation/DeviceN, for one)
+//! come online. Follow-up branches migrate the remaining operators
+//! incrementally, validating parity at each step.
 //!
 //! Each stage has its own unit tests in its module: colour resolution can be
 //! tested without any rendering happening, overprint resolution can be tested
 //! by feeding `GraphicsState` mocks. This is the payoff of the layering —
 //! capabilities become individually testable.
 
-// The pipeline lands dead at the integration layer (Phase 3 wires one
-// operator behind an env-var toggle; subsequent branches migrate the rest).
-// The `dead_code` allow keeps the module compiling clean under
-// `-D warnings` while the migration is in flight; remove it once every
-// stage has at least one production caller. The `unused_imports` allow
-// covers the convenience re-exports below — Phase 3 consumes a subset
-// (`ResolutionPipeline`, `ResolutionContext`, the intent + resolved
-// types); the rest become live as follow-up branches migrate operators.
+// Several stages (the per-plate ink router, the explicit blend planner,
+// the dedicated PaintBackend trait) are scaffolding for future backends
+// that have zero callers today. The `dead_code` allow keeps the module
+// compiling clean under `-D warnings` while those callers come online;
+// remove it once every stage has at least one production caller. The
+// `unused_imports` allow covers the convenience re-exports below — the
+// pilot consumes a subset (`ResolutionPipeline`, `ResolutionContext`, the
+// intent + resolved types); the rest become live as follow-up branches
+// migrate operators.
 #![allow(dead_code, unused_imports)]
 
 pub(crate) mod backend;
@@ -76,6 +78,8 @@ pub(crate) mod intent;
 pub(crate) mod overprint;
 pub(crate) mod pipeline;
 pub(crate) mod resolved;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub(crate) use backend::PaintBackend;
 pub(crate) use blend::BlendResolver;
