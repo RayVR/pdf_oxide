@@ -32,6 +32,26 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tiny_skia::{Color, Path, PathBuilder, Pixmap, PixmapPaint, Transform};
 
+/// Which paint side(s) the unified pipeline helper should resolve for the
+/// current operator.
+///
+/// Path operators name their sides directly; the text variant defers to
+/// `gs.render_mode` (`Tr`) because the same `Tj` / `TJ` operator paints
+/// fill, stroke, both, or nothing depending on the active text render
+/// mode (ISO 32000-1 §9.3.6 Table 106).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelinePaintKind {
+    /// `f`, `F`, `f*` — path-fill only.
+    PathFill,
+    /// `S` — path-stroke only.
+    PathStroke,
+    /// `B`, `b`, `B*`, `b*` — fill then stroke (two `PaintIntent`s flow
+    /// through the same helper call, one per side).
+    PathFillStroke,
+    /// `Tj`, `TJ`, `'`, `"` — sides chosen by `gs.render_mode`.
+    Text,
+}
+
 /// Image output formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -1155,18 +1175,15 @@ impl PageRenderer {
                             // byte-for-byte. Line width / cap / join / dash
                             // come from the cloned `gs` unchanged, so the
                             // stroke geometry is identical either way.
-                            let pipeline_rgba = self.pipeline_resolve_stroke_rgba(doc, gs);
+                            let spliced = self.pipeline_resolve_paint_gs(
+                                doc,
+                                gs,
+                                PipelinePaintKind::PathStroke,
+                            );
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            if let Some((r, g, b, a)) = pipeline_rgba {
-                                let mut spliced = gs.clone();
-                                spliced.stroke_color_rgb = (r, g, b);
-                                spliced.stroke_alpha = a;
-                                self.path_rasterizer
-                                    .stroke_path_clipped(pixmap, &path, transform, &spliced, clip);
-                            } else {
-                                self.path_rasterizer
-                                    .stroke_path_clipped(pixmap, &path, transform, gs, clip);
-                            }
+                            self.path_rasterizer
+                                .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                         }
                     } else {
                         let _ = current_path.finish();
@@ -1191,30 +1208,21 @@ impl PageRenderer {
                             // splice the resulting RGBA into a transient
                             // GraphicsState copy that the rasteriser consumes.
                             // Off → no behaviour change.
-                            let pipeline_rgba = self.pipeline_resolve_fill_rgba(doc, gs);
+                            let spliced = self.pipeline_resolve_paint_gs(
+                                doc,
+                                gs,
+                                PipelinePaintKind::PathFill,
+                            );
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            if let Some((r, g, b, a)) = pipeline_rgba {
-                                let mut spliced = gs.clone();
-                                spliced.fill_color_rgb = (r, g, b);
-                                spliced.fill_alpha = a;
-                                self.path_rasterizer.fill_path_clipped(
-                                    pixmap,
-                                    &path,
-                                    transform,
-                                    &spliced,
-                                    tiny_skia::FillRule::Winding,
-                                    clip,
-                                );
-                            } else {
-                                self.path_rasterizer.fill_path_clipped(
-                                    pixmap,
-                                    &path,
-                                    transform,
-                                    gs,
-                                    tiny_skia::FillRule::Winding,
-                                    clip,
-                                );
-                            }
+                            self.path_rasterizer.fill_path_clipped(
+                                pixmap,
+                                &path,
+                                transform,
+                                render_gs,
+                                tiny_skia::FillRule::Winding,
+                                clip,
+                            );
                         }
                     } else {
                         let _ = current_path.finish();
@@ -1264,27 +1272,22 @@ impl PageRenderer {
                             // Off-toggle keeps `gs` borrowed directly (no
                             // clone) so the parity invariant is preserved
                             // and the off-path stays alloc-free.
-                            let fill_rgba = self.pipeline_resolve_fill_rgba(doc, gs);
-                            let stroke_rgba = self.pipeline_resolve_stroke_rgba(doc, gs);
-                            let fill_spliced = fill_rgba.map(|(r, g, b, a)| {
-                                let mut s = gs.clone();
-                                s.fill_color_rgb = (r, g, b);
-                                s.fill_alpha = a;
-                                s
-                            });
-                            let stroke_spliced = stroke_rgba.map(|(r, g, b, a)| {
-                                let mut s = gs.clone();
-                                s.stroke_color_rgb = (r, g, b);
-                                s.stroke_alpha = a;
-                                s
-                            });
-                            let fill_gs: &GraphicsState = fill_spliced.as_ref().unwrap_or(gs);
-                            let stroke_gs: &GraphicsState = stroke_spliced.as_ref().unwrap_or(gs);
+                            // Single splice for both sides — the rasteriser
+                            // reads fill fields for the fill pass and stroke
+                            // fields for the stroke pass, so one clone with
+                            // both sides written is equivalent to two
+                            // single-side clones.
+                            let spliced = self.pipeline_resolve_paint_gs(
+                                doc,
+                                gs,
+                                PipelinePaintKind::PathFillStroke,
+                            );
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.path_rasterizer.fill_path_clipped(
-                                pixmap, &path, transform, fill_gs, fill_rule, clip,
+                                pixmap, &path, transform, render_gs, fill_rule, clip,
                             );
                             self.path_rasterizer
-                                .stroke_path_clipped(pixmap, &path, transform, stroke_gs, clip);
+                                .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                         }
                     } else {
                         let _ = current_path.finish();
@@ -1304,38 +1307,34 @@ impl PageRenderer {
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            // Fill side — same routing as `Fill`/`Fill*`.
-                            let fill_rgba = self.pipeline_resolve_fill_rgba(doc, gs);
-                            let fill_spliced = fill_rgba.map(|(r, g, b, a)| {
-                                let mut s = gs.clone();
-                                s.fill_color_rgb = (r, g, b);
-                                s.fill_alpha = a;
-                                s
-                            });
-                            let fill_gs: &GraphicsState = fill_spliced.as_ref().unwrap_or(gs);
+                            // One unified resolve covers both fill and the
+                            // optional stroke pass — for plain `f*` the
+                            // helper produces a fill-only splice; for
+                            // `B*`/`b*` both sides are spliced into the
+                            // same clone. Either way, the rasteriser reads
+                            // the side it needs from `render_gs`.
+                            let kind = if matches!(op, Operator::FillStrokeEvenOdd) {
+                                PipelinePaintKind::PathFillStroke
+                            } else {
+                                PipelinePaintKind::PathFill
+                            };
+                            let spliced = self.pipeline_resolve_paint_gs(doc, gs, kind);
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap,
                                 &path,
                                 transform,
-                                fill_gs,
+                                render_gs,
                                 tiny_skia::FillRule::EvenOdd,
                                 clip,
                             );
                             if matches!(op, Operator::FillStrokeEvenOdd) {
-                                // Stroke side independently routed — Type 4
-                                // Separation on the stroke colour is now
-                                // honoured when the pilot toggle is on.
-                                let stroke_rgba = self.pipeline_resolve_stroke_rgba(doc, gs);
-                                let stroke_spliced = stroke_rgba.map(|(r, g, b, a)| {
-                                    let mut s = gs.clone();
-                                    s.stroke_color_rgb = (r, g, b);
-                                    s.stroke_alpha = a;
-                                    s
-                                });
-                                let stroke_gs: &GraphicsState =
-                                    stroke_spliced.as_ref().unwrap_or(gs);
+                                // Stroke side: Type 4 Separation on the
+                                // stroke colour is honoured when the pilot
+                                // toggle is on; the spliced `render_gs`
+                                // carries the resolved stroke fields.
                                 self.path_rasterizer
-                                    .stroke_path_clipped(pixmap, &path, transform, stroke_gs, clip);
+                                    .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                             }
                         }
                     } else {
@@ -1414,7 +1413,8 @@ impl PageRenderer {
                             // operator-arm level — not per glyph — so the cost
                             // is amortised across the whole string. Off → no
                             // behaviour change, gs borrowed directly.
-                            let spliced = self.pipeline_resolve_text_gs(doc, gs);
+                            let spliced =
+                                self.pipeline_resolve_paint_gs(doc, gs, PipelinePaintKind::Text);
                             let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
@@ -1461,7 +1461,8 @@ impl PageRenderer {
                             // `T* Tj` per ISO 32000-1; the resolved colour
                             // depends only on the prior colour-setting ops,
                             // so the resolve happens here, not inside `T*`.
-                            let spliced = self.pipeline_resolve_text_gs(doc, gs);
+                            let spliced =
+                                self.pipeline_resolve_paint_gs(doc, gs, PipelinePaintKind::Text);
                             let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
@@ -1504,7 +1505,8 @@ impl PageRenderer {
                             // clones its own `current_gs` from the value it
                             // receives, so the spliced colour propagates to
                             // every glyph element automatically.
-                            let spliced = self.pipeline_resolve_text_gs(doc, gs);
+                            let spliced =
+                                self.pipeline_resolve_paint_gs(doc, gs, PipelinePaintKind::Text);
                             let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.text_rasterizer.render_tj_array(
                                 pixmap,
@@ -1560,7 +1562,8 @@ impl PageRenderer {
                             // influence the resolved colour, so the resolve
                             // happens immediately before painting just like in
                             // `Tj` / `'`.
-                            let spliced = self.pipeline_resolve_text_gs(doc, gs);
+                            let spliced =
+                                self.pipeline_resolve_paint_gs(doc, gs, PipelinePaintKind::Text);
                             let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
@@ -2689,65 +2692,53 @@ impl PageRenderer {
         Ok(output.into_inner())
     }
 
-    /// Resolve the current fill colour through the resolution pipeline if it
-    /// is enabled, returning a final RGBA the caller can install on a paint.
+    /// Resolve the colours an operator needs through the resolution
+    /// pipeline and return a `GraphicsState` clone with the resolved RGBA
+    /// spliced into the fields the rasteriser reads. Returns `None` when
+    /// the toggle is off, when the operator's [`PipelinePaintKind`] does
+    /// not select any side requiring resolution (e.g. text under Tr=3),
+    /// or when no side produced an RGBA the composite backend can
+    /// consume directly — letting the caller borrow the original `gs`
+    /// and keep the off-path allocation-free.
     ///
-    /// Thin wrapper around [`Self::pipeline_resolve_rgba`] specialised to
-    /// [`PaintSide::Fill`]; kept as a named entry point because it reads
-    /// cleanly at the path-fill call sites.
-    fn pipeline_resolve_fill_rgba(
-        &self,
-        doc: &PdfDocument,
-        gs: &GraphicsState,
-    ) -> Option<(f32, f32, f32, f32)> {
-        self.pipeline_resolve_rgba(doc, gs, PaintSide::Fill)
-    }
-
-    /// Resolve the current stroke colour through the resolution pipeline if
-    /// it is enabled. Symmetric to [`Self::pipeline_resolve_fill_rgba`].
-    fn pipeline_resolve_stroke_rgba(
-        &self,
-        doc: &PdfDocument,
-        gs: &GraphicsState,
-    ) -> Option<(f32, f32, f32, f32)> {
-        self.pipeline_resolve_rgba(doc, gs, PaintSide::Stroke)
-    }
-
-    /// Resolve the text-painting colours through the resolution pipeline
-    /// and return a `GraphicsState` clone with the resolved RGBA spliced
-    /// into the fill / stroke fields the text rasteriser reads. Returns
-    /// `None` when the toggle is off, when the active Tr mode does not
-    /// require any resolved side, or when neither side has a resolvable
-    /// non-Device colour to route — letting the caller borrow the
-    /// original `gs` directly and keep the off-path allocation-free.
+    /// One helper for all paint operators. Path-fill, path-stroke,
+    /// path-fill-stroke, and text all flow through this; each variant of
+    /// [`PipelinePaintKind`] decides which side(s) to resolve. Both sides
+    /// resolve independently — the pipeline keys all of its side-specific
+    /// behaviour off `intent.side`, so a Type 4 Separation on the fill
+    /// side and a plain DeviceRGB on the stroke side route correctly
+    /// without contaminating each other.
     ///
-    /// Tr-mode handling (ISO 32000-1 §9.3.6 Table 106):
+    /// Text-side `Tr`-mode handling (ISO 32000-1 §9.3.6 Table 106):
     /// * `0`, `2`, `4`, `6` fill the glyph → resolve fill side.
     /// * `1`, `2`, `5`, `6` stroke the glyph → resolve stroke side.
     /// * `3` is invisible (no painting); skip resolution entirely so
     ///   PDFs that emit text-as-OCR-overlay don't pay the per-`Tj`
     ///   pipeline-clone cost.
-    ///
-    /// Both sides resolve independently — the pipeline keys all of its
-    /// side-specific behaviour off `intent.side`, so a Type 4 Separation
-    /// on the fill side and a plain DeviceRGB on the stroke side route
-    /// correctly without contaminating each other.
-    pub(crate) fn pipeline_resolve_text_gs(
+    pub(crate) fn pipeline_resolve_paint_gs(
         &self,
         doc: &PdfDocument,
         gs: &GraphicsState,
+        kind: PipelinePaintKind,
     ) -> Option<GraphicsState> {
         if !self.pipeline_enabled_cache {
             return None;
         }
-        // Tr=3 → invisible text. No glyph paint happens, so neither side
-        // needs resolving. The text matrix still advances; that's handled
-        // unconditionally outside the resolve helper.
-        if gs.render_mode == 3 {
-            return None;
-        }
-        let fills = matches!(gs.render_mode, 0 | 2 | 4 | 6);
-        let strokes = matches!(gs.render_mode, 1 | 2 | 5 | 6);
+        let (fills, strokes) = match kind {
+            PipelinePaintKind::PathFill => (true, false),
+            PipelinePaintKind::PathStroke => (false, true),
+            PipelinePaintKind::PathFillStroke => (true, true),
+            PipelinePaintKind::Text => {
+                // Tr=3 → invisible text. No glyph paint happens, so
+                // neither side needs resolving. The text matrix still
+                // advances; that's handled unconditionally outside the
+                // resolve helper.
+                if gs.render_mode == 3 {
+                    return None;
+                }
+                (matches!(gs.render_mode, 0 | 2 | 4 | 6), matches!(gs.render_mode, 1 | 2 | 5 | 6))
+            },
+        };
         let fill_rgba = if fills {
             self.pipeline_resolve_rgba(doc, gs, PaintSide::Fill)
         } else {
@@ -3156,8 +3147,8 @@ mod tests {
     //     splice, which holds whether the helper returns `None` or
     //     `Some(clone)`. We probe the return value directly here.
     //
-    // Both probes call `pipeline_resolve_text_gs` directly. The wider
-    // integration coverage stays untouched.
+    // Both probes call `pipeline_resolve_paint_gs` with the `Text`
+    // variant directly. The wider integration coverage stays untouched.
     // ---------------------------------------------------------------------
 
     use crate::content::graphics_state::GraphicsState;
@@ -3200,7 +3191,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_resolve_text_gs_strokes_magenta_under_tr1() {
+    fn pipeline_resolve_paint_gs_text_strokes_magenta_under_tr1() {
         // T-1 stroke-side resolution probe.
         //
         // Construct a `PageRenderer` with the toggle on and a
@@ -3226,7 +3217,7 @@ mod tests {
 
         let doc = fixture_doc();
         let spliced = renderer
-            .pipeline_resolve_text_gs(&doc, &gs)
+            .pipeline_resolve_paint_gs(&doc, &gs, PipelinePaintKind::Text)
             .expect("Tr=1 stroke side must produce a spliced GraphicsState");
 
         let (r, g, b) = spliced.stroke_color_rgb;
@@ -3241,7 +3232,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_resolve_text_gs_returns_none_when_toggle_off() {
+    fn pipeline_resolve_paint_gs_text_returns_none_when_toggle_off() {
         // T-2 helper-disabled probe. With the toggle off the helper must
         // return `None` regardless of how rich the inputs are — including
         // a Tr=2 fill+stroke configuration that would otherwise drive
@@ -3263,7 +3254,7 @@ mod tests {
         gs.stroke_color_components = smallvec![0.0, 0.0, 1.0];
 
         let doc = fixture_doc();
-        let result = renderer.pipeline_resolve_text_gs(&doc, &gs);
+        let result = renderer.pipeline_resolve_paint_gs(&doc, &gs, PipelinePaintKind::Text);
         assert!(result.is_none(), "helper must return None when the toggle is off; got Some(_)");
     }
 }
