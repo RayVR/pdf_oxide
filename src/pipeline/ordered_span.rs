@@ -222,7 +222,8 @@ impl OrderedTextSpan {
     /// Returns the struct-tree-scope `/ActualText` replacement when one
     /// is attached; otherwise the underlying span's text. Returns an
     /// empty borrowed string when the span has been suppressed by an
-    /// ancestor's emission (see [`actualtext_replacement`]).
+    /// ancestor's emission (see
+    /// [`Self::actualtext_replacement`]).
     pub fn effective_text(&self) -> &str {
         match &self.actualtext_replacement {
             Some(s) => s,

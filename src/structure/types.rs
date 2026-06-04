@@ -455,9 +455,9 @@ pub struct ActualTextIndex {
 
     /// MCIDs whose raw glyph spans must be suppressed during assembly.
     ///
-    /// Every MCID present in [`mcid_to_actual_text`] is also present in
-    /// this set. Suppression is required to prevent duplicate output
-    /// when the replacement text is emitted from an
+    /// Every MCID present in [`Self::mcid_to_actual_text`] is also
+    /// present in this set. Suppression is required to prevent
+    /// duplicate output when the replacement text is emitted from an
     /// [`ActualTextEmission`].
     pub covered_mcids: HashSet<u32>,
 
