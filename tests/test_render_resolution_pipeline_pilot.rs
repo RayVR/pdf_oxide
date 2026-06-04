@@ -1890,19 +1890,39 @@ fn pilot_image_mask_device_cmyk_parity_pipeline_off_vs_on() {
 
 #[test]
 fn pilot_image_mask_indexed_parity_pipeline_off_vs_on() {
-    // Indexed colour space — palette of 4 RGB triplets. `0 sc` against
-    // index 0 selects the first triplet (1.0, 0.0, 0.0 → red). Both
-    // paths fold this through the colour-space resolver to a Device
-    // RGB; parity must hold.
+    // Indexed colour space — palette of 4 RGB triplets at indices 0..3.
+    // Wave-3 reality: neither the inline path (page_renderer.rs ~:974)
+    // nor the pipeline performs the palette lookup yet — both fall back
+    // to `index / 255` as a gray value (the inline branch was wired to
+    // match the pipeline's `resolve_indexed` gray fallback so the
+    // toggle agrees). Parity off-vs-on covers the gray-fallback
+    // agreement.
+    //
+    // We pick a non-zero index (128) so the fallback produces a
+    // distinctive mid-gray instead of near-black — that lets us pin
+    // the gray-fallback *value*, which will fail loudly the day someone
+    // implements real Indexed lookup in the resolver and forces this
+    // test to migrate to a true palette-lookup assertion.
     let mask = solid_image_mask_bytes(8, 8);
     let palette = "<FF0000 00FF00 0000FF FFFFFF>";
     let resources = format!("/ColorSpace << /CS1 [/Indexed /DeviceRGB 3 {}] >>", palette);
-    let content = "q\n/CS1 cs\n0 sc\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
+    let content = "q\n/CS1 cs\n128 sc\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, &resources, 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
     assert_eq!(off, on, "ImageMask Indexed fill must be byte-identical off vs on");
+
+    // Pin the gray-fallback value. `128 / 255 ≈ 0.502 → ≈128`. If real
+    // palette lookup ever lands, index 128 is out of range for the
+    // 4-entry palette and the assertion will fail — the right outcome:
+    // the implementer must then either clamp to hival (index 3, blue)
+    // or define the behaviour explicitly, and rewrite this test.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        r == g && g == b && (118..=138).contains(&(r as i32)),
+        "Indexed gray fallback must paint ≈ index/255 mid-gray; got ({r}, {g}, {b})"
+    );
 }
 
 // ---------- ImageMask capability gain (Type 4 Separation) ----------
