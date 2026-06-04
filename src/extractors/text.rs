@@ -2359,6 +2359,17 @@ pub struct TextExtractor<'doc> {
     /// Tracks the MCID of the currently active marked content sequence.
     /// Used to associate extracted text with structure tree elements.
     current_mcid: Option<u32>,
+    /// Set of MCIDs whose BDC carried inline `/ActualText` on this
+    /// page.
+    ///
+    /// Populated by the BDC handler whenever it observes
+    /// `/ActualText` on the properties dictionary. The struct-tree-
+    /// scope ActualText applier (in `document.rs`) uses this set to
+    /// honour MC-scope-wins precedence: an ancestor StructElem's
+    /// `/ActualText` must NOT override an MCID whose in-stream
+    /// /ActualText has already been applied at extraction time
+    /// (ISO 32000-1:2008 §14.6, §14.9.4).
+    mc_actualtext_mcids: HashSet<u32>,
     /// Stack of marked content contexts (per PDF Spec Section 14.6)
     ///
     /// Tracks nested marked content tags to enable artifact filtering.
@@ -2500,6 +2511,7 @@ impl<'doc> TextExtractor<'doc> {
             config,
             merging_config: SpanMergingConfig::default(),
             current_mcid: None,
+            mc_actualtext_mcids: HashSet::new(),
             extract_spans: true,      // Default to span mode (PDF spec compliant)
             tj_span_buffer: None,     // No buffer initially
             span_sequence_counter: 0, // Initialize sequence counter
@@ -2553,6 +2565,17 @@ impl<'doc> TextExtractor<'doc> {
     /// Set the document reference for loading XObjects.
     pub fn set_document(&mut self, document: &'doc crate::document::PdfDocument) {
         self.document = Some(document);
+    }
+
+    /// Take ownership of the set of MCIDs whose marked-content
+    /// sequence carried an inline `/ActualText` property on this
+    /// extraction.
+    ///
+    /// The set is observed by the BDC handler; this method drains it
+    /// out so the document layer can stash it on a per-page side
+    /// channel for the struct-tree-scope ActualText applier.
+    pub fn take_mc_actualtext_mcids(&mut self) -> HashSet<u32> {
+        std::mem::take(&mut self.mc_actualtext_mcids)
     }
 
     /// Set layer names (Optional Content Groups) to exclude from extraction.
@@ -5617,6 +5640,14 @@ impl<'doc> TextExtractor<'doc> {
                         if let Some(text_bytes) = actual_text_obj.as_string() {
                             actual_text = Some(Self::decode_pdf_text_string(text_bytes));
                             log::debug!("Marked content has ActualText: {:?}", actual_text);
+                            // Record that this MCID's in-stream
+                            // /ActualText is the authoritative
+                            // replacement (MC-scope wins over any
+                            // ancestor's struct-tree-scope
+                            // /ActualText).
+                            if let Some(mcid) = self.current_mcid {
+                                self.mc_actualtext_mcids.insert(mcid);
+                            }
                         }
                     }
 

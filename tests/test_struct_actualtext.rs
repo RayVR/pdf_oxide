@@ -143,7 +143,25 @@ impl PdfBuilder {
         out
     }
 
+    /// Build a PDF with an OCG layer whose `/Name` is `layer_name`.
+    /// The content stream is expected to wrap its MCID-emitting BDC
+    /// inside a parent `/OC /Properties << /OCG <ref> >>` BDC so the
+    /// layer-exclusion path can suppress its glyphs. The layer is
+    /// referenced from the page's `/Resources /Properties` dict under
+    /// the name "L".
+    fn build_with_ocg(self, layer_name: &str) -> Vec<u8> {
+        // The OCG object number is appended after all the other
+        // objects. We embed it via a string substitution shim on the
+        // built bytes: simplest path is to pre-thread it into the
+        // build pipeline. See `build_impl`.
+        self.build_impl(Some(layer_name.to_string()))
+    }
+
     fn build(self) -> Vec<u8> {
+        self.build_impl(None)
+    }
+
+    fn build_impl(self, ocg_layer: Option<String>) -> Vec<u8> {
         use std::collections::BTreeMap;
 
         // Object numbering convention:
@@ -165,8 +183,14 @@ impl PdfBuilder {
         let first_content = first_page + n_pages;
         let parent_tree = first_content + n_pages;
         let struct_tree_root = parent_tree + 1;
+        // OCG (optional content group) object, when used.
+        let ocg = if ocg_layer.is_some() {
+            Some(struct_tree_root + 1)
+        } else {
+            None
+        };
         // Caller-side elem.obj_num MUST be >= first_struct_elem.
-        let first_struct_elem = struct_tree_root + 1;
+        let first_struct_elem = struct_tree_root + 1 + if ocg.is_some() { 1 } else { 0 };
 
         // Verify obj_nums are unique and high enough.
         let mut used = std::collections::HashSet::new();
@@ -192,14 +216,27 @@ impl PdfBuilder {
         } else {
             "<< /Marked true >>"
         };
+        let oc_props = match ocg {
+            Some(o) => format!(
+                " /OCProperties << /OCGs [{} 0 R] /D << /Order [{} 0 R] >> >>",
+                o, o
+            ),
+            None => String::new(),
+        };
         objs.insert(
             catalog,
             format!(
-                "<< /Type /Catalog /Pages {} 0 R /MarkInfo {} /StructTreeRoot {} 0 R >>",
-                pages, mark_info, struct_tree_root
+                "<< /Type /Catalog /Pages {} 0 R /MarkInfo {} /StructTreeRoot {} 0 R{} >>",
+                pages, mark_info, struct_tree_root, oc_props
             )
             .into_bytes(),
         );
+        if let (Some(ocg_num), Some(layer_name)) = (ocg, ocg_layer.clone()) {
+            objs.insert(
+                ocg_num,
+                format!("<< /Type /OCG /Name ({}) >>", layer_name).into_bytes(),
+            );
+        }
 
         // Pages tree.
         let kids: String = (0..n_pages)
@@ -233,13 +270,17 @@ impl PdfBuilder {
             stream.extend_from_slice(content_bytes);
             stream.extend_from_slice(b"\nendstream");
             objs.insert(content_obj, stream);
+            let props_entry = match ocg {
+                Some(o) => format!(" /Properties << /L {} 0 R >>", o),
+                None => String::new(),
+            };
             objs.insert(
                 first_page + i,
                 format!(
                     "<< /Type /Page /Parent {} 0 R /MediaBox [0 0 612 792] \
-                     /Resources << /Font << /F1 {} 0 R >> /ProcSet [/PDF /Text] >> \
+                     /Resources << /Font << /F1 {} 0 R >> /ProcSet [/PDF /Text]{} >> \
                      /Contents {} 0 R /StructParents {} >>",
-                    pages, font, content_obj, i
+                    pages, font, props_entry, content_obj, i
                 )
                 .into_bytes(),
             );
@@ -765,6 +806,115 @@ fn actualtext_emits_when_suspects_true() {
     assert!(
         !extracted.contains('X'),
         "raw 'X' must NOT appear, got {:?}",
+        extracted
+    );
+}
+
+/// Fixture 3: MC-scope ActualText nested inside a struct-tree
+/// ActualText scope. PDF spec precedence: MC-scope (inner, content
+/// stream) wins over struct-tree (outer) for the same MCID, because
+/// the in-stream replacement is the most specific declaration.
+fn fixture_descendant_mc_scope() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    // BDC carries inline /ActualText "mc" — content stream rewrites
+    // raw glyph "X" to "mc" at extraction time.
+    let content = "BT\n/F1 12 Tf\n50 700 Td\n\
+                   /Span << /MCID 0 /ActualText <FEFF006D0063> >> BDC\n\
+                   (X) Tj\n\
+                   EMC\nET\n";
+    b.add_page_content(content.as_bytes().to_vec());
+    // StructElem on the same MCID carries /ActualText "struct".
+    let _ = b.add_elem(
+        Elem::new(8, "Span", 7)
+            .page(4)
+            .actual_text("struct")
+            .k(K::Mcid(0, 0)),
+    );
+    b.register_mcid(0, 0, 8);
+    b.build()
+}
+
+#[test]
+fn mc_scope_actualtext_wins_over_struct_scope() {
+    let pdf = fixture_descendant_mc_scope();
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let extracted = doc.extract_text(0).expect("extract_text");
+    // Precedence: MC-scope replacement is innermost and most
+    // specific; it must beat the enclosing struct-tree /ActualText.
+    assert!(
+        extracted.contains("mc"),
+        "MC-scope replacement 'mc' must appear (innermost wins), got {:?}",
+        extracted
+    );
+    assert!(
+        !extracted.contains("struct"),
+        "struct-tree replacement 'struct' must NOT appear (MC-scope wins), got {:?}",
+        extracted
+    );
+    assert!(
+        !extracted.contains('X'),
+        "raw 'X' must NOT appear, got {:?}",
+        extracted
+    );
+}
+
+/// Fixture 11a: All covered MCIDs are inside an excluded OCG layer —
+/// emission must be skipped.
+fn fixture_ocg_excluded_all() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    // Wrap the MCID's BDC inside an OCG /OC /L scope (L is the name
+    // declared in /Resources /Properties).
+    let content = "BT\n/F1 12 Tf\n50 700 Td\n\
+                   /OC /L BDC\n\
+                   /Span << /MCID 0 >> BDC\n\
+                   (X) Tj\n\
+                   EMC\n\
+                   EMC\nET\n";
+    b.add_page_content(content.as_bytes().to_vec());
+    // Object num accounting: when an OCG is added, first_struct_elem
+    // shifts up by 1 (see build_impl).
+    let _ = b.add_elem(
+        Elem::new(9, "Span", 7)
+            .page(4)
+            .actual_text("replacement")
+            .k(K::Mcid(0, 0)),
+    );
+    b.register_mcid(0, 0, 9);
+    b.build_with_ocg("HiddenLayer")
+}
+
+#[test]
+fn actualtext_ocg_excluded_all_suppresses_emission() {
+    let pdf = fixture_ocg_excluded_all();
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let mut excluded = std::collections::HashSet::new();
+    excluded.insert("HiddenLayer".to_string());
+    let extracted = doc
+        .extract_text_filtered(0, excluded, std::collections::HashSet::new())
+        .expect("extract_text_filtered");
+    assert!(
+        !extracted.contains("replacement"),
+        "ActualText emission must be skipped when every covered MCID is OCG-excluded, got {:?}",
+        extracted
+    );
+    assert!(
+        !extracted.contains('X'),
+        "raw 'X' must also be suppressed under OCG exclusion, got {:?}",
+        extracted
+    );
+}
+
+#[test]
+fn actualtext_ocg_visible_path_still_emits() {
+    // Counter-test: when the OCG layer is NOT excluded, the
+    // emission must still fire (proves the suppression is layer-
+    // gated, not always-on).
+    let pdf = fixture_ocg_excluded_all();
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let extracted = doc.extract_text(0).expect("extract_text");
+    assert!(
+        extracted.contains("replacement"),
+        "without excluding the OCG, the emission must fire normally, got {:?}",
         extracted
     );
 }

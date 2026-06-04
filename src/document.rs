@@ -393,6 +393,16 @@ pub struct PdfDocument {
     /// content replacement, not reading order — see
     /// `actualtext_index`).
     actualtext_index_cache: Mutex<Option<Option<Arc<crate::structure::ActualTextIndex>>>>,
+    /// Per-page set of MCIDs whose marked-content sequence carried an
+    /// inline `/ActualText` property (ISO 32000-1:2008 §14.6).
+    ///
+    /// Populated by the text extractor each time it processes a BDC
+    /// operator on a page. The struct-tree-scope ActualText applier
+    /// consults this set to enforce the precedence rule: the MC-scope
+    /// (inline) replacement is the innermost and most specific
+    /// declaration for the MCID it covers, so a struct-tree-scope
+    /// `/ActualText` on an ancestor element must NOT override it.
+    pub(crate) mc_actualtext_mcids: Mutex<HashMap<usize, HashSet<u32>>>,
     /// `Table` structure elements bucketed by page, built once via
     /// `find_table_elements_all_pages` (one tree walk) so the converter table
     /// path does an O(1) lookup instead of walking the tree per page.
@@ -937,6 +947,7 @@ impl PdfDocument {
             structure_tree_cache: Mutex::new(None),
             structure_content_cache: Mutex::new(None),
             actualtext_index_cache: Mutex::new(None),
+            mc_actualtext_mcids: Mutex::new(HashMap::new()),
             table_elements_cache: Mutex::new(None),
             page_cache: Mutex::new(HashMap::new()),
             page_cache_populated: AtomicBool::new(false),
@@ -8434,6 +8445,12 @@ impl PdfDocument {
             page_index as u32,
             &mcid_map,
         );
+        let mc_wins: HashSet<u32> = self
+            .mc_actualtext_mcids
+            .lock_or_recover()
+            .get(&page_index)
+            .cloned()
+            .unwrap_or_default();
 
         // Step 4: Assemble text in structure order
         let mut text = String::with_capacity(mcid_map.len() * 50); // estimate
@@ -8456,9 +8473,10 @@ impl PdfDocument {
 
             // If this MCID is covered by an ActualText emission, the
             // raw glyphs are suppressed; emit the replacement at the
-            // emission's anchor instead.
+            // emission's anchor instead. MC-scope-wins precedence
+            // exempts MCIDs whose BDC carried inline /ActualText.
             if let Some(ref idx) = at_index {
-                if idx.covered_mcids.contains(&mcid) {
+                if idx.covered_mcids.contains(&mcid) && !mc_wins.contains(&mcid) {
                     consumed_mcids.insert(mcid);
                     for emission in &page_emissions {
                         if emission.anchor_mcid == mcid {
@@ -8605,6 +8623,18 @@ impl PdfDocument {
         if idx.covered_mcids.is_empty() {
             return;
         }
+        // MC-scope-wins precedence: skip suppression / replacement for
+        // any MCID whose BDC already carried inline /ActualText. The
+        // extractor has already applied the in-stream replacement at
+        // span.text; the ancestor struct-tree /ActualText is the
+        // outer (less specific) declaration and must not override.
+        let mc_wins: HashSet<u32> = self
+            .mc_actualtext_mcids
+            .lock_or_recover()
+            .get(&page_index)
+            .cloned()
+            .unwrap_or_default();
+
         // Group present MCIDs to determine emission visibility.
         let mut mcid_present: HashMap<u32, Vec<TextSpan>> = HashMap::new();
         for s in spans.iter() {
@@ -8625,6 +8655,11 @@ impl PdfDocument {
         for (i, s) in spans.iter_mut().enumerate() {
             let Some(m) = s.mcid else { continue };
             if !idx.covered_mcids.contains(&m) {
+                continue;
+            }
+            if mc_wins.contains(&m) {
+                // MC-scope replacement already applied; leave span
+                // alone and do not let an ancestor override.
                 continue;
             }
             if let Some(text) = anchor_text.get(&m) {
@@ -8670,6 +8705,13 @@ impl PdfDocument {
         if idx.covered_mcids.is_empty() {
             return;
         }
+        let mc_wins: HashSet<u32> = self
+            .mc_actualtext_mcids
+            .lock_or_recover()
+            .get(&page_index)
+            .cloned()
+            .unwrap_or_default();
+
         // Build a mcid_map of present MCIDs to decide visibility.
         let mut mcid_present: HashMap<u32, Vec<TextSpan>> = HashMap::new();
         for o in ordered.iter() {
@@ -8708,6 +8750,12 @@ impl PdfDocument {
         for o in ordered.iter_mut() {
             let Some(m) = o.span.mcid else { continue };
             if !idx.covered_mcids.contains(&m) {
+                continue;
+            }
+            if mc_wins.contains(&m) {
+                // MC-scope wins: leave the in-stream replacement
+                // intact and do not let an ancestor's struct-tree
+                // /ActualText override.
                 continue;
             }
             if let Some(text) = anchor_text.get(&m) {
@@ -8870,6 +8918,13 @@ impl PdfDocument {
             page_index as u32,
             &mcid_map,
         );
+        // MC-scope-wins precedence set (see `apply_actualtext_to_spans`).
+        let mc_wins: HashSet<u32> = self
+            .mc_actualtext_mcids
+            .lock_or_recover()
+            .get(&page_index)
+            .cloned()
+            .unwrap_or_default();
 
         log::debug!(
             "Cached structure content: {} items for page {}, {} MCIDs with spans, {} ActualText emissions on this page",
@@ -8898,9 +8953,12 @@ impl PdfDocument {
 
             // If this MCID is covered by an ActualText emission, the
             // raw glyphs are suppressed (the replacement is emitted
-            // when we reach its anchor MCID — see below).
+            // when we reach its anchor MCID — see below). MC-scope-
+            // wins precedence exempts MCIDs whose BDC carried inline
+            // /ActualText: their span text already holds the
+            // (innermost) replacement.
             if let Some(ref idx) = at_index {
-                if idx.covered_mcids.contains(&mcid) {
+                if idx.covered_mcids.contains(&mcid) && !mc_wins.contains(&mcid) {
                     consumed_mcids.insert(mcid);
                     // Find emission(s) anchored on this MCID.
                     for emission in &page_emissions {
@@ -10821,7 +10879,19 @@ impl PdfDocument {
             }
         }
 
-        extractor.extract_text_spans(&content_data)
+        let spans = extractor.extract_text_spans(&content_data)?;
+        // Drain MCIDs whose in-stream /ActualText was applied during
+        // extraction and stash on the document so the struct-tree-
+        // scope applier honours MC-scope-wins precedence (§14.9.4).
+        let mc_set = extractor.take_mc_actualtext_mcids();
+        if !mc_set.is_empty() {
+            self.mc_actualtext_mcids
+                .lock_or_recover()
+                .entry(page_index)
+                .or_default()
+                .extend(mc_set);
+        }
+        Ok(spans)
     }
 
     /// Extract text from a page, excluding content from specified layers and inks.
