@@ -48,10 +48,26 @@ fn parse_form_matrix(dict: &std::collections::HashMap<String, Object>) -> tiny_s
 }
 
 /// Knockout transparency group threshold for the alpha short-circuit
-/// (§11.6.6.2). A fully opaque paint is visually identical between the
-/// knockout and non-knockout paths, so we short-circuit the buffer dance
-/// when `alpha >= 1.0 - eps`. Slightly under 1.0 to absorb f32 rounding.
+/// (§11.6.6.2). A fully opaque paint with `BM=Normal` is visually
+/// identical between the knockout and non-knockout paths, so we
+/// short-circuit the buffer dance when `alpha >= 1.0 - eps`. Slightly
+/// under 1.0 to absorb f32 rounding.
 const KNOCKOUT_ALPHA_OPAQUE: f32 = 0.9999;
+
+/// Compute the value to feed `knockout_aware_paint`'s `effective_alpha`.
+/// For `BM=Normal` it's just the GS alpha; for any non-separable / non-
+/// Normal blend mode the formula reads the destination, so even a fully
+/// opaque paint needs the backdrop-redirect dance in a knockout group.
+/// Returning `0.0` forces the helper to take the dance path regardless of
+/// the actual GS alpha — `gs_alpha` itself isn't used downstream past the
+/// `< KNOCKOUT_ALPHA_OPAQUE` comparison.
+fn knockout_paint_alpha(gs_alpha: f32, blend_mode: &str) -> f32 {
+    if blend_mode == "Normal" {
+        gs_alpha
+    } else {
+        0.0
+    }
+}
 
 /// Run a paint operation in a knockout-aware fashion. When the enclosing
 /// group has a knockout backdrop and the effective alpha is below
@@ -71,7 +87,15 @@ where
 {
     if effective_alpha < KNOCKOUT_ALPHA_OPAQUE {
         if let Some(backdrop) = knockout_backdrop {
+            // Per-paint clone is O(W·H). Tracked for a follow-up that
+            // hoists a single scratch pixmap across the knockout group
+            // and writes via `copy_from_slice` instead of `clone`.
             let mut temp = backdrop.clone();
+            // If `paint_fn` errors mid-paint, `temp` is left in whatever
+            // partial state the rasterizer wrote. We still run
+            // `knockout_merge` so the caller observes the same partial-
+            // write semantics as the non-knockout path (which would
+            // half-paint `pixmap` directly on the same error).
             let result = paint_fn(&mut temp);
             knockout_merge(pixmap, &temp, backdrop);
             return result;
@@ -81,10 +105,18 @@ where
 }
 
 /// Merge a temp pixmap (a paint rendered against the knockout backdrop)
-/// back into the group's accumulating buffer. For each pixel that differs
-/// between `temp` and `backdrop` — i.e. each pixel the paint touched —
-/// the temp's value replaces the destination. Pixels the paint didn't
-/// touch remain whatever the previous paint left in `dest`.
+/// back into the group's accumulating buffer. For each pixel where
+/// `temp` differs from `backdrop` — i.e. each pixel the paint demonstrably
+/// changed from the initial backdrop — `temp`'s value replaces the
+/// destination. Pixels that compare equal to the backdrop remain whatever
+/// the previous paint left in `dest`.
+///
+/// Caveat: a paint that legitimately produces a byte-identical result to
+/// the backdrop pixel (e.g. drawing white onto white, or fully transparent
+/// over fully transparent) is treated as "untouched" and the prior paint's
+/// value survives. In practice the affected cases are visually
+/// indistinguishable; a coverage-mask-based detector would be needed for
+/// strict §11.6.6.2 conformance in those corner cases.
 ///
 /// All three pixmaps must share dimensions; callers always allocate them
 /// at the group pixmap's W*H so this holds.
@@ -1209,7 +1241,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.stroke_alpha,
+                                knockout_paint_alpha(gs.stroke_alpha, &gs.blend_mode),
                                 |target| {
                                     path_rasterizer
                                         .stroke_path_clipped(target, &path, transform, gs, clip);
@@ -1239,7 +1271,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.fill_alpha,
+                                knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode),
                                 |target| {
                                     path_rasterizer.fill_path_clipped(
                                         target,
@@ -1282,7 +1314,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.fill_alpha,
+                                knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode),
                                 |target| {
                                     path_rasterizer.fill_path_clipped(
                                         target, &path, transform, gs, fill_rule, clip,
@@ -1292,7 +1324,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.stroke_alpha,
+                                knockout_paint_alpha(gs.stroke_alpha, &gs.blend_mode),
                                 |target| {
                                     path_rasterizer
                                         .stroke_path_clipped(target, &path, transform, gs, clip);
@@ -1322,7 +1354,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.fill_alpha,
+                                knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode),
                                 |target| {
                                     path_rasterizer.fill_path_clipped(
                                         target,
@@ -1338,7 +1370,7 @@ impl PageRenderer {
                                 knockout_aware_paint(
                                     pixmap,
                                     knockout_backdrop.as_ref(),
-                                    gs.stroke_alpha,
+                                    knockout_paint_alpha(gs.stroke_alpha, &gs.blend_mode),
                                     |target| {
                                         path_rasterizer.stroke_path_clipped(
                                             target, &path, transform, gs, clip,
@@ -1420,7 +1452,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.fill_alpha,
+                                knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode),
                                 |target| {
                                     text_rasterizer.render_text(
                                         target, text, transform, gs, resources, doc, clip, fonts,
@@ -1455,7 +1487,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.fill_alpha,
+                                knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode),
                                 |target| {
                                     text_rasterizer.render_text(
                                         target, text, transform, gs, resources, doc, clip, fonts,
@@ -1492,7 +1524,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.fill_alpha,
+                                knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode),
                                 |target| {
                                     text_rasterizer.render_tj_array(
                                         target, array, transform, gs, resources, doc, clip, fonts,
@@ -1544,7 +1576,7 @@ impl PageRenderer {
                             knockout_aware_paint(
                                 pixmap,
                                 knockout_backdrop.as_ref(),
-                                gs.fill_alpha,
+                                knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode),
                                 |target| {
                                     text_rasterizer.render_text(
                                         target, text, transform, gs, resources, doc, clip, fonts,
@@ -1573,7 +1605,7 @@ impl PageRenderer {
                         // knockout purposes — render the image or form into
                         // a backdrop-relative temp and merge so it replaces
                         // (rather than blends with) prior paints in the group.
-                        let alpha = gs.fill_alpha;
+                        let alpha = knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode);
                         knockout_aware_paint(
                             pixmap,
                             knockout_backdrop.as_ref(),
@@ -1758,7 +1790,7 @@ impl PageRenderer {
                         let transform = combine_transforms(base_transform, &gs.ctm);
                         let clip_owned = effective_clip(&clip_stack, &soft_mask_stack);
                         let clip = clip_owned.as_deref();
-                        let alpha = gs.fill_alpha;
+                        let alpha = knockout_paint_alpha(gs.fill_alpha, &gs.blend_mode);
                         knockout_aware_paint(
                             pixmap,
                             knockout_backdrop.as_ref(),
@@ -2894,10 +2926,14 @@ impl PageRenderer {
         // Combine parent transform with form matrix
         let combined_transform = parent_transform.pre_concat(form_matrix);
 
-        // Check for transparency group (PDF spec section 11.6.6)
-        let is_transparency_group = dict
+        // Check for transparency group (PDF spec section 11.6.6). /Group may be
+        // an indirect reference (`/Group 12 0 R`) in real-world output; resolve
+        // it before reading its fields.
+        let group_obj = dict
             .get("Group")
-            .and_then(|g| g.as_dict())
+            .and_then(|g| doc.resolve_object(g).ok());
+        let group_dict = group_obj.as_ref().and_then(|g| g.as_dict());
+        let is_transparency_group = group_dict
             .map(|gd| gd.get("S").and_then(|s| s.as_name()) == Some("Transparency"))
             .unwrap_or(false);
 
@@ -2920,23 +2956,26 @@ impl PageRenderer {
             // Per PDF spec 11.6.6: Render transparency group to a separate pixmap,
             // then composite onto the parent. For isolated groups (I=true), the
             // initial backdrop is fully transparent.
-            let group_dict = dict.get("Group").and_then(|g| g.as_dict());
+            //
+            // Accept boolean true *or* a non-zero integer for /I and /K —
+            // some legacy tools emit `/K 1` instead of `/K true`.
+            let parse_flag = |v: &Object| -> bool {
+                match v {
+                    Object::Boolean(b) => *b,
+                    Object::Integer(n) => *n != 0,
+                    _ => false,
+                }
+            };
             let is_isolated = group_dict
                 .and_then(|gd| gd.get("I"))
-                .map(|i| match i {
-                    Object::Boolean(b) => *b,
-                    _ => false,
-                })
+                .map(&parse_flag)
                 .unwrap_or(false);
             // §11.6.6.2 knockout flag — when true, each painted element
             // composites against the group's *initial backdrop* rather than
             // the accumulating result.
             let is_knockout = group_dict
                 .and_then(|gd| gd.get("K"))
-                .map(|i| match i {
-                    Object::Boolean(b) => *b,
-                    _ => false,
-                })
+                .map(&parse_flag)
                 .unwrap_or(false);
 
             log::debug!(

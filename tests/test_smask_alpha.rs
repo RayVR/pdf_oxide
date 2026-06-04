@@ -913,6 +913,195 @@ fn smask_clips_image_paint() {
     );
 }
 
+/// Build a Luminosity-SMask fixture where `/G` paints a full-page
+/// uniform colour given by `(r, g, b)` (each in 0..=255). The page then
+/// fills full black through `/GS1`; the rendered centre pixel's R should
+/// reflect the BT.601 luminance of `(r,g,b)` composited over the white
+/// page background as `255 - luma`.
+fn build_pdf_with_luminosity_uniform_color_smask(r: u8, g: u8, b: u8) -> Vec<u8> {
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\nQ\n";
+    let group_content = format!(
+        "{r:.3} {g:.3} {b:.3} rg\n0 0 100 100 re\nf\n",
+        r = r as f32 / 255.0,
+        g = g as f32 / 255.0,
+        b = b as f32 / 255.0
+    );
+    let group_content = group_content.as_bytes();
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    finalize_pdf(buf, offsets)
+}
+
+/// BT.601 weight pinning — pure red. Luma = 0.299·255 ≈ 76; composite
+/// black over white = 255 − 76 ≈ 179. A weight bug that gave luma 150
+/// (green-dominant) would land at R ≈ 105; a swap to blue-dominant would
+/// give R ≈ 226. The tight band ±6 catches both.
+#[test]
+fn bt601_luma_pure_red_yields_r_approx_179() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_uniform_color_smask(255, 0, 0))
+        .expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let r = decode_png(&img.data).get_pixel(50, 50)[0] as i32;
+    assert!(
+        (r - 179).abs() <= 6,
+        "Pure red under BT.601 luma must give R ≈ 179; got {r}"
+    );
+}
+
+/// BT.601 weight pinning — pure green. Luma = 0.587·255 ≈ 150; composite
+/// black over white = 255 − 150 ≈ 105.
+#[test]
+fn bt601_luma_pure_green_yields_r_approx_105() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_uniform_color_smask(0, 255, 0))
+        .expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let r = decode_png(&img.data).get_pixel(50, 50)[0] as i32;
+    assert!(
+        (r - 105).abs() <= 6,
+        "Pure green under BT.601 luma must give R ≈ 105; got {r}"
+    );
+}
+
+/// BT.601 weight pinning — pure blue. Luma = 0.114·255 ≈ 29; composite
+/// black over white = 255 − 29 ≈ 226.
+#[test]
+fn bt601_luma_pure_blue_yields_r_approx_226() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_uniform_color_smask(0, 0, 255))
+        .expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let r = decode_png(&img.data).get_pixel(50, 50)[0] as i32;
+    assert!(
+        (r - 226).abs() <= 6,
+        "Pure blue under BT.601 luma must give R ≈ 226; got {r}"
+    );
+}
+
+/// Build a Luminosity-SMask fixture where `/G` paints uniform gray at the
+/// given level (`/<gray> g`), and the SMask carries a Type-2 exponential
+/// `/TR` with the given `N`. Used to multi-sample the transfer function.
+fn build_pdf_with_luminosity_smask_tr_type2(gray: f32, n: f32) -> Vec<u8> {
+    let page_content = b"q\n/GS1 gs\n0 g\n0 0 100 100 re\nf\nQ\n";
+    let group_content = format!("{gray:.3} g\n0 0 100 100 re\nf\n");
+    let group_content = group_content.as_bytes();
+
+    let mut buf = Vec::new();
+    let mut offsets = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+           /Contents 4 0 R \
+           /Resources << /ExtGState << /GS1 5 0 R >> >> \
+           /Group << /Type /Group /S /Transparency >> >>\nendobj\n",
+    );
+    offsets.push(buf.len());
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", page_content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(page_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"5 0 obj\n<< /Type /ExtGState /SMask 6 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /Type /Mask /S /Luminosity /G 7 0 R /TR 8 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n",
+        group_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(group_content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(buf.len());
+    let tr = format!(
+        "8 0 obj\n<< /FunctionType 2 /Domain [0 1] /Range [0 1] \
+            /C0 [0] /C1 [1] /N {n} >>\nendobj\n"
+    );
+    buf.extend_from_slice(tr.as_bytes());
+
+    finalize_pdf(buf, offsets)
+}
+
+/// `/TR` Type-2 N=2 pin at three luma input points: 0.25, 0.5, 0.75.
+/// Mask after transfer: 0.0625, 0.25, 0.5625. Composite over white:
+/// R ≈ 239, 191, 112. A bug that uses x¹, x³, or x⁴ would fail at least
+/// one assertion (different curvature shows up at the endpoints).
+#[test]
+fn tr_type2_squared_pins_exponent_at_three_points() {
+    let cases = [
+        (0.25_f32, 239_i32),
+        (0.50_f32, 191_i32),
+        (0.75_f32, 112_i32),
+    ];
+    for (gray, expected) in cases {
+        let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_smask_tr_type2(gray, 2.0))
+            .expect("parse");
+        let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+        let r = decode_png(&img.data).get_pixel(50, 50)[0] as i32;
+        assert!(
+            (r - expected).abs() <= 8,
+            "/TR Type 2 N=2 at gray={gray} must give R ≈ {expected}; got {r}"
+        );
+    }
+}
+
+/// `/TR` Type-2 with `N <= 0` must be rejected (§7.10.3). The mask should
+/// then come straight from BT.601 luma with no transfer applied: 0.5 g →
+/// luma ≈ 128 → R ≈ 127. A regression that drops the `N > 0 && is_finite`
+/// guard would let `0_f64.powf(0.0) = 1.0` invert the mask everywhere
+/// and produce R ≈ 0.
+#[test]
+fn tr_type2_invalid_n_falls_through_to_identity() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_luminosity_smask_tr_type2(0.5, -1.0))
+        .expect("parse");
+    let img = render_page(&doc, 0, &RenderOptions::with_dpi(72)).expect("render");
+    let r = decode_png(&img.data).get_pixel(50, 50)[0] as i32;
+    assert!(
+        (r - 127).abs() <= 8,
+        "/TR with N=-1 must be rejected, falling through to identity (R ≈ 127); got {r}"
+    );
+}
+
 #[test]
 fn ext_gstate_alpha_smask_blocks_paint_under_transparent_mask() {
     let pdf = build_pdf_with_alpha_smask();
