@@ -1596,17 +1596,24 @@ fn pilot_text_helper_returns_none_when_pipeline_disabled() {
 // untouched.
 // =====================================================================
 
-/// Build a one-page PDF with an ImageMask XObject `/IM1` filled with raw
-/// 1-bit stencil bytes. `content_ops` runs on the page (typically sets
-/// the fill colour, a CTM, then `/IM1 Do`). `resources_extra` is appended
-/// into the page's `/Resources` dictionary (use it for `/ColorSpace`
-/// when a non-device fill is required).
-fn build_pdf_image_mask(
+/// Shared core for the two ImageMask-fixture builders below. Emits a
+/// one-page PDF whose page references `/IM1` as an ImageMask XObject and
+/// — when `type4_program` is `Some(_)` — an indirect Type 4 tint
+/// transform as object 6 (the Separation colour space the page
+/// resources declare via `resources_extra` is expected to reference
+/// `6 0 R`).
+///
+/// `content_ops` runs on the page (typically sets the fill colour, a
+/// CTM, then `/IM1 Do`). `resources_extra` is appended into the page's
+/// `/Resources` dictionary (use it for `/ColorSpace` when a non-device
+/// fill is required). `mask_data` is the raw 1-bit stencil byte stream.
+fn build_pdf_image_mask_core(
     content_ops: &str,
     resources_extra: &str,
     width: u32,
     height: u32,
     mask_data: &[u8],
+    type4_program: Option<&str>,
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"%PDF-1.4\n");
@@ -1643,15 +1650,58 @@ fn build_pdf_image_mask(
     buf.extend_from_slice(mask_data);
     buf.extend_from_slice(b"\nendstream\nendobj\n");
 
+    // Optional Type 4 function as object 6 — present only when the
+    // caller's Separation colour space references it.
+    let func_off = if let Some(program) = type4_program {
+        let off = buf.len();
+        let func_hdr = format!(
+            "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+            program.len()
+        );
+        buf.extend_from_slice(func_hdr.as_bytes());
+        buf.extend_from_slice(program.as_bytes());
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+        Some(off)
+    } else {
+        None
+    };
+
+    // xref + trailer: 6 or 7 objects depending on whether the Type 4
+    // function is present.
     let xref_off = buf.len();
-    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
-    for off in [cat_off, pages_off, page_off, stream_off, xobj_off] {
+    let (size, header) = if func_off.is_some() {
+        (7, "xref\n0 7\n0000000000 65535 f \n")
+    } else {
+        (6, "xref\n0 6\n0000000000 65535 f \n")
+    };
+    buf.extend_from_slice(header.as_bytes());
+    let core_entries = [cat_off, pages_off, page_off, stream_off, xobj_off];
+    for off in core_entries {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    if let Some(off) = func_off {
         buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     buf.extend_from_slice(
-        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+        format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", size, xref_off)
+            .as_bytes(),
     );
     buf
+}
+
+/// Build a one-page PDF with an ImageMask XObject `/IM1` filled with raw
+/// 1-bit stencil bytes. `content_ops` runs on the page (typically sets
+/// the fill colour, a CTM, then `/IM1 Do`). `resources_extra` is appended
+/// into the page's `/Resources` dictionary (use it for `/ColorSpace`
+/// when a non-device fill is required).
+fn build_pdf_image_mask(
+    content_ops: &str,
+    resources_extra: &str,
+    width: u32,
+    height: u32,
+    mask_data: &[u8],
+) -> Vec<u8> {
+    build_pdf_image_mask_core(content_ops, resources_extra, width, height, mask_data, None)
 }
 
 /// Build a one-page PDF with an ImageMask XObject `/IM1` *and* an
@@ -1666,59 +1716,14 @@ fn build_pdf_image_mask_with_type4(
     mask_data: &[u8],
     type4_program: &str,
 ) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"%PDF-1.4\n");
-
-    let cat_off = buf.len();
-    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    let pages_off = buf.len();
-    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-    let page_off = buf.len();
-    let page = format!(
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
-         /Resources << /XObject << /IM1 5 0 R >> {} >> /Contents 4 0 R >>\nendobj\n",
-        resources_extra
-    );
-    buf.extend_from_slice(page.as_bytes());
-
-    let stream_off = buf.len();
-    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content_ops.len());
-    buf.extend_from_slice(stream_hdr.as_bytes());
-    buf.extend_from_slice(content_ops.as_bytes());
-    buf.extend_from_slice(b"\nendstream\nendobj\n");
-
-    let xobj_off = buf.len();
-    let xobj_hdr = format!(
-        "5 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true \
-         /Width {} /Height {} /BitsPerComponent 1 /Length {} >>\nstream\n",
+    build_pdf_image_mask_core(
+        content_ops,
+        resources_extra,
         width,
         height,
-        mask_data.len()
-    );
-    buf.extend_from_slice(xobj_hdr.as_bytes());
-    buf.extend_from_slice(mask_data);
-    buf.extend_from_slice(b"\nendstream\nendobj\n");
-
-    let func_off = buf.len();
-    let func_hdr = format!(
-        "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
-        type4_program.len()
-    );
-    buf.extend_from_slice(func_hdr.as_bytes());
-    buf.extend_from_slice(type4_program.as_bytes());
-    buf.extend_from_slice(b"\nendstream\nendobj\n");
-
-    let xref_off = buf.len();
-    buf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
-    for off in [cat_off, pages_off, page_off, stream_off, xobj_off, func_off] {
-        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
-    }
-    buf.extend_from_slice(
-        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
-    );
-    buf
+        mask_data,
+        Some(type4_program),
+    )
 }
 
 /// Build a one-page PDF with a standard (non-mask) Image XObject `/IM1`.
