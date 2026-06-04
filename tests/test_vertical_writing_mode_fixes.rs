@@ -304,6 +304,174 @@ fn c5_to_unicode_wmode_does_not_override_encoding_wmode() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// I1 — pipeline reading-order strategies must honor wmode
+// ---------------------------------------------------------------------------
+
+/// Synthetic vertical-majority page: spans are tagged wmode=1 and
+/// arranged in two right-to-left columns. The pipeline (to_markdown,
+/// to_html) must produce tategaki order — right column top-to-bottom,
+/// then left column top-to-bottom — across every reading-order strategy.
+#[test]
+fn i1_pipeline_routes_vertical_majority_through_tategaki_sort() {
+    use pdf_oxide::geometry::Rect;
+    use pdf_oxide::layout::TextSpan;
+    use pdf_oxide::pipeline::{ReadingOrderContext, TextPipeline};
+
+    fn mk(text: &str, x: f32, y: f32) -> TextSpan {
+        TextSpan {
+            text: text.to_string(),
+            bbox: Rect::new(x, y, 12.0, 12.0),
+            font_name: "Test".to_string(),
+            font_size: 12.0,
+            wmode: 1,
+            ..TextSpan::default()
+        }
+    }
+
+    // Reading order should be A, B, C, D, E, F.
+    // Right column (x≈500): A (y=700), B (y=688), C (y=676).
+    // Left column  (x≈300): D (y=700), E (y=688), F (y=676).
+    let spans = vec![
+        mk("D", 300.0, 700.0),
+        mk("F", 300.0, 676.0),
+        mk("B", 500.0, 688.0),
+        mk("C", 500.0, 676.0),
+        mk("A", 500.0, 700.0),
+        mk("E", 300.0, 688.0),
+    ];
+
+    let pipeline = TextPipeline::new();
+    let ordered = pipeline
+        .process(spans, ReadingOrderContext::new())
+        .expect("pipeline process");
+    let combined: String = ordered.iter().map(|o| o.span.text.as_str()).collect();
+    assert_eq!(
+        combined, "ABCDEF",
+        "vertical-majority pipeline must produce tategaki order; got {:?}",
+        combined
+    );
+}
+
+/// to_markdown and to_html — both route through `TextPipeline::process`
+/// per src/document.rs:14258 / 14588. The vertical reading-order test
+/// PDF (two columns: A-C right, D-F left under Identity-V) must produce
+/// tategaki order in both output formats.
+#[test]
+fn i1_to_markdown_and_to_html_route_vertical_through_tategaki() {
+    // Reuse the two-column tategaki PDF structure used by the existing
+    // reading-order test, but inline it here so this file does not couple
+    // to the other test file.
+    let cmap = b"\
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+6 beginbfchar
+<0001> <0041>
+<0002> <0042>
+<0003> <0043>
+<0004> <0044>
+<0005> <0045>
+<0006> <0046>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end";
+    let content = b"BT /F1 12 Tf \
+        1 0 0 1 500 700 Tm <0001> Tj \
+        1 0 0 1 500 680 Tm <0002> Tj \
+        1 0 0 1 500 660 Tm <0003> Tj \
+        1 0 0 1 300 700 Tm <0004> Tj \
+        1 0 0 1 300 680 Tm <0005> Tj \
+        1 0 0 1 300 660 Tm <0006> Tj \
+        ET";
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let o1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+    let o2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+    let o3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] \
+          /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n",
+    );
+    let o4 = pdf.len();
+    pdf.extend_from_slice(format!("4 0 obj << /Length {} >> stream\n", content.len()).as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let o5 = pdf.len();
+    pdf.extend_from_slice(
+        b"5 0 obj << /Type /Font /Subtype /Type0 /BaseFont /TestFont \
+          /Encoding /Identity-V /DescendantFonts [6 0 R] /ToUnicode 7 0 R >> endobj\n",
+    );
+    let o6 = pdf.len();
+    pdf.extend_from_slice(
+        b"6 0 obj << /Type /Font /Subtype /CIDFontType2 /BaseFont /TestFont \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /DW 1000 /DW2 [880 -1000] >> endobj\n",
+    );
+    let o7 = pdf.len();
+    pdf.extend_from_slice(format!("7 0 obj << /Length {} >> stream\n", cmap.len()).as_bytes());
+    pdf.extend_from_slice(cmap);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for off in [o1, o2, o3, o4, o5, o6, o7] {
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref
+        )
+        .as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(pdf).expect("parse tategaki PDF");
+    // Disable table extraction so the converter doesn't mis-detect the
+    // two columns × three rows as a tabular layout. This test is about
+    // tategaki reading order, not table extraction.
+    let mut opts = pdf_oxide::converters::ConversionOptions::default();
+    opts.extract_tables = false;
+
+    let md = doc.to_markdown(0, &opts).expect("to_markdown");
+    // Strip whitespace+newlines for the comparison — exact formatting
+    // varies by converter (paragraph wrapping etc.) but the character
+    // order must be tategaki.
+    let md_chars: String = md.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    assert!(
+        md_chars.contains("ABCDEF"),
+        "to_markdown must preserve tategaki reading order; got {:?}",
+        md_chars
+    );
+
+    let html = doc.to_html(0, &opts).expect("to_html");
+    // Strip HTML tags (<p>, </p>, etc.) before checking character order.
+    let mut html_chars = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag && c.is_ascii_alphabetic() => html_chars.push(c),
+            _ => {},
+        }
+    }
+    assert!(
+        html_chars.contains("ABCDEF"),
+        "to_html must preserve tategaki reading order; got {:?}",
+        html_chars
+    );
+}
+
 /// Counter-test: a vertical /Encoding (Identity-V) with a ToUnicode that has
 /// no /WMode directive must still produce wmode=1.
 #[test]
