@@ -2575,30 +2575,40 @@ fn pilot_shading_type4_separation_under_pipeline_respects_user_space_ctm() {
     let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
 
-    // Sample in tiny-skia's `SpreadMode::Pad` region — to the left
-    // of the C0 endpoint, where any pixel projecting to a negative
-    // gradient-t is clamped to pure C0 regardless of how far away
-    // it sits from the axis. The gradient axis maps from user
-    // (10, 10) → (60, 10); pixmap (5, 95) corresponds to user
-    // (5, 5), which projects to t < 0 and lands in the Pad region.
-    // This isolates the C0 value cleanly (no interpolation toward
-    // C1), so we can pin the resolved-magenta vs raw-RGB-white
-    // divergence with tight thresholds.
-    let (r_on, g_on, b_on, a_on) = pixel_at(&on, 5, 95);
+    // Sample close to the C0 endpoint, inside the gradient slab.
+    // The gradient axis maps from user (10, 10) → (60, 10). The
+    // helper omits `/Extend` so the slab is `[false false]`
+    // (spec default) and the past-endpoint regions are page
+    // background. Sample at user (15, 10), pixmap (15, 90), where
+    // `t = (15 - 10) / (60 - 10) = 0.1` — close enough to the C0
+    // endpoint that the resolved-magenta vs raw-white divergence
+    // dominates.
+    let (r_on, g_on, b_on, a_on) = pixel_at(&on, 15, 90);
     assert!(
-        r_on >= 250 && g_on <= 5 && b_on >= 250 && a_on == 255,
-        "under a non-identity CTM, the pipeline must paint the Pad-clamped \
-         C0 region pure magenta (Type-4 evaluation of /C0 [1] under the \
+        r_on >= 240 && g_on <= 30 && b_on >= 240 && a_on == 255,
+        "under a non-identity CTM, the pipeline must paint near the C0 endpoint \
+         predominantly magenta (Type-4 evaluation of /C0 [1] under the \
          Separation space); got ({r_on}, {g_on}, {b_on}, {a_on})"
     );
 
-    // The inline path reads /C0 [1] as `(1, 1, 1)` white, so the
-    // same Pad-region pixel must be pure white.
-    let (r_off, g_off, b_off, _) = pixel_at(&off, 5, 95);
+    // Inline path reads /C0 [1] as `(1, 1, 1)` white, then
+    // interpolates t=0.1 toward C1=[0]=raw-RGB-black (Separation 0
+    // tint also reads `/C1 [0]` raw as RGB black under the inline
+    // path), so the pixel reads as a slight-gray near-white.
+    let (r_off, g_off, b_off, _) = pixel_at(&off, 15, 90);
     assert!(
-        r_off >= 250 && g_off >= 250 && b_off >= 250,
-        "inline path must paint the Pad-clamped C0 region pure white \
-         (inline reads /C0 [1] as RGB white); got ({r_off}, {g_off}, {b_off})"
+        r_off >= 200 && g_off >= 200 && b_off >= 200,
+        "inline path near the C0 endpoint must be light grey (inline reads \
+         /C0 [1] as white, /C1 [0] as black, t≈0.1); got ({r_off}, {g_off}, {b_off})"
+    );
+    // The visible divergence: pipeline keeps a magenta tint (green
+    // ≪ red, blue), inline goes grey (channels close to each other).
+    let max_off = r_off.max(g_off).max(b_off);
+    let min_off = r_off.min(g_off).min(b_off);
+    assert!(
+        (max_off - min_off) < 10,
+        "inline path must read all RGB channels near-equal (no chroma); \
+         got ({r_off}, {g_off}, {b_off})"
     );
 
     assert_ne!(off, on, "Type 4 Separation shading endpoint must drive a visible difference");

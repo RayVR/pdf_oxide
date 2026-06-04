@@ -303,7 +303,9 @@ fn qa_axial_vertical_coords_toggle_parity() {
 /// to the left of coordinate-0). The gradient runs right-to-left in
 /// user space. The colour at the "high-x" end of the page should be
 /// C0 (since C0 sits at the *first* listed point, which is at the
-/// right). Toggle parity must hold.
+/// right). Toggle parity must hold. Declares `/Extend [true true]`
+/// so the gradient pads past the axis ends with the endpoint
+/// colours — the assertions below sample inside that padded region.
 #[test]
 fn qa_axial_reversed_coords_toggle_parity() {
     // /C0 at (90, 50), /C1 at (10, 50). The "high x" side of the page
@@ -315,7 +317,7 @@ fn qa_axial_reversed_coords_toggle_parity() {
         "[90 50 10 50]",
         "[0 1 0]", // C0 = green
         "[1 1 1]", // C1 = white
-        "",
+        "/Extend [true true]",
         "",
         "",
         &[],
@@ -469,21 +471,15 @@ fn qa_axial_extend_true_true_toggle_parity() {
 }
 
 /// Probe 5 — Explicit `/Extend [false false]`. Per spec, when false
-/// the shading must NOT paint beyond the geometric endpoints. tiny-skia's
-/// `SpreadMode::Pad` clamps to the endpoint colour, which is the
-/// wrong behaviour for `[false false]` — anything outside the axis
-/// projection should be the page background, not the endpoint colour.
-///
-/// **#[ignore]** — The current `render_axial_shading` hard-codes
-/// `SpreadMode::Pad` and ignores `/Extend` entirely. Both paths share
-/// the bug; this probe pins it.
-///
-/// Bug name: WAVE4-SHADING-EXTEND-NOT-HONOURED.
+/// the shading must NOT paint beyond the geometric endpoints. The
+/// renderer now builds an axis-perpendicular slab clip from the
+/// gradient endpoints and intersects it with the inherited
+/// `clip_mask`, so pixels past the axis projection retain the page
+/// background instead of the SpreadMode::Pad clamp colour.
 #[test]
-#[ignore = "WAVE4-SHADING-EXTEND-NOT-HONOURED: /Extend [false false] should NOT paint past geometric endpoints"]
 fn qa_axial_extend_false_false_does_not_paint_past_endpoints() {
     // Axis the middle 20% of the page. With Extend [false false] the
-    // pixel at x=5 (far left of axis) should be the page background,
+    // pixel at x=5 (far left of axis) must stay the page background,
     // not C0 red.
     let content = "/Sh1 sh\n";
     let bytes = build_pdf_axial_shading(
@@ -500,8 +496,8 @@ fn qa_axial_extend_false_false_does_not_paint_past_endpoints() {
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
     let (r, g, b, _) = pixel_at(&on, 5, 50);
-    // A spec-compliant renderer leaves this pixel as the white page
-    // background. The current renderer paints it C0 red.
+    // Spec-compliant: pixels outside the axis must be the page
+    // background.
     assert!(
         r > 230 && g > 230 && b > 230,
         "with /Extend [false false], pixels outside the axis must be page background; \
@@ -509,9 +505,11 @@ fn qa_axial_extend_false_false_does_not_paint_past_endpoints() {
     );
 }
 
-/// Probe 5b — Companion parity pin: even though `/Extend` is dropped,
-/// off-vs-on must still match. Locks in the pre-existing bug while
-/// pinning the wave-4 invariant (toggle parity for Device families).
+/// Probe 5b — Companion parity pin: `/Extend [false false]` must
+/// produce byte-identical pixmaps off vs on. Both paths consult the
+/// same `/Extend` array and apply the same slab clip; the splice
+/// only changes endpoint colours, which here are equal under
+/// DeviceRGB.
 #[test]
 fn qa_axial_extend_false_false_toggle_parity() {
     let content = "/Sh1 sh\n";
@@ -550,14 +548,18 @@ fn qa_axial_extend_false_false_toggle_parity() {
 /// defines the gradient as a family of circles interpolating between
 /// `(x0, y0, r0)` and `(x1, y1, r1)`. `render_radial_shading` now
 /// honours all six coordinates, so the inner-circle centre carries
-/// C0 and the outer-circle centre carries C1.
+/// C0 and the outer-circle centre carries C1. Declares `/Extend
+/// [true true]` so the gradient paints inside the inner disk and
+/// outside the outer circle — the assertion samples at the inner
+/// disk's centre, which the default `/Extend [false false]` would
+/// clip away.
 #[test]
 fn qa_radial_non_concentric_circles_uses_x0_y0() {
     // Inner circle at (20, 50) r=5; outer at (80, 50) r=30. A
-    // spec-compliant renderer would paint C0 red around (20, 50) and
-    // C1 white around (80, 50). The current renderer paints both
-    // around (80, 50). Pin: pixel at (20, 50) should be near-red if
-    // the gradient honoured x0/y0.
+    // spec-compliant renderer paints C0 red around (20, 50) and C1
+    // white around (80, 50). With /Extend [true true] the gradient
+    // also pads inside the inner disk with C0 colour and outside the
+    // outer circle with C1.
     let content = "/Sh1 sh\n";
     let bytes = build_pdf_radial_shading(
         content,
@@ -565,7 +567,7 @@ fn qa_radial_non_concentric_circles_uses_x0_y0() {
         "[20 50 5 80 50 30]",
         "[1 0 0]",
         "[1 1 1]",
-        "",
+        "/Extend [true true]",
         "",
         &[],
     );
@@ -606,6 +608,9 @@ fn qa_radial_non_concentric_circles_toggle_parity() {
 /// the most common radial-shading shape in real PDFs (highlight
 /// gradients, spotlight effects). `render_radial_shading` now honours
 /// the inner-circle origin, so the C0 endpoint lands at (x0, y0).
+/// Declares `/Extend [true true]` so the gradient pads outside the
+/// outer circle with C1 — the assertion uses a point near the outer
+/// centre which under the default `[false false]` would clip away.
 #[test]
 fn qa_radial_zero_radius_inner_at_distinct_point() {
     // Inner point at (30, 30); outer circle at (60, 60) r=40. A
@@ -617,7 +622,7 @@ fn qa_radial_zero_radius_inner_at_distinct_point() {
         "[30 30 0 60 60 40]",
         "[1 0 0]",
         "[1 1 1]",
-        "",
+        "/Extend [true true]",
         "",
         &[],
     );
