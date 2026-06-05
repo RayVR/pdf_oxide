@@ -3062,3 +3062,183 @@ fn build_minimal_cmyk_to_rgb_lut8_profile_with_shadow_ramp(
     profile.extend_from_slice(&lut);
     profile
 }
+
+// ===========================================================================
+// Real-corpus regression: vendor branding logo equivalent
+// ===========================================================================
+//
+// The user surfaced an early-project regression where a vendor branding
+// logo's green mark rendered too vivid/lime through the §10.3.5
+// additive-clamp fallback instead of muted/olive (the press-target colour
+// the CMYK profile maps the build to).
+//
+// We don't have the real branding-logo PDF on disk. Building a synthetic
+// equivalent that demonstrates the same shape (a green CMYK build whose
+// additive-clamp value diverges from the qcms-converted value in the
+// "too vivid → muted" direction) is the next-best regression sentry:
+// it pins the OutputIntent pipeline shifts the green-mark colour in the
+// predicted direction, byte-for-byte.
+//
+// Real-corpus probe: when a future engineer adds the real branding-logo
+// PDF to `tests/fixtures/`, the assertion shape carries over byte-for-
+// byte (the qcms reference for the embedded profile's mapping of the
+// green build). The synthetic version uses our constant-CLUT
+// `target_l_byte=200` profile — that maps every CMYK input to a
+// neutral grey, NOT a specific colour. This is the limitation of the
+// synthetic fixture: it proves "OutputIntent shifted the colour"
+// directionally, not "OutputIntent shifted it TOWARDS the real
+// press-target value." That's what a real press profile would prove.
+
+/// Pin that a CMYK paint that matches the typical "green logo build"
+/// (C=0.30, M=0.05, Y=0.95, K=0.05) renders DIFFERENTLY through the
+/// OutputIntent ICC vs through the §10.3.5 additive-clamp fallback,
+/// AND that the OutputIntent direction is towards the constant-CLUT
+/// reference (proxy for "muted press target") rather than the vivid
+/// additive-clamp value.
+///
+/// Why this matters: the original regression user-surfaced was that a
+/// vendor branding logo's green mark printed muted-olive on the press
+/// but rendered vivid-lime on screen (additive-clamp). Wiring the
+/// OutputIntent profile through the renderer is the fix that closes
+/// the press-vs-screen divergence. The synthetic profile here uses
+/// the constant-CLUT target — every CMYK input maps to ~(194, 194,
+/// 194), a muted neutral. Distinct from the §10.3.5 vivid-lime value
+/// for the same input, so the directional check fires.
+///
+/// Three pins:
+///   1. The render WITHOUT OutputIntent produces the §10.3.5 additive-
+///      clamp value for the green CMYK build. That's the pre-#97
+///      baseline.
+///   2. The render WITH OutputIntent produces the qcms reference value
+///      for the profile's mapping of that build.
+///   3. The OutputIntent value is closer to the constant-CLUT
+///      reference (~194) than to the §10.3.5 value, demonstrating
+///      directional correctness even on a synthetic fixture.
+#[test]
+fn qa_round4_branding_green_mark_routes_through_output_intent() {
+    // Green-mark CMYK build matching the typical vendor-logo colour
+    // recipe — high yellow, moderate cyan, minimal magenta and black.
+    // The §10.3.5 additive-clamp value is:
+    //   R = 1 - (0.30 + 0.05) = 0.65 → 166
+    //   G = 1 - (0.05 + 0.05) = 0.90 → 230
+    //   B = 1 - (0.95 + 0.05) = 0.00 → 0
+    // i.e. RGB(166, 230, 0) — vivid lime-green, brand-mismatched.
+    //
+    // The OutputIntent path through profile B (target_l_byte=200) maps
+    // every CMYK input to roughly RGB(194, 194, 194) — muted neutral.
+    // This is a proxy for "muted olive that the real press profile
+    // would produce"; the synthetic fixture's constant CLUT doesn't
+    // produce the actual olive value, but it proves the conversion
+    // ROUTE shifts the colour towards the press target rather than
+    // emitting the raw additive-clamp value.
+
+    // ---- WITHOUT OutputIntent ----
+    {
+        let content = "0.30 0.05 0.95 0.05 k\n20 20 60 60 re\nf\n";
+        let pdf = build_pdf_with_catalog_entries_and_content("", content, None);
+        let doc = PdfDocument::from_bytes(pdf).expect("open no-OI fixture");
+        assert!(
+            doc.output_intent_cmyk_profile().is_none(),
+            "no-OI fixture must declare no /OutputIntents"
+        );
+        let rgba = render_rgba(&doc);
+        let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+        assert_eq!(
+            (r, g, b, a),
+            (166u8, 230, 0, 255),
+            "without /OutputIntents the green-mark CMYK build must produce the §10.3.5 \
+             additive-clamp value RGB(166, 230, 0) — vivid lime. This is the pre-#97 \
+             baseline; got ({r},{g},{b},{a})"
+        );
+    }
+
+    // ---- WITH OutputIntent (profile B, target_l_byte=200) ----
+    let profile_b = build_minimal_cmyk_to_rgb_lut8_profile(PROFILE_B_TARGET_L_BYTE);
+    // Derive the qcms byte-exact reference for the actual paint input
+    // BEFORE asserting the render, so the assertion ties the rendered
+    // pixel to a verifiable CMM output. The 8-bit round-trip the
+    // resolver does maps 0.30 → 77, 0.05 → 13, 0.95 → 242, 0.05 → 13.
+    let qcms_ref = {
+        use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+        use std::sync::Arc;
+        let prof = Arc::new(IccProfile::parse(profile_b.clone(), 4).expect("parse B"));
+        let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
+        t.convert_cmyk_pixel(77, 13, 242, 13)
+    };
+
+    let content = "0.30 0.05 0.95 0.05 k\n20 20 60 60 re\nf\n";
+    let catalog_entries = "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic Press) /DestOutputProfile 5 0 R >>]";
+    let pdf =
+        build_pdf_with_catalog_entries_and_content(catalog_entries, content, Some(&profile_b));
+    let doc = PdfDocument::from_bytes(pdf).expect("open with-OI fixture");
+    assert!(
+        doc.output_intent_cmyk_profile().is_some(),
+        "with-OI fixture must expose the OutputIntent profile"
+    );
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (qcms_ref[0], qcms_ref[1], qcms_ref[2], 255),
+        "with /OutputIntents the green-mark CMYK build must render through the qcms \
+         reference {qcms_ref:?}; got ({r},{g},{b},{a}). (166,230,0,_) would mean the \
+         OutputIntent route was bypassed and the §10.3.5 additive-clamp fired."
+    );
+
+    // ---- Direction-of-shift sanity check ----
+    //
+    // The additive-clamp value is RGB(166, 230, 0); the OutputIntent
+    // value is qcms_ref. "Direction-of-shift" check: does the
+    // OutputIntent value move us AWAY from the vivid-lime channel
+    // distribution (very low B, very high G, mid R) towards a more
+    // neutral / less-saturated value? Saturation in HSV terms is
+    // (max - min) / max — vivid lime has saturation ≈ 1.0; neutral
+    // grey has saturation 0.
+    let additive = (166u8, 230, 0);
+    let oi = (qcms_ref[0], qcms_ref[1], qcms_ref[2]);
+    let saturation = |c: (u8, u8, u8)| -> f32 {
+        let max = c.0.max(c.1).max(c.2) as f32;
+        let min = c.0.min(c.1).min(c.2) as f32;
+        if max == 0.0 {
+            0.0
+        } else {
+            (max - min) / max
+        }
+    };
+    let sat_additive = saturation(additive);
+    let sat_oi = saturation(oi);
+    assert!(
+        sat_oi < sat_additive,
+        "OutputIntent value must be LESS saturated than the additive-clamp value \
+         to demonstrate the press-target direction-of-shift; saturation additive={:.3} \
+         vs OutputIntent={:.3}",
+        sat_additive,
+        sat_oi
+    );
+}
+
+/// HONEST_GAP marker: real branding-logo PDF fixture is not on disk in
+/// this worktree. The synthetic test above exercises the conversion
+/// route; a real-corpus probe with a vendor-issued press profile would
+/// pin the qcms reference is within a documented ΔE threshold of the
+/// commercial-viewer baseline. Until that fixture lands the directional
+/// sanity check (saturation collapses through the OutputIntent path) is
+/// the proxy.
+const HONEST_GAP_NO_REAL_BRANDING_FIXTURE: &str =
+    "HONEST_GAP_NO_REAL_BRANDING_FIXTURE: no real branding-logo PDF on disk; \
+     the synthetic green-mark probe exercises the route but uses a constant-CLUT \
+     profile rather than a real press profile. A future engineer with a vendor-\
+     issued ICC and the branding-logo PDF should add a CIEDE2000 ΔE assertion \
+     against the commercial-viewer baseline.";
+
+/// Pin the HONEST_GAP marker is referenced so the compile-time string
+/// constant doesn't drop. Acts as the documentation point for the
+/// missing real-corpus fixture; surface it in any future audit of
+/// outstanding press-quality probes.
+#[test]
+fn qa_round4_real_branding_fixture_honest_gap() {
+    // Reference the marker so dead-code lint doesn't trip in a feature
+    // build where the marker would otherwise be unused. The test passes
+    // unconditionally — its existence is the audit trail.
+    let _ = HONEST_GAP_NO_REAL_BRANDING_FIXTURE;
+}
