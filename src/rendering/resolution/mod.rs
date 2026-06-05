@@ -98,14 +98,31 @@
 //!
 //! # Status (this branch)
 //!
-//! The pipeline is wired behind an env-var toggle in the page renderer
-//! (`PDF_OXIDE_RESOLUTION_PIPELINE=1`) and used for the path fill /
-//! stroke / combo operators (`f`, `f*`, `S`, `s`, `B`, `B*`, `b`, `b*`).
-//! With the toggle off, behaviour is byte-identical to the inline
-//! dispatcher arms; toggle on, capabilities the inline arms can't reach
-//! (PostScript Type 4 tint transforms on Separation/DeviceN, for one)
-//! come online. Follow-up branches migrate the remaining operators
-//! incrementally, validating parity at each step.
+//! The pipeline is the **sole** paint-resolution path on the composite (RGB)
+//! renderer for every migrated operator family: path fill / stroke / combo
+//! (`f`, `f*`, `S`, `s`, `B`, `B*`, `b`, `b*`); text showing (`Tj`, `TJ`,
+//! `'`, `"`); `Do` for image XObjects and `/ImageMask true`; and `sh`
+//! (axial Type 2, radial Type 3 — including non-concentric `/Coords`,
+//! `/Domain`, `/Extend`). The env-var toggle that briefly gated the
+//! pipeline during the migration was removed once parity stabilised; there
+//! is no inline alternative path on the composite renderer for these
+//! operators.
+//!
+//! [`SeparationBackend`] is wired into [`super::separation_renderer`]'s
+//! per-plate operator walker for the fill / stroke / combo paint sites; the
+//! shipping `tint_for_ink` decision tree survives only as a private parity
+//! reference for the per-plate byte-for-byte equivalence test on
+//! [`SeparationBackend`]. With the backend driving plate output, the
+//! Type 4 spot / DeviceN / ICCBased N=4 capabilities the composite renderer
+//! gained in waves 1-4 now reach the per-plate output as well.
+//!
+//! Capabilities the pipeline closed (composite path; now also on plates
+//! via [`SeparationBackend`]):
+//!
+//! - PostScript Type 4 spot-colour tint transforms.
+//! - ICCBased N=4 alternates routed as DeviceCMYK.
+//! - DeviceN multi-colorant Type 4 tint transforms.
+//! - Radial shading non-concentric `/Coords`, plus `/Domain` and `/Extend`.
 //!
 //! Each stage has its own unit tests in its module: colour resolution can be
 //! tested without any rendering happening, overprint resolution can be tested
