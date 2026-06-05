@@ -153,6 +153,8 @@ mod tests {
             ],
             selector: InkSelector::Listed,
             all_tint: 0.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         }
     }
 
@@ -236,6 +238,8 @@ mod tests {
             participating: smallvec![],
             selector: InkSelector::Listed,
             all_tint: 0.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         };
         let color = ResolvedColor::Rgba {
             r: 1.0,
@@ -269,6 +273,8 @@ mod tests {
             participating: smallvec![],
             selector: InkSelector::All,
             all_tint: 0.6,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         };
         let router = InkRouter::new();
         for ink_name in [
@@ -301,6 +307,8 @@ mod tests {
             participating: smallvec![],
             selector: InkSelector::All,
             all_tint: 1.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         };
         let router = InkRouter::new();
         for ink_name in ["Cyan", "Magenta", "Yellow", "Black", "PANTONE Reflex Blue"] {
@@ -326,6 +334,8 @@ mod tests {
             participating: smallvec![],
             selector: InkSelector::None,
             all_tint: 0.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         };
         let router = InkRouter::new();
         for ink_name in [
@@ -364,6 +374,8 @@ mod tests {
             ],
             selector: InkSelector::Listed,
             all_tint: 0.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         };
         let color = ResolvedColor::PerChannel {
             channels: Box::new(smallvec![
@@ -400,6 +412,8 @@ mod tests {
             ],
             selector: InkSelector::Listed,
             all_tint: 0.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         };
         let color = ResolvedColor::PerChannel {
             channels: Box::new(smallvec![

@@ -81,7 +81,7 @@ impl ResolutionPipeline {
         // space. The OverprintResolver doesn't see the colour space
         // (only the resolved colour), so the override happens here on
         // the composer where both are available.
-        apply_inks_selector_override(&intent.color, &mut overprint);
+        apply_inks_selector_override(&intent.color, &mut overprint, ctx);
         let blend = self.blend.resolve(intent.gs);
         let clip = self.clip.resolve_with_mask(clip_mask);
 
@@ -105,9 +105,22 @@ impl ResolutionPipeline {
 /// per-plate routing selector on the overprint plan. Composite (RGB)
 /// backends ignore the selector; the per-plate [`super::InkRouter`]
 /// honours it.
+///
+/// Also rewrites `participating` so per-plate routing of a non-reserved
+/// Separation source targets the named spot plate at the source tint —
+/// rather than the alternate-CMYK decomposition the resolver evaluates
+/// for composite output. The spec model: Separation `/Pantone-185 1 scn`
+/// paints the Pantone-185 plate at 1.0 (and per §11.7.4 knocks out
+/// other plates under OP=false, leaves them alone under OP=true). The
+/// alternate CMYK is for composite preview only — it must not drive
+/// the C/M/Y/K plates.
+///
+/// DeviceN sources keep the per-channel participating list the
+/// OverprintResolver produced from `ResolvedColor::PerChannel`.
 fn apply_inks_selector_override(
     color: &LogicalColor,
     overprint: &mut super::resolved::OverprintPlan,
+    ctx: &ResolutionContext,
 ) {
     let LogicalColor::Spaced { space, components } = color else {
         return;
@@ -115,7 +128,12 @@ fn apply_inks_selector_override(
     let Some(arr) = space.as_array() else {
         return;
     };
-    if arr.first().and_then(|o| o.as_name()) != Some("Separation") {
+    let type_name = arr.first().and_then(|o| o.as_name());
+    if type_name == Some("DeviceN") {
+        apply_devicen_override(arr, components, overprint);
+        return;
+    }
+    if type_name != Some("Separation") {
         return;
     }
     match arr.get(1).and_then(|o| o.as_name()) {
@@ -127,7 +145,184 @@ fn apply_inks_selector_override(
             overprint.selector = InkSelector::None;
             overprint.all_tint = 0.0;
         },
-        _ => {},
+        Some(spot_name) => {
+            // §8.6.6.3: a conforming device with the named colorant
+            // paints that colorant directly; without it, the alternate
+            // colour space and tint transform are used to approximate
+            // the colorant. Record the spot identity here; the alt-CMYK
+            // decomposition (computed from the source's tint transform
+            // when the alternate is DeviceCMYK) is recorded too so the
+            // per-plate backend can pick the right routing per-surface.
+            use super::resolved::{InkName, ParticipatingChannel, SpotSource};
+            let tint = components.first().copied().unwrap_or(0.0);
+            // Replace participating with the spot-only entry. The
+            // per-plate backend reads `spot_source` to decide whether
+            // to honour this entry (device has spot plate) or fall
+            // through to `alt_cmyk_fallback` (device doesn't).
+            let mut v = smallvec::SmallVec::<[ParticipatingChannel; 8]>::new();
+            v.push(ParticipatingChannel {
+                ink: InkName::new(spot_name),
+                value: tint,
+            });
+            overprint.participating = v;
+            overprint.spot_source = Some(SpotSource {
+                ink: InkName::new(spot_name),
+                tint,
+            });
+            // Stash the alternate-CMYK decomposition for the §8.6.6.3
+            // fallback (device lacks the spot plate). Evaluating the
+            // tint transform twice — once here, once inside
+            // ColorResolver — is wasteful but keeps the resolver
+            // surface unchanged.
+            if let Some(alt) = eval_separation_alt_cmyk(arr, components.first().copied(), ctx) {
+                overprint.alt_cmyk_fallback = Some(alt);
+            }
+        },
+        None => {},
+    }
+}
+
+/// ISO 32000-1 §8.6.6.4: a DeviceN source declares an ordered list of
+/// colorant names. Each operator component is a per-colorant tint; the
+/// per-plate router maps each tint to the plate sharing the colorant's
+/// name. Stamp `participating` with `(name_i, tint_i)` pairs so the
+/// router walks them directly. Channels literally named "None" are
+/// dropped per spec.
+fn apply_devicen_override(
+    arr: &[crate::object::Object],
+    components: &[f32],
+    overprint: &mut super::resolved::OverprintPlan,
+) {
+    use super::resolved::{InkName, ParticipatingChannel};
+    let Some(names_obj) = arr.get(1) else {
+        return;
+    };
+    let Some(names_arr) = names_obj.as_array() else {
+        return;
+    };
+    let mut v = smallvec::SmallVec::new();
+    for (i, n) in names_arr.iter().enumerate() {
+        let Some(name) = n.as_name() else { continue };
+        if name == "None" {
+            continue;
+        }
+        let value = components.get(i).copied().unwrap_or(0.0);
+        v.push(ParticipatingChannel {
+            ink: InkName::new(name),
+            value,
+        });
+    }
+    overprint.participating = v;
+}
+
+/// Evaluate a Separation source's tint transform at `tint` and return
+/// the resulting CMYK quadruple if the alternate space is DeviceCMYK.
+/// Returns `None` for non-CMYK alternates (the spec §8.6.6.3 fallback
+/// to alt-CMYK only applies when the alternate is, in fact, CMYK).
+fn eval_separation_alt_cmyk(
+    arr: &[crate::object::Object],
+    tint: Option<f32>,
+    ctx: &ResolutionContext,
+) -> Option<[f32; 4]> {
+    use crate::object::Object;
+    let tint = tint?;
+    let alt_cs = arr.get(2)?;
+    if alt_cs.as_name() != Some("DeviceCMYK") && alt_cs.as_name() != Some("CMYK") {
+        return None;
+    }
+    let func_obj_raw = arr.get(3)?;
+    let func_obj_owned;
+    let func_obj: &Object = match ctx.doc.resolve_object(func_obj_raw) {
+        Ok(resolved) => {
+            func_obj_owned = resolved;
+            &func_obj_owned
+        },
+        Err(_) => func_obj_raw,
+    };
+    let func_dict = func_obj.as_dict()?;
+    let func_type = func_dict.get("FunctionType").and_then(|o| o.as_integer())?;
+    match func_type {
+        2 => {
+            // Type 2 exponential: y_j = C0_j + tint^N * (C1_j - C0_j).
+            let n = func_dict
+                .get("N")
+                .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
+                .unwrap_or(1.0) as f32;
+            let c0 = func_dict.get("C0").and_then(|o| o.as_array());
+            let c1 = func_dict.get("C1").and_then(|o| o.as_array());
+            let pow = if n == 1.0 { tint } else { tint.powf(n) };
+            let mut out = [0.0f32; 4];
+            for j in 0..4 {
+                let c0j = c0
+                    .and_then(|a| a.get(j))
+                    .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
+                    .unwrap_or(0.0) as f32;
+                let c1j = c1
+                    .and_then(|a| a.get(j))
+                    .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
+                    .unwrap_or(if j == 3 { 0.0 } else { 1.0 }) as f32;
+                out[j] = (c0j + pow * (c1j - c0j)).clamp(0.0, 1.0);
+            }
+            Some(out)
+        },
+        4 => {
+            // Type 4 PostScript calculator: invoke the shared evaluator.
+            let Object::Stream { dict, .. } = func_obj else {
+                return None;
+            };
+            let bytes = func_obj.decode_stream_data().ok()?;
+            let domain = dict
+                .get("Domain")
+                .and_then(|o| o.as_array())
+                .map(|a| {
+                    a.chunks_exact(2)
+                        .map(|c| {
+                            let lo = c[0]
+                                .as_real()
+                                .or_else(|| c[0].as_integer().map(|i| i as f64))
+                                .unwrap_or(0.0);
+                            let hi = c[1]
+                                .as_real()
+                                .or_else(|| c[1].as_integer().map(|i| i as f64))
+                                .unwrap_or(1.0);
+                            [lo, hi]
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let range = dict
+                .get("Range")
+                .and_then(|o| o.as_array())
+                .map(|a| {
+                    a.chunks_exact(2)
+                        .map(|c| {
+                            let lo = c[0]
+                                .as_real()
+                                .or_else(|| c[0].as_integer().map(|i| i as f64))
+                                .unwrap_or(0.0);
+                            let hi = c[1]
+                                .as_real()
+                                .or_else(|| c[1].as_integer().map(|i| i as f64))
+                                .unwrap_or(1.0);
+                            [lo, hi]
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let inputs = vec![tint as f64];
+            let out =
+                crate::functions::evaluate_type4_clamped(&bytes, &inputs, &domain, &range).ok()?;
+            if out.len() < 4 {
+                return None;
+            }
+            Some([
+                out[0].clamp(0.0, 1.0) as f32,
+                out[1].clamp(0.0, 1.0) as f32,
+                out[2].clamp(0.0, 1.0) as f32,
+                out[3].clamp(0.0, 1.0) as f32,
+            ])
+        },
+        _ => None,
     }
 }
 
@@ -302,14 +497,22 @@ mod tests {
             ctm: Matrix::identity(),
         };
         let cmd = pipeline.resolve(&intent, &ctx, None).unwrap();
-        match cmd.color {
-            ResolvedColor::Rgba { r, g, b, a } => {
-                assert!((r - 1.0).abs() < 1e-3);
-                assert!((g - 0.0).abs() < 1e-3);
-                assert!((b - 1.0).abs() < 1e-3);
-                assert!((a - 1.0).abs() < 1e-3);
+        // Separation with a DeviceCMYK alternate now emits Cmyk so the
+        // per-plate router has the channel decomposition. Project to
+        // RGBA here and pin the expected magenta.
+        let (r, g, b, a) = match cmd.color {
+            ResolvedColor::Rgba { r, g, b, a } => (r, g, b, a),
+            ResolvedColor::Cmyk { c, m, y, k, a } => {
+                let rr = (1.0 - (c + k).min(1.0)).clamp(0.0, 1.0);
+                let gg = (1.0 - (m + k).min(1.0)).clamp(0.0, 1.0);
+                let bb = (1.0 - (y + k).min(1.0)).clamp(0.0, 1.0);
+                (rr, gg, bb, a)
             },
-            _ => panic!("expected Rgba"),
-        }
+            other => panic!("expected Rgba or Cmyk; got {other:?}"),
+        };
+        assert!((r - 1.0).abs() < 1e-3);
+        assert!((g - 0.0).abs() < 1e-3);
+        assert!((b - 1.0).abs() < 1e-3);
+        assert!((a - 1.0).abs() < 1e-3);
     }
 }

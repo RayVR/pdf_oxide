@@ -96,6 +96,8 @@ impl OverprintResolver {
             // the OverprintResolver stays stateless and source-agnostic.
             selector: InkSelector::Listed,
             all_tint: 0.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         }
     }
 }

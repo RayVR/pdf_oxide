@@ -102,6 +102,46 @@ impl PaintBackend for SeparationBackend {
             super::resolved::ClipPlan::Mask(arc) => Some(arc.as_ref()),
         };
 
+        // §8.6.6.3 conformance decision: for a Separation source, does
+        // the device have the named colorant plate? If yes, the
+        // OverprintPlan's `participating` (which the composer wrote as
+        // `[(spot, tint)]`) drives routing directly. If no, the per-plate
+        // path falls through to `alt_cmyk_fallback` so the CMYK
+        // approximation reaches the standard plates.
+        let device_has_spot_plate = match &cmd.overprint.spot_source {
+            Some(spot) => surface.inks.iter().any(|i| i == &spot.ink),
+            None => false,
+        };
+
+        // Build a per-call overprint plan reflecting the device fallback.
+        // The router doesn't see surface state, so we surface the
+        // §8.6.6.3 fallback to it via the participating list it walks.
+        let fallback_plan;
+        let effective_plan: &super::resolved::OverprintPlan =
+            if cmd.overprint.spot_source.is_some() && !device_has_spot_plate {
+                // Device lacks the spot plate → use alt-CMYK approximation.
+                let alt = cmd.overprint.alt_cmyk_fallback.unwrap_or([0.0; 4]);
+                let mut v = smallvec::SmallVec::new();
+                for (j, name) in ["Cyan", "Magenta", "Yellow", "Black"].iter().enumerate() {
+                    v.push(super::resolved::ParticipatingChannel {
+                        ink: InkName::new(*name),
+                        value: alt[j],
+                    });
+                }
+                fallback_plan = super::resolved::OverprintPlan {
+                    enabled: cmd.overprint.enabled,
+                    mode: cmd.overprint.mode,
+                    participating: v,
+                    selector: cmd.overprint.selector,
+                    all_tint: cmd.overprint.all_tint,
+                    spot_source: None,
+                    alt_cmyk_fallback: None,
+                };
+                &fallback_plan
+            } else {
+                &cmd.overprint
+            };
+
         // Per-plate routing decision and rasterisation.
         for (plate_idx, ink) in surface.inks.iter().enumerate() {
             // The router needs a `&GraphicsState` for its API contract, but
@@ -110,7 +150,7 @@ impl PaintBackend for SeparationBackend {
             // GraphicsState so the call compiles without changing the
             // router's surface in this wave.
             let gs = crate::content::graphics_state::GraphicsState::new();
-            let action = self.router.route(&gs, ink, &cmd.color, &cmd.overprint);
+            let action = self.router.route(&gs, ink, &cmd.color, effective_plan);
             let tint = match action {
                 InkAction::Skip => continue,
                 InkAction::Paint(t) => t,
@@ -283,6 +323,8 @@ mod tests {
                 ],
                 selector: InkSelector::Listed,
                 all_tint: 0.0,
+                spot_source: None,
+                alt_cmyk_fallback: None,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -402,6 +444,8 @@ mod tests {
                 ],
                 selector: InkSelector::Listed,
                 all_tint: 0.0,
+                spot_source: None,
+                alt_cmyk_fallback: None,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -445,6 +489,8 @@ mod tests {
                 participating: SmallVec::new(),
                 selector: InkSelector::Listed,
                 all_tint: 0.0,
+                spot_source: None,
+                alt_cmyk_fallback: None,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -522,6 +568,8 @@ mod tests {
                 }],
                 selector: InkSelector::Listed,
                 all_tint: 0.0,
+                spot_source: None,
+                alt_cmyk_fallback: None,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -619,6 +667,8 @@ mod tests {
                 participating: SmallVec::new(),
                 selector: InkSelector::All,
                 all_tint: 0.6,
+                spot_source: None,
+                alt_cmyk_fallback: None,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -677,6 +727,8 @@ mod tests {
                 participating: SmallVec::new(),
                 selector: InkSelector::None,
                 all_tint: 0.0,
+                spot_source: None,
+                alt_cmyk_fallback: None,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,

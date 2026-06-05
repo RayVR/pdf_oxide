@@ -3211,6 +3211,16 @@ impl PageRenderer {
         let cmd = pipeline.resolve(&intent, &ctx, None).ok()?;
         match cmd.color {
             ResolvedColor::Rgba { r, g, b, a } => Some((r, g, b, a)),
+            // Compound spaces (Separation/DeviceN with a DeviceCMYK
+            // alternate) emit Cmyk so the per-plate backend has the
+            // channel decomposition. Project to RGBA via §10.3.5
+            // additive-clamp for the composite backend.
+            ResolvedColor::Cmyk { c, m, y, k, a } => {
+                let r = 1.0 - (c + k).min(1.0);
+                let g = 1.0 - (m + k).min(1.0);
+                let b = 1.0 - (y + k).min(1.0);
+                Some((r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), a))
+            },
             _ => None,
         }
     }

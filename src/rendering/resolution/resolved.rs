@@ -124,6 +124,33 @@ pub(crate) struct OverprintPlan {
     /// alternate-space tint-transform evaluation for the per-plate path —
     /// the operator's raw component value is what every plate receives.
     pub(crate) all_tint: f32,
+    /// Per ISO 32000-1 §8.6.6.3 conformance: a Separation source whose
+    /// colorant name *is in the device's plate set* paints that plate
+    /// directly; otherwise the alternate colour space + tint transform
+    /// are used to approximate the colorant. The pipeline composer
+    /// records the spot-source identity here so the per-plate backend
+    /// can decide per-surface whether to use the direct routing
+    /// ([`Self::participating`] interpreted as `[(spot, tint)]`) or
+    /// the alt-CMYK fallback ([`Self::alt_cmyk_fallback`]).
+    pub(crate) spot_source: Option<SpotSource>,
+    /// Alternate-CMYK decomposition the resolver evaluated for a
+    /// Separation / DeviceN source. Backends consult this when the
+    /// device lacks the source's named colorant — per §8.6.6.3 the alt
+    /// is composite-only on conforming devices, but per-plate devices
+    /// that don't have the spot plate fall through to the alt-CMYK
+    /// channels.
+    pub(crate) alt_cmyk_fallback: Option<[f32; 4]>,
+}
+
+/// Identity of the source Separation colorant the pipeline composer
+/// recorded for the per-plate fallback decision.
+#[derive(Debug, Clone)]
+pub(crate) struct SpotSource {
+    /// Source colorant name (e.g. `"Pantone-185"`, `"MagentaSpot"`).
+    pub(crate) ink: InkName,
+    /// Operator tint for the source — `components[0]` from the `scn`
+    /// operator.
+    pub(crate) tint: f32,
 }
 
 /// One element of an [`OverprintPlan::participating`] list. The component
@@ -209,6 +236,8 @@ mod tests {
             participating: SmallVec::new(),
             selector: InkSelector::Listed,
             all_tint: 0.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         };
         assert!(!plan.enabled);
     }
@@ -239,6 +268,8 @@ mod tests {
             ],
             selector: InkSelector::Listed,
             all_tint: 0.0,
+            spot_source: None,
+            alt_cmyk_fallback: None,
         };
         assert_eq!(plan.participating.len(), 4);
         assert!(!plan.participating.spilled());

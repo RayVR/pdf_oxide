@@ -93,7 +93,7 @@ impl ColorResolver {
         match type_name {
             "DeviceGray" | "G" | "CalGray" => Ok(first_as_gray(components, alpha)),
             "DeviceRGB" | "RGB" | "CalRGB" => Ok(three_as_rgb(components, alpha)),
-            "DeviceCMYK" | "CMYK" => Ok(four_as_cmyk(components, alpha)),
+            "DeviceCMYK" | "CMYK" => Ok(four_as_cmyk_native(components, alpha)),
             "ICCBased" => self.resolve_iccbased(arr, components, ctx, alpha),
             "Separation" | "DeviceN" => {
                 self.resolve_separation_or_devicen(arr, components, ctx, alpha)
@@ -136,7 +136,7 @@ impl ColorResolver {
         match n {
             1 if !components.is_empty() => Ok(first_as_gray(components, alpha)),
             3 if components.len() >= 3 => Ok(three_as_rgb(components, alpha)),
-            4 if components.len() >= 4 => Ok(four_as_cmyk(components, alpha)),
+            4 if components.len() >= 4 => Ok(four_as_cmyk_native(components, alpha)),
             _ => Ok(first_as_gray(components, alpha)),
         }
     }
@@ -246,6 +246,19 @@ impl ColorResolver {
         };
 
         // Project the alternate-space values through their colour space.
+        // The per-plate routing (which named plate gets the tint, what
+        // happens to other plates) is determined by the source colour
+        // space — Separation /Pantone-185 paints the Pantone-185 plate,
+        // not the C/M/Y/K plates. That routing decision lives on the
+        // OverprintPlan's `participating`, stamped by the pipeline
+        // composer (see `apply_inks_selector_override`).
+        //
+        // The composite-side colour resolution is the alternate-space
+        // value projected to RGBA — that's what the alternate is for
+        // per §8.6.6.3 (composite-only fallback). Emit ResolvedColor::Rgba
+        // here so the composite backend gets the right colour without
+        // accidentally feeding the alternate's CMYK decomposition into
+        // the per-plate path.
         match alt_cs_name {
             Some("DeviceCMYK") | Some("CMYK") if altspace_values.len() >= 4 => {
                 Ok(four_as_cmyk(&altspace_values, alpha))
@@ -302,7 +315,12 @@ impl ColorResolver {
     }
 }
 
-/// Convert a fully-evaluated device-family colour into a final RGBA.
+/// Convert a fully-evaluated device-family colour into a final
+/// [`ResolvedColor`]. Cmyk passes through as `ResolvedColor::Cmyk` so
+/// per-plate backends route by channel and the OPM=1 zero-component
+/// rule (§11.7.4.3) can fire on DeviceCMYK direct sources. Composite
+/// consumers project Cmyk → Rgba on demand (see page_renderer's
+/// `run_pipeline_for_logical`).
 fn device_to_rgba(dev: DeviceColor, alpha: f32) -> ResolvedColor {
     match dev {
         DeviceColor::Gray(g) => ResolvedColor::Rgba {
@@ -312,9 +330,12 @@ fn device_to_rgba(dev: DeviceColor, alpha: f32) -> ResolvedColor {
             a: alpha,
         },
         DeviceColor::Rgb(r, g, b) => ResolvedColor::Rgba { r, g, b, a: alpha },
-        DeviceColor::Cmyk(c, m, y, k) => {
-            let (r, g, b) = cmyk_to_rgb(c, m, y, k);
-            ResolvedColor::Rgba { r, g, b, a: alpha }
+        DeviceColor::Cmyk(c, m, y, k) => ResolvedColor::Cmyk {
+            c: c.clamp(0.0, 1.0),
+            m: m.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+            k: k.clamp(0.0, 1.0),
+            a: alpha,
         },
     }
 }
@@ -325,7 +346,7 @@ fn resolve_device_alias(name: &str, components: &[f32], alpha: f32) -> ResolvedC
             first_as_gray(components, alpha)
         },
         "DeviceRGB" | "RGB" | "CalRGB" if components.len() >= 3 => three_as_rgb(components, alpha),
-        "DeviceCMYK" | "CMYK" if components.len() >= 4 => four_as_cmyk(components, alpha),
+        "DeviceCMYK" | "CMYK" if components.len() >= 4 => four_as_cmyk_native(components, alpha),
         _ => first_as_gray(components, alpha),
     }
 }
@@ -349,9 +370,29 @@ fn three_as_rgb(components: &[f32], alpha: f32) -> ResolvedColor {
     }
 }
 
+/// Emit `ResolvedColor::Rgba` from a 4-component CMYK via §10.3.5
+/// additive-clamp. Used by the Separation / DeviceN alternate-CMYK
+/// projection — the per-plate routing for those sources is governed
+/// by the source colour space, not the alternate's CMYK decomposition,
+/// so the alt is composite-only.
 fn four_as_cmyk(components: &[f32], alpha: f32) -> ResolvedColor {
     let (r, g, b) = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
     ResolvedColor::Rgba { r, g, b, a: alpha }
+}
+
+/// Emit `ResolvedColor::Cmyk` carrying the four-channel decomposition
+/// for genuine DeviceCMYK / ICCBased N=4 sources. The per-plate
+/// router consumes this directly (process-ink routing + OPM=1 zero-
+/// component rule); the composite path projects to RGBA via the
+/// §10.3.5 additive-clamp formula in `run_pipeline_for_logical`.
+fn four_as_cmyk_native(components: &[f32], alpha: f32) -> ResolvedColor {
+    ResolvedColor::Cmyk {
+        c: components[0].clamp(0.0, 1.0),
+        m: components[1].clamp(0.0, 1.0),
+        y: components[2].clamp(0.0, 1.0),
+        k: components[3].clamp(0.0, 1.0),
+        a: alpha,
+    }
 }
 
 /// ISO 32000-1:2008 §10.3.5 additive-clamp DeviceCMYK → DeviceRGB.
@@ -448,21 +489,27 @@ mod tests {
         ResolutionContext::new(doc, spaces)
     }
 
+    /// Assert resolved colour matches expected RGBA. Accepts either
+    /// `ResolvedColor::Rgba` directly or `ResolvedColor::Cmyk`
+    /// projected via the §10.3.5 additive-clamp formula (the resolver
+    /// now emits Cmyk for Separation / DeviceN sources with a CMYK
+    /// alternate so per-plate backends see the channel decomposition;
+    /// composite consumers project on demand).
     fn assert_rgba(c: ResolvedColor, r: f32, g: f32, b: f32, a: f32) {
-        match c {
-            ResolvedColor::Rgba {
-                r: rr,
-                g: gg,
-                b: bb,
-                a: aa,
-            } => {
-                assert!((rr - r).abs() < 1e-3, "r: got {rr}, want {r}");
-                assert!((gg - g).abs() < 1e-3, "g: got {gg}, want {g}");
-                assert!((bb - b).abs() < 1e-3, "b: got {bb}, want {b}");
-                assert!((aa - a).abs() < 1e-3, "a: got {aa}, want {a}");
+        let (rr, gg, bb, aa) = match c {
+            ResolvedColor::Rgba { r, g, b, a } => (r, g, b, a),
+            ResolvedColor::Cmyk { c, m, y, k, a } => {
+                let rr = (1.0 - (c + k).min(1.0)).clamp(0.0, 1.0);
+                let gg = (1.0 - (m + k).min(1.0)).clamp(0.0, 1.0);
+                let bb = (1.0 - (y + k).min(1.0)).clamp(0.0, 1.0);
+                (rr, gg, bb, a)
             },
-            _ => panic!("expected Rgba"),
-        }
+            other => panic!("expected Rgba or Cmyk; got {other:?}"),
+        };
+        assert!((rr - r).abs() < 1e-3, "r: got {rr}, want {r}");
+        assert!((gg - g).abs() < 1e-3, "g: got {gg}, want {g}");
+        assert!((bb - b).abs() < 1e-3, "b: got {bb}, want {b}");
+        assert!((aa - a).abs() < 1e-3, "a: got {aa}, want {a}");
     }
 
     #[test]
@@ -664,9 +711,18 @@ mod tests {
             components: smallvec::smallvec![1.0],
         };
         let c = resolver.resolve(&lc, &ctx(&doc, &spaces), 1.0).unwrap();
+        // Separation with a DeviceCMYK alternate now emits Cmyk so the
+        // per-plate router can route channels by name. Project the
+        // result to RGBA for the regression-guard comparison.
         let (r, g, b) = match c {
             ResolvedColor::Rgba { r, g, b, .. } => (r, g, b),
-            _ => panic!("expected Rgba"),
+            ResolvedColor::Cmyk { c, m, y, k, .. } => {
+                let rr = (1.0 - (c + k).min(1.0)).clamp(0.0, 1.0);
+                let gg = (1.0 - (m + k).min(1.0)).clamp(0.0, 1.0);
+                let bb = (1.0 - (y + k).min(1.0)).clamp(0.0, 1.0);
+                (rr, gg, bb)
+            },
+            other => panic!("expected Rgba or Cmyk; got {other:?}"),
         };
         // The old inline path would have produced gray = 1.0 - 1.0 = 0.0
         // for all channels. The pipeline must never produce that for a

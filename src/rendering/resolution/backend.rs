@@ -111,6 +111,8 @@ mod tests {
                 participating: SmallVec::new(),
                 selector: InkSelector::Listed,
                 all_tint: 0.0,
+                spot_source: None,
+                alt_cmyk_fallback: None,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
