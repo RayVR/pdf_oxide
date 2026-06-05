@@ -276,26 +276,18 @@ fn qa_wave5_separation_cmyk_full_black_paints_only_black_plate() {
     assert_eq!(cyan_value, 0, "Cyan plate untouched");
 }
 
-/// Probe 2 — CMYK PDF with a Type-4 Separation spot color, pin the
-/// deferral. The wave-5 commit message for 6f5aede lists the
-/// separation_renderer.rs operator walker integration as a documented
-/// deferral — the shipping per-plate path still uses `tint_for_ink`,
-/// which only resolves Type-2 tint transforms.
+/// Probe 2 — CMYK PDF with a Type-4 Separation spot colour at the
+/// public `render_separation` surface. The separation walker routes
+/// the paint through the resolution pipeline, which evaluates the
+/// Type-4 alternate-CMYK tint transform and hands the resulting CMYK
+/// decomposition to the per-plate InkRouter. For
+/// `TYPE4_MAGENTA = { 0.0 exch 0.0 0.0 }` and tint=1 the alternate
+/// resolves to CMYK(0, 1, 0, 0), so the Magenta plate carries the
+/// full tint at the rect.
 ///
-/// At the public `render_separation` surface, a Type-4 Separation spot
-/// at tint=1.0 should produce magenta on the Magenta plate. The
-/// shipping path can't reach the Type-4 evaluator from inside
-/// `tint_for_ink`, so the spot's alternate CMYK never resolves and the
-/// Magenta plate stays empty.
-///
-/// This test pins the current behaviour (Magenta plate stays 0) so the
-/// follow-up branch that wires `tint_for_ink` through the pipeline can
-/// remove the pin in the same commit. Pre-followup: 0. Post-followup
-/// (when separation_renderer.rs is migrated): expect ≥ 240.
-///
-/// Tracking name: WAVE5-DEFER-SEPARATION-RENDERER-TYPE4-VIA-TINT-FOR-INK.
+/// This pins the bug-fixed value, not the bug value.
 #[test]
-fn qa_wave5_defer_separation_renderer_type4_spot_via_tint_for_ink() {
+fn qa_wave5_separation_renderer_type4_spot_paints_magenta_plate() {
     let content = "/CS1 cs\n1 scn\n10 10 80 80 re\nf\n";
     let resources = "/ColorSpace << /CS1 [/Separation /MagentaSpot /DeviceCMYK 5 0 R] >>";
     let bytes = build_pdf_with_type4(content, TYPE4_MAGENTA, resources);
@@ -304,12 +296,13 @@ fn qa_wave5_defer_separation_renderer_type4_spot_via_tint_for_ink() {
     let magenta = render_separation(&doc, 0, "Magenta", 72).expect("render Magenta plate");
     let idx = (50 * magenta.width as usize) + 50;
     let value = magenta.data[idx];
-    // Documented deferral: shipping path leaves the plate at 0.
+    // CMYK(0, 1, 0, 0) → Magenta plate at full tint. The fill_separation
+    // gray encoding is `(tint * 255).round() as u8` with no anti-alias
+    // softening at the interior sample point, so the value is the
+    // exact rounded byte: 255.
     assert_eq!(
-        value, 0,
-        "WAVE5-DEFER: separation_renderer.rs still uses tint_for_ink (Type-2 only); \
-         when it migrates onto the pipeline, the spot's alternate CMYK resolves to \
-         Magenta plate ~255. Today: 0. Flip this assertion when the deferral closes."
+        value, 255,
+        "Type-4 Separation spot at tint=1 must resolve to Magenta plate at 255; got {value}"
     );
 }
 
