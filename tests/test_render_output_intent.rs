@@ -53,7 +53,9 @@ const OUTPUT_INTENT_DEFER_PHASE_9_DEFAULT_CMYK: &str =
 // Minimal CMYK ICC profile synthesis
 // ===========================================================================
 //
-// ICC v2 profile structure (per ICC.1:2004-10 §7):
+// ICC profile structure (per ICC.1:2004-10 §7 for v2; ICC.1:2010 §7
+// for v4 — the layout is identical, only the version byte at offset
+// 8..12 differs):
 //   - 128-byte header
 //   - 4-byte tag count
 //   - tag table: N × 12 bytes (signature, offset, size)
@@ -93,6 +95,67 @@ const OUTPUT_INTENT_DEFER_PHASE_9_DEFAULT_CMYK: &str =
 /// `RGB(~128, ~128, ~128)`. a* and b* are pinned at 128 (decoded as
 /// 0, the achromatic axis).
 fn build_minimal_cmyk_to_rgb_lut8_profile(target_l_byte: u8) -> Vec<u8> {
+    build_minimal_cmyk_to_rgb_lut8_profile_with_version(target_l_byte, IccProfileVersion::V2)
+}
+
+/// ICC profile header version byte (bytes 8..12 of the 128-byte header).
+///
+/// ICC.1:2004-10 §7.2.3 (Table 14): the first byte is the major
+/// revision, the second the minor, bytes 10..12 are reserved (must be
+/// zero). qcms 0.3.0's `check_profile_version` (iccread.rs:274) reads
+/// the reserved bytes and rejects anything non-zero, but the version
+/// comparison itself is commented out — both v2 (0x02400000) and v4
+/// (0x04000000) profile headers parse provided the tag-data the qcms
+/// CMM consumes is itself well-formed.
+///
+/// LUT8 (`mft1`) tag bodies are an ICC v2-era construct. ICC v4
+/// introduces the `mAB ` tag form; qcms parses both for the `A2B0`
+/// transform-direction tag, so a v4-versioned profile whose A2B0 body
+/// is still an mft1 LUT8 is parseable end-to-end. A true v4 profile
+/// with mAB tag bodies needs richer tag construction (curve sets,
+/// matrices, a CLUT) — synthesising one in-test for the constant-CLUT
+/// fixture trick gains nothing the version-byte flip already proves;
+/// the LUT8 body is intent-invariant whether the header advertises v2
+/// or v4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IccProfileVersion {
+    /// 2.4.0.0 — the version qcms 0.3.0's iccread treats as the LUT8
+    /// path.
+    V2,
+    /// 4.0.0.0 — the modern major revision. qcms 0.3.0 accepts the
+    /// header (no major-revision check) and reads whatever A2B0 tag
+    /// body is present; a v4 header with an mft1 LUT8 body is a
+    /// legitimate forward-compatible encoding.
+    V4,
+}
+
+impl IccProfileVersion {
+    fn header_bytes(self) -> [u8; 4] {
+        // ICC.1:2004-10 §7.2.3: major.minor with bytes 10..12 reserved
+        // (must be zero per the spec; qcms enforces this in
+        // check_profile_version).
+        match self {
+            // 2.4.0.0
+            Self::V2 => 0x0240_0000u32.to_be_bytes(),
+            // 4.0.0.0 — the modern major. qcms 0.3.0's
+            // check_profile_version (iccread.rs:281-288) has the
+            // major-revision check commented out with the comment
+            // "Checking the version doesn't buy us anything"; only the
+            // reserved bytes are validated.
+            Self::V4 => 0x0400_0000u32.to_be_bytes(),
+        }
+    }
+}
+
+/// Like [`build_minimal_cmyk_to_rgb_lut8_profile`] but with an
+/// explicit ICC version-byte choice in the 128-byte header. Used by
+/// the phase-6 ICC v4 verification probe to assert qcms 0.3.0 accepts
+/// the v4 header at parse time and drives the same constant-CLUT body
+/// to the same byte-exact RGB reference.
+fn build_minimal_cmyk_to_rgb_lut8_profile_with_version(
+    target_l_byte: u8,
+    version: IccProfileVersion,
+) -> Vec<u8> {
     // LUT8 tag body for in=4 out=3 grid=2.
     // Sizes:
     //   header: 48
@@ -164,8 +227,10 @@ fn build_minimal_cmyk_to_rgb_lut8_profile(target_l_byte: u8) -> Vec<u8> {
     // Profile size at bytes 0..4.
     profile[0..4].copy_from_slice(&total_size.to_be_bytes());
     // Preferred CMM at bytes 4..8 — left zero (no preference).
-    // Profile version: 2.4.0.0 at bytes 8..12.
-    profile[8..12].copy_from_slice(&0x0240_0000u32.to_be_bytes());
+    // Profile version at bytes 8..12. The version byte is determined
+    // by `version` so the phase-6 v4 probe can flip just this field
+    // while keeping the same constant-CLUT LUT8 body.
+    profile[8..12].copy_from_slice(&version.header_bytes());
     // Device class: 'prtr' (output device).
     profile[12..16].copy_from_slice(b"prtr");
     // Colour space: 'CMYK'.
@@ -1834,5 +1899,173 @@ fn qa_round2_iccbased_n4_precedence_survives_form_xobject_scope() {
          (126,126,126,_) means Form scope dropped the embedded-ICC routing and the \
          document OutputIntent fired. (191,255,255,_) means neither profile was \
          consulted."
+    );
+}
+
+// ===========================================================================
+// Phase 6: ICC v4 support verification through qcms 0.3.0
+// ===========================================================================
+//
+// qcms 0.3.0 reports ICC v4 support via `iccv4-enabled` (a default feature
+// in our build). The `check_profile_version` function at
+// `qcms-0.3.0/src/iccread.rs:274` reads only the reserved bytes 10..12 of
+// the header and rejects them if non-zero; the major/minor comparison is
+// commented out with the comment "Checking the version doesn't buy us
+// anything". So a profile whose header advertises v4 (`0x04 0x00 0x00
+// 0x00`) parses through qcms identically to a v2 (`0x02 0x40 0x00 0x00`)
+// header — the reserved bytes are zero in both cases.
+//
+// The TRUE ICC v4 difference at the wire level is in the A2B0 tag body:
+// v2 uses `mft1` (LUT8) or `mft2` (LUT16); v4 introduces the `mAB ` tag
+// form with separate input curves, a matrix, a CLUT, and output curves
+// (ICC.1:2010 §10.10). qcms parses both: for the A2B0 transform
+// direction the dispatch is at `iccread.rs:1675-1681` (RGB) and
+// `:1716-1722` (CMYK) — `mft1`/`mft2` → `read_tag_lutType`; `mAB ` →
+// `read_tag_lutmABType`. So a CMYK profile carrying a v4 header AND an
+// mAB body would also work; we don't synthesise that combination here
+// because constructing a valid mAB tag requires four full input curves
+// + a 4D CLUT + three output curves + their offsets, none of which the
+// constant-CLUT fixture trick benefits from.
+//
+// The probe below pins three claims:
+//   1. A CMYK profile whose header declares ICC v4 parses through
+//      `IccProfile::parse`.
+//   2. qcms 0.3.0 builds a real CMM (`Transform::has_cmm() == true`)
+//      from that v4-header profile.
+//   3. The byte-exact RGB output for `convert_cmyk_pixel(64, 0, 0, 0)`
+//      matches the v2 reference (126, 126, 126) — i.e. the version-byte
+//      flip is non-destructive when the underlying LUT8 body is
+//      identical.
+
+/// Pin that qcms 0.3.0 accepts an ICC-v4-versioned CMYK profile and
+/// drives the same byte-exact CMYK→RGB conversion as the v2-headered
+/// equivalent through a `Transform`.
+///
+/// This is the unit-level v4 verification — proves the qcms CMM
+/// dispatch handles the v4 version byte without rejecting the profile
+/// or falling back to the §10.3.5 additive-clamp wrapper inside
+/// `Transform::convert_cmyk_pixel`.
+///
+/// Reference value: `target_l_byte=135` projects through the
+/// Lab→XYZ→sRGB chain to RGB(126, 126, 126). Independently verified
+/// via the round-1 byte-exact harness; intent-invariant by
+/// construction (constant CLUT).
+#[test]
+fn qa_round3_iccbased_v4_profile_compiles_through_qcms_to_same_reference() {
+    use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+    use std::sync::Arc;
+
+    let v2 = build_minimal_cmyk_to_rgb_lut8_profile_with_version(135, IccProfileVersion::V2);
+    let v4 = build_minimal_cmyk_to_rgb_lut8_profile_with_version(135, IccProfileVersion::V4);
+
+    // Confirm the version bytes are what we intended at the wire level.
+    // Without this gate a regression in the builder could silently emit
+    // the same header twice and the test would pass for the wrong reason.
+    assert_eq!(v2[8..12], [0x02, 0x40, 0x00, 0x00], "v2 header bytes incorrect");
+    assert_eq!(v4[8..12], [0x04, 0x00, 0x00, 0x00], "v4 header bytes incorrect");
+    // The rest of the profile must match byte-for-byte — only the
+    // version field differs. Otherwise the RGB comparison below could
+    // be affected by an unrelated change.
+    assert_eq!(v2.len(), v4.len(), "v2 and v4 profiles must differ only in version bytes");
+    for i in 0..v2.len() {
+        if (8..12).contains(&i) {
+            continue;
+        }
+        assert_eq!(v2[i], v4[i], "v2/v4 builders diverge at byte {i}");
+    }
+
+    let prof_v2 = Arc::new(IccProfile::parse(v2, 4).expect("v2 profile must parse"));
+    let prof_v4 = Arc::new(
+        IccProfile::parse(v4, 4)
+            .expect("v4 profile must parse through IccProfile::parse — qcms 0.3.0 accepts v4"),
+    );
+
+    let t_v2 = Transform::new_srgb_target(prof_v2, RenderingIntent::RelativeColorimetric);
+    let t_v4 = Transform::new_srgb_target(prof_v4, RenderingIntent::RelativeColorimetric);
+
+    assert!(
+        t_v2.has_cmm(),
+        "v2 profile must compile into a real qcms transform; \
+         without it the v4-vs-v2 byte-exact comparison degenerates"
+    );
+    assert!(
+        t_v4.has_cmm(),
+        "v4 profile must compile into a real qcms transform. qcms 0.3.0's \
+         check_profile_version (iccread.rs:274) is documented to accept v4 \
+         headers; if this assertion fires the qcms version no longer matches \
+         the plan's research-confirmed behaviour"
+    );
+
+    let rgb_v2 = t_v2.convert_cmyk_pixel(64, 0, 0, 0);
+    let rgb_v4 = t_v4.convert_cmyk_pixel(64, 0, 0, 0);
+    assert_eq!(
+        rgb_v2,
+        [126u8, 126, 126],
+        "v2 byte-exact reference must be (126,126,126) — round-1 pin"
+    );
+    assert_eq!(
+        rgb_v4,
+        [126u8, 126, 126],
+        "v4 byte-exact reference must equal v2's (126,126,126); qcms 0.3.0 \
+         treats the version byte as informational and drives the same LUT8 \
+         body. Got {rgb_v4:?}"
+    );
+}
+
+/// Pin that an ICC v4 profile threaded through a synthetic PDF's
+/// `/OutputIntents` array renders the DeviceCMYK paint via the qcms
+/// CMM end-to-end, not through the §10.3.5 additive-clamp fallback.
+///
+/// This is the integration-level v4 probe: confirms the version-byte
+/// flip survives the full chain
+/// `IccProfile::parse → ResolutionContext::with_output_intent →
+/// cmyk_to_rgb_via_intent → Transform::new_srgb_target →
+/// Transform::convert_cmyk_pixel`.
+///
+/// Reference: same `target_l_byte=135` → near-neutral grey ~(128, 128,
+/// 128) for any CMYK input including (0.25, 0, 0, 0). The additive-
+/// clamp pin for that input is (191, 255, 255); the integration
+/// assertion must land in the qcms-converted neighbourhood, not the
+/// fallback.
+#[test]
+fn qa_round3_iccbased_v4_output_intent_drives_render_through_qcms() {
+    let icc_v4 = build_minimal_cmyk_to_rgb_lut8_profile_with_version(135, IccProfileVersion::V4);
+
+    // Sanity-pin the v4 profile parses + compiles + produces the round-1
+    // byte-exact reference. Without this the integration assertion could
+    // fail for the wrong reason (e.g. profile reject → §10.3.5 fallback
+    // fires → 191,255,255 instead of ~128).
+    {
+        use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+        use std::sync::Arc;
+        let prof = Arc::new(
+            IccProfile::parse(icc_v4.clone(), 4)
+                .expect("v4 profile parses through IccProfile::parse"),
+        );
+        let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
+        assert!(t.has_cmm(), "v4 profile must compile into a real qcms CMM");
+        assert_eq!(
+            t.convert_cmyk_pixel(64, 0, 0, 0),
+            [126u8, 126, 126],
+            "v4 profile must produce the round-1 byte-exact reference (126,126,126)"
+        );
+    }
+
+    let pdf = build_pdf_cmyk_with_output_intent(&icc_v4);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic v4 PDF");
+    assert!(
+        doc.output_intent_cmyk_profile().is_some(),
+        "v4 fixture must expose its OutputIntent via the document accessor; \
+         a None here means /N=4 filter or stream decode failed for the v4 \
+         profile bytes"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, _a) = pixel_at(&rgba, 50, 50);
+    let near = |v: u8| (v as i32 - 128).abs() <= 10;
+    assert!(
+        near(r) && near(g) && near(b),
+        "v4 OutputIntent must drive the render through qcms — expected ~(128,128,128); \
+         got ({r}, {g}, {b}). (191,255,255) would mean the §10.3.5 fallback fired."
     );
 }
