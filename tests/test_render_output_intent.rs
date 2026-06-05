@@ -1589,11 +1589,19 @@ fn page_level_default_gray_routes_bare_device_gray_through_override() {
         "/DefaultGray override → Separation magenta projection must produce B=255; \
          got ({r},{g},{b},{a})"
     );
-    assert!(
-        (120..=130).contains(&g),
+    // tiny-skia's f32 → u8 conversion at color.rs:444 is
+    // `(c * 255.0 + 0.5) as u8` — round-half-up via truncation. For
+    // c=0.5 that's 0.5 * 255.0 + 0.5 = 128.0 → 128, deterministic
+    // across platforms and tiny-skia builds. Earlier rounds asserted
+    // a (120..=130) tolerance against a supposed platform-dependent
+    // rounding; the actual conversion is exact, so pin the byte.
+    assert_eq!(
+        g, 128,
         "/DefaultGray override → Separation magenta projection must produce \
-         G ≈ 127-128 (1.0 - 0.5 = 0.5 → 127.5 rounded); got G={g}, full pixel \
-         ({r},{g},{b},{a}). G=255 would mean no magenta — override bypassed."
+         G=128 (additive-clamp of CMYK(0,0.5,0,0) gives G=0.5; tiny-skia's \
+         f32→u8 conversion is (c*255.0+0.5) as u8 = 128, deterministic); \
+         got G={g}, full pixel ({r},{g},{b},{a}). G=255 would mean no \
+         magenta — override bypassed."
     );
     assert_eq!(a, 255, "alpha=1 paint must be fully opaque; got a={a}");
 }
