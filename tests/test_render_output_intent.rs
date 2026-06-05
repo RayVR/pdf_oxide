@@ -3619,3 +3619,247 @@ fn qa_round4_real_branding_fixture_honest_gap() {
     // unconditionally — its existence is the audit trail.
     let _ = HONEST_GAP_NO_REAL_BRANDING_FIXTURE;
 }
+
+// ===========================================================================
+// Edge-case regression sentries: document-/OutputIntents-shape oddities
+// ===========================================================================
+//
+// These probes pin the renderer's response to malformed or unusual
+// `/OutputIntents` array shapes. Each probe builds a PDF whose catalog
+// declares an OutputIntent entry that the accessor MUST refuse to surface
+// (wrong `/N`, missing `/DestOutputProfile`, garbage stream contents) and
+// asserts the renderer falls through to the §10.3.5 additive-clamp value
+// for a `/DeviceCMYK` paint of (0.25, 0, 0, 0). They are regression
+// sentries — current behaviour, not failing-first probes — so a future
+// change that loosens the accessor's filtering (e.g. accepting an N=3
+// OutputIntent as CMYK) would flip them RED and surface the regression.
+
+/// `/N=3` (RGB) OutputIntent with a `/DeviceCMYK` paint operator. The
+/// reader at `document.rs:3645-3648` filters on `Some(4)`; an `/N 3`
+/// entry is skipped and `output_intent_cmyk_profile()` returns `None`,
+/// so the renderer reaches the §10.3.5 additive-clamp fallback.
+///
+/// Regression sentry: a regression that broadened the `/N` filter to
+/// accept N=3 would route CMYK bytes through an RGB profile and either
+/// panic at qcms's channel-count assert or emit garbage RGB.
+#[test]
+fn output_intent_n3_rgb_profile_rejected_at_reader_falls_through_to_additive_clamp() {
+    // Build a PDF whose /OutputIntents entry declares /N 3 on its
+    // /DestOutputProfile stream. The body bytes don't have to parse as a
+    // real RGB ICC profile because the accessor filters on /N before it
+    // ever invokes IccProfile::parse on the stream payload.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic RGB) /DestOutputProfile 5 0 R >>] >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>\nendobj\n");
+    let stream_off = buf.len();
+    let content = "0.25 0 0 0 k\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_off = buf.len();
+    // /N 3 — accessor rejects before parsing the body.
+    let bogus = vec![0u8; 128];
+    let icc_hdr = format!("5 0 obj\n<< /N 3 /Length {} >>\nstream\n", bogus.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(&bogus);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    let obj_count = 6;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    let doc = PdfDocument::from_bytes(buf).expect("open synthetic PDF");
+
+    // Cross-pin: the accessor MUST refuse the N=3 entry.
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "an /OutputIntents entry with /N 3 (RGB) must be filtered out by \
+         output_intent_cmyk_profile(); only /N 4 (CMYK) entries are eligible"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (191u8, 255, 255, 255),
+        "an N=3 OutputIntent must fall through to §10.3.5 additive-clamp \
+         byte-for-byte for /DeviceCMYK paint; got ({r},{g},{b},{a})"
+    );
+}
+
+/// `/OutputIntents` entry with `/OutputCondition` text only and **no**
+/// `/DestOutputProfile` stream. The accessor's `entry_dict.get("DestOutputProfile")`
+/// check at `document.rs:3630-3633` returns `None`, the entry is skipped,
+/// and the whole array exhausts → `output_intent_cmyk_profile()` is `None`.
+/// CMYK paint falls through to §10.3.5.
+///
+/// Regression sentry: a regression that materialised a default profile
+/// when none was declared would surface here.
+#[test]
+fn output_intent_with_outputcondition_string_only_no_destoutputprofile_falls_through() {
+    // No DestOutputProfile, no profile stream object at all. /OutputCondition
+    // is just a human-readable string (PDF/X advisory metadata per
+    // §14.11.5 — "the intended printing condition", e.g. "FOGRA39"); it
+    // does not carry the ICC bytes itself.
+    let catalog_entries =
+        "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (FOGRA39 (ISO 12647-2:2004)) /OutputConditionIdentifier (FOGRA39) >>]";
+    let content_ops = "0.25 0 0 0 k\n20 20 60 60 re\nf\n";
+    let pdf = build_pdf_with_catalog_entries_and_content(catalog_entries, content_ops, None);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+
+    // Cross-pin: missing /DestOutputProfile means the accessor returns
+    // None even though /OutputIntents is present and well-formed otherwise.
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "an /OutputIntents entry without a /DestOutputProfile stream must \
+         surface as None; the /OutputCondition string is advisory metadata, \
+         not a fallback colour source"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (191u8, 255, 255, 255),
+        "a /OutputCondition-only entry must fall through to §10.3.5 \
+         additive-clamp byte-for-byte; got ({r},{g},{b},{a})"
+    );
+}
+
+/// Two `/OutputIntents` entries in catalog-declaration order — first
+/// `/N 3` (RGB), second `/N 4` (CMYK). The accessor iterates the array
+/// (`document.rs:3621`) and returns the first entry whose `/N` matches 4
+/// AND whose stream parses through `IccProfile::parse`. The N=3 entry is
+/// skipped at the /N filter; the N=4 entry's CLUT (target_l_byte = 135)
+/// is consumed; the rendered pixel matches the qcms reference for that
+/// profile (RGB(126, 126, 126)).
+///
+/// Regression sentry: a regression that returned the FIRST array entry
+/// regardless of /N would surface a None and additive-clamp here.
+#[test]
+fn output_intent_array_picks_first_cmyk_entry_skipping_rgb() {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    // Two-entry /OutputIntents array: RGB first, CMYK second.
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic RGB) /DestOutputProfile 5 0 R >> << /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK) /DestOutputProfile 6 0 R >>] >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>\nendobj\n");
+    let stream_off = buf.len();
+    // Paint CMYK(0.25, 0, 0, 0) — matches the canonical reference input.
+    let content = "0.25 0 0 0 k\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // RGB entry first — bogus body, filtered at /N 3 before parse.
+    let rgb_off = buf.len();
+    let bogus = vec![0u8; 128];
+    let rgb_hdr = format!("5 0 obj\n<< /N 3 /Length {} >>\nstream\n", bogus.len());
+    buf.extend_from_slice(rgb_hdr.as_bytes());
+    buf.extend_from_slice(&bogus);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // CMYK entry second — real LUT8 profile keyed on target_l_byte=135,
+    // whose qcms reference for CMYK(64, 0, 0, 0) is RGB(126, 126, 126).
+    let cmyk_profile = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let cmyk_off = buf.len();
+    let cmyk_hdr = format!("6 0 obj\n<< /N 4 /Length {} >>\nstream\n", cmyk_profile.len());
+    buf.extend_from_slice(cmyk_hdr.as_bytes());
+    buf.extend_from_slice(&cmyk_profile);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    let obj_count = 7;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [cat_off, pages_off, page_off, stream_off, rgb_off, cmyk_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    let doc = PdfDocument::from_bytes(buf).expect("open synthetic PDF");
+
+    // Cross-pin: the accessor surfaces the SECOND entry's profile.
+    let profile = doc
+        .output_intent_cmyk_profile()
+        .expect("the CMYK entry must be picked from a mixed-N array");
+    assert_eq!(
+        profile.n_components(),
+        4,
+        "the surfaced profile must be /N=4 — the second array entry"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    // Pinned byte-exact against the qcms 0.3.0 reference for the
+    // target_l_byte=135 profile + CMYK(64, 0, 0, 0). Matches the
+    // canonical reference asserted in
+    // `output_intent_render_pixel_is_byte_exact_against_qcms_reference`.
+    assert_eq!(
+        (r, g, b, a),
+        (126u8, 126, 126, 255),
+        "with a mixed [RGB, CMYK] /OutputIntents array the second (CMYK) \
+         entry must drive the render byte-for-byte against the qcms \
+         reference; got ({r},{g},{b},{a})"
+    );
+}
+
+/// `/DestOutputProfile` stream whose bytes are pure garbage — not even a
+/// 128-byte ICC header, no `acsp` signature, random bytes. The accessor's
+/// `IccProfile::parse(bytes, 4)` call at `document.rs:3653` returns `None`,
+/// the entry is skipped, and the renderer falls through to §10.3.5.
+///
+/// This is distinct from the header-only probe at
+/// `output_intent_with_unparseable_profile_falls_through_to_additive_clamp`:
+/// that probe pins fall-through happens INSIDE `Transform::convert_cmyk_pixel`
+/// (the header parses, qcms refuses to build the CMM). This probe pins the
+/// earlier rejection where `IccProfile::parse` returns None up front — no
+/// header, nothing to keep.
+///
+/// Regression sentry: a regression that propagated the un-parsed bytes to
+/// qcms (or that silently emitted a degenerate IccProfile from a parse
+/// failure) would surface here as a panic or as a non-additive-clamp pixel.
+#[test]
+fn output_intent_malformed_iccbased_stream_falls_through() {
+    // 64 bytes of recognisable garbage — too short for an ICC header
+    // (128 bytes minimum) and contains no acsp signature.
+    let garbage: Vec<u8> = (0u8..=63u8).collect();
+    let pdf = build_pdf_cmyk_with_output_intent(&garbage);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+
+    // Cross-pin: IccProfile::parse rejects garbage; accessor surfaces None.
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "IccProfile::parse must reject a 64-byte garbage stream (less than \
+         the 128-byte ICC header minimum); accessor must surface None"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (191u8, 255, 255, 255),
+        "a malformed /DestOutputProfile stream (sub-header-length garbage) \
+         must fall through to §10.3.5 additive-clamp byte-for-byte without \
+         panicking; got ({r},{g},{b},{a})"
+    );
+}
