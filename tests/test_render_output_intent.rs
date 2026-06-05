@@ -369,3 +369,44 @@ fn device_cmyk_paint_with_output_intent_renders_via_icc_not_additive_clamp() {
          fallback fired — the resolver is not consulting ctx.output_intent_cmyk."
     );
 }
+
+// ===========================================================================
+// Negative pin: no OutputIntent → §10.3.5 additive-clamp preserved
+// ===========================================================================
+
+/// Pin that a /DeviceCMYK fill on a page whose document declares no
+/// `/OutputIntents` array is rendered through ISO 32000-1:2008
+/// §10.3.5's additive-clamp formula, byte-for-byte, as it shipped
+/// before OutputIntent threading landed.
+///
+/// This is the contrapositive of the positive test: when
+/// `ctx.output_intent_cmyk` is `None`, the resolver MUST fall through
+/// to the shipped behaviour. A bug that unconditionally consulted
+/// some other ICC profile (or that flipped the precedence rules) would
+/// surface here as the wrong colour.
+#[test]
+fn device_cmyk_paint_without_output_intent_renders_additive_clamp() {
+    let pdf = build_pdf_cmyk_without_output_intent();
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    // Cross-check the catalog has no OutputIntent — if it did, this
+    // test would conflate "no OI" with "OI that happens to produce
+    // additive-clamp values" and could pass for the wrong reason.
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "fixture must declare no /OutputIntents in catalog"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, _a) = pixel_at(&rgba, 50, 50);
+
+    // CMYK(0.25, 0, 0, 0) → additive-clamp:
+    //   R = 1 - (0.25 + 0) = 0.75 → 191
+    //   G = 1 - (0.00 + 0) = 1.00 → 255
+    //   B = 1 - (0.00 + 0) = 1.00 → 255
+    assert_eq!(
+        (r, g, b),
+        (191, 255, 255),
+        "without /OutputIntents the §10.3.5 additive-clamp fallback must \
+         be preserved byte-for-byte; got ({r}, {g}, {b})"
+    );
+}
