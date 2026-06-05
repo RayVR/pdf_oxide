@@ -1792,6 +1792,111 @@ fn qa_round4_default_gray_iccbased_n1_routes_through_qcms() {
     );
 }
 
+/// Pin a malformed `/DefaultCMYK <string>` entry falls through to the
+/// document `/OutputIntents` profile rather than silently mis-rendering
+/// the paint via first-component-as-gray.
+///
+/// A `/Default<Family>` entry per §8.6.5.6 MUST be a colour space —
+/// a Name (device-family alias) or an Array (CalGray, ICCBased,
+/// Separation, …). A PDF that declares `/DefaultCMYK (some string)`
+/// is malformed; the renderer must decide between:
+///   1. Honour the malformed entry by routing through
+///      `resolve_spaced`'s catch-all `first_as_gray` arm. For
+///      CMYK(0.25, 0, 0, 0) this produces RGB(64, 64, 64) — wrong
+///      colour, silent mis-rendering, indistinguishable from a
+///      buggy override.
+///   2. Treat the malformed entry as "no override declared" and
+///      fall through to the device-family path:
+///      `ResolvedColor::Cmyk` → composite projection via
+///      `cmyk_to_rgb_via_intent` → `ctx.output_intent_cmyk`. For
+///      this fixture's constant-CLUT OutputIntent that's RGB
+///      ~(128, 128, 128) — the press-target colour the OutputIntent
+///      claims is right, which is the best fallback a renderer can
+///      offer for a malformed override.
+///
+/// We pick option 2 — a malformed `/Default<Family>` is structurally
+/// indistinguishable from the entry being absent, so honouring the
+/// OutputIntent matches the §8.6.5.6 + §14.11.5 precedence cascade
+/// the rest of the resolver implements.
+///
+/// Fixture: catalog declares /OutputIntents → constant-grey CMYK
+/// profile; page declares /DefaultCMYK as a literal PDF string
+/// (`/DefaultCMYK (not a colour space)`). Content paints
+/// `0.25 0 0 0 k`. With the fix the pixel matches the OutputIntent
+/// reference; without it the pixel is the literal-grey (64, 64, 64).
+#[test]
+fn qa_round4_malformed_default_cmyk_falls_through_to_output_intent() {
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+
+    // OutputIntent reference: feed CMYK(0.25, 0, 0, 0) through the
+    // same constant-CLUT profile the catalog declares. With the
+    // fall-through path firing, the rendered pixel must match this.
+    let oi_ref = {
+        use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+        use std::sync::Arc;
+        let prof = Arc::new(IccProfile::parse(icc.clone(), 4).expect("CMYK profile parses"));
+        let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
+        assert!(t.has_cmm(), "synthesised CMYK profile must compile for the reference path");
+        // Renderer quantises 0.25 → 64; the constant CLUT then produces
+        // ~(128, 128, 128) regardless of the CMYK input.
+        let rgb = t.convert_cmyk_pixel(64, 0, 0, 0);
+        [rgb[0], rgb[1], rgb[2]]
+    };
+
+    // Build the PDF directly — none of the existing builders carry
+    // a malformed /DefaultCMYK entry. /DefaultCMYK (string) is a
+    // literal PDF string object: parses to Object::String, which is
+    // neither a Name nor an Array.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    let catalog = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK) /DestOutputProfile 5 0 R >>] >>\nendobj\n";
+    buf.extend_from_slice(catalog.as_bytes());
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /DefaultCMYK (not a colour space) >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+    let stream_off = buf.len();
+    let content = "0.25 0 0 0 k\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_off = buf.len();
+    let icc_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", icc.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(&icc);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(buf).expect("open synthetic PDF");
+    assert!(
+        doc.output_intent_cmyk_profile().is_some(),
+        "fixture must declare a CMYK /OutputIntents — without it the test \
+         can't distinguish the fall-through from the malformed path"
+    );
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (oi_ref[0], oi_ref[1], oi_ref[2], 255),
+        "Malformed /DefaultCMYK (string) must fall through to the document \
+         /OutputIntents path; expected qcms reference {:?}; got \
+         ({r},{g},{b},{a}). RGB(64, 64, 64) means the resolver honoured the \
+         malformed entry via first_as_gray — silent mis-rendering of CMYK \
+         paint as a literal-grey gradient.",
+        oi_ref
+    );
+}
+
 /// Pin that 1000 same-colour `/DeviceCMYK` paint operators on a single
 /// page build the qcms `Transform` exactly once. This is the cache
 /// hit-rate assertion the plan calls for: without caching every
