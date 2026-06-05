@@ -1027,7 +1027,26 @@ fn paint_through_pipeline(
         color: logical,
         ctm: gs.ctm,
     };
-    let ctx = ResolutionContext::new(doc, color_spaces);
+    // Thread the same colour-policy borrows as the composite path
+    // (page_renderer's run_pipeline_for_logical). The per-plate backend
+    // consumes ResolvedColor::Cmyk channel-by-channel for plate routing
+    // and never projects to RGBA, so the document /OutputIntents CMYK
+    // profile carried here is effectively no-op for separations — the
+    // plates ARE the press-target ink coverage. Threading it uniformly
+    // keeps the resolver call surface symmetric with the composite path
+    // so a single ColorResolver change can't silently diverge between
+    // the two renderers.
+    let output_intent = doc.output_intent_cmyk_profile();
+    let ctx = ResolutionContext::new(doc, color_spaces)
+        .with_output_intent(output_intent.as_ref())
+        .with_rendering_intent(crate::color::RenderingIntent::from_pdf_name(
+            &gs.rendering_intent,
+        ))
+        .with_defaults(
+            color_spaces.get("DefaultGray"),
+            color_spaces.get("DefaultRGB"),
+            color_spaces.get("DefaultCMYK"),
+        );
     let cmd = pipeline.resolve(&intent, &ctx, None)?;
     // Wrap the clip mask back into a borrowed ClipPlan-equivalent via
     // the SeparationSurface's externally-visible state. The
