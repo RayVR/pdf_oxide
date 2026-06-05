@@ -1762,3 +1762,115 @@ fn probe37_cloned_spans_carry_replacement_not_raw() {
 // /StructTreeRoot, so we only cover the explicit Marked=false
 // case from probe17c above.)
 // =============================================================
+
+// =============================================================
+// Probe 40: cross-MCID merge predicate — fragments with different
+//          MCIDs MUST stay separate even when they would otherwise
+//          satisfy every other merge condition (same font, same
+//          baseline, zero gap).
+//
+// Spec basis (ISO 32000-1:2008 §14.6, §14.8): the MCID is the
+// structural unit. Two same-line fragments with different MCIDs
+// belong to different marked-content references and therefore to
+// different structure elements (or different references to the
+// same element). Merging them would silently fuse their identities
+// — the merged span keeps `current.mcid` and drops the other —
+// destroying the boundary that structure-tree reading order,
+// tree-scope ActualText suppression, and table-cell membership
+// rely on.
+//
+// Fixture: a single visible word "Hello" emitted across two MCIDs
+// in the same Span content stream, in the same font, on the same
+// baseline, with a zero gap between them. Without the same_mcid
+// gate this would merge into one span "Hello" carrying MCID 0;
+// with the gate the two fragments survive as separate spans
+// "He" and "llo" carrying MCIDs 0 and 1 respectively.
+// =============================================================
+
+fn fixture_probe40_cross_mcid_no_merge() -> Vec<u8> {
+    // "He" at MCID 0, "llo" at MCID 1 — same font, same baseline,
+    // zero gap; the natural pre-PR behaviour was to glue these into
+    // "Hello" under is_same_font + same_line + tight gap.
+    let content = b"BT\n/F1 12 Tf\n50 700 Td\n\
+         /Span << /MCID 0 >> BDC\n(He) Tj\nEMC\n\
+         /Span << /MCID 1 >> BDC\n(llo) Tj\nEMC\n\
+         ET\n"
+        .to_vec();
+    let mut b = PdfBuilder::new();
+    b.add_page_content(content);
+    let _e0 = b.add_elem(Elem::new(8, "Span", 7).page(4).k(K::Mcid(0, 0)));
+    let _e1 = b.add_elem(Elem::new(9, "Span", 7).page(4).k(K::Mcid(1, 0)));
+    b.register_mcid(0, 0, 8);
+    b.register_mcid(0, 1, 9);
+    b.build()
+}
+
+#[test]
+fn probe40_cross_mcid_fragments_do_not_merge() {
+    let pdf = fixture_probe40_cross_mcid_no_merge();
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let page = doc.extract_page_text(0).expect("extract_page_text");
+
+    // Both fragments must be present.
+    let texts: Vec<String> = page.spans.iter().map(|s| s.text.clone()).collect();
+    assert!(texts.iter().any(|t| t == "He"), "fragment 'He' missing from spans: {:?}", texts);
+    assert!(
+        texts.iter().any(|t| t == "llo"),
+        "fragment 'llo' missing from spans: {:?}",
+        texts
+    );
+
+    // The pre-PR fused form must NOT appear.
+    assert!(
+        !texts.iter().any(|t| t == "Hello"),
+        "fragments must not merge across MCIDs; found 'Hello' in {:?}",
+        texts
+    );
+
+    // MCIDs are preserved per fragment.
+    let mcids: Vec<Option<u32>> = page.spans.iter().map(|s| s.mcid).collect();
+    assert!(
+        mcids.contains(&Some(0)) && mcids.contains(&Some(1)),
+        "expected MCIDs 0 and 1 each on their own span; got {:?}",
+        mcids
+    );
+}
+
+// =============================================================
+// Probe 41: regression sentry — same-MCID fragments still merge
+//          when they should. Pins that the same_mcid gate does
+//          not break the common case where a producer emits
+//          multiple Tj operators inside one /Span /MCID BDC ... EMC
+//          envelope (e.g. cross-font glue, small-caps glue, decimal
+//          merges within one marked-content reference). Without
+//          this pin a future refactor could turn same_mcid into
+//          "always require different objects" and silently
+//          fragment every tagged word.
+// =============================================================
+
+fn fixture_probe41_same_mcid_still_merges() -> Vec<u8> {
+    // "He" and "llo" both inside MCID 0 — same font, same baseline,
+    // zero gap. Must merge to "Hello".
+    let content = b"BT\n/F1 12 Tf\n50 700 Td\n\
+         /Span << /MCID 0 >> BDC\n(He) Tj\n(llo) Tj\nEMC\n\
+         ET\n"
+        .to_vec();
+    let mut b = PdfBuilder::new();
+    b.add_page_content(content);
+    let _e = b.add_elem(Elem::new(8, "Span", 7).page(4).k(K::Mcid(0, 0)));
+    b.register_mcid(0, 0, 8);
+    b.build()
+}
+
+#[test]
+fn probe41_same_mcid_fragments_merge_to_single_word() {
+    let pdf = fixture_probe41_same_mcid_still_merges();
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let page = doc.extract_page_text(0).expect("extract_page_text");
+    let texts: Vec<String> = page.spans.iter().map(|s| s.text.clone()).collect();
+    assert!(
+        texts.iter().any(|t| t == "Hello"),
+        "same-MCID fragments must still merge to 'Hello'; got spans={:?}",
+        texts
+    );
+}
