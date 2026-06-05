@@ -334,6 +334,98 @@ fn qa_wave5_type4_separation_composite_renders_magenta() {
     );
 }
 
+/// Probe 6 — Deferral pin for `ColorResolver` not emitting
+/// `PerChannel` / `Cmyk` end-to-end for Separation / DeviceN. The
+/// resolver always projects compound colour spaces down to
+/// `ResolvedColor::Rgba`, then folds CMYK → RGB via §10.3.5
+/// additive-clamp. This means:
+///
+///   - `OverprintResolver` (run after `ColorResolver`) sees `Rgba`
+///     and produces an empty `participating` channel set — so
+///     `InkRouter::route` returns `Skip` for every plate, even when
+///     overprint is enabled.
+///   - The new `SeparationBackend::paint` therefore skips every plate
+///     for any Separation/DeviceN source, which would manifest as
+///     "spot plates stay empty" when the operator walker eventually
+///     drives `SeparationBackend` (today it doesn't — the deferral is
+///     paired with `separation_renderer.rs` still using `tint_for_ink`).
+///
+/// We pin this from the composite-path side: a CMYK fill at
+/// `1 0 0 0 k` (pure cyan) renders cyan on the composite. The
+/// pipeline produces `Rgba { r: 0, g: 1, b: 1, a }`, and the
+/// `OverprintResolver` discards the CMYK channel decomposition. This
+/// is documented deferral #2 in the wave-5 acceptance notes.
+///
+/// Tracking name: WAVE5-DEFER-COLORRESOLVER-RGBA-ONLY-FOR-COMPOUND-SPACES.
+///
+/// The pin shape: the composite output is "cyan-coloured RGB
+/// (0, 255, 255)" — bit-exact byte values from the additive-clamp
+/// formula. A follow-up that wires the resolver to emit
+/// `ResolvedColor::Cmyk` for DeviceCMYK sources would not change this
+/// composite output (the composite backend would still see the
+/// folded RGBA), so the pin survives the deferral closure.
+#[test]
+fn qa_wave5_defer_color_resolver_rgba_only_for_compound_spaces() {
+    let content = "1 0 0 0 k\n10 10 80 80 re\nf\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let pixmap = render(&doc);
+    let (r, g, b, a) = center_pixel(&pixmap);
+    assert!(
+        r < 5 && g > 250 && b > 250 && a == 255,
+        "DeviceCMYK(1,0,0,0) → additive-clamp RGB(0, 1, 1) → exact bytes (0, 255, 255, 255); \
+         got ({r}, {g}, {b}, {a})"
+    );
+}
+
+/// Probe 7 — SeparationBackend equivalence with the inline
+/// `fill_separation` helper, with a different path / transform /
+/// tint combination than the in-source unit test. The in-source test
+/// covers a Cyan-only fill at tint 0.5 with identity transform and a
+/// 10×10 axis-aligned rect. This probe extends the equivalence to:
+///
+///   - A Magenta plate at tint 0.7,
+///   - 50×50 rotated rectangle under a non-identity CTM,
+///   - Under a `q ... Q` (graphics state save/restore) bracket.
+///
+/// Because `SeparationBackend` is `pub(crate)` we can't drive it
+/// directly from an integration test. We rely on the shipping
+/// `render_separation` API to exercise the same `fill_separation`
+/// inline helper the backend's unit test compares against — by
+/// construction (same CTM, same tint, same path) the inline helper
+/// path through `render_separation` and the wave-5 backend's path
+/// produce identical pixmaps. This probe pins the inline path so a
+/// regression that breaks `fill_separation` (which the backend's
+/// unit test is byte-compared against) breaks here too.
+#[test]
+fn qa_wave5_separation_inline_path_magenta_rotated_rect() {
+    use pdf_oxide::rendering::render_separation;
+    // CMYK(0, 0.7, 0, 0) → only Magenta plate carries tint.
+    // 50×50 rotated 45° around centre.
+    let content = "q\n0.7071 0.7071 -0.7071 0.7071 50 0 cm\n0 0.7 0 0 k\n0 0 50 50 re\nf\nQ\n";
+    let bytes = build_pdf(content, "");
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let magenta = render_separation(&doc, 0, "Magenta", 72).expect("render Magenta plate");
+    // The Magenta plate must have at least *some* coverage in the
+    // page interior (the rotated rect overlaps the page). Bounds
+    // check the integral.
+    let any_inked: bool = magenta.data.iter().any(|&v| v >= 100);
+    assert!(
+        any_inked,
+        "rotated Magenta-only fill must produce inked pixels with value >= 100"
+    );
+    // And the value where it's inked is the tint exactly (255 * 0.7 ≈ 178/179).
+    let max_value = magenta.data.iter().copied().max().unwrap_or(0);
+    assert!(
+        (175..=181).contains(&max_value),
+        "Magenta plate peak value should be ~179 (tint 0.7); got {max_value}"
+    );
+    // Cyan plate must be empty (tint 0).
+    let cyan = render_separation(&doc, 0, "Cyan", 72).expect("render Cyan plate");
+    let cyan_max = cyan.data.iter().copied().max().unwrap_or(0);
+    assert_eq!(cyan_max, 0, "Cyan plate must be fully untouched");
+}
+
 // ===========================================================================
 // PROBE 9-11: Toggle removal sanity
 //
