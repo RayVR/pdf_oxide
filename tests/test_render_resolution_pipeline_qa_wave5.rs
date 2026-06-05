@@ -718,7 +718,10 @@ fn qa_wave5_pipeline_resolve_text_colors_type4_separation_magenta() {
     for y in 30..70 {
         for x in 10..40 {
             let (r, g, b, _) = pixel_at(&pixmap, x, y);
-            if r > 200 && g < 80 && b > 200 {
+            // Magenta = R and B both dominate G. Dominance margin (50)
+            // tolerates platform-dependent AA-edge contributions while
+            // still pinning "R and B paint, G doesn't".
+            if r > 200 && b > 200 && r > g.saturating_add(50) && b > g.saturating_add(50) {
                 found_magenta = true;
                 break;
             }

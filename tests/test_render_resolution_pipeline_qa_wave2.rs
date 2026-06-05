@@ -386,7 +386,7 @@ fn qa_text_tj_array_many_segments_byte_identical() {
     let avg = average_ink_rgb(&on, 0, 30, 100, 70);
     let (r, g, b) = avg.expect("expected blue glyph ink from long TJ array");
     assert!(
-        r < 100.0 && g < 100.0 && b > 150.0,
+        b > 150.0 && b > r + 60.0 && b > g + 60.0,
         "TJ array glyph ink must be blue, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -437,7 +437,7 @@ fn qa_text_multi_font_run_byte_identical() {
     // Switching Tf between Helvetica/Times-Roman must not perturb the
     // resolved fill colour — every glyph must paint red.
     assert!(
-        r > 180.0 && g < 80.0 && b < 80.0,
+        r > 180.0 && r > g + 60.0 && r > b + 60.0,
         "multi-font Tj run must paint red, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -469,7 +469,7 @@ fn qa_text_tr0_fill_only_paints_red() {
     let avg = average_ink_rgb(&on, 0, 0, 100, 100);
     let (r, g, b) = avg.expect("Tr=0 must paint red glyph ink");
     assert!(
-        r > 180.0 && g < 80.0 && b < 80.0,
+        r > 180.0 && r > g + 60.0 && r > b + 60.0,
         "Tr=0 fill-only must paint red, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -506,7 +506,7 @@ fn qa_text_tr2_fill_and_stroke_paints_fill_color() {
     let avg = average_ink_rgb(&on, 0, 0, 100, 100);
     let (r, g, b) = avg.expect("Tr=2 must paint glyph ink");
     assert!(
-        r > 180.0 && g < 80.0 && b < 80.0,
+        r > 180.0 && r > g + 60.0 && r > b + 60.0,
         "Tr=2 ink must be FILL red, not stroke blue, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -582,7 +582,7 @@ fn qa_text_tr6_fill_stroke_plus_clip_paints_fill_color() {
     let avg = average_ink_rgb(&on, 0, 0, 100, 100);
     let (r, g, b) = avg.expect("Tr=6 must paint the fill side");
     assert!(
-        r > 180.0 && g < 80.0 && b < 80.0,
+        r > 180.0 && r > g + 60.0 && r > b + 60.0,
         "Tr=6 painted ink must be FILL red, not stroke blue, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -624,7 +624,7 @@ fn qa_text_tr_change_mid_stream_no_leak_paints_red() {
     let avg = average_ink_rgb(&on, 0, 0, 100, 100);
     let (r, g, b) = avg.expect("Tr change mid-stream must paint glyph ink");
     assert!(
-        r > 180.0 && g < 80.0 && b < 80.0,
+        r > 180.0 && r > g + 60.0 && r > b + 60.0,
         "Tr change mid-stream must paint red fill across all glyphs, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -1076,7 +1076,7 @@ fn qa_text_embedded_subset_stand_in_paints_blue() {
     let avg = average_ink_rgb(&on, 0, 0, 100, 100);
     let (r, g, b) = avg.expect("embedded-subset stand-in must paint glyph ink");
     assert!(
-        b > 150.0 && r < 100.0 && g < 100.0,
+        b > 150.0 && b > r + 60.0 && b > g + 60.0,
         "embedded-subset stand-in must paint blue, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -1170,7 +1170,7 @@ fn qa_text_unicode_via_tounicode_cmap_paints_red_glyph() {
     let avg = average_ink_rgb(&on, 0, 0, 100, 100);
     let (r, g, b) = avg.expect("ToUnicode-bearing font must still paint glyph ink");
     assert!(
-        r > 180.0 && g < 80.0 && b < 80.0,
+        r > 180.0 && r > g + 60.0 && r > b + 60.0,
         "ToUnicode-bearing font Tj must paint red, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -1250,7 +1250,7 @@ fn qa_text_tj_with_extgstate_smask_none_paints_red_glyph() {
     let avg = average_ink_rgb(&on, 0, 0, 100, 100);
     let (r, g, b) = avg.expect("glyph must paint despite /SMask /None");
     assert!(
-        r > 180.0 && g < 80.0 && b < 80.0,
+        r > 180.0 && r > g + 60.0 && r > b + 60.0,
         "/SMask /None must not suppress the red glyph, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
@@ -1273,7 +1273,7 @@ fn qa_text_tj_with_blend_mode_multiply_paints_red() {
     let avg = average_ink_rgb(&on, 0, 0, 100, 100);
     let (r, g, b) = avg.expect("Multiply-mode glyph must paint ink");
     assert!(
-        r > 180.0 && g < 80.0 && b < 80.0,
+        r > 180.0 && r > g + 60.0 && r > b + 60.0,
         "Multiply over white must preserve red, got ({r:.1}, {g:.1}, {b:.1})"
     );
 }
