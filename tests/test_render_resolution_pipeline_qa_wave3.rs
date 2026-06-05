@@ -510,7 +510,7 @@ fn build_pdf_standard_image_indexed(
 /// does not splice the pipeline on these; the standard-image branch
 /// paints the CMYK pixel data unchanged.
 #[test]
-fn qa_standard_image_cmyk_pass_through_byte_identical() {
+fn qa_standard_image_cmyk_pass_through_paints_magenta_centre() {
     // 4x4 CMYK pixels, all (0, 1, 0, 0) → magenta under additive clamp.
     // Each pixel is 4 bytes (one per component).
     let mut pixels = Vec::with_capacity(16 * 4);
@@ -534,7 +534,7 @@ fn qa_standard_image_cmyk_pass_through_byte_identical() {
 /// of 256 entries (full 8-bit). Pixel data picks index 0 (red palette
 /// entry) for every sample.
 #[test]
-fn qa_standard_image_indexed_256_pass_through_byte_identical() {
+fn qa_standard_image_indexed_256_pass_through_paints_red_centre() {
     // Build a 256-entry palette: index 0 = red, all others = white.
     let mut palette = Vec::with_capacity(256 * 3);
     palette.extend_from_slice(&[0xFFu8, 0x00, 0x00]); // index 0: red
@@ -625,7 +625,7 @@ fn qa_image_with_explicit_imagemask_false_routes_to_standard_image() {
 /// remain stable — the image goes through `render_image`, not the mask
 /// branch.
 #[test]
-fn qa_standard_image_iccbased_n4_pass_through_byte_identical() {
+fn qa_standard_image_iccbased_n4_pass_through_paints_visible_ink() {
     // 2x2 CMYK pixels (16 bytes), all magenta.
     let mut pixels = Vec::with_capacity(16);
     for _ in 0..4 {

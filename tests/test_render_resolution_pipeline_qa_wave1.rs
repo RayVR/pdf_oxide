@@ -175,7 +175,7 @@ fn count_marked_pixels(rgba: &[u8]) -> usize {
 /// 100×100 page exercises every migrated arm 200× per render — large
 /// enough to surface drift if any exists.
 #[test]
-fn qa_long_stream_repeated_fill_stroke_byte_identical() {
+fn qa_long_stream_repeated_fill_stroke_paints_dense_marks() {
     let mut content = String::new();
     content.push_str("1 0 0 rg\n0 1 0 RG\n2 w\n");
     // 200 rectangles, each with a fill, stroke, and one combo, scattered
@@ -212,7 +212,7 @@ fn qa_long_stream_repeated_fill_stroke_byte_identical() {
 /// rather than collapsing to one canonical RGBA the pipeline could hide a
 /// bug behind.
 #[test]
-fn qa_mixed_all_paint_operators_byte_identical() {
+fn qa_mixed_all_paint_operators_paints_across_page() {
     let mut content = String::new();
     content.push_str("3 w\n");
     let ops = ["f", "f*", "S", "B", "B*", "b", "b*"];
@@ -249,7 +249,7 @@ fn qa_mixed_all_paint_operators_byte_identical() {
 /// Pattern: save state, change a state field, paint, restore, paint
 /// again. Repeat with different field combinations.
 #[test]
-fn qa_interleaved_graphics_state_changes_byte_identical() {
+fn qa_interleaved_graphics_state_changes_preserve_marks() {
     let content = "\
         1 0 0 rg\n0 1 0 RG\n2 w\n\
         q\n3 w\n0 J\n0 j\n10 10 30 30 re\nB\nQ\n\

@@ -333,7 +333,7 @@ fn average_ink_rgb(rgba: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> Option<(f
 /// every glyph through the spliced GS the helper produces — so any
 /// per-glyph leak through to the resolver also surfaces here.
 #[test]
-fn qa_text_long_run_many_tj_calls_byte_identical() {
+fn qa_text_long_run_many_tj_calls_paints_substantial_ink() {
     let mut content = String::new();
     content.push_str("BT 1 0 0 rg /F1 8 Tf 5 90 Td ");
     let sizes = [8u32, 16, 24, 32];
@@ -362,7 +362,7 @@ fn qa_text_long_run_many_tj_calls_byte_identical() {
 /// pipeline were to re-resolve per array element or per glyph it would
 /// drift on this fixture.
 #[test]
-fn qa_text_tj_array_many_segments_byte_identical() {
+fn qa_text_tj_array_many_segments_paints_blue() {
     // 20 segments: alternating 1-char strings and small numeric kern
     // offsets. Build it in a loop so the count is unambiguous.
     let mut array = String::new();
@@ -396,7 +396,7 @@ fn qa_text_tj_array_many_segments_byte_identical() {
 /// font size between iterations to ensure the pipeline state correctly
 /// tears down between operator arms.
 #[test]
-fn qa_text_interleaved_with_path_operators_byte_identical() {
+fn qa_text_interleaved_with_path_operators_paints_well_inked_page() {
     let content = "\
         1 0 0 rg 10 10 30 30 re f\n\
         BT 0 0 1 rg /F1 14 Tf 10 60 Td (Hello) Tj ET\n\
@@ -421,7 +421,7 @@ fn qa_text_interleaved_with_path_operators_byte_identical() {
 /// The pipeline routes colour, not font; switching fonts mid-`BT/ET`
 /// must not perturb the resolved colour for either side.
 #[test]
-fn qa_text_multi_font_run_byte_identical() {
+fn qa_text_multi_font_run_paints_red() {
     // Use the two-font fixture: alternate /F1 (Helvetica) and /F2
     // (Times-Roman). Same text content, same fill colour through the
     // whole run.
