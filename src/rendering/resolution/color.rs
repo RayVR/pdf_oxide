@@ -261,21 +261,27 @@ impl ColorResolver {
         //
         // No per-plate routing complication here — RGB never lands on
         // CMYK plates — so we emit ResolvedColor::Rgba directly. The
-        // per-page CMYK transform cache is not consulted (it's keyed on
-        // CMYK transforms; an RGB profile would have a different
-        // n_components and the cache invariant wouldn't hold). N=3
-        // overrides are rarer than N=4, so the per-paint Transform
-        // construction is acceptable until a follow-up generalises the
-        // cache.
+        // per-page transform cache (originally introduced for CMYK,
+        // but n_components-agnostic at the key level — see
+        // `CmykTransformCache` docstring) is consulted here too: an
+        // /ICCBased N=3 profile used by a /DefaultRGB override gets
+        // hit by every bare /DeviceRGB paint on the page, so caching
+        // the compiled qcms transform pays back for the same reason
+        // the CMYK arm above does.
         #[cfg(feature = "icc")]
         if n == 3 && components.len() >= 3 {
             if let Ok(bytes) = resolved_stream.decode_stream_data() {
                 if let Some(profile) = crate::color::IccProfile::parse(bytes, 3) {
                     let profile = std::sync::Arc::new(profile);
-                    let transform = crate::color::Transform::new_srgb_target(
-                        std::sync::Arc::clone(&profile),
-                        ctx.rendering_intent,
-                    );
+                    let transform: std::sync::Arc<crate::color::Transform> =
+                        if let Some(cache) = ctx.cmyk_transform_cache {
+                            cache.get_or_build(&profile, ctx.rendering_intent)
+                        } else {
+                            std::sync::Arc::new(crate::color::Transform::new_srgb_target(
+                                std::sync::Arc::clone(&profile),
+                                ctx.rendering_intent,
+                            ))
+                        };
                     if transform.has_cmm() {
                         let r = components[0].clamp(0.0, 1.0);
                         let g = components[1].clamp(0.0, 1.0);

@@ -35,6 +35,16 @@ use crate::object::Object;
 
 /// Per-page cache of compiled qcms transforms.
 ///
+/// Naming note: the type is called `CmykTransformCache` for historical
+/// reasons — it was introduced to amortise the 17⁴ CLUT precomputation
+/// `qcms::Transform::new_to` runs for CMYK input. The cache key is
+/// `(profile.content_hash(), intent)` which is n_components-agnostic
+/// at the storage level, so the same cache also serves N=3 (RGB)
+/// `/ICCBased` profiles routed through `/DefaultRGB` overrides and any
+/// other ICC arm the resolver grows. The "Cmyk" in the name reflects
+/// where the perf trap was first measured, not a constraint on what
+/// the cache can hold.
+///
 /// Constructing a `Transform` runs `qcms::Transform::new_to` which
 /// precomputes a 17⁴ = 83 521-sample CLUT for CMYK input (see
 /// `qcms-0.3.0/src/transform.rs:1245-1281`). The per-pixel
@@ -42,19 +52,28 @@ use crate::object::Object;
 /// against the CLUT; rebuilding the transform per paint operator is
 /// the perf trap. A single page can carry thousands of `k`/`f` pairs
 /// emitting the same CMYK quadruple — without the cache every one of
-/// those paints pays the precomputation cost.
+/// those paints pays the precomputation cost. The N=3 RGB path
+/// doesn't precompute a CLUT but still runs the qcms profile-build
+/// overhead per Transform; caching pays back equally there.
 ///
 /// The cache key is `(profile.content_hash(), intent)`:
 ///
 /// * **Profile identity** — the same `Arc<IccProfile>` instance always
 ///   compiles to the same transform per intent, so hashing the profile
-///   bytes is sufficient. Multiple profiles can coexist on a single
-///   page when a Form XObject carries its own `/ICCBased` colour space
-///   distinct from the document `/OutputIntents` profile; the
-///   content-hash keying separates them automatically. Two profiles
-///   with byte-identical contents would collide on the cache key, but
-///   the resulting transform is identical so the collision is
-///   harmless.
+///   bytes is sufficient. The hash of the bytes incorporates the
+///   colour-space signature (`'CMYK'` / `'RGB '` / `'GRAY'`) so an
+///   RGB and a CMYK profile cannot share a cache entry even if they
+///   happen to collide on `DefaultHasher` — and each `Transform`
+///   carries its source profile's `n_components`, so callers asking
+///   for the wrong conversion (`convert_rgb_buffer` on a CMYK
+///   transform) fall through the n_components guard inside
+///   `Transform` instead of silently mis-converting.
+///   Multiple profiles can coexist on a single page when a Form
+///   XObject carries its own `/ICCBased` colour space distinct from
+///   the document `/OutputIntents` profile; the content-hash keying
+///   separates them automatically. Two profiles with byte-identical
+///   contents would collide on the cache key, but the resulting
+///   transform is identical so the collision is harmless.
 /// * **Rendering intent** — `qcms::Transform::new_to` takes intent as
 ///   a parameter; qcms 0.3.0 ignores it internally (the `_intent`
 ///   underscore at `transform.rs:1288`), but the cache key still
