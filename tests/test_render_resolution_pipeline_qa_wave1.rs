@@ -277,12 +277,14 @@ fn qa_interleaved_graphics_state_changes_byte_identical() {
 /// Probe 4 — Hairline stroke (line width well under 1 device pixel).
 ///
 /// The pipeline clones `gs` and overwrites only `stroke_color_rgb` and
-/// `stroke_alpha`; line width must round-trip exactly. At a 0.25-px width
-/// the rasteriser produces a faint anti-aliased line; if the pipeline
-/// accidentally promoted the width (e.g. via a default-init clone) the
-/// off and on pixmaps would diverge.
+/// `stroke_alpha`; line width must round-trip through the pipeline splice
+/// exactly. At a 0.25-px width the rasteriser produces a faint
+/// anti-aliased line; if the splice accidentally promoted the width
+/// (e.g. via a default-init clone) the painted pixmap would diverge from
+/// the expected hairline. The capability under test is that the operator
+/// round-trips without panicking and the line-width survives the splice.
 #[test]
-fn qa_stroke_hairline_width_parity() {
+fn qa_stroke_hairline_width_renders_full_pixmap() {
     // 0.25-px stroke at 72 DPI is below the sub-pixel anti-alias
     // threshold the rasteriser uses, so the on-paper output is
     // effectively zero coverage — the spec doesn't guarantee
@@ -306,7 +308,7 @@ fn qa_stroke_hairline_width_parity() {
 /// means "thinnest line the device can render"; the renderer's existing
 /// behaviour is what we pin — the page must render without panicking.
 #[test]
-fn qa_stroke_zero_width_parity() {
+fn qa_stroke_zero_width_renders_full_pixmap() {
     let content = "1 0 0 RG\n0 w\n20 50 m\n80 50 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
@@ -321,10 +323,10 @@ fn qa_stroke_zero_width_parity() {
 /// Probe 6 — Negative line width (malformed PDF).
 ///
 /// The spec says width must be non-negative; some PDFs in the wild carry
-/// negative values from broken producers. Both paths must degrade
-/// identically — no panic, no divergence between off and on.
+/// negative values from broken producers. The renderer must degrade
+/// gracefully — no panic — and still produce a full pixmap.
 #[test]
-fn qa_stroke_negative_width_parity_no_panic() {
+fn qa_stroke_negative_width_renders_without_panic() {
     let content = "1 0 0 RG\n-3 w\n20 50 m\n80 50 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
@@ -343,7 +345,7 @@ fn qa_stroke_negative_width_parity_no_panic() {
 /// happens inside `device_to_rgba`. The painted stroke must blend to a
 /// faded red, confirming the alpha was sourced and folded as expected.
 #[test]
-fn qa_stroke_alpha_ca_extgstate_parity() {
+fn qa_stroke_alpha_ca_extgstate_blends_to_faded_red() {
     let content = "/Half gs\n1 0 0 RG\n10 w\n20 20 60 60 re\nS\n";
     let resources = "/ExtGState << /Half << /Type /ExtGState /CA 0.5 >> >>";
     let bytes = build_pdf(content, resources);
@@ -365,7 +367,7 @@ fn qa_stroke_alpha_ca_extgstate_parity() {
 /// long horizontal stroke with a clear dash pattern surfaces any pipeline
 /// path that would forget the dashing.
 #[test]
-fn qa_stroke_dash_pattern_parity() {
+fn qa_stroke_dash_pattern_produces_partial_coverage() {
     let content = "1 0 0 RG\n4 w\n[6 3] 0 d\n10 50 m\n90 50 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
@@ -396,7 +398,7 @@ fn qa_stroke_dash_pattern_parity() {
 /// `M 100` allows long miter spikes; at a sharp join the spike length is
 /// observable. Pipeline must round-trip the miter limit.
 #[test]
-fn qa_stroke_extreme_miter_limit_parity() {
+fn qa_stroke_extreme_miter_limit_paints_miter_spike() {
     let content = "1 0 0 RG\n6 w\n0 J\n0 j\n100 M\n20 80 m\n50 50 l\n20 20 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
@@ -432,7 +434,7 @@ fn qa_stroke_extreme_miter_limit_parity() {
 /// either resets it to identity, the rotated rectangle won't paint at
 /// the right place.
 #[test]
-fn qa_combo_under_rotated_scaled_ctm_parity() {
+fn qa_combo_under_rotated_scaled_ctm_paints_both_fill_and_stroke() {
     // CTM: rotate 30°, scale 0.8, translate (10, 10). Then paint a
     // rectangle through `B`. The fill side and stroke side must both
     // honour the same CTM.
@@ -495,7 +497,7 @@ fn qa_stroke_under_extgstate_with_smask_no_divergence() {
 /// for both sub-operations; a path that tracked one clip on the inline
 /// route and another on the pipeline route would diverge.
 #[test]
-fn qa_combo_under_active_clip_parity() {
+fn qa_combo_under_active_clip_paints_only_inside_band() {
     // Set up a clip that's a small horizontal band across the page, then
     // do `B` of a rectangle that extends well past the band on top and
     // bottom. Only the in-band fraction of the fill and stroke is
@@ -597,9 +599,9 @@ fn qa_indexed_scn_stroke_index_as_gray_fallback() {
 /// The pipeline inspects `/N` and dispatches to the device-family
 /// fallback; the painted fill must reach the pixmap.
 #[test]
-fn qa_iccbased_cmyk_n4_fill_parity() {
+fn qa_iccbased_cmyk_n4_fill_paints_centre_cyan() {
     // Embed a minimal ICCBased stream with /N 4. We don't ship a real
-    // ICC profile blob — both paths read /N and route to the CMYK
+    // ICC profile blob — the resolver reads /N and routes to the CMYK
     // fallback without consulting the profile bytes for the non-icc
     // build, so an empty stream is sufficient here.
     let mut buf: Vec<u8> = Vec::new();
@@ -767,7 +769,7 @@ fn qa_separation_all_colorant() {
 /// The pipeline must NOT capture `Pattern` colour-space resolution
 /// out from under that — it should leave the pattern path alone.
 #[test]
-fn qa_pattern_colour_space_falls_back_to_inline_parity() {
+fn qa_pattern_colour_space_degenerate_cs_does_not_crash() {
     // A bare `/Pattern cs` followed by a non-pattern paint is degenerate
     // but parses. The point of this probe is that the pipeline must
     // return None (falls back to inline) for Pattern-shaped logical
@@ -922,7 +924,7 @@ fn qa_malformed_separation_array_no_panic() {
 /// the renderer's long-standing handling of an oversize component
 /// list against a single-channel Separation.
 #[test]
-fn qa_scn_too_many_components_for_space_parity() {
+fn qa_scn_too_many_components_for_space_renders_marked_centre() {
     let type4_program = "{ 0.0 exch 0.0 0.0 }";
     let resources = "/ColorSpace << /Spot [/Separation /SpotName /DeviceCMYK 5 0 R] >>";
     // `scn` with four numbers against a single-channel Separation: the

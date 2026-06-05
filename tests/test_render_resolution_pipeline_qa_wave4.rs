@@ -1267,7 +1267,8 @@ fn qa_shading_under_multiply_blend_mode_paints_inside_axis() {
 
 /// Build a PDF carrying a raw shading dict of arbitrary `/ShadingType`.
 /// Used for pass-through probes where the shading type is unsupported
-/// — both paths should reach the same `unsupported` arm.
+/// — the renderer must reach the `unsupported` arm and degrade
+/// gracefully without panic.
 fn build_pdf_raw_shading_type(shading_type: i32) -> Vec<u8> {
     // Minimum-viable shading dict for the unsupported types: declare
     // ShadingType, a ColorSpace, and a tiny stream-shaped dict so the
