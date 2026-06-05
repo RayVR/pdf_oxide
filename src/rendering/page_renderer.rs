@@ -22,8 +22,8 @@ use crate::object::{Object, ObjectRef};
 use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState};
 use crate::rendering::path_rasterizer::PathRasterizer;
 use crate::rendering::resolution::{
-    DeviceColor, LogicalColor, PaintIntent, PaintKind, PaintSide, ResolutionContext,
-    ResolutionPipeline, ResolvedColor,
+    CmykTransformCache, DeviceColor, LogicalColor, PaintIntent, PaintKind, PaintSide,
+    ResolutionContext, ResolutionPipeline, ResolvedColor,
 };
 use crate::rendering::text_rasterizer::TextRasterizer;
 
@@ -213,6 +213,13 @@ pub struct PageRenderer {
     /// access per `render_page` invocation. Stays `None` (no allocation) when
     /// the set is empty — the common case.
     excluded_layers_snapshot: Option<Arc<HashSet<String>>>,
+    /// Per-page compiled qcms transform cache. The resolution
+    /// pipeline borrows this through `ResolutionContext` so every
+    /// CMYK paint operator within a page reuses the same compiled
+    /// `Transform` for a given `(profile, intent)` pair. Cleared per
+    /// page in `render_page_with_options`; lives across paint
+    /// operators within the page.
+    pub(crate) cmyk_transform_cache: CmykTransformCache,
 }
 
 impl PageRenderer {
@@ -225,7 +232,19 @@ impl PageRenderer {
             fonts: HashMap::new(),
             color_spaces: HashMap::new(),
             excluded_layers_snapshot: None,
+            cmyk_transform_cache: CmykTransformCache::new(),
         }
+    }
+
+    /// Number of qcms transform constructions the per-page cache has
+    /// observed since the last `render_page_with_options` call. Test-
+    /// support only: never enabled in production builds. Lets the
+    /// integration suite assert "1000 same-colour CMYK paints built 1
+    /// transform" without racing concurrent tests that might also
+    /// trigger `Transform::new_srgb_target` via the global counter.
+    #[cfg(feature = "test-support")]
+    pub fn cmyk_transform_cache_build_count(&self) -> usize {
+        self.cmyk_transform_cache.build_count()
     }
 
     /// Render a page to a raster image.
@@ -242,6 +261,12 @@ impl PageRenderer {
         // Clear caches for new page
         self.fonts.clear();
         self.color_spaces.clear();
+        // The qcms transform cache is per-page: dropping every entry
+        // keeps memory bounded when the renderer is reused across many
+        // pages with distinct /OutputIntents profiles, while still
+        // amortising transform construction across paints within a
+        // single page.
+        self.cmyk_transform_cache.clear();
 
         // Refresh the excluded-layers snapshot once per page. The effective
         // set combines (a) the PDF's default-off OCGs per /OCProperties/D
@@ -1034,6 +1059,21 @@ impl PageRenderer {
                 },
                 Operator::SetDash { array, phase } => {
                     gs_stack.current_mut().dash_pattern = (array.clone(), *phase);
+                },
+                Operator::SetRenderingIntent { intent } => {
+                    // ISO 32000-1:2008 §10.7.3 `/RI` operator. Updates
+                    // the graphics-state rendering-intent string; the
+                    // colour stage reads `gs.rendering_intent` and
+                    // dispatches qcms with the matching intent
+                    // (`crate::color::RenderingIntent::from_pdf_name`
+                    // maps unknown names back to /RelativeColorimetric
+                    // per the spec's "unrecognised → relative" rule).
+                    // Without this dispatch the parser would update
+                    // the operator stream but the gs.rendering_intent
+                    // field would stay at its default forever; the
+                    // CMYK transform cache would collapse every
+                    // intent's paint into a single shared entry.
+                    gs_stack.current_mut().rendering_intent = intent.clone();
                 },
 
                 // Path construction
@@ -3195,6 +3235,11 @@ impl PageRenderer {
         // /N=4 and parses the embedded stream; we just hand the Arc
         // (when present) to the context.
         let output_intent = doc.output_intent_cmyk_profile();
+        // Hand the per-page CMYK transform cache to the resolver. The
+        // cache lives on `Self` (cleared at render start in
+        // `render_page_with_options`); threading it here is what
+        // turns the 1000-paint same-colour case from "rebuild qcms
+        // transform 1000×" into "cache miss once, hit 999×".
         let ctx = ResolutionContext::new(doc, color_spaces)
             .with_output_intent(output_intent.as_ref())
             .with_rendering_intent(crate::color::RenderingIntent::from_pdf_name(
@@ -3204,7 +3249,8 @@ impl PageRenderer {
                 color_spaces.get("DefaultGray"),
                 color_spaces.get("DefaultRGB"),
                 color_spaces.get("DefaultCMYK"),
-            );
+            )
+            .with_cmyk_transform_cache(Some(&self.cmyk_transform_cache));
         // No geometry is needed: the colour stage only reads `color`
         // (and reads `gs` for the alpha fold). `ColorOnly` lets the
         // intent express that without conjuring a placeholder path.

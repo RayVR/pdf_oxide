@@ -396,6 +396,14 @@ wasm-ml = ["wasm-ocr"]
 # Debug feature for span merging analysis
 debug-span-merging = []
 
+# Test-support hooks for integration tests. Currently exposes a global
+# atomic counter (`crate::color::TRANSFORM_BUILD_COUNT`) so the
+# per-page qcms transform-cache test can assert exact build counts
+# without resorting to noisy wall-clock measurement. Production builds
+# never enable this feature — the counter's atomic store/load pays
+# zero overhead when the feature is off.
+test-support = []
+
 # Page rendering to images (pure Rust via tiny-skia)
 rendering = ["dep:tiny-skia", "dep:fast_image_resize", "system-fonts", "dep:hayro-jbig2"]
 

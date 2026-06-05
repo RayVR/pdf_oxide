@@ -25,12 +25,113 @@
 //! it once per page (or once per Form XObject scope) and hand it to every
 //! `resolve` call without per-intent allocation.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::color::{IccProfile, RenderingIntent};
+use crate::color::{IccProfile, RenderingIntent, Transform};
 use crate::document::PdfDocument;
 use crate::object::Object;
+
+/// Per-page cache of compiled qcms transforms.
+///
+/// Constructing a `Transform` runs `qcms::Transform::new_to` which
+/// precomputes a 17⁴ = 83 521-sample CLUT for CMYK input (see
+/// `qcms-0.3.0/src/transform.rs:1245-1281`). The per-pixel
+/// `convert_cmyk_pixel` call is then a cheap tetrahedral interpolation
+/// against the CLUT; rebuilding the transform per paint operator is
+/// the perf trap. A single page can carry thousands of `k`/`f` pairs
+/// emitting the same CMYK quadruple — without the cache every one of
+/// those paints pays the precomputation cost.
+///
+/// The cache key is `(profile.content_hash(), intent)`:
+///
+/// * **Profile identity** — the same `Arc<IccProfile>` instance always
+///   compiles to the same transform per intent, so hashing the profile
+///   bytes is sufficient. Multiple profiles can coexist on a single
+///   page when a Form XObject carries its own `/ICCBased` colour space
+///   distinct from the document `/OutputIntents` profile; the
+///   content-hash keying separates them automatically. Two profiles
+///   with byte-identical contents would collide on the cache key, but
+///   the resulting transform is identical so the collision is
+///   harmless.
+/// * **Rendering intent** — `qcms::Transform::new_to` takes intent as
+///   a parameter; qcms 0.3.0 ignores it internally (the `_intent`
+///   underscore at `transform.rs:1288`), but the cache key still
+///   includes it so a future qcms upgrade that honours the parameter
+///   doesn't silently share transforms across intents.
+///
+/// Interior mutability via `RefCell` because callers hold `&Context`
+/// (the resolver is invoked through immutable references; making it
+/// `&mut` would force the operator dispatcher to rewire every
+/// resolver call to thread mutable borrows through the colour stage).
+/// Single-threaded by construction — `ResolutionContext` is never
+/// shared across threads within a render call.
+pub(crate) struct CmykTransformCache {
+    entries: RefCell<HashMap<(u64, RenderingIntent), Arc<Transform>>>,
+    /// Test-support counter: every cache miss (i.e. every call that
+    /// actually constructs a fresh `Transform`) increments this
+    /// instance-local counter. Distinct from the global
+    /// `crate::color::TRANSFORM_BUILD_COUNT` so tests can assert on
+    /// per-cache hit rates without racing other parallel tests that
+    /// might also build transforms.
+    #[cfg(feature = "test-support")]
+    pub(crate) build_count: std::cell::Cell<usize>,
+}
+
+impl CmykTransformCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: RefCell::new(HashMap::new()),
+            #[cfg(feature = "test-support")]
+            build_count: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Look up or build the compiled `Transform` for `(profile,
+    /// intent)`. On a cache miss the closure builds the transform once
+    /// and inserts it; subsequent calls return the cached
+    /// `Arc<Transform>`. The borrow on `entries` is released between
+    /// the `get` probe and the `insert` so the closure can re-enter
+    /// the cache safely (it won't — but defensive locking shape).
+    pub(crate) fn get_or_build(
+        &self,
+        profile: &Arc<IccProfile>,
+        intent: RenderingIntent,
+    ) -> Arc<Transform> {
+        let key = (profile.content_hash(), intent);
+        if let Some(t) = self.entries.borrow().get(&key).cloned() {
+            return t;
+        }
+        let t = Arc::new(Transform::new_srgb_target(Arc::clone(profile), intent));
+        self.entries.borrow_mut().insert(key, Arc::clone(&t));
+        #[cfg(feature = "test-support")]
+        self.build_count.set(self.build_count.get() + 1);
+        t
+    }
+
+    /// Drop every entry. Called per page so the cache doesn't leak
+    /// transforms across renders when `PageRenderer` is reused.
+    pub(crate) fn clear(&self) {
+        self.entries.borrow_mut().clear();
+        #[cfg(feature = "test-support")]
+        self.build_count.set(0);
+    }
+
+    /// Number of cache misses observed in the cache's lifetime since
+    /// the last `clear()`. Test-only — never exposed on production
+    /// builds.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn build_count(&self) -> usize {
+        self.build_count.get()
+    }
+}
+
+impl Default for CmykTransformCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Per-page (or per-Form XObject) context for the resolution pipeline.
 ///
@@ -52,6 +153,18 @@ pub(crate) struct ResolutionContext<'a> {
     pub(crate) default_rgb: Option<&'a Object>,
     /// Page-level `/DefaultCMYK` override (§8.6.5.6), when present.
     pub(crate) default_cmyk: Option<&'a Object>,
+    /// Per-page compiled qcms transform cache. When `Some`, the
+    /// colour stage looks up `(profile, intent)` in the cache before
+    /// calling `Transform::new_srgb_target` — the latter precomputes
+    /// an 17⁴ CLUT and dominates per-paint cost on documents that
+    /// repeat the same CMYK colour. The cache is shared across every
+    /// `ResolutionContext` instance built within a single page render
+    /// so the operator-walker's fresh-context-per-paint pattern still
+    /// amortises transform construction. `None` skips caching — the
+    /// resolver builds a fresh transform per paint, which is what the
+    /// unit-test paths and the `cargo test --lib` resolver tests
+    /// exercise.
+    pub(crate) cmyk_transform_cache: Option<&'a CmykTransformCache>,
 }
 
 impl<'a> ResolutionContext<'a> {
@@ -72,7 +185,22 @@ impl<'a> ResolutionContext<'a> {
             default_gray: None,
             default_rgb: None,
             default_cmyk: None,
+            cmyk_transform_cache: None,
         }
+    }
+
+    /// Attach a per-page CMYK transform cache. The cache lives on
+    /// `PageRenderer` (cleared per page) so transform construction is
+    /// amortised across the many `ResolutionContext` instances the
+    /// operator dispatcher builds inside a single render. `None`
+    /// (the default) skips caching — appropriate for unit tests that
+    /// only exercise a handful of conversions.
+    pub(crate) fn with_cmyk_transform_cache(
+        mut self,
+        cache: Option<&'a CmykTransformCache>,
+    ) -> Self {
+        self.cmyk_transform_cache = cache;
+        self
     }
 
     /// Attach the document's `/OutputIntents` CMYK profile, when one is

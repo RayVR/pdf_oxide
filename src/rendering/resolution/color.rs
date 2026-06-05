@@ -148,10 +148,25 @@ impl ColorResolver {
         if n == 4 && components.len() >= 4 {
             if let Ok(bytes) = resolved_stream.decode_stream_data() {
                 if let Some(profile) = crate::color::IccProfile::parse(bytes, 4) {
-                    let transform = crate::color::Transform::new_srgb_target(
-                        std::sync::Arc::new(profile),
-                        ctx.rendering_intent,
-                    );
+                    let profile = std::sync::Arc::new(profile);
+                    // Per-page transform cache keyed on profile content
+                    // hash + intent (see CmykTransformCache). The
+                    // embedded /ICCBased profile is parsed afresh on
+                    // every paint operator (the decode + parse happens
+                    // above), but the qcms CMM is the heavy bit and
+                    // gets reused across paints whose ICCBased stream
+                    // hashes identically. Unit tests skip the cache
+                    // (ctx.cmyk_transform_cache is None) and pay the
+                    // per-call build cost.
+                    let transform: std::sync::Arc<crate::color::Transform> =
+                        if let Some(cache) = ctx.cmyk_transform_cache {
+                            cache.get_or_build(&profile, ctx.rendering_intent)
+                        } else {
+                            std::sync::Arc::new(crate::color::Transform::new_srgb_target(
+                                std::sync::Arc::clone(&profile),
+                                ctx.rendering_intent,
+                            ))
+                        };
                     if transform.has_cmm() {
                         let c = components[0].clamp(0.0, 1.0);
                         let m = components[1].clamp(0.0, 1.0);
@@ -502,11 +517,25 @@ pub(crate) fn cmyk_to_rgb_via_intent(
         let m_u8 = (m.clamp(0.0, 1.0) * 255.0).round() as u8;
         let y_u8 = (y.clamp(0.0, 1.0) * 255.0).round() as u8;
         let k_u8 = (k.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let transform = crate::color::Transform::new_srgb_target(
-            std::sync::Arc::clone(profile),
-            ctx.rendering_intent,
-        );
-        let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
+        // The per-page CmykTransformCache holds the compiled qcms
+        // transform across the many `ResolutionContext` instances the
+        // operator dispatcher builds inside one render. Without the
+        // cache, every CMYK paint operator rebuilds the 17⁴ CLUT
+        // (qcms::Transform::new_to) — that's the perf trap the cache
+        // exists to eliminate. The unit-test path skips the cache
+        // (`with_cmyk_transform_cache` is the renderer-only opt-in)
+        // and pays the per-call build cost; integration tests cover
+        // the cached path through render_page.
+        let rgb = if let Some(cache) = ctx.cmyk_transform_cache {
+            let transform = cache.get_or_build(profile, ctx.rendering_intent);
+            transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8)
+        } else {
+            let transform = crate::color::Transform::new_srgb_target(
+                std::sync::Arc::clone(profile),
+                ctx.rendering_intent,
+            );
+            transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8)
+        };
         return (rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0);
     }
     // No OutputIntent → spec fallback. The `ctx` borrow is held through

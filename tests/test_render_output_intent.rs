@@ -1084,17 +1084,36 @@ fn page_level_default_cmyk_takes_precedence_over_output_intent() {
     panic!("placeholder: not yet implemented — phase 9 consumer pending");
 }
 
-/// Document the per-paint qcms-transform construction cost so the phase 7
-/// caching PR can show a measurable win. This probe is `#[ignore]`-ed in
-/// the default suite; running it with `--ignored` produces a baseline
-/// duration that phase 7 can compare against.
+/// Pin that 1000 same-colour `/DeviceCMYK` paint operators on a single
+/// page build the qcms `Transform` exactly once. This is the cache
+/// hit-rate assertion the plan calls for: without caching every
+/// `k`/`f` pair rebuilds the qcms transform (an 17×17×17×17 CLUT
+/// precomputation that dominates the per-paint cost). With the cache
+/// the first paint builds; the remaining 999 hit.
 ///
-/// The probe paints 1000 same-colour `k`+`re`+`f` operators on a single
-/// page. Without caching the renderer builds 1000 qcms transforms;
-/// caching should reduce that to one.
+/// The build count comes from the `CmykTransformCache`'s own counter
+/// (`PageRenderer::cmyk_transform_cache_build_count`), gated on
+/// `#[cfg(feature = "test-support")]`. Reading the per-instance
+/// counter avoids racing other concurrent integration tests that
+/// might also call `Transform::new_srgb_target` on the same process —
+/// the cache is local to the `PageRenderer` we construct here, so
+/// nobody else touches it.
+///
+/// **Why a counter instead of wall-clock duration:** wall-clock
+/// measurements are noisy (CPU thermal state, OS scheduling, debug-vs-
+/// release builds) and would conflate caching with unrelated perf
+/// drift. A counter is exact: 1 build proves the cache works, N builds
+/// proves it doesn't.
+///
+/// **Feature gate:** the per-cache build counter is exposed only when
+/// the `test-support` feature is on (production builds carry zero
+/// overhead); the test runs under
+/// `cargo test --features rendering,icc,test-support`.
+#[cfg(feature = "test-support")]
 #[test]
-#[ignore = "OUTPUT_INTENT_DEFER_PHASE_7_CACHING"]
-fn output_intent_thousand_cmyk_paints_baseline_cost() {
+fn output_intent_thousand_cmyk_paints_build_one_transform() {
+    use pdf_oxide::rendering::{PageRenderer, RenderOptions};
+
     let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
     let mut ops = String::new();
     for i in 0..1000 {
@@ -1105,15 +1124,73 @@ fn output_intent_thousand_cmyk_paints_baseline_cost() {
         "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (S) /DestOutputProfile 5 0 R >>]";
     let pdf = build_pdf_with_catalog_entries_and_content(catalog_entries, &ops, Some(&icc));
     let doc = PdfDocument::from_bytes(pdf).expect("open");
-    let start = std::time::Instant::now();
-    let _ = render_rgba(&doc);
-    let elapsed = start.elapsed();
-    eprintln!(
-        "OUTPUT_INTENT_PHASE_7_BASELINE: 1000 same-colour DeviceCMYK paints took {:?} \
-         (each rebuilds the qcms transform; phase 7 caches)",
-        elapsed
+
+    let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72));
+    let _ = renderer.render_page(&doc, 0).expect("render");
+
+    let built = renderer.cmyk_transform_cache_build_count();
+    assert_eq!(
+        built, 1,
+        "1000 same-colour /DeviceCMYK paints under one /OutputIntents profile \
+         and one rendering intent must build qcms::Transform exactly once \
+         (cache miss on first paint, hit on the next 999). Built {built} times — \
+         the per-page CMYK transform cache regressed or is missing."
     );
-    // No assertion — baseline-measurement probe.
+}
+
+/// Pin that two different rendering intents on the same page +
+/// OutputIntent split the cache into two entries — each intent gets
+/// its own `Transform`. Critical because qcms's `Transform::new_to`
+/// takes an intent parameter; even though qcms 0.3.0 currently
+/// ignores that parameter for CMYK (see HONEST_GAP in the phase 8
+/// section below), the cache key MUST include intent so a future qcms
+/// upgrade that honours intent doesn't silently emit the wrong colour
+/// from a shared transform.
+///
+/// The fixture interleaves two `ri` operators (rendering-intent
+/// overrides) inside a single page's content stream. The PDF spec's
+/// §10.7.3 `ri` operator sets the graphics-state rendering intent —
+/// pdf_oxide parses this and the colour stage threads it through
+/// `ctx.rendering_intent`. With two distinct intents seen on the
+/// page, the cache holds two `Transform` instances (one per intent),
+/// not one shared across both.
+///
+/// HONEST_GAP: this probe also pins that the `ri` operator dispatch
+/// is wired through `gs.rendering_intent`. If a regression removed
+/// the `Operator::SetRenderingIntent` arm from the page renderer,
+/// every paint would resolve under the default
+/// /RelativeColorimetric intent and the cache would collapse to one
+/// entry — surfaced here as a count of 1 instead of 2.
+#[cfg(feature = "test-support")]
+#[test]
+fn qa_round3_cache_keys_include_rendering_intent() {
+    use pdf_oxide::rendering::{PageRenderer, RenderOptions};
+
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    // Two paints: first under /RI /RelativeColorimetric (default),
+    // second after switching to /RI /Perceptual. The `ri` operator
+    // takes a name argument; both pin different cache keys.
+    let ops = "0.25 0 0 0 k\n10 10 20 20 re\nf\n\
+               /Perceptual ri\n\
+               0.50 0 0 0 k\n40 10 20 20 re\nf\n";
+    let catalog_entries =
+        "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (S) /DestOutputProfile 5 0 R >>]";
+    let pdf = build_pdf_with_catalog_entries_and_content(catalog_entries, ops, Some(&icc));
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+
+    let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72));
+    let _ = renderer.render_page(&doc, 0).expect("render");
+
+    let built = renderer.cmyk_transform_cache_build_count();
+    assert_eq!(
+        built, 2,
+        "Two distinct rendering intents on one page + one OutputIntent profile \
+         must split the transform cache into two entries — one per intent. \
+         Built {built} times; expected exactly 2. A count of 1 means the \
+         cache key drops the intent (incorrect — qcms's Transform::new_to \
+         takes intent as a parameter even if 0.3.0 ignores it internally); \
+         a count > 2 means a regression."
+    );
 }
 
 // ===========================================================================
