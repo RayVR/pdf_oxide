@@ -378,9 +378,7 @@ fn build_pdf_separation_type4_devicecmyk_with_output_intent(
 /// drives the magenta component, the second is dropped. With content
 /// `[1.0 0.5] scn` the input is (tint0=1.0, tint1=0.5) and the output is
 /// CMYK(0, 1, 0, 0).
-fn build_pdf_devicen_type4_devicecmyk_with_output_intent(
-    output_intent_profile: &[u8],
-) -> Vec<u8> {
+fn build_pdf_devicen_type4_devicecmyk_with_output_intent(output_intent_profile: &[u8]) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"%PDF-1.4\n");
 
@@ -504,7 +502,9 @@ fn build_pdf_embedded_iccbased_with_different_output_intent(
     let xref_off = buf.len();
     let obj_count = 7;
     buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
-    for off in [cat_off, pages_off, page_off, stream_off, icc_a_off, icc_b_off] {
+    for off in [
+        cat_off, pages_off, page_off, stream_off, icc_a_off, icc_b_off,
+    ] {
         buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     buf.extend_from_slice(
@@ -1178,8 +1178,7 @@ fn embedded_iccbased_n4_trumps_document_output_intent() {
         );
     }
 
-    let pdf =
-        build_pdf_embedded_iccbased_with_different_output_intent(&profile_a, &profile_b);
+    let pdf = build_pdf_embedded_iccbased_with_different_output_intent(&profile_a, &profile_b);
     let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
     // Cross-check the OutputIntent accessor sees profile A. If it didn't
     // the test would conflate "OI not seen" with "OI seen but bypassed
@@ -1411,4 +1410,3 @@ fn devicen_type4_alt_devicecmyk_composite_routes_through_output_intent() {
          (255,0,255,_) means §10.3.5 additive-clamp fired."
     );
 }
-
