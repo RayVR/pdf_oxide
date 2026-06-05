@@ -1543,145 +1543,15 @@ fn qa_adversarial_dangling_color_space_ref_pipeline_diverges_from_inline() {
 }
 
 // ===========================================================================
-// Probes 30-31 — Performance.
-//
-// Mirrors wave-1/2/3 perf-probe shape: pipeline-on cost on a paint-heavy
-// page must stay within a sane multiplier of pipeline-off cost. Wave 4
-// adds two pre-resolves per shading invocation (`/C0` and `/C1`
-// endpoint resolution), each costing a logical-colour construction +
-// a ResolutionPipeline build + a single resolve_paint call. Bound: 6×,
-// matching waves 1-3.
-//
-// Second probe: one large shading covering the full page must be
-// O(pixmap size), not O(invocations). One call to the helper, one
-// gradient build, one tiny-skia rasterise. The pipeline-on cost must
-// be within a small absolute multiplier of the pipeline-off cost
-// (the pre-resolve is paid once); a regression that re-resolved per
-// pixel would blow this up.
+// Performance — wall-clock budget on a paint-heavy page. The wave 1-4
+// off-vs-on ratio tests no longer make sense (the toggle is gone, both
+// 'off' and 'on' run the pipeline), so they're retired. The remaining
+// wall-clock budget guards against an O(N) clone spiral in the helper.
 // ===========================================================================
 
-/// Probe 30 — 1000 small shading invocations on one page. Each `q ...
-/// Q` block renders a small Type-2 axial shading. Pipeline-on must
-/// stay within 6× pipeline-off cost.
-#[test]
-fn qa_shading_perf_thousand_invocations_under_six_x_inline_bound() {
-    // 1000 paints (32×32 grid yields 1024; we cap at 1000). Each
-    // paint does `q sx 0 0 sy tx ty cm /Sh1 sh Q`. The shading is
-    // DeviceRGB so the splice fires per call (pre-resolve produces
-    // an RGBA pair and the gradient stop colours flow through).
-    let mut content = String::new();
-    let mut painted = 0;
-    for row in 0..32 {
-        for col in 0..32 {
-            if painted >= 1000 {
-                break;
-            }
-            // Each shading is 2×2 user units placed in the row-major
-            // grid (3-unit pitch).
-            let tx = col * 3;
-            let ty = row * 3;
-            content.push_str(&format!("q 2 0 0 2 {} {} cm /Sh1 sh Q\n", tx, ty));
-            painted += 1;
-        }
-        if painted >= 1000 {
-            break;
-        }
-    }
-    assert_eq!(painted, 1000);
-
-    let bytes = build_pdf_axial_shading(
-        &content,
-        "/DeviceRGB",
-        "[0 0 1 0]", // axis runs from (0, 0) to (1, 0); CTM stretches it
-        "[1 0 0]",
-        "[0 0 1]",
-        "",
-        "",
-        "",
-        &[],
-    );
-    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-
-    // Warm-up — first render has paging-in / cache-warming cost that
-    // would skew the off-vs-on ratio if measured.
-    let _ = render_with_pipeline(&doc, false);
-    let _ = render_with_pipeline(&doc, true);
-
-    let t_off = Instant::now();
-    for _ in 0..3 {
-        let _ = render_with_pipeline(&doc, false);
-    }
-    let dt_off = t_off.elapsed();
-    let t_on = Instant::now();
-    for _ in 0..3 {
-        let _ = render_with_pipeline(&doc, true);
-    }
-    let dt_on = t_on.elapsed();
-
-    let ratio = dt_on.as_secs_f64() / dt_off.as_secs_f64().max(1e-9);
-    assert!(
-        ratio < 6.0,
-        "1000-shading pipeline-on render must stay within 6x pipeline-off cost; \
-         off={:.3} ms, on={:.3} ms, ratio={:.2}",
-        dt_off.as_secs_f64() * 1000.0,
-        dt_on.as_secs_f64() * 1000.0,
-        ratio
-    );
-}
-
-/// Probe 31 — One large shading covering the full page. The work
-/// must be O(pixmap size), not O(invocations) — single shading call,
-/// single helper invocation, single gradient build, single
-/// tiny-skia rasterise. Pipeline-on cost must be a tight absolute
-/// multiple of pipeline-off cost (the pre-resolve is paid once).
-#[test]
-fn qa_shading_perf_single_full_page_pipeline_on_close_to_off() {
-    let content = "/Sh1 sh\n";
-    let bytes = build_pdf_axial_shading(
-        content,
-        "/DeviceRGB",
-        "[0 50 100 50]",
-        "[1 0 0]",
-        "[0 0 1]",
-        "",
-        "",
-        "",
-        &[],
-    );
-    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-
-    // Warm-up.
-    let _ = render_with_pipeline(&doc, false);
-    let _ = render_with_pipeline(&doc, true);
-
-    let t_off = Instant::now();
-    for _ in 0..10 {
-        let _ = render_with_pipeline(&doc, false);
-    }
-    let dt_off = t_off.elapsed();
-    let t_on = Instant::now();
-    for _ in 0..10 {
-        let _ = render_with_pipeline(&doc, true);
-    }
-    let dt_on = t_on.elapsed();
-
-    let ratio = dt_on.as_secs_f64() / dt_off.as_secs_f64().max(1e-9);
-    // Single-invocation: the pre-resolve cost should be a tiny
-    // constant relative to the rasterise; bound is 3×.
-    assert!(
-        ratio < 3.0,
-        "single-shading pipeline-on must be O(pixmap-size), within 3x pipeline-off; \
-         off={:.3} ms, on={:.3} ms, ratio={:.2}",
-        dt_off.as_secs_f64() * 1000.0,
-        dt_on.as_secs_f64() * 1000.0,
-        ratio
-    );
-}
-
-/// Probe 31b — Hard wall-clock budget on the 1000-shading run. A
-/// pipeline-on render of 1000 DeviceRGB shadings must complete
-/// inside 5 s on the CI baseline — guards against an O(N) clone
-/// spiral in the helper.
+/// Hard wall-clock budget on the 1000-shading run. A pipeline render of
+/// 1000 DeviceRGB shadings must complete inside the budget on the CI
+/// baseline — guards against an O(N) clone spiral in the helper.
 #[test]
 fn qa_shading_perf_thousand_invocations_within_five_seconds() {
     let mut content = String::new();

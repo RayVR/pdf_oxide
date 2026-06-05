@@ -3108,46 +3108,22 @@ impl PageRenderer {
     ///
     /// Fill and stroke share one helper because the only differences are
     /// which `gs` fields supply the colour and which `PaintSide` the
-    /// pipeline routes against. Splitting these into one helper per side
-    /// would mean duplicating the entire context build for no behavioural
-    /// reason; the pipeline's colour stage already keys all of its
-    /// side-specific behaviour (e.g. alpha fold) off `intent.side`.
+    /// pipeline routes against. The pipeline's colour stage already
+    /// keys all of its side-specific behaviour (e.g. alpha fold) off
+    /// `intent.side`.
     fn pipeline_resolve_rgba(
         &self,
         doc: &PdfDocument,
         gs: &GraphicsState,
         side: PaintSide,
     ) -> Option<(f32, f32, f32, f32)> {
-        let pipeline = ResolutionPipeline::new();
-        let color_spaces = &self.color_spaces;
-        let ctx = ResolutionContext::new(doc, color_spaces);
         let (space_name, components) = match side {
             PaintSide::Fill => (gs.fill_color_space.as_str(), &gs.fill_color_components),
             PaintSide::Stroke => (gs.stroke_color_space.as_str(), &gs.stroke_color_components),
         };
-        let resolved_space_obj = color_spaces.get(space_name);
+        let resolved_space_obj = self.color_spaces.get(space_name);
         let logical = build_logical_color(space_name, components, resolved_space_obj);
-
-        // No geometry is needed here: the dispatcher only consumes the
-        // resolved RGBA to splice into the graphics state, then paints
-        // through its own (non-pipeline) rasteriser. `ColorOnly` lets
-        // the intent express that without conjuring a placeholder path.
-        let intent = PaintIntent {
-            kind: PaintKind::ColorOnly,
-            side,
-            gs,
-            color: logical,
-            ctm: gs.ctm,
-        };
-        let cmd = pipeline.resolve(&intent, &ctx, None).ok()?;
-        match cmd.color {
-            ResolvedColor::Rgba { r, g, b, a } => Some((r, g, b, a)),
-            // Non-RGBA variants are produced when the pipeline grows
-            // CMYK/PerChannel outputs (for separation backends). The
-            // composite backend takes the no-op fallback here, which keeps
-            // the door open for migrating without breaking parity.
-            _ => None,
-        }
+        self.run_pipeline_for_logical(doc, &self.color_spaces, logical, gs, side)
     }
 
     /// `gs`-free overload of the colour-resolution path: route an
@@ -3181,63 +3157,60 @@ impl PageRenderer {
         components: &[f32],
         alpha: f32,
     ) -> Option<(f32, f32, f32, f32)> {
-        // Derive a name + resolved-space pair from the supplied space
-        // object. Two shapes appear in real PDFs for a shading dict's
+        // Two shapes appear in real PDFs for a shading dict's
         // `/ColorSpace`: a Name (either a Device alias like
         // `/DeviceRGB` or a per-page resource name like `/CS1`), or an
         // inline Array (e.g. `[/Separation /MagentaSpot /DeviceCMYK
         // funcRef]`). `build_logical_color` already handles both via
         // its name + `Option<&Object>` arguments, so this wrapper just
-        // dispatches into it.
+        // dispatches into it; inline arrays get the empty name so the
+        // Device-family fast-path doesn't fire.
         let (space_name, resolved_space): (&str, Option<&Object>) = match space {
-            Object::Name(n) => {
-                // Device aliases short-circuit through the name match
-                // inside `build_logical_color`; non-device names look
-                // up the resolved space in the per-page colour-space
-                // map (the dispatcher pre-resolved the name there).
-                let resolved = color_spaces.get(n.as_str());
-                (n.as_str(), resolved)
-            },
-            other => {
-                // Inline array (or any other shape — Stream, etc.):
-                // hand the resolved space object through directly and
-                // use a sentinel name so the Device-family fast-path in
-                // `build_logical_color` doesn't fire. The actual
-                // colour-space dispatch keys off the resolved space
-                // object, not the name, for non-Device families.
-                ("", Some(other))
-            },
+            Object::Name(n) => (n.as_str(), color_spaces.get(n.as_str())),
+            other => ("", Some(other)),
         };
         let logical = build_logical_color(space_name, components, resolved_space);
 
         // The pipeline reads `gs.fill_alpha` for fill-side alpha fold.
-        // A default `GraphicsState` carries `fill_alpha = 1.0`; we patch
-        // it to the caller's `alpha` so the resolver folds the correct
-        // alpha into the returned RGBA. Every other field is left at
-        // its default — overprint and blend stages run on this fake gs
-        // too, but their outputs (`OverprintPlan`, `BlendPlan`) are
-        // discarded: the caller only consumes the RGBA. The default
-        // `GraphicsState` has overprint disabled and blend Normal, so
-        // even though the resolved-paint-cmd carries these plans they
-        // never surface as observable behaviour.
+        // A synthesised default `GraphicsState` patched with `alpha`
+        // produces the correct RGBA; overprint / blend plans on the
+        // synth gs are produced but discarded — only the colour is
+        // returned.
         let mut synth_gs = GraphicsState::new();
         synth_gs.fill_alpha = alpha;
+        self.run_pipeline_for_logical(doc, color_spaces, logical, &synth_gs, PaintSide::Fill)
+    }
 
+    /// Core resolver step shared between [`Self::pipeline_resolve_rgba`]
+    /// (gs-bound path-side resolution) and
+    /// [`Self::pipeline_resolve_components`] (gs-free shading-endpoint
+    /// resolution). Builds the [`PaintIntent`], runs the pipeline, and
+    /// projects the resolved colour down to an RGBA tuple — returning
+    /// `None` for non-RGBA variants the composite backend cannot
+    /// consume directly.
+    fn run_pipeline_for_logical(
+        &self,
+        doc: &PdfDocument,
+        color_spaces: &HashMap<String, Object>,
+        logical: LogicalColor<'_>,
+        gs: &GraphicsState,
+        side: PaintSide,
+    ) -> Option<(f32, f32, f32, f32)> {
         let pipeline = ResolutionPipeline::new();
         let ctx = ResolutionContext::new(doc, color_spaces);
+        // No geometry is needed: the colour stage only reads `color`
+        // (and reads `gs` for the alpha fold). `ColorOnly` lets the
+        // intent express that without conjuring a placeholder path.
         let intent = PaintIntent {
             kind: PaintKind::ColorOnly,
-            side: PaintSide::Fill,
-            gs: &synth_gs,
+            side,
+            gs,
             color: logical,
-            ctm: synth_gs.ctm,
+            ctm: gs.ctm,
         };
         let cmd = pipeline.resolve(&intent, &ctx, None).ok()?;
         match cmd.color {
             ResolvedColor::Rgba { r, g, b, a } => Some((r, g, b, a)),
-            // Non-RGBA outputs (per-channel for separation backends)
-            // can't be fed to the composite gradient backend; the
-            // caller's inline behaviour stays in force for those.
             _ => None,
         }
     }
