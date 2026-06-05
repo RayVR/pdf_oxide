@@ -359,6 +359,80 @@ fn build_minimal_rgb_to_lab_lut8_profile(target_l_byte: u8) -> Vec<u8> {
     profile
 }
 
+/// Build a minimal valid ICC v2 Gray TRC profile.
+///
+/// Unlike the LUT8-based CMYK and RGB fixtures, Gray ICC profiles use
+/// the simpler `kTRC` (Tone Reproduction Curve) tag — a single curve
+/// mapping the device byte into the linear PCS. qcms 0.3.0's
+/// `iccread.rs:1712-1714` reads only the `kTRC` tag for GRAY-signed
+/// profiles; no A2B0 / B2A0 / colorant / matrix tags are needed.
+///
+/// The curve emitted here is a 256-entry `curv` table that linearly
+/// ramps from 0 to 65535, corresponding to a gamma of 1.0 (the linear
+/// identity). qcms's gray transform path then drives the destination
+/// sRGB profile's output_gamma_lut_{r,g,b}: a linear input byte
+/// becomes a linear PCS-Y value (`device/255`), which the sRGB
+/// inverse-gamma encoding then converts to a perceptual sRGB byte.
+/// The result is the canonical sRGB encoding of the linear gray:
+/// `byte → sRGB_inv_gamma(byte/255) → sRGB byte`.
+///
+/// Using gamma 1.0 keeps the profile honest (a deliberate, not
+/// accidental, identity in linear space) and produces a distinctive
+/// reference value through the sRGB encoder that's nowhere near the
+/// raw input byte for mid-tones — making a no-ICC fall-through
+/// failure mode immediately visible.
+fn build_minimal_gray_trc_profile() -> Vec<u8> {
+    // ICC v2 `curveType` tag body shape (ICC.1:2004-10 §10.5):
+    //   bytes 0..4   type signature 'curv' (0x63757276)
+    //   bytes 4..8   reserved zero
+    //   bytes 8..12  count (number of entries)
+    //   bytes 12..   count × u16 entries (big-endian)
+    //
+    // 256-entry linear ramp 0..65535 — qcms reads this as the input
+    // gamma table for the gray channel.
+    let entry_count: u32 = 256;
+    let mut curv = Vec::with_capacity(12 + (entry_count as usize) * 2);
+    curv.extend_from_slice(&0x6375_7276u32.to_be_bytes()); // 'curv'
+    curv.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    curv.extend_from_slice(&entry_count.to_be_bytes());
+    for i in 0..entry_count {
+        // Linear ramp: 0 → 0, 255 → 65535. This matches the encoding
+        // qcms's `lut_interp_linear` expects (the table is sampled
+        // linearly across [0, 1] and the entry value is treated as a
+        // u16 in the linear PCS-Y representation).
+        let v = ((i * 65535) / (entry_count - 1)) as u16;
+        curv.extend_from_slice(&v.to_be_bytes());
+    }
+
+    // Envelope: 128-byte header + 4 (tag count) + 12 (one tag entry) +
+    // curveType body. Tag data offset = 144.
+    let mut profile = vec![0u8; 128];
+    let total_size: u32 = 128 + 4 + 12 + curv.len() as u32;
+    profile[0..4].copy_from_slice(&total_size.to_be_bytes());
+    profile[8..12].copy_from_slice(&IccProfileVersion::V2.header_bytes());
+    // Display device profile — qcms accepts mntr/scnr/prtr/spac for
+    // the colour-space-profile arm that GRAY signatures take. mntr is
+    // the most common shape for Gray ICC.
+    profile[12..16].copy_from_slice(b"mntr");
+    // Colour space: 'GRAY' — single channel input.
+    profile[16..20].copy_from_slice(b"GRAY");
+    // PCS: 'XYZ ' — qcms's gray pipeline expects an XYZ PCS for the
+    // linear PCS-Y interpretation of the curve.
+    profile[20..24].copy_from_slice(b"XYZ ");
+    profile[36..40].copy_from_slice(b"acsp");
+    // Illuminant XYZ at 68..80 — D50 (0.9642, 1.0, 0.8249).
+    profile[68..72].copy_from_slice(&0x0000_F6D6u32.to_be_bytes());
+    profile[72..76].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    profile[76..80].copy_from_slice(&0x0000_D32Du32.to_be_bytes());
+
+    profile.extend_from_slice(&1u32.to_be_bytes()); // tag count = 1
+    profile.extend_from_slice(&0x6b54_5243u32.to_be_bytes()); // 'kTRC'
+    profile.extend_from_slice(&144u32.to_be_bytes()); // offset
+    profile.extend_from_slice(&(curv.len() as u32).to_be_bytes()); // size
+    profile.extend_from_slice(&curv);
+    profile
+}
+
 // ===========================================================================
 // PDF construction helpers
 // ===========================================================================
@@ -1549,15 +1623,14 @@ fn page_level_default_rgb_routes_bare_device_rgb_through_override() {
 /// §10.3.5 (no OutputIntent declared in this fixture). The colour
 /// change is visible and discriminates the routes.
 ///
-/// Why not an ICC Gray profile? qcms 0.3.0's LUT8 (`mft1`) parser
-/// (`iccread.rs:760`) only accepts in_chan ∈ {3, 4}; a 1-channel LUT8
-/// would be rejected at compile time. Real Gray ICC profiles use TRC
-/// (Tone Reproduction Curve) tags, which require richer fixture
-/// construction. The Separation/Type-4 override exercises the same
-/// dispatch path the /DefaultGray consumer needs to drive — when the
-/// override is declared, the resolver MUST hand the gray component to
-/// the override's space rather than emitting bare gray RGBA — without
-/// rebuilding a Gray ICC fixture.
+/// **Coverage note:** this Separation route covers the dispatcher
+/// edge of /DefaultGray (the override is consulted; the gray
+/// component reaches the override's colour space). The complementary
+/// N=1 ICC route — `/DefaultGray [/ICCBased <N=1 TRC stream>]` —
+/// drives the qcms gray pipeline and is pinned by
+/// `qa_round4_default_gray_iccbased_n1_routes_through_qcms` below.
+/// The two probes together prove both ends of the §8.6.5.6
+/// /DefaultGray contract: dispatch and ICC conversion.
 #[test]
 fn page_level_default_gray_routes_bare_device_gray_through_override() {
     let pdf = build_pdf_default_gray_routes_bare_device_gray();
@@ -1604,6 +1677,119 @@ fn page_level_default_gray_routes_bare_device_gray_through_override() {
          magenta — override bypassed."
     );
     assert_eq!(a, 255, "alpha=1 paint must be fully opaque; got a={a}");
+}
+
+/// Pin `/DefaultGray [/ICCBased <N=1 TRC stream>]` drives bare
+/// `/DeviceGray` paint through the qcms gray pipeline.
+///
+/// Round 3 documented "qcms 0.3.0's LUT8 parser only accepts in_chan ∈
+/// {3, 4}; a 1-channel LUT8 would be rejected at compile time" — true
+/// for LUT8 (`mft1`) bodies, but qcms's GRAY-signature arm at
+/// `iccread.rs:1712-1714` is a *separate* path that reads the `kTRC`
+/// (gray TRC) curveType tag, not a LUT8. A real N=1 Gray ICC profile
+/// uses `kTRC`, qcms compiles it via `transform_create` →
+/// `qcms_transform_data_gray_*` (`transform.rs:437-475`), and the
+/// gray channel becomes RGB through the destination sRGB profile's
+/// output gamma tables. The resolver previously had no N=1 arm at all
+/// — `resolve_iccbased` fell straight to `first_as_gray(components)`,
+/// emitting the literal gray byte without ever consulting qcms.
+///
+/// Fixture: a one-page PDF whose /DefaultGray is `[/ICCBased <N=1
+/// linear-curv TRC stream>]`. The TRC is a 256-entry linear ramp
+/// 0..65535 → effectively gamma 1.0 in the linear PCS-Y
+/// representation. Painting `0.5 g` routes the 0.5 gray byte (128)
+/// through the qcms transform; the linear PCS-Y is encoded back to
+/// sRGB via the destination sRGB profile's inverse gamma. The
+/// resulting RGB is the canonical sRGB encoding of linear gray 0.5 —
+/// a value distinct from the no-override RGB(128, 128, 128) literal.
+///
+/// The expected RGB is derived empirically from the same qcms call
+/// the resolver makes: build the profile, parse it through
+/// `IccProfile::parse`, call `Transform::new_srgb_target` +
+/// `convert_gray_buffer`, and compare byte-exact. No tolerance — the
+/// renderer and the reference call use the same code path.
+#[test]
+fn qa_round4_default_gray_iccbased_n1_routes_through_qcms() {
+    let profile = build_minimal_gray_trc_profile();
+
+    // Sanity-pin the synthesised Gray profile parses through
+    // IccProfile::parse (N=1) and compiles into a real qcms transform.
+    // Without this gate the integration assertion below could fail
+    // for the wrong reason (e.g. profile rejected → resolver
+    // fall-through to literal gray).
+    let gray_ref = {
+        use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+        use std::sync::Arc;
+        let prof = Arc::new(
+            IccProfile::parse(profile.clone(), 1).expect("Gray TRC profile parses through IccProfile::parse(_, 1)"),
+        );
+        let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
+        assert!(
+            t.has_cmm(),
+            "synthesised Gray TRC profile must compile into a real qcms CMM; \
+             without it the /DefaultGray ICC test degrades to fall-through and \
+             asserts the wrong thing"
+        );
+        // Render reference: feed the single gray byte 128 (the painted
+        // 0.5 quantised at the resolver boundary) and read back the
+        // 3 RGB bytes qcms produces. The renderer's resolver runs the
+        // same call inside the N=1 arm, so the rendered pixel must
+        // match byte-exact.
+        let out = t.convert_gray_buffer(&[128u8]);
+        assert_eq!(out.len(), 3, "Gray8 → RGB8 conversion emits 3 bytes per input");
+        [out[0], out[1], out[2]]
+    };
+
+    // Build the PDF: /DefaultGray → [/ICCBased <N=1 stream>], paint
+    // `0.5 g` covering a 60×60 rect at the canvas centre. Object
+    // layout mirrors `build_pdf_default_rgb_overrides_bare_device_rgb`
+    // but with /N 1 on the ICC stream and a one-byte component.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /DefaultGray [/ICCBased 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+    let stream_off = buf.len();
+    let content = "0.5 g\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_off = buf.len();
+    let icc_hdr = format!("5 0 obj\n<< /N 1 /Length {} >>\nstream\n", profile.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(&profile);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(buf).expect("open synthetic PDF");
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "fixture must declare no /OutputIntents — the /DefaultGray ICC override \
+         drives the route entirely"
+    );
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (gray_ref[0], gray_ref[1], gray_ref[2], 255),
+        "/DefaultGray [/ICCBased N=1] override must route bare /DeviceGray paint \
+         through the qcms gray pipeline; expected qcms reference {:?}; got \
+         ({r},{g},{b},{a}). (128,128,128,_) means the resolver fell through to \
+         first_as_gray and never consulted qcms — the N=1 arm is missing.",
+        gray_ref
+    );
 }
 
 /// Pin that 1000 same-colour `/DeviceCMYK` paint operators on a single
