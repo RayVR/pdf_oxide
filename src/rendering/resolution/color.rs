@@ -124,15 +124,48 @@ impl ColorResolver {
         };
         let n = dict.get("N").and_then(|o| o.as_integer()).unwrap_or(3);
 
-        // Without the `icc` feature we have no CMM at all — fall back to the
-        // §10.3.5 formula via the device-family path. With the feature, we
-        // could materialise a `crate::color::Transform` and route through
-        // qcms, but this branch only fires on per-operator colour change
-        // (not per-pixel) and the source profile is rarely set at this
-        // call site — the typical case is "DeviceCMYK lookalike ICCBased
-        // with N=4 and the OutputIntent profile already covering it".
-        // We keep parity with the existing inline behaviour by treating N
-        // as the channel-count hint and falling through to device families.
+        // §8.6.5.5 precedence: an ICCBased colour space carries its own
+        // conversion source. The embedded profile wins over the document
+        // /OutputIntents profile when CMYK→RGB is requested. Decode the
+        // stream, parse the bytes through IccProfile::parse (which
+        // cross-checks the dict's /N against the ICC header signature),
+        // and compile a qcms Transform against the active rendering
+        // intent. On any failure (no `icc` feature, decode error,
+        // mismatched header, qcms refusal) we fall through to the
+        // device-family path — that path emits ResolvedColor::Cmyk for
+        // N=4, which the composite projection then converts through
+        // ctx.output_intent_cmyk: the document OutputIntent becomes the
+        // default when the embedded profile can't actually drive a CMM.
+        #[cfg(feature = "icc")]
+        if n == 4 && components.len() >= 4 {
+            if let Ok(bytes) = resolved_stream.decode_stream_data() {
+                if let Some(profile) = crate::color::IccProfile::parse(bytes, 4) {
+                    let transform = crate::color::Transform::new_srgb_target(
+                        std::sync::Arc::new(profile),
+                        ctx.rendering_intent,
+                    );
+                    if transform.has_cmm() {
+                        let c_u8 = (components[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let m_u8 = (components[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let y_u8 = (components[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let k_u8 = (components[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
+                        return Ok(ResolvedColor::Rgba {
+                            r: rgb[0] as f32 / 255.0,
+                            g: rgb[1] as f32 / 255.0,
+                            b: rgb[2] as f32 / 255.0,
+                            a: alpha,
+                        });
+                    }
+                }
+            }
+        }
+
+        // No usable embedded profile — fall through to the device-family
+        // hint. For N=4 this emits ResolvedColor::Cmyk so per-plate
+        // backends still see the channel decomposition, and the
+        // composite projection routes through ctx.output_intent_cmyk
+        // (which is the spec default when no embedded ICC is available).
         match n {
             1 if !components.is_empty() => Ok(first_as_gray(components, alpha)),
             3 if components.len() >= 3 => Ok(three_as_rgb(components, alpha)),
