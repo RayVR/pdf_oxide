@@ -291,6 +291,158 @@ fn build_pdf_cmyk_without_output_intent() -> Vec<u8> {
     build_pdf_with_catalog_entries_and_content("", content_ops, None)
 }
 
+/// Build a PDF whose page paints a `/Separation` colour space (with a
+/// Type-4 PostScript tint transform that produces CMYK(0, tint, 0, 0))
+/// against a document-level `/OutputIntents` CMYK profile.
+///
+/// Object layout:
+///   1 — Catalog (with /OutputIntents → 5 0 R)
+///   2 — Pages
+///   3 — Page (with Resources /ColorSpace /CS1 →
+///       [/Separation /MagentaSpot /DeviceCMYK 6 0 R])
+///   4 — Content stream
+///   5 — OutputIntent profile stream
+///   6 — Tint-transform Type-4 stream
+///
+/// The Type-4 program `{ 0.0 exch 0.0 0.0 }` lifts the input tint into
+/// the M position so the alternate-space output is CMYK(0, tint, 0, 0).
+fn build_pdf_separation_type4_devicecmyk_with_output_intent(
+    output_intent_profile: &[u8],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    let catalog = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK) /DestOutputProfile 5 0 R >>] >>\nendobj\n";
+    buf.extend_from_slice(catalog.as_bytes());
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/Separation /MagentaSpot /DeviceCMYK 6 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    // Activate the Separation colour space and paint the rect with full
+    // tint (1.0). With the Type-4 program below, the tint transform
+    // produces CMYK(0, 1, 0, 0).
+    let content = "/CS1 cs\n1.0 scn\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_off = buf.len();
+    let icc_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", output_intent_profile.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(output_intent_profile);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let tint_off = buf.len();
+    // Type 4 PostScript tint transform. Stack semantics per the
+    // resolver-side test in src/rendering/resolution/color.rs:697:
+    // `{ 0.0 exch 0.0 0.0 }` consumes input tint and leaves the stack
+    // bottom-to-top as [0, tint, 0, 0] — i.e. CMYK output (C=0, M=tint,
+    // Y=0, K=0). Domain [0 1] is the input range; Range [0 1 0 1 0 1 0 1]
+    // is the four-component CMYK output range.
+    let tint_program: &[u8] = b"{ 0.0 exch 0.0 0.0 }";
+    let tint_hdr = format!(
+        "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+        tint_program.len()
+    );
+    buf.extend_from_slice(tint_hdr.as_bytes());
+    buf.extend_from_slice(tint_program);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let obj_count = 7;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off, tint_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    buf
+}
+
+/// Same shape as `build_pdf_separation_type4_devicecmyk_with_output_intent`
+/// but the colour space is a 2-colorant `/DeviceN` whose alternate is
+/// `/DeviceCMYK` and whose Type-4 tint transform consumes the two input
+/// tints and emits CMYK(0, tint0, 0, 0) — i.e. only the first input
+/// drives the magenta component, the second is dropped. With content
+/// `[1.0 0.5] scn` the input is (tint0=1.0, tint1=0.5) and the output is
+/// CMYK(0, 1, 0, 0).
+fn build_pdf_devicen_type4_devicecmyk_with_output_intent(
+    output_intent_profile: &[u8],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    let catalog = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK) /DestOutputProfile 5 0 R >>] >>\nendobj\n";
+    buf.extend_from_slice(catalog.as_bytes());
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    // DeviceN colorant array: two named spot inks. The tint-transform
+    // function is referenced by indirect object.
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/DeviceN [/Magenta /Cyan] /DeviceCMYK 6 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    // Activate the DeviceN colour space and paint with two component
+    // tints (1.0, 0.5). The Type-4 tint transform drops the second tint
+    // and emits CMYK(0, tint0, 0, 0) = CMYK(0, 1, 0, 0).
+    let content = "/CS1 cs\n1.0 0.5 scn\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_off = buf.len();
+    let icc_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", output_intent_profile.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(output_intent_profile);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let tint_off = buf.len();
+    // Type 4 program with two inputs (the two DeviceN colorant tints).
+    // Stack on entry: [tint0, tint1]. Program: `{ pop 0.0 exch 0.0 0.0 }`
+    // pops tint1, then `0.0 exch 0.0 0.0` leaves stack bottom-to-top as
+    // [0, tint0, 0, 0] (C=0, M=tint0, Y=0, K=0).
+    let tint_program: &[u8] = b"{ pop 0.0 exch 0.0 0.0 }";
+    let tint_hdr = format!(
+        "6 0 obj\n<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+        tint_program.len()
+    );
+    buf.extend_from_slice(tint_hdr.as_bytes());
+    buf.extend_from_slice(tint_program);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let obj_count = 7;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off, tint_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    buf
+}
+
 /// Build a PDF that declares BOTH an `/OutputIntents` CMYK profile A and
 /// a page-resources `/ColorSpace /CS1 [/ICCBased <stream>]` colour space
 /// whose embedded N=4 profile B is a DIFFERENT minimal CMYK profile. The
@@ -1050,6 +1202,213 @@ fn embedded_iccbased_n4_trumps_document_output_intent() {
          — the spec precedence (§8.6.5.5) is inverted. (191,255,255,_) means neither \
          profile was consulted and §10.3.5 fired.",
         (br, bg, bb, 255u8)
+    );
+}
+
+// ===========================================================================
+// Phase 5: Separation / DeviceN with DeviceCMYK alternate routes through OutputIntent
+// ===========================================================================
+//
+// ISO 32000-1:2008 §8.6.6.3 (Separation) and §8.6.6.4 (DeviceN): when the
+// device lacks the named colorant plate, the colour is approximated via
+// the alternate colour space and the tint transform. When the alternate
+// is /DeviceCMYK, the alternate's CMYK quadruple is then converted to
+// RGB for the composite output path — and that conversion MUST honour
+// the document /OutputIntents profile, since composite output is the
+// "viewer's screen" surface the OutputIntent describes.
+//
+// Today (post-round-1) the resolver's
+// `resolve_separation_or_devicen` arm dispatches a CMYK-alternate
+// result through `four_as_cmyk(&altspace_values, alpha, ctx)`, which
+// itself calls `cmyk_to_rgb_via_intent` — the same OutputIntent-aware
+// helper the bare /DeviceCMYK paint path consumes. So the routing is
+// already correct, but the probes below pin it byte-for-byte so a
+// regression that detoured Separation/DeviceN through a non-context-
+// aware CMYK→RGB path would surface immediately.
+//
+// These probes are categorised as REGRESSION GUARDS in the TDD-discipline
+// sense (they pass at HEAD without code changes) because the routing
+// landed during round-1 phase 2. The TDD-failing-test→implementation
+// pair for this behaviour is documented at fa1b947's prior history
+// (round-1 phase 2). The probes here lock the routing for the
+// specifically named Separation Type-4 and DeviceN Type-4 cases the
+// plan body called out.
+//
+// Discrimination audit: before committing the probes, the impl agent
+// temporarily flipped `four_as_cmyk` in src/rendering/resolution/color.rs
+// to bypass `cmyk_to_rgb_via_intent` and call bare `cmyk_to_rgb` (the
+// §10.3.5 helper) instead. With that flip, both
+// `*_composite_routes_through_output_intent` probes failed with the
+// expected (255, 0, 255, 255) value, demonstrating they actively
+// discriminate between "OutputIntent honoured" and "additive-clamp
+// fallback". The flip was reverted before the commit landed; the audit
+// confirms the probes do what their names say.
+
+/// Pin that a `/Separation /MagentaSpot /DeviceCMYK <Type-4 tint
+/// transform>` paint operator's composite-side RGBA is the document
+/// `/OutputIntents` profile's conversion of the tint-transform's CMYK
+/// output — NOT the §10.3.5 additive-clamp of that CMYK quadruple.
+///
+/// Fixture: tint transform `{ 0.0 exch 0.0 0.0 }` produces CMYK(0, tint,
+/// 0, 0). At tint=1.0 the alternate-CMYK value is (0, 1, 0, 0); §10.3.5
+/// of that is RGB(255, 0, 255) (magenta). The OutputIntent profile
+/// (constant-CLUT, target_l_byte=135) maps every CMYK input to
+/// RGB(126, 126, 126), so an OutputIntent-honouring composite pixel is
+/// (126, 126, 126).
+///
+/// Three observable outcomes:
+///   - (126, 126, 126, 255): composite routed through OutputIntent — pass.
+///   - (255, 0, 255, 255): composite ran §10.3.5 directly — fail
+///     (alt-CMYK projection bypassed `cmyk_to_rgb_via_intent`).
+///   - any other RGB: tint transform or qcms behaviour drifted.
+#[test]
+fn separation_type4_alt_devicecmyk_composite_routes_through_output_intent() {
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    // Sanity-pin the OutputIntent reference for CMYK(0, 255, 0, 0) —
+    // intent-invariant by construction (constant CLUT) so a single
+    // intent is enough.
+    {
+        use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+        use std::sync::Arc;
+        let prof = Arc::new(IccProfile::parse(icc.clone(), 4).expect("parse"));
+        let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
+        let rgb = t.convert_cmyk_pixel(0, 255, 0, 0);
+        assert_eq!(
+            rgb,
+            [126u8, 126, 126],
+            "OutputIntent profile must map CMYK(0,255,0,0) to (126,126,126); \
+             fixture is invalid otherwise (got {rgb:?})"
+        );
+    }
+
+    let pdf = build_pdf_separation_type4_devicecmyk_with_output_intent(&icc);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    assert!(
+        doc.output_intent_cmyk_profile().is_some(),
+        "fixture must declare a CMYK OutputIntent for the routing to be probed"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (126u8, 126, 126, 255),
+        "Separation Type-4 /DeviceCMYK alternate must route the alt-CMYK \
+         quadruple through the document /OutputIntents profile on the \
+         composite path; expected (126,126,126,255); got ({r},{g},{b},{a}). \
+         (255,0,255,_) means the §10.3.5 additive-clamp of CMYK(0,1,0,0) \
+         fired — the resolver bypassed cmyk_to_rgb_via_intent for the \
+         Separation alt-CMYK projection."
+    );
+}
+
+/// Counter-pin: with no `/OutputIntents` declared, the same Separation
+/// Type-4 alt-CMYK paint MUST produce the §10.3.5 additive-clamp value
+/// for CMYK(0, 1, 0, 0) = RGB(255, 0, 255).
+///
+/// The positive pin above asserts "OutputIntent wins on composite when
+/// present"; this counter-pin asserts "no-OutputIntent → §10.3.5
+/// preserved byte-for-byte" — i.e. the OutputIntent route doesn't leak
+/// into a no-OutputIntent fixture (which would imply some hard-coded
+/// CMM hung around the renderer rather than the configured route).
+#[test]
+fn separation_type4_alt_devicecmyk_without_output_intent_renders_additive_clamp() {
+    // Inline-build a PDF identical to
+    // `build_pdf_separation_type4_devicecmyk_with_output_intent` but
+    // without /OutputIntents. Object IDs shift down by one because the
+    // ICC stream is dropped: catalog → pages → page → content → tint
+    // (obj 5 instead of obj 6).
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/Separation /MagentaSpot /DeviceCMYK 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    let content = "/CS1 cs\n1.0 scn\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let tint_off = buf.len();
+    let tint_program: &[u8] = b"{ 0.0 exch 0.0 0.0 }";
+    let tint_hdr = format!(
+        "5 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+        tint_program.len()
+    );
+    buf.extend_from_slice(tint_hdr.as_bytes());
+    buf.extend_from_slice(tint_program);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let obj_count = 6;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [cat_off, pages_off, page_off, stream_off, tint_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(buf).expect("open synthetic PDF");
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "fixture must declare no /OutputIntents for the counter-pin to actually contest the route"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (255u8, 0, 255, 255),
+        "Separation Type-4 /DeviceCMYK alternate without /OutputIntents must \
+         fall through to §10.3.5 additive-clamp of CMYK(0,1,0,0) = (255,0,255); \
+         got ({r},{g},{b},{a})"
+    );
+}
+
+/// Pin that a 2-colorant `/DeviceN [/Magenta /Cyan] /DeviceCMYK
+/// <Type-4 tint transform>` paint operator's composite-side RGBA is
+/// also routed through the document `/OutputIntents` profile when the
+/// tint transform's alternate-CMYK output lands in the resolver.
+///
+/// Fixture: tint transform `{ pop 0.0 exch 0.0 0.0 }` consumes the two
+/// colorant tints, drops the second, and emits CMYK(0, tint0, 0, 0).
+/// Content `1.0 0.5 scn` provides (tint0=1.0, tint1=0.5) → alternate
+/// CMYK(0, 1, 0, 0). The OutputIntent profile maps that to
+/// RGB(126, 126, 126); the §10.3.5 additive-clamp value would be
+/// RGB(255, 0, 255).
+#[test]
+fn devicen_type4_alt_devicecmyk_composite_routes_through_output_intent() {
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let pdf = build_pdf_devicen_type4_devicecmyk_with_output_intent(&icc);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    assert!(
+        doc.output_intent_cmyk_profile().is_some(),
+        "fixture must declare a CMYK OutputIntent for the routing to be probed"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (126u8, 126, 126, 255),
+        "DeviceN Type-4 /DeviceCMYK alternate must route the alt-CMYK \
+         quadruple through the document /OutputIntents profile on the \
+         composite path; expected (126,126,126,255); got ({r},{g},{b},{a}). \
+         (255,0,255,_) means §10.3.5 additive-clamp fired."
     );
 }
 
