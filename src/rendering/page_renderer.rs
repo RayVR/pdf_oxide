@@ -3188,7 +3188,23 @@ impl PageRenderer {
         side: PaintSide,
     ) -> Option<(f32, f32, f32, f32)> {
         let pipeline = ResolutionPipeline::new();
-        let ctx = ResolutionContext::new(doc, color_spaces);
+        // Document /OutputIntents CMYK profile + page-level
+        // /Default[Gray|RGB|CMYK] (§8.6.5.6) + graphics-state rendering
+        // intent (§10.7.3) feed the colour stage's ICC dispatch. The
+        // `output_intent_cmyk_profile()` accessor already filters for
+        // /N=4 and parses the embedded stream; we just hand the Arc
+        // (when present) to the context.
+        let output_intent = doc.output_intent_cmyk_profile();
+        let ctx = ResolutionContext::new(doc, color_spaces)
+            .with_output_intent(output_intent.as_ref())
+            .with_rendering_intent(crate::color::RenderingIntent::from_pdf_name(
+                &gs.rendering_intent,
+            ))
+            .with_defaults(
+                color_spaces.get("DefaultGray"),
+                color_spaces.get("DefaultRGB"),
+                color_spaces.get("DefaultCMYK"),
+            );
         // No geometry is needed: the colour stage only reads `color`
         // (and reads `gs` for the alpha fold). `ColorOnly` lets the
         // intent express that without conjuring a placeholder path.
