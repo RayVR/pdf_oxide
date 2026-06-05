@@ -1,12 +1,7 @@
 //! Wave-4 QA probes for the resolution-pipeline migration (shading `sh`).
 //!
-//! Sibling to waves 1 (paths/stroke), 2 (text), 3 (ImageMask + `Do`). The
-//! pilot file (`test_render_resolution_pipeline_pilot.rs`) covers the
-//! happy path: DeviceRGB / DeviceGray Type-2 axial parity, the Type-4
-//! Separation capability gain, DeviceRGB Type-3 radial parity, CTM/clip
-//! preservation, and Type-1 / Type-4 mesh pass-through.
-//!
-//! This wave-4 QA suite probes the corners the pilot doesn't:
+//! Sibling to waves 1 (paths/stroke), 2 (text), 3 (ImageMask + `Do`).
+//! This wave-4 QA suite probes the shading-side corners:
 //!
 //! 1. **Type 2 axial edges** — non-horizontal `/Coords` (vertical,
 //!    reversed, diagonal); non-default `/Domain`; explicit `/Extend`
@@ -19,18 +14,15 @@
 //!    sub-functions with different domains, Type 2 with `N != 1`.
 //! 5. **State interaction** — `q ... Q`, SMask, clip path, blend mode.
 //! 6. **Pass-through types** — Type 1 function-based, Type 4-7 meshes
-//!    must stay byte-identical under the toggle.
+//!    must remain unchanged because the pipeline doesn't migrate them.
 //! 7. **Adversarial input** — missing `/ColorSpace`, missing `/Function`,
 //!    missing `/C0` / `/C1`, empty `/Functions` array; no-panic
 //!    invariant.
-//! 8. **Performance** — N-shading pipeline-on vs pipeline-off wall-clock
-//!    ratio; one large shading should be O(pixmap size).
+//! 8. **Performance** — N-shading render must hold a sane budget; one
+//!    large shading should be O(pixmap size).
 //!
-//! Style mirrors waves 1-3: build a tiny PDF inline, render twice
-//! through `render_with_pipeline`, compare pixmaps or sample pixels.
-//! When a probe finds a bug, the test is committed with `#[ignore]` and
-//! a comment naming the failing invariant; pin tests are committed
-//! enabled.
+//! Style mirrors waves 1-3: build a tiny PDF inline, render through
+//! `render_with_pipeline`, compare pixmaps or sample pixels.
 
 #![cfg(feature = "rendering")]
 #![allow(dead_code)] // probes accrete across commits; not every helper is wired up yet.
@@ -40,13 +32,13 @@ use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Process-wide lock for env-var test orchestration. Cargo runs
-/// integration tests in parallel; flipping `PDF_OXIDE_RESOLUTION_PIPELINE`
-/// must not race with another test's read.
+/// Process-wide lock retained as scaffolding so the `render_with_pipeline`
+/// helpers keep a single serialisation point if a future probe needs to
+/// mutate process-global rendering state.
 static PIPELINE_TOGGLE_LOCK: Mutex<()> = Mutex::new(());
 
 // ===========================================================================
-// PDF construction helpers — self-contained so a fix-pass to the pilot or
+// PDF construction helpers — self-contained so a fix-pass to the
 // wave-1/2/3 QA helpers can't accidentally invalidate the wave-4 invariants.
 //
 // All builders produce a 100×100 user-space page with a single shading
@@ -253,10 +245,10 @@ fn count_ink_pixels(rgba: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> usize {
 // ===========================================================================
 
 /// Probe 1 — Vertical `/Coords` (`[x0 y0 x0 y1]`). The axis runs
-/// top-to-bottom rather than left-to-right. Pre-existing behaviour;
-/// toggle parity must hold since DeviceRGB short-circuits at the
-/// Device-family arm of `build_logical_color` and folds the same RGBA
-/// triple into the stop as the inline path's `parse_color_array`.
+/// top-to-bottom rather than left-to-right. DeviceRGB short-circuits
+/// at the Device-family arm of `build_logical_color` and folds the
+/// same RGBA triple into the stop the renderer's `parse_color_array`
+/// would have produced.
 #[test]
 fn qa_axial_vertical_coords_toggle_parity() {
     // Red at top (y=10) → blue at bottom (y=90) in user space. PDF
@@ -294,9 +286,9 @@ fn qa_axial_vertical_coords_toggle_parity() {
 /// to the left of coordinate-0). The gradient runs right-to-left in
 /// user space. The colour at the "high-x" end of the page should be
 /// C0 (since C0 sits at the *first* listed point, which is at the
-/// right). Toggle parity must hold. Declares `/Extend [true true]`
-/// so the gradient pads past the axis ends with the endpoint
-/// colours — the assertions below sample inside that padded region.
+/// right). Declares `/Extend [true true]` so the gradient pads past
+/// the axis ends with the endpoint colours — the assertions below
+/// sample inside that padded region.
 #[test]
 fn qa_axial_reversed_coords_toggle_parity() {
     // /C0 at (90, 50), /C1 at (10, 50). The "high x" side of the page
@@ -386,10 +378,10 @@ fn qa_axial_domain_other_than_unit_interval() {
     );
 }
 
-/// Probe 3b — Companion pin: with the current (buggy) implementation,
-/// /Domain is dropped; the toggle parity must still hold. This is the
+/// Probe 3b — Companion pin: the gradient still paints inside the
+/// axis interior under a non-default `/Domain`. This is the
 /// regression pin that catches a future Domain implementation that
-/// breaks off/on parity while only fixing one side.
+/// stops painting altogether.
 #[test]
 fn qa_axial_domain_other_than_unit_interval_toggle_parity() {
     let content = "/Sh1 sh\n";
@@ -683,7 +675,7 @@ fn qa_radial_zero_radius_inner_at_distinct_point_renders_pixmap() {
 /// outside the larger circle should be C1, pixels inside the
 /// degenerate inner point should be C0. The current renderer uses
 /// `SpreadMode::Pad` which happens to match the spec here — pin the
-/// parity and the visible behaviour.
+/// visible behaviour.
 #[test]
 fn qa_radial_extend_true_true_toggle_parity_and_correctness() {
     let content = "/Sh1 sh\n";
@@ -717,21 +709,20 @@ fn qa_radial_extend_true_true_toggle_parity_and_correctness() {
 // ===========================================================================
 // Probes 9-12 — Colour space stress.
 //
-// Wave-4's central capability: the shading dict's `/ColorSpace` finally
-// participates. The pilot covers Type-4 Separation/DeviceCMYK; this
-// probe group covers ICCBased N=4 (the most common spot CMYK proxy),
-// Indexed (lookup-table palette), DeviceN with multi-colorant Type-4
-// (multi-spot inks), and an inline-`/ColorSpace` form Type-4 Separation
-// (capability cross-check against the pilot's pattern).
+// Wave-4's central capability: the shading dict's `/ColorSpace`
+// finally participates. This probe group covers Type-4
+// Separation/DeviceCMYK, ICCBased N=4 (the most common spot CMYK
+// proxy), Indexed (lookup-table palette), DeviceN with multi-colorant
+// Type-4 (multi-spot inks), and an inline-`/ColorSpace` form Type-4
+// Separation.
 // ===========================================================================
 
 /// Probe 9 — Inline `/ColorSpace [/Separation /Magenta /DeviceCMYK
-/// <Type4>]` with `/C0 [1]`. Same shape the pilot covers as a
-/// stand-alone capability test; included here too so a regression that
-/// drops the inline-array branch of `pipeline_resolve_components`
-/// fails both files. Asserts the pipeline paints magenta at C0; the
-/// inline path paints white (it reads `/C0 [1]` as `(1, 1, 1)` RGB
-/// via the 1-element grayscale fallback in `parse_color_array`).
+/// <Type4>]` with `/C0 [1]`. The pipeline routes through
+/// `pipeline_resolve_components` and evaluates the Type-4 tint
+/// transform, so the C0 endpoint paints magenta. The legacy
+/// `parse_color_array` path would have read `/C0 [1]` as `(1, 1, 1)`
+/// RGB via the 1-element grayscale fallback and painted white.
 #[test]
 fn qa_inline_separation_devicecmyk_type4_capability_pin() {
     let type4 = "0.0 exch 0.0 0.0";
@@ -760,12 +751,11 @@ fn qa_inline_separation_devicecmyk_type4_capability_pin() {
 
 /// Probe 10 — Shading with `/ColorSpace [/ICCBased <stream ref>]`,
 /// `/N 4` (CMYK-ish ICC profile), and `/C0 [0 1 0 0]` (magenta in
-/// CMYK). The inline path's `parse_color_array` reads only the first
-/// three components (`(0, 1, 0)` → green!), while the pipeline routes
-/// the components through the ICCBased branch which dispatches on
-/// `/N`: `N=4` → `four_as_cmyk` → CMYK(0, 1, 0, 0) → RGB magenta
-/// (1, 0, 1). The pipeline gets magenta; the inline path gets green.
-/// This is a capability gain — pin both behaviours.
+/// CMYK). The pipeline routes the components through the ICCBased
+/// branch which dispatches on `/N`: `N=4` → `four_as_cmyk` →
+/// CMYK(0, 1, 0, 0) → RGB magenta (1, 0, 1). The legacy
+/// `parse_color_array` would have read only the first three components
+/// (`(0, 1, 0)` → green); this is the capability gain.
 #[test]
 fn qa_iccbased_n4_cmyk_endpoint_pipeline_corrects_inline_truncation() {
     // ICC profile stream: empty body is enough — the wave-4 helper
@@ -805,12 +795,11 @@ fn qa_iccbased_n4_cmyk_endpoint_pipeline_corrects_inline_truncation() {
 /// the gradient stop falls back to `Color::BLACK`. Result: the
 /// pipeline paints a mid-grey gradient, the inline path paints black.
 ///
-/// This is a toggle-on-vs-off **divergence**; both behaviours are
-/// "wrong" by spec (neither path does the palette lookup), but the
+/// Both behaviours (the pipeline clamp and the legacy black fallback)
+/// are "wrong" by spec — neither path does the palette lookup. The
 /// pipeline's clamp accidentally produces a more sensible visible
-/// result. Pin both sides — the divergence is a known capability gap
-/// for Indexed gradients pending a proper palette-lookup
-/// implementation.
+/// result. This is a known capability gap for Indexed gradients
+/// pending a proper palette-lookup implementation.
 #[test]
 fn qa_indexed_endpoint_pipeline_clamps_inline_falls_to_black() {
     // Lookup table: 256 entries of arbitrary RGB. We never read it
@@ -854,11 +843,11 @@ fn qa_indexed_endpoint_pipeline_clamps_inline_falls_to_black() {
 /// /DeviceCMYK <Type4 multi-input>]`. Two colorants; the Type-4 tint
 /// transform takes two inputs and emits four CMYK outputs. `/C0
 /// [1 0]` (full SpotA, no SpotB) — the program "exch pop 0 1 0 0"
-/// maps that to CMYK(0, 1, 0, 0) magenta. The inline path
-/// `parse_color_array` reads `[1 0]` as a 2-element array → falls to
-/// the `(0, 0, 0)` else branch (black). The pipeline routes through
+/// maps that to CMYK(0, 1, 0, 0) magenta. The pipeline routes through
 /// `resolve_separation_or_devicen` → Type-4 evaluator → CMYK→RGB
-/// magenta.
+/// magenta. The legacy `parse_color_array` would have read `[1 0]` as
+/// a 2-element array and fallen to the `(0, 0, 0)` else branch
+/// (black).
 #[test]
 fn qa_devicen_two_colorant_type4_capability_pin() {
     // Type-4 program: takes 2 inputs (SpotA tint, SpotB tint),
@@ -1032,10 +1021,10 @@ fn qa_type2_n_not_one_endpoint_extraction_unchanged() {
 /// /Function (NOT as a Separation tint transform). The helper's match
 /// arm explicitly rejects FunctionType 0 and 4 used as the shading
 /// function (they produce colours at intermediate domain points, not
-/// at fixed /C0 / /C1 arrays). Caller falls back to the inline path
-/// which also doesn't handle Type 4 here — both paths render the
-/// default (0, 0, 0) → (1, 1, 1) endpoints. Pin no panic + toggle
-/// parity.
+/// at fixed /C0 / /C1 arrays). The caller falls back to the legacy
+/// gradient path which also doesn't handle Type 4 here — both code
+/// paths render the default (0, 0, 0) → (1, 1, 1) endpoints. Pin
+/// no-panic and a full pixmap.
 #[test]
 fn qa_type4_as_shading_function_helper_returns_none_falls_back() {
     let program = "{ 1.0 exch 0.0 0.0 }";
@@ -1066,14 +1055,15 @@ fn qa_type4_as_shading_function_helper_returns_none_falls_back() {
 // touches `gs` directly (a synthetic GraphicsState is built carrying
 // only fill_alpha). The graphics-state stack, SMask, clip mask, and
 // blend mode all flow through `render_shading` and downstream
-// tiny-skia paint helpers unmodified. Toggle parity is the invariant
-// for every probe in this group.
+// tiny-skia paint helpers unmodified. Each probe in this group
+// confirms the relevant state survives the splice into the rendered
+// pixmap.
 // ===========================================================================
 
 /// Probe 17 — Shading drawn inside `q ... Q`. The save/restore around
-/// the shading call must not perturb the splice; toggle parity is
-/// the invariant. Because the gradient fills the whole pixmap, the
-/// most reliable cross-check is whole-pixmap parity off vs on.
+/// the shading call must not perturb the splice; the gradient must
+/// still paint its axis interior after the surrounding state is
+/// restored.
 #[test]
 fn qa_shading_inside_q_q_toggle_parity() {
     // `q 0.8 g /Sh1 sh Q` — the inner `0.8 g` would leak fill state
@@ -1185,9 +1175,10 @@ fn build_pdf_shading_under_smask(space_str: &str, c0: &str, c1: &str, smask_gray
     buf
 }
 
-/// Probe 18 — Shading under an active SMask. The SMask is a luminosity
-/// mask whose gray value sets the alpha. Toggle parity is the
-/// invariant — the splice must not perturb SMask state.
+/// Probe 18 — Shading under an active SMask. The SMask is a
+/// luminosity mask whose gray value sets the alpha. The splice must
+/// not perturb SMask state — the rendered pixmap must remain a full
+/// 100×100 RGBA.
 #[test]
 fn qa_shading_under_smask_renders_without_panic() {
     // Mid-gray SMask → alpha ≈ 0.5 across the page. The DeviceRGB
@@ -1200,10 +1191,10 @@ fn qa_shading_under_smask_renders_without_panic() {
     assert_eq!(on.len(), 100 * 100 * 4, "SMask-bearing shading must produce a full pixmap");
 }
 
-/// Probe 19 — Shading drawn under an active clip path. Pilot covers
-/// the basic case via Type-4 Separation; this probe pins DeviceRGB
-/// parity with a non-rectangular clip (triangle) to stretch the path
-/// state.
+/// Probe 19 — Shading drawn under an active clip path. This probe
+/// stretches the clip-path side with a non-rectangular (triangular)
+/// clip: outside the triangle the page background must remain visible
+/// after the gradient paints inside.
 #[test]
 fn qa_shading_under_triangular_clip_toggle_parity() {
     // Triangle clip: corners at (10, 10), (90, 10), (50, 90).
@@ -1276,15 +1267,11 @@ fn qa_shading_under_multiply_blend_mode_paints_inside_axis() {
 // every non-axial/non-radial shading on the legacy inline path
 // verbatim. For Types 1, 4, 5, 6, 7 the wave-4 splice does NOT fire
 // at all — the pre-resolve helper short-circuits because the gate
-// is false. Pin byte-identical output for both toggle states; pilot
-// already covers Type 1 (function-based) and Type 4 (free-form
-// Gouraud triangle mesh) — this group adds Type 5 (lattice mesh),
-// Type 6 (Coons patch mesh), and Type 7 (tensor patch mesh).
+// is false.
 //
 // On the current renderer, types 4-7 fall through to a `log::debug!`
-// catch-all in `render_shading` (page_renderer.rs:1834) — no paint
-// emitted, no error returned. The probe pins this behaviour: both
-// toggles produce the same blank page; no panic.
+// catch-all in `render_shading` — no paint emitted, no error
+// returned. Each probe pins the no-panic + full-pixmap invariant.
 // ===========================================================================
 
 /// Build a PDF carrying a raw shading dict of arbitrary `/ShadingType`.
@@ -1305,9 +1292,10 @@ fn build_pdf_raw_shading_type(shading_type: i32) -> Vec<u8> {
     build_pdf_shading_raw("/Sh1 sh\n", &shading_body, "", &[])
 }
 
-/// Probe 21 — Type 1 (function-based) shading. Pilot covers this with
-/// a concrete content fixture; here we pin the unsupported-arm path
-/// for completeness (no /Function entry).
+/// Probe 21 — Type 1 (function-based) shading. Pin the
+/// unsupported-arm path (no /Function entry): the renderer must reach
+/// the `log::debug!` catch-all without panicking and still emit a
+/// full pixmap.
 #[test]
 fn qa_type1_function_based_shading_no_panic_full_pixmap() {
     // Type 1 falls through to the unsupported-arm `log::debug!` catch
@@ -1320,11 +1308,10 @@ fn qa_type1_function_based_shading_no_panic_full_pixmap() {
     assert_eq!(on.len(), 100 * 100 * 4, "Type-1 shading must produce a full pixmap");
 }
 
-/// Probe 22 — Type 4 (free-form Gouraud triangle mesh) shading.
-/// Pilot already covers this with a richer fixture; the parity
-/// invariant under the simpler unsupported-arm shape pins that
-/// the dispatcher gate keeps Type 4 on the inline path regardless
-/// of the toggle.
+/// Probe 22 — Type 4 (free-form Gouraud triangle mesh) shading. The
+/// dispatcher gate keeps Type 4 on the legacy inline path; this probe
+/// pins that the helper short-circuit + inline catch-all combo never
+/// panics on a minimal Type-4 dict.
 #[test]
 fn qa_type4_mesh_shading_no_panic_full_pixmap() {
     let bytes = build_pdf_raw_shading_type(4);
@@ -1369,16 +1356,16 @@ fn qa_type7_tensor_patch_mesh_shading_no_panic_full_pixmap() {
 //
 // The wave-4 helper uses `?` on every dict-lookup, so missing fields
 // drop the helper into `None` and the caller falls back to the
-// inline path. The inline path uses `unwrap_or` defaults so it also
-// stays panic-free. Pin the invariant: every malformed shading must
-// produce a defined result (Ok or Err — either is fine) and the
-// renderer must not panic. Pilot doesn't cover these.
+// legacy gradient path. That path uses `unwrap_or` defaults so it
+// also stays panic-free. Pin the invariant: every malformed shading
+// must produce a defined result (Ok or Err — either is fine) and the
+// renderer must not panic.
 // ===========================================================================
 
 /// Probe 26 — Shading dict missing `/ColorSpace`. The pre-resolve
 /// helper's `shading.get("ColorSpace")?` returns None → helper
-/// returns None → caller falls back to inline which uses `/C0` raw
-/// as RGB. No panic.
+/// returns None → caller falls back to the legacy gradient path
+/// which uses `/C0` raw as RGB. No panic.
 #[test]
 fn qa_adversarial_missing_color_space_no_panic() {
     let shading_body = "<< /ShadingType 2 /Coords [0 50 100 50] /Domain [0 1] \
@@ -1392,8 +1379,9 @@ fn qa_adversarial_missing_color_space_no_panic() {
 
 /// Probe 27 — Shading dict missing `/Function`. The helper's
 /// `shading.get("Function")?` returns None → helper returns None →
-/// caller falls back to inline which then reads None and returns
-/// the default `((0,0,0), (1,1,1))` endpoint pair. No panic.
+/// caller falls back to the legacy gradient path which then reads
+/// None and returns the default `((0,0,0), (1,1,1))` endpoint pair.
+/// No panic.
 #[test]
 fn qa_adversarial_missing_function_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
@@ -1407,8 +1395,8 @@ fn qa_adversarial_missing_function_no_panic() {
 
 /// Probe 28 — Type 2 function missing `/C0` (or `/C1`). The helper's
 /// `func_dict.get("C0")?` returns None → helper returns None →
-/// caller falls back to inline which uses the `unwrap_or((0,0,0))`
-/// default. No panic.
+/// caller falls back to the legacy gradient path which uses the
+/// `unwrap_or((0,0,0))` default. No panic.
 #[test]
 fn qa_adversarial_missing_c0_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
@@ -1437,7 +1425,8 @@ fn qa_adversarial_missing_c1_no_panic() {
 
 /// Probe 29 — Type 3 stitching function with empty `/Functions`
 /// array. The helper's `funcs.first()?` returns None → helper
-/// returns None → caller falls back to inline. No panic.
+/// returns None → caller falls back to the legacy gradient path.
+/// No panic.
 #[test]
 fn qa_adversarial_empty_stitching_functions_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
@@ -1455,7 +1444,7 @@ fn qa_adversarial_empty_stitching_functions_no_panic() {
 /// renderer's `render_axial_shading` short-circuits with `return
 /// Ok(())` when `Coords` isn't a 4+-element array; the wave-4
 /// helper still runs but its endpoint resolution is moot because
-/// nothing paints. Pin no-panic + parity.
+/// nothing paints. Pin no-panic and a full pixmap.
 #[test]
 fn qa_adversarial_missing_coords_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB /Domain [0 1] \
@@ -1473,13 +1462,12 @@ fn qa_adversarial_missing_coords_no_panic() {
 /// returns Err (and propagates None via `?`) or returns Ok with an
 /// `Object::Null` (which is neither a Name nor an Array, so
 /// `pipeline_resolve_components` falls into the catch-all gray
-/// fallback) determines the toggle-on behaviour.
+/// fallback) determines what the pipeline paints.
 ///
-/// No-panic invariant pinned. No-parity invariant pinned with an
-/// `#[ignore]` — the wave-4 pipeline path produces a grayscale
-/// gradient (gray = C0[0]) while the inline path produces the raw
-/// RGB triple (1, 0, 0) → red. Toggle-on vs toggle-off diverges
-/// visibly under this specific malformed input.
+/// No-panic invariant pinned. The pipeline path produces a
+/// grayscale gradient (gray = C0[0]); the legacy `parse_color_array`
+/// would have produced the raw RGB triple (1, 0, 0). This is a
+/// documented capability gap under malformed input.
 ///
 /// Bug name: WAVE4-DANGLING-CS-REF-PIPELINE-FALLS-TO-GRAY.
 #[test]
@@ -1495,14 +1483,10 @@ fn qa_adversarial_dangling_color_space_ref_no_panic_pin() {
 }
 
 /// Probe 29d — Capability-divergence pin for the dangling-/ColorSpace
-/// case. Pipeline produces grayscale; inline produces raw RGB. This
-/// is a documented MINOR divergence under malformed input — neither
-/// path matches a spec-compliant renderer (which would either reject
-/// the PDF or fall back to a defined default), but the divergence
-/// is observable and worth documenting.
-///
-/// No-panic invariant on the dangling-ref input. The pipeline-only
-/// renderer still produces a defined pixmap on this malformed input.
+/// case. The pipeline produces grayscale where a spec-compliant
+/// renderer would either reject the PDF or fall back to a defined
+/// default. The pipeline-only renderer still produces a defined
+/// pixmap on this malformed input — pin the no-panic invariant.
 #[test]
 fn qa_adversarial_dangling_color_space_ref_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace 99 0 R /Coords [0 50 100 50] /Domain [0 1] \
@@ -1515,9 +1499,7 @@ fn qa_adversarial_dangling_color_space_ref_no_panic() {
 }
 
 // ===========================================================================
-// Performance — wall-clock budget on a paint-heavy page. The wave 1-4
-// off-vs-on ratio tests no longer make sense (the toggle is gone, both
-// 'off' and 'on' run the pipeline), so they're retired. The remaining
+// Performance — wall-clock budget on a paint-heavy page. The remaining
 // wall-clock budget guards against an O(N) clone spiral in the helper.
 // ===========================================================================
 
@@ -1555,8 +1537,7 @@ fn qa_shading_perf_thousand_invocations_within_five_seconds() {
     let t = Instant::now();
     let _ = render_with_pipeline(&doc, true);
     let dt = t.elapsed();
-    // Generous bound — tightened from the original 5 s after wave 5
-    // collapsed the toggle. Cargo runs the wave-4 integration tests in
+    // Generous bound. Cargo runs the wave-4 integration tests in
     // parallel; under heavy scheduling pressure isolated wall time of
     // 2-3 s balloons to 20-25 s. The bound preserves the "no O(N)
     // clone spiral" intent while staying tolerant of that pressure.

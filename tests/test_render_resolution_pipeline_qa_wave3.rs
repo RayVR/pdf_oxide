@@ -1,20 +1,15 @@
 //! Wave-3 QA probes for the resolution-pipeline migration (ImageMask + `Do`).
 //!
 //! Sibling to `test_render_resolution_pipeline_qa_wave1.rs` (paths,
-//! stroke, combos) and `_qa_wave2.rs` (text). The pilot tests
-//! (`test_render_resolution_pipeline_pilot.rs`) already cover the happy
-//! path: Device{RGB,Gray,CMYK,Indexed} parity, the Type 4 Separation
-//! capability gain, standard image and Form XObject byte-identical
-//! pass-through, plus CTM- and clip-preservation pins.
+//! stroke, combos) and `_qa_wave2.rs` (text). This suite probes the
+//! ImageMask / `Do`-side corners:
 //!
-//! This wave-3 QA suite probes the corners the pilot doesn't:
-//!
-//! 1. **ImageMask rendering correctness** — the wave-3 `Do` arm calls
-//!    a brand-new `render_image_mask` helper; small / wide-with-padding /
-//!    tall stencils; `/Decode [1 0]` polarity invert; missing / malformed
-//!    `/Decode`; rotated and mirrored CTMs.
+//! 1. **ImageMask rendering correctness** — `render_image_mask` covers
+//!    small / wide-with-padding / tall stencils; `/Decode [1 0]`
+//!    polarity invert; missing / malformed `/Decode`; rotated and
+//!    mirrored CTMs.
 //! 2. **Pass-through pins for the non-mask branch** — CMYK / Indexed /
-//!    ICCBased N=4 standard images must keep their inline behaviour.
+//!    ICCBased N=4 standard images must keep their existing behaviour.
 //! 3. **Inline-image coverage** — `BI ... ID ... EI` is a separate parse
 //!    path the renderer may or may not dispatch; pin the current
 //!    behaviour either way.
@@ -26,14 +21,11 @@
 //!    `/All` / `/None` colorants applied to ImageMask fill.
 //! 7. **Adversarial input** — too-short / too-long / zero-dim / huge-dim
 //!    stencil streams.
-//! 8. **Performance** — N-paint pipeline-on vs pipeline-off wall-clock
-//!    ratio (one-resolve-per-Do invariant, matching wave-2's pattern).
+//! 8. **Performance** — N-paint render must hold the one-resolve-per-Do
+//!    invariant (matching wave-2's pattern).
 //!
-//! Style mirrors waves 1 + 2: build a tiny PDF inline, render twice
-//! through `render_with_pipeline`, compare pixmaps or sample pixels.
-//! When a probe finds a bug, the test is committed with `#[ignore]` and
-//! a comment naming the failing invariant; pin tests are committed
-//! enabled.
+//! Style mirrors waves 1 + 2: build a tiny PDF inline, render through
+//! `render_with_pipeline`, compare pixmaps or sample pixels.
 
 #![cfg(feature = "rendering")]
 #![allow(dead_code)] // probes accrete across commits; not every helper is wired up yet.
@@ -43,13 +35,13 @@ use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Process-wide lock for env-var test orchestration. Cargo runs
-/// integration tests in parallel; flipping `PDF_OXIDE_RESOLUTION_PIPELINE`
-/// must not race with another test's read.
+/// Process-wide lock retained as scaffolding so the `render_with_pipeline`
+/// helpers keep a single serialisation point if a future probe needs to
+/// mutate process-global rendering state.
 static PIPELINE_TOGGLE_LOCK: Mutex<()> = Mutex::new(());
 
 // ===========================================================================
-// PDF construction helpers — self-contained so a fix-pass to the pilot or
+// PDF construction helpers — self-contained so a fix-pass to the
 // wave-1/2 QA helpers can't accidentally invalidate the wave-3 invariants.
 // ===========================================================================
 
@@ -196,15 +188,16 @@ fn empty_image_mask_bytes(width: u32, height: u32) -> Vec<u8> {
 // ===========================================================================
 // Probes 1-9 — ImageMask rendering correctness (the new capability).
 //
-// `render_image_mask` is brand new in wave 3. Even ignoring the pipeline
-// toggle, it must decode the 1-bit stream correctly (row padding, default
-// vs inverted Decode, missing Decode, malformed Decode), stay panic-free
-// on degenerate input, and respect CTM rotation / mirroring.
+// `render_image_mask` must decode the 1-bit stream correctly (row
+// padding, default vs inverted Decode, missing Decode, malformed
+// Decode), stay panic-free on degenerate input, and respect CTM
+// rotation / mirroring.
 // ===========================================================================
 
 /// Probe 1 — 1×1 ImageMask stencil. A single opaque sample painted with
-/// a known fill colour. Toggle parity (the fill is DeviceRGB, so both
-/// paths read `gs.fill_color_rgb` and the spliced clone short-circuits).
+/// a known fill colour. With a DeviceRGB fill the spliced clone
+/// short-circuits, so the rasteriser reads `gs.fill_color_rgb`
+/// directly.
 #[test]
 fn qa_image_mask_1x1_solid_toggle_parity() {
     let mask = solid_image_mask_bytes(1, 1); // 1 byte, all opaque
@@ -268,8 +261,8 @@ fn qa_image_mask_tall_height_toggle_parity() {
 /// (every byte 0xFF), under inverted Decode that should fill the whole
 /// stencil; under default Decode it would be transparent.
 ///
-/// PIN: the wave-3 helper supports `/Decode [1 0]`. This is a positive
-/// pin — the renderer must paint, and toggle off vs on must match.
+/// PIN: the wave-3 helper supports `/Decode [1 0]`. The renderer must
+/// paint the all-1s stencil as fully filled under inverted Decode.
 #[test]
 fn qa_image_mask_decode_inverted_polarity_paints_under_ff_bytes() {
     let mask = vec![0xFFu8; 1]; // 8x1 stencil, all bits 1
@@ -327,10 +320,9 @@ fn qa_image_mask_malformed_decode_no_panic_default_polarity() {
     }
 }
 
-/// Probe 7 — ImageMask under a CTM that rotates 90° clockwise. CTM
-/// preservation across the spliced GS clone (pipeline path) and across
-/// the inline path must match byte-for-byte. The stencil itself
-/// (8×1, all opaque) becomes a vertical band when rotated.
+/// Probe 7 — ImageMask under a CTM that rotates 90° clockwise. The
+/// CTM must round-trip across the spliced GS clone so the stencil
+/// (8×1, all opaque) lands as a vertical band on the page.
 #[test]
 fn qa_image_mask_ctm_90deg_rotation_toggle_parity() {
     let mask = solid_image_mask_bytes(8, 1);
@@ -353,7 +345,7 @@ fn qa_image_mask_ctm_90deg_rotation_toggle_parity() {
 /// mirror). The image flip lives in `render_image_mask`'s
 /// `pre_translate(0, 1).pre_scale(1/w, -1/h)`; a negative-scale CTM
 /// composes correctly only if the helper's flip is applied in the
-/// right order. Toggle parity confirms the migration didn't break it.
+/// right order.
 #[test]
 fn qa_image_mask_negative_scale_mirror_toggle_parity() {
     let mask = solid_image_mask_bytes(8, 1);
@@ -393,8 +385,8 @@ fn qa_image_mask_negative_determinant_ctm_toggle_parity() {
 // Wave 3 routes ONLY `/ImageMask true` through the pipeline; standard
 // images go to `render_image` unchanged. These probes pin that the
 // guard reads `/ImageMask true` strictly (not "any /ImageMask entry")
-// and that toggle-on remains byte-identical to toggle-off for
-// non-mask images across the colour spaces that matter.
+// and that non-mask images render correctly across the colour spaces
+// that matter.
 // ===========================================================================
 
 /// Build a one-page PDF with a standard (non-mask) Image XObject `/IM1`
@@ -523,8 +515,8 @@ fn build_pdf_standard_image_indexed(
 }
 
 /// Probe 10 — CMYK standard image (non-mask) pass-through. Wave 3
-/// must not splice the pipeline on these; output byte-identical
-/// regardless of the toggle.
+/// does not splice the pipeline on these; the standard-image branch
+/// paints the CMYK pixel data unchanged.
 #[test]
 fn qa_standard_image_cmyk_pass_through_byte_identical() {
     // 4x4 CMYK pixels, all (0, 1, 0, 0) → magenta under additive clamp.
@@ -578,9 +570,9 @@ fn qa_standard_image_indexed_256_pass_through_byte_identical() {
 fn qa_image_with_explicit_imagemask_false_routes_to_standard_image() {
     // Mint a 4x4 DeviceGray standard image AND tag it with `/ImageMask
     // false`. The renderer must NOT take the mask branch (no
-    // `render_image_mask` call), and toggle off vs on must be
-    // byte-identical because the pipeline isn't routed for standard
-    // images.
+    // `render_image_mask` call) — the pipeline isn't routed for
+    // standard images, so the centre pixel must reflect the grey
+    // sample data, not the active fill colour.
     let pixels = vec![0x80u8; 16];
     let content = "q\n80 0 0 80 10 10 cm\n/IM1 Do\nQ\n";
 
@@ -640,10 +632,11 @@ fn qa_image_with_explicit_imagemask_false_routes_to_standard_image() {
 }
 
 /// Probe 12b — ICCBased N=4 (CMYK ICC profile) standard image (non-mask)
-/// pass-through. The ICC profile is supplied as an indirect stream (object
-/// 6). Even if the extractor falls back when the ICC bytes are not a
-/// valid profile, the *routing decision* (mask vs standard) must remain
-/// stable: toggle off vs on byte-identical.
+/// pass-through. The ICC profile is supplied as an indirect stream
+/// (object 6). Even if the extractor falls back when the ICC bytes are
+/// not a valid profile, the routing decision (mask vs standard) must
+/// remain stable — the image goes through `render_image`, not the mask
+/// branch.
 #[test]
 fn qa_standard_image_iccbased_n4_pass_through_byte_identical() {
     // 2x2 CMYK pixels (16 bytes), all magenta.
@@ -757,7 +750,7 @@ fn build_pdf_inline_image_bytes(content_ops: &[u8]) -> Vec<u8> {
 
 /// Probe 13 — Inline ImageMask via `BI ... ID ... EI`. Pin the current
 /// behaviour: the renderer does NOT dispatch `Operator::InlineImage`,
-/// so the page is blank regardless of the toggle.
+/// so the page is blank.
 ///
 /// If a future wave adds inline-image support, this test will fail —
 /// at which point the new arm needs its own pipeline routing for
@@ -1074,9 +1067,9 @@ fn qa_form_xobject_with_inner_image_mask_type4_separation_capability_gain() {
 }
 
 /// Probe 16 — Two-level Form recursion (Form-in-Form), where the
-/// innermost content invokes an ImageMask. Toggle parity for a
-/// DeviceRGB fill — the resolved colour is the same on both paths so
-/// the pixmaps must match.
+/// innermost content invokes an ImageMask with a DeviceRGB fill. The
+/// rendered centre pixel must be the expected colour after the
+/// pipeline routes the mask through both Form recursions.
 #[test]
 fn qa_form_in_form_with_image_mask_toggle_parity() {
     let mask = solid_image_mask_bytes(8, 8);
@@ -1107,9 +1100,8 @@ fn qa_form_in_form_with_image_mask_toggle_parity() {
 /// probing it). When the page sets the fill colour and then invokes a
 /// Form which paints an ImageMask, the Form's content stream does NOT
 /// see the page's `rg` — the centre paints black instead of the
-/// inherited fill. Symmetric across the pipeline toggle (so it is NOT
-/// a wave-3 regression, but rather a graphics-state-propagation gap
-/// at the Form recursion boundary).
+/// inherited fill. This is a graphics-state-propagation gap at the
+/// Form recursion boundary, not a pipeline-side issue.
 ///
 /// Pinned `#[ignore]` to record the discovery without failing CI.
 /// Bug name: **FORM-RECURSION-FILL-NOT-INHERITED** — the renderer's
@@ -1142,8 +1134,8 @@ fn qa_form_fill_inheritance_bug_pin() {
 
 /// Probe 17 — Form-XObject with a nested CTM transformation around
 /// the inner ImageMask. Inside the Form, an inner `q ... cm ... /IM1
-/// Do ... Q` must compose with the page's `cm` cleanly under both
-/// toggle states.
+/// Do ... Q` must compose with the page's `cm` cleanly through the
+/// pipeline-routed mask paint.
 #[test]
 fn qa_form_xobject_inner_ctm_around_image_mask_toggle_parity() {
     let mask = solid_image_mask_bytes(8, 8);
@@ -1348,17 +1340,14 @@ fn qa_image_mask_then_standard_then_mask_interleaved_toggle_parity() {
 }
 
 /// Probe 20 — ImageMask under an active SMask. The renderer must apply
-/// the SMask to the paint; toggle parity (a DeviceRGB fill resolves
-/// identically through both paths).
+/// the SMask to the paint; a DeviceRGB fill resolves through the
+/// pipeline and the spliced clone must carry the SMask through.
 #[test]
 fn qa_image_mask_under_active_smask_toggle_parity() {
-    // Build a PDF with an SMask-bearing ExtGState. The pilot doesn't
-    // exercise this for ImageMask; we want the parity guarantee.
-    //
-    // Strategy: page resources carry /GS1 in /ExtGState with `/SMask
-    // /None` set explicitly. This is the "no smask" form but it
-    // exercises the ExtGState plumbing without needing a full SMask
-    // dict (which requires a transparency group XObject).
+    // Page resources carry /GS1 in /ExtGState with `/SMask /None` set
+    // explicitly. This is the "no smask" form but it exercises the
+    // ExtGState plumbing without needing a full SMask dict (which
+    // requires a transparency group XObject).
     let mask = solid_image_mask_bytes(8, 8);
     let resources = "/ExtGState << /GS1 << /SMask /None >> >>";
     let content = "q\n/GS1 gs\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
@@ -1375,8 +1364,8 @@ fn qa_image_mask_under_active_smask_toggle_parity() {
 }
 
 /// Probe 21 — ImageMask under an active clip path. Pixels outside the
-/// clip must be unchanged; toggle parity confirms the spliced clone
-/// doesn't drop the clip.
+/// clip must remain unpainted; the spliced GS clone must not drop the
+/// clip state.
 #[test]
 fn qa_image_mask_under_active_clip_toggle_parity_corner_unchanged() {
     let mask = solid_image_mask_bytes(8, 8);
@@ -1401,8 +1390,8 @@ fn qa_image_mask_under_active_clip_toggle_parity_corner_unchanged() {
 
 /// Probe 22 — ImageMask painted under a non-Normal blend mode. The
 /// wave-3 `render_image_mask` reads `gs.blend_mode` and converts it
-/// via `pdf_blend_mode_to_skia`. Toggle parity confirms the spliced
-/// clone preserves the blend mode.
+/// via `pdf_blend_mode_to_skia`. The spliced clone must preserve the
+/// blend mode field through to the rasteriser.
 #[test]
 fn qa_image_mask_multiply_blend_mode_toggle_parity() {
     let mask = solid_image_mask_bytes(8, 8);
@@ -1427,8 +1416,8 @@ fn qa_image_mask_multiply_blend_mode_toggle_parity() {
 // `render_image_mask` reads `gs.fill_color_rgb` once per paint; the
 // pipeline must populate that from the Type 4 / DeviceN program. The
 // `/All` / `/None` colorant-name special cases are not honoured today
-// (existing behaviour) — pin off-vs-on parity (or capability divergence,
-// as appropriate).
+// (existing behaviour) — pin whatever the renderer actually paints
+// today as the regression anchor.
 // ===========================================================================
 
 /// Build a one-page PDF with an ImageMask XObject `/IM1` and an
@@ -1519,8 +1508,8 @@ fn qa_image_mask_100_paints_type4_separation_capability_at_scale() {
         }
     }
 
-    // Use the imagemask-with-Type4 builder from the pilot helper shape.
-    // We duplicate the layout here to keep this file self-contained.
+    // Inline a PDF layout matching the shared imagemask-with-Type4
+    // helper, so this probe stays self-contained.
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"%PDF-1.4\n");
     let cat_off = buf.len();
@@ -1610,9 +1599,9 @@ fn qa_image_mask_devicen_multi_colorant_type4_capability() {
 }
 
 /// Probe 25 — Separation `/All` colorant applied to an ImageMask. The
-/// pipeline runs the tint transform like any other Separation; toggle-on
-/// must produce the Type-4-evaluated colour. Mirror of the wave-2 text
-/// `/All` test.
+/// pipeline runs the tint transform like any other Separation, so the
+/// rendered centre pixel must reflect the Type-4-evaluated colour.
+/// Mirror of the wave-2 text `/All` test.
 #[test]
 fn qa_image_mask_separation_all_colorant_pipeline_paints_type4_output() {
     let mask = solid_image_mask_bytes(8, 8);

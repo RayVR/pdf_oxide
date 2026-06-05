@@ -1,19 +1,18 @@
 //! Wave-1 QA probes for the resolution-pipeline migration.
 //!
-//! These tests live next to the wave-1 pilot suite
-//! (`test_render_resolution_pipeline_pilot.rs`) and exist for two reasons:
+//! Two roles:
 //!
 //! 1. **Adversarial coverage** — push fill/stroke routing through scale,
-//!    interleaving, malformed inputs, and edge-of-spec colour spaces; flag
-//!    any divergence between toggle-off and toggle-on as a pipeline-side
-//!    parity bug.
-//! 2. **Regression pins** — when a probe area does *not* surface a divergence,
-//!    pin the current behaviour with a passing test so the next wave cannot
-//!    silently regress it.
+//!    interleaving, malformed inputs, and edge-of-spec colour spaces;
+//!    surface any pipeline-side bug that lets a paint operator reach the
+//!    rasteriser with the wrong colour, alpha, or geometry.
+//! 2. **Regression pins** — when a probe area does *not* surface a
+//!    misbehaviour, pin the current shipped behaviour so a future change
+//!    cannot silently regress it.
 //!
-//! Style mirrors the pilot file: build a single-page PDF inline, render
-//! twice (toggle off, toggle on), and either compare pixmaps byte-for-byte
-//! or sample specific pixels.
+//! Each test builds a single-page PDF inline, renders it through the
+//! resolution pipeline (the only paint path), and either compares the
+//! pixmap shape or samples specific pixels.
 
 #![cfg(feature = "rendering")]
 
@@ -21,15 +20,15 @@ use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 use std::sync::Mutex;
 
-/// Process-wide lock for env-var test orchestration. Cargo runs integration
-/// tests in parallel; flipping `PDF_OXIDE_RESOLUTION_PIPELINE` must not race
-/// with another test's read.
+/// Process-wide lock retained as scaffolding so the `render_with_pipeline`
+/// helpers keep a single serialisation point if a future probe needs to
+/// mutate process-global rendering state. No live test depends on it now
+/// that the resolution pipeline is unconditional.
 static PIPELINE_TOGGLE_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
-// PDF construction helpers (mirrors the pilot's helpers; kept here so the QA
-// suite is self-contained and a fix-pass to the pilot can't accidentally
-// break the QA invariants).
+// PDF construction helpers. Kept self-contained so a fix-pass to a sibling
+// QA suite can't accidentally break the invariants probed here.
 // ---------------------------------------------------------------------------
 
 /// Build a tiny one-page PDF whose content stream is `content_ops`, with a
@@ -164,8 +163,7 @@ fn pixel_at(rgba: &[u8], x: u32, y: u32) -> (u8, u8, u8, u8) {
 
 /// Count non-default-background pixels (R, G, or B differs from white).
 /// Used as a positive probe that the operator stream actually painted
-/// something — converted from earlier off-vs-on parity checks after the
-/// pipeline toggle was removed.
+/// something through the pipeline.
 #[allow(dead_code)]
 fn count_marked_pixels(rgba: &[u8]) -> usize {
     rgba.chunks_exact(4)
@@ -174,18 +172,17 @@ fn count_marked_pixels(rgba: &[u8]) -> usize {
 }
 
 // ===========================================================================
-// PROBE AREA: Toggle-on parity at scale (probes 1, 2, 3)
+// PROBE AREA: Pipeline stability at scale (probes 1, 2, 3)
 // ===========================================================================
 
 /// Probe 1 — Long content stream with many fill/stroke operators of each type.
 ///
 /// The pipeline routes every fill/stroke through a fresh `ResolutionPipeline`
-/// instance per call. Any per-call state leak, mutation of the borrowed
-/// `gs` it shouldn't make, or asymmetric handling of repeated dispatch
-/// would manifest as drift between toggle-off and toggle-on after enough
-/// repetitions. 200 operators of each kind on a 100×100 page exercises every
-/// migrated arm 200× per render — large enough to surface drift if any
-/// exists.
+/// instance per call. Any per-call state leak or mutation of the borrowed
+/// `gs` it shouldn't make would surface after enough repetitions as
+/// missing or incorrectly-coloured marks. 200 operators of each kind on a
+/// 100×100 page exercises every migrated arm 200× per render — large
+/// enough to surface drift if any exists.
 #[test]
 fn qa_long_stream_repeated_fill_stroke_byte_identical() {
     let mut content = String::new();
@@ -447,7 +444,7 @@ fn qa_stroke_extreme_miter_limit_parity() {
 fn qa_combo_under_rotated_scaled_ctm_parity() {
     // CTM: rotate 30°, scale 0.8, translate (10, 10). Then paint a
     // rectangle through `B`. The fill side and stroke side must both
-    // honour the same CTM under the toggle.
+    // honour the same CTM.
     let content = "\
         0.6928 0.4 -0.4 0.6928 10 10 cm\n\
         0 1 0 rg\n1 0 0 RG\n5 w\n\
@@ -486,10 +483,9 @@ fn qa_combo_under_rotated_scaled_ctm_parity() {
 #[test]
 fn qa_stroke_under_extgstate_with_smask_no_divergence() {
     // We don't fully wire an SMask (the bytes are deliberately simple);
-    // the assertion is only that toggle-flip doesn't perturb whatever
-    // both paths produce. If the inline path ignores `/SMask` today and
-    // the pipeline does too, off == on. If they ever diverge, this test
-    // will catch it.
+    // the assertion is only that the pipeline does not panic and the
+    // stroke still reaches the pixmap when a no-op `/SMask /None` is
+    // present in the graphics state.
     let content = "/Sm gs\n1 0 0 RG\n10 w\n20 20 60 60 re\nS\n";
     let resources = "/ExtGState << /Sm << /Type /ExtGState /SMask /None >> >>";
     let bytes = build_pdf(content, resources);
@@ -776,11 +772,10 @@ fn qa_separation_all_colorant() {
     );
 }
 
-/// Probe 18 — Pattern colour space (`/Pattern` for tiling). The pilot
-/// doesn't migrate `sh`, and `Pattern` cs entries today resolve via the
-/// inline path's pattern handler. The pipeline must NOT capture
-/// `Pattern` colour-space resolution out from under that — it should
-/// fall back to the inline path.
+/// Probe 18 — Pattern colour space (`/Pattern` for tiling). `Pattern`
+/// cs entries resolve via the renderer's existing pattern handler.
+/// The pipeline must NOT capture `Pattern` colour-space resolution
+/// out from under that — it should leave the pattern path alone.
 #[test]
 fn qa_pattern_colour_space_falls_back_to_inline_parity() {
     // A bare `/Pattern cs` followed by a non-pattern paint is degenerate
@@ -892,28 +887,22 @@ fn qa_type4_out_of_range_output_clamps() {
 ///
 /// `[/Separation /Name]` is a 2-element array — both `arr.get(2)` and
 /// `arr.get(3)` return None. The pipeline's resolver falls through to
-/// `first_as_gray(components, alpha)`. The inline path's `scn` handler
-/// goes to its `Separation | DeviceN` branch and computes `g = 1.0 - t`.
-///
-/// These are different fall-back semantics: pipeline gives the tint as
-/// gray (e.g. `0.7` → light gray), inline gives `1 - tint` (e.g. `0.7` →
-/// `0.3` → dark gray). Off-vs-on must agree per the parity invariant;
-/// this is the same family of bug as probe 13 — Separation without a
-/// valid function still hits the inline fallback differently.
+/// `g = 1.0 - tint`, matching the long-standing behaviour of the
+/// renderer's `scn`/`SCN` `Separation | DeviceN` branch when no
+/// function is available.
 #[test]
 fn qa_bug_malformed_separation_array_diverges() {
-    // Wave-1 fix: the pipeline's `resolve_separation_or_devicen` now
-    // falls back to `g = 1.0 - tint` whenever the array is malformed or
-    // the function dict is missing / unrecognised, matching the
-    // long-standing inline `scn`/`SCN` behaviour. Off-vs-on parity is
-    // restored.
+    // The pipeline's `resolve_separation_or_devicen` falls back to
+    // `g = 1.0 - tint` whenever the array is malformed or the function
+    // dict is missing / unrecognised, matching the long-standing
+    // renderer behaviour for `scn`/`SCN` on a broken Separation array.
     let resources = "/ColorSpace << /Spot [/Separation /SpotName] >>";
     let content = "/Spot cs\n0.7 scn\n20 20 60 60 re\nf\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
     // Malformed Separation (no altCS, no tint transform) falls back to
-    // `g = 1.0 - tint` per the long-standing inline behaviour the
+    // `g = 1.0 - tint` per the long-standing renderer behaviour the
     // pipeline mirrors. For tint=0.7 that's g=0.3, painted as gray
     // (76, 76, 76) at the rect centre.
     let (r, g, b, _) = center_pixel(&on);
@@ -939,9 +928,9 @@ fn qa_malformed_separation_array_no_panic() {
 /// Probe 23 — `scn` invoked with more components than the colour space
 /// expects (1-channel Separation with 4 components on the stack).
 ///
-/// The pipeline reads `components[0]` and ignores the rest. The inline
-/// path does the same (`components[0]` for the tint). Off-vs-on must
-/// agree.
+/// The pipeline reads `components[0]` and ignores the rest, matching
+/// the renderer's long-standing handling of an oversize component
+/// list against a single-channel Separation.
 #[test]
 fn qa_scn_too_many_components_for_space_parity() {
     let type4_program = "{ 0.0 exch 0.0 0.0 }";
@@ -989,20 +978,16 @@ fn qa_scn_too_few_components_no_panic() {
 // PROBE AREA: Performance + memory (probes 25-26)
 // ===========================================================================
 
-/// Probe 25 — Wall-clock comparison: 1000 fills, toggle off vs on.
+/// Probe 25 — Wall-clock smoke check: 1000 fills, all through the
+/// pipeline.
 ///
 /// The pipeline allocates a single-pixel `PathBuilder`, builds a
 /// `LogicalColor`, instantiates a `ResolutionPipeline`, and runs the
-/// colour stage on every paint. The off path is a direct
-/// `gs.fill_color_rgb` read. The ratio is the cost of routing through
-/// the pipeline on the hot path.
-///
-/// This test does NOT assert a tight bound — wall-clock varies by
-/// system, and the wave-1 design intentionally favours correctness
-/// (capability gain) over hot-path latency. It exists to surface a
-/// 100×-scale regression that would be visible to operators: anything
-/// over 10× should warrant investigation. The bound is therefore
-/// generous (20×).
+/// colour stage on every paint. This test does NOT assert a tight
+/// bound — wall-clock varies by system, and the design intentionally
+/// favours correctness (capability gain) over hot-path latency. It
+/// exists to surface a 100×-scale regression that would be visible to
+/// operators.
 #[test]
 fn qa_perf_thousand_fills_within_bound() {
     let mut content = String::with_capacity(20_000);
@@ -1047,12 +1032,12 @@ fn qa_perf_thousand_fills_within_bound() {
 /// Per combo, that's two of each — 10 allocations per combo (roughly).
 ///
 /// We can't measure heap activity in a stable way from inside `cargo
-/// test`, so this is a *behavioural* pin: render N combos under toggle
-/// on, render N combos under toggle off, and confirm both succeed and
-/// produce the same output. The intent is to flag the cost — N = 500
-/// combos exercising the hot path twice with two pipeline calls each =
-/// 1000 ResolutionPipeline instantiations per render. If this becomes a
-/// real ceiling, the cost is documented here.
+/// test`, so this is a *behavioural* pin: render N combos through the
+/// pipeline and confirm the render succeeds and paints visible marks.
+/// The intent is to flag the cost — N = 500 combos exercising the hot
+/// path twice with two pipeline calls each = 1000 ResolutionPipeline
+/// instantiations per render. If this becomes a real ceiling, the cost
+/// is documented here.
 #[test]
 fn qa_perf_combo_alloc_pressure_does_not_break_correctness() {
     let mut content = String::with_capacity(20_000);
@@ -1076,18 +1061,14 @@ fn qa_perf_combo_alloc_pressure_does_not_break_correctness() {
 }
 
 // ===========================================================================
-// PROBE AREA: Regression coverage — corpus PDFs with toggle on (probe 27)
+// PROBE AREA: Regression coverage — corpus PDFs through the pipeline (probe 27)
 // ===========================================================================
 
-/// Probe 27 — Real-world fixture PDFs render identically with toggle
-/// on vs off. The pilot's synthetic fixtures exercise specific code
-/// paths; a corpus PDF that doesn't use Separation or DeviceN colour
-/// spaces should produce byte-identical output under both toggles.
-///
-/// We pick `simple.pdf` because it's small, ship-checked-in, and
-/// exercises real text + path rendering through the pipeline-migrated
-/// operators. Other corpus PDFs are also worth pinning; we use one as
-/// a representative.
+/// Probe 27 — Real-world fixture PDFs render through the pipeline
+/// without panicking. We pick `simple.pdf` because it's small,
+/// ship-checked-in, and exercises real text + path rendering through
+/// the pipeline-migrated operators. Other corpus PDFs are also worth
+/// pinning; we use one as a representative.
 #[test]
 fn qa_corpus_simple_pdf_renders_without_panic() {
     // simple.pdf is a deliberately blank fixture — the probe here is

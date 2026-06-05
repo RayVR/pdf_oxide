@@ -1,19 +1,16 @@
 //! Wave-2 QA probes for the resolution-pipeline migration (text operators).
 //!
-//! Sibling file to `test_render_resolution_pipeline_qa_wave1.rs`. The pilot
-//! tests (`test_render_resolution_pipeline_pilot.rs`) already cover the
-//! happy-path parity and the Type 4 fill capability gain for `Tj`. This
+//! Sibling file to `test_render_resolution_pipeline_qa_wave1.rs`. This
 //! suite probes:
 //!
 //! 1. **Scale** — long text-heavy streams, TJ arrays with many segments,
 //!    multi-font runs, mixed text + path operators. Any per-call leak or
-//!    asymmetric routing surfaces as drift between toggle-off and
-//!    toggle-on.
+//!    asymmetric routing surfaces as missing or mis-coloured glyphs.
 //! 2. **Mode coverage** — all 8 `Tr` modes, including the clip-adding
-//!    modes (4-7) that wave-2 doesn't currently exercise in the pilot.
+//!    modes (4-7).
 //! 3. **Capability gain on text** — Type 4 Separation / DeviceN / `All` /
 //!    `None` colourants on text fill; the wave-1-class bug
-//!    ("inline `scn` falls back to `1 - tint`") regresses to text too.
+//!    ("legacy `scn` falls back to `1 - tint`") applied to text too.
 //! 4. **State preservation** — `Tc`, `Tw`, `Tz`, `TL`, `Tm`, `Td`, `TD`
 //!    must not be perturbed by the spliced GS clone.
 //! 5. **Font system** — CID Type 0, embedded-subset stand-in, built-in
@@ -22,13 +19,12 @@
 //!    smask/blend/clip.
 //! 7. **Adversarial input** — empty `()`, whitespace-only, extreme TJ
 //!    offsets, all-numeric TJ array.
-//! 8. **Performance** — 1000-glyph pipeline-on render must not blow up
-//!    relative to a 1000-glyph pipeline-off render (one-resolve-per-Tj
-//!    invariant).
+//! 8. **Performance** — 1000-glyph render through the pipeline must not
+//!    blow up (one-resolve-per-Tj invariant).
 //!
 //! Style mirrors the wave-1 QA suite: build a tiny PDF inline, render
-//! twice through `render_with_pipeline`, compare pixmaps byte-for-byte
-//! or sample specific pixel regions.
+//! through `render_with_pipeline`, compare pixmaps byte-for-byte or
+//! sample specific pixel regions.
 
 #![cfg(feature = "rendering")]
 
@@ -37,14 +33,14 @@ use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Process-wide lock for env-var test orchestration. Cargo runs integration
-/// tests in parallel; flipping `PDF_OXIDE_RESOLUTION_PIPELINE` must not race
-/// with another test's read.
+/// Process-wide lock retained as scaffolding so the `render_with_pipeline`
+/// helpers keep a single serialisation point if a future probe needs to
+/// mutate process-global rendering state.
 static PIPELINE_TOGGLE_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
-// PDF construction helpers — self-contained so a fix-pass to the pilot or
-// wave-1 QA helpers can't accidentally invalidate the wave-2 invariants.
+// PDF construction helpers — self-contained so a fix-pass to the wave-1 QA
+// helpers can't accidentally invalidate the wave-2 invariants.
 // ---------------------------------------------------------------------------
 
 /// Build a one-page text-fixture PDF with a Helvetica `/F1` Type 1 font
@@ -337,8 +333,8 @@ fn average_ink_rgb(rgba: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> Option<(f
 
 /// Probe 1 — Long text-heavy page: many `Tj` operators with mid-stream font
 /// size changes. The pipeline allocates a fresh resolver per `Tj`; any
-/// per-call state leak or asymmetric routing across repeated dispatch would
-/// surface as drift between toggle-off and toggle-on.
+/// per-call state leak or asymmetric routing across repeated dispatch
+/// would surface as missing or mis-coloured glyphs.
 ///
 /// Fixture: 12 `Tj` calls, font sizes alternating 8/16/24/32, every call
 /// emits a 10-char string. That's >120 glyphs; the rasteriser routes
@@ -461,19 +457,16 @@ fn qa_text_multi_font_run_byte_identical() {
 // `pipeline_resolve_text_gs` short-circuits Tr=3 to None, resolves fill for
 // 0/2/4/6 and stroke for 1/2/5/6. Tr=4-7 add to the current clipping path
 // in the spec; the current text rasteriser does NOT implement clip-add for
-// text, so today both paths paint just like 0-2 and don't accumulate clip
-// state. These tests assert PARITY across the toggle — any divergence
-// flags either a pipeline bug or a clip-handling regression.
+// text, so today these modes paint just like 0-2 and don't accumulate
+// clip state. These tests pin that the pipeline drives those modes into
+// the rasteriser without colour or geometry corruption.
 //
-// If the implementation later adds clip-from-text support, these tests'
-// assertions will still hold (parity invariant) but the *inline* path
-// would have to do the clip add as well; otherwise toggle-on would
-// diverge.
+// If the implementation later adds clip-from-text support, these tests
+// will still hold, just with additional clip-state assertions layered
+// on top.
 
-/// Probe 5a — Tr=0 (fill-only): pipeline parity on a plain DeviceRGB fill.
-/// Already covered by the pilot's `pilot_tj_device_rgb_parity` — this is
-/// just the QA-suite anchor making sure the suite's wider Tr coverage has
-/// the trivial mode pinned too.
+/// Probe 5a — Tr=0 (fill-only): the pipeline must paint a plain DeviceRGB
+/// fill on a `Tj` glyph as the expected RGB.
 #[test]
 fn qa_text_tr0_fill_only_paints_red() {
     let content = "BT 1 0 0 rg /F1 40 Tf 0 Tr 10 30 Td (M) Tj ET\n";
@@ -719,10 +712,9 @@ fn qa_text_tj_devicen_multi_colorant_type4_capability() {
 }
 
 /// Probe 9 — Separation with `/All` colorant name on text fill. The
-/// pipeline doesn't special-case the name — runs the tint transform like
-/// any other Separation. Toggle-on must produce the magenta-shape;
-/// toggle-off falls back. Toggle parity is asserted via the
-/// inline-differs-from-pipeline pin (matching the wave-1 sibling).
+/// pipeline doesn't special-case the name — runs the tint transform
+/// like any other Separation, so the rendered glyph picks up the
+/// magenta-shape from the Type 4 program.
 #[test]
 fn qa_text_tj_separation_all_colorant() {
     let type4_program = "{ 0.0 exch 0.0 0.0 }";
@@ -783,10 +775,9 @@ fn qa_text_tj_separation_none_colorant_paints_zero_ink() {
 // that dial value through the pipeline path. Confirm the OUTPUT differs in
 // the expected direction AND each PDF round-trips off-vs-on byte-identical.
 
-/// Probe 11 — Tc (character spacing) preserved through the pipeline. Wider
-/// Tc widens the inter-glyph gap, pushing the rightmost glyph further
-/// right. Both renders are toggle-on; the toggle-off parity is the
-/// secondary invariant.
+/// Probe 11 — Tc (character spacing) preserved through the pipeline.
+/// Wider Tc widens the inter-glyph gap, pushing the rightmost glyph
+/// further right; the spliced GS clone must round-trip Tc unchanged.
 #[test]
 fn qa_text_tc_character_spacing_preserved() {
     let normal = "BT 1 0 0 rg /F1 16 Tf 5 50 Td (HHH) Tj ET\n";
@@ -853,15 +844,14 @@ fn qa_text_tw_word_spacing_preserved() {
     assert_eq!(wide_off, wide_on, "Tw=5 must round-trip through pipeline path");
 }
 
-/// Probe 13 — Tz (horizontal scaling) preserved. The pilot already pins
-/// this against `Tj`; the QA suite adds the `TJ` variant — wave-1's I2
-/// "Tz not applied to vertical advance" fix is on the path-side; verify
-/// it didn't regress wave-2's horizontal-scaled TJ.
+/// Probe 13 — Tz (horizontal scaling) preserved on the `TJ` variant.
+/// Tz must survive the spliced GS clone so the horizontal advance the
+/// rasteriser computes is identical to the un-spliced path.
 #[test]
 fn qa_text_tz_horizontal_scale_preserved_on_tj_array() {
     // Use a multi-glyph plain string in TJ (no kerns, just one segment)
-    // so the same horizontal advance path the pilot exercises for `Tj`
-    // is now driven by `TJ`.
+    // so the same horizontal advance path exercised for `Tj` is also
+    // driven by `TJ`.
     let normal = "BT 1 0 0 rg /F1 16 Tf 5 50 Td [(HHH)] TJ ET\n";
     let narrow = "BT 1 0 0 rg /F1 16 Tf 50 Tz 5 50 Td [(HHH)] TJ ET\n";
     let normal_doc = PdfDocument::from_bytes(build_pdf_text(normal, "")).unwrap();
@@ -891,9 +881,10 @@ fn qa_text_tz_horizontal_scale_preserved_on_tj_array() {
     assert_eq!(narrow_off, narrow_on, "Tz=50 must round-trip through pipeline path");
 }
 
-/// Probe 14 — TL (text leading) preserved. `'` (Quote) uses TL to advance
-/// the text matrix down by `-TL` before painting. Two `'` calls separated
-/// by TL=30 must land on visibly different lines. Toggle parity holds.
+/// Probe 14 — TL (text leading) preserved. `'` (Quote) uses TL to
+/// advance the text matrix down by `-TL` before painting. Two `'`
+/// calls separated by TL=20 must land on visibly different lines after
+/// going through the pipeline.
 #[test]
 fn qa_text_tl_leading_preserved_on_quote() {
     // Two `'` calls. Each advances down by TL=20 from the prior baseline.
@@ -962,12 +953,10 @@ fn qa_text_td_translation_preserved() {
 /// Tz=50 produce the same rightmost ink column. The Tz dial IS applied
 /// to ordinary glyph advance (probe 13 verifies this for plain strings).
 ///
-/// Toggle off and on both exhibit the same behaviour: this is an inline
-/// pre-existing bug (the kerning-advance branch in the rasteriser doesn't
-/// multiply by Tz / 100), not introduced by the wave-2 migration. The
-/// pin asserts the parity invariant — pipeline does NOT make this bug
-/// worse — and is `#[ignore]`d so the gate stays green while the bug
-/// is documented for a follow-up.
+/// This is a pre-existing rasteriser bug (the kerning-advance branch
+/// doesn't multiply by Tz / 100), not introduced by the migration. The
+/// pin documents the bug for a follow-up and is `#[ignore]`d so the
+/// gate stays green.
 #[test]
 #[ignore = "pre-existing inline bug: Tz not applied to TJ numeric kerning advance — parity pin (both paths share the bug)"]
 fn qa_text_tz_not_applied_to_tj_kerning_advance_parity_pin() {
@@ -1085,8 +1074,8 @@ fn build_pdf_cid_type0(content_ops: &str) -> Vec<u8> {
 /// Probe 17 — CID Type 0 font on `Tj`. Identity-H encoding means each
 /// pair of source bytes is a 16-bit CID. Whether the rasteriser falls
 /// back to a system font or paints glyphs correctly is out of scope;
-/// what we pin is the toggle-parity invariant — the pipeline migration
-/// must not perturb the byte-identical output for Type 0 fonts.
+/// what we pin is that the renderer's colour-routing dispatch accepts
+/// Type 0 fonts without panicking and produces a full pixmap.
 #[test]
 fn qa_text_cid_type0_font_no_panic_full_pixmap() {
     // Identity-H two-byte CIDs. The pipeline migration must accept
@@ -1125,10 +1114,10 @@ fn qa_text_embedded_subset_stand_in_paints_blue() {
     );
 }
 
-/// Probe 19 — Built-in Helvetica fallback. Most tests use this implicitly;
-/// this is the explicit pin so the QA suite has a named anchor: the
-/// standard-14 Helvetica path is the most common rendering path and must
-/// be byte-identical under the toggle.
+/// Probe 19 — Built-in Helvetica fallback. Most tests use this
+/// implicitly; this is the explicit pin so the QA suite has a named
+/// anchor: the standard-14 Helvetica path is the most common rendering
+/// path and must paint a recognisable blue glyph through the pipeline.
 #[test]
 fn qa_text_built_in_helvetica_fallback_paints_blue_ink() {
     let content = "BT 0.2 0.4 0.8 rg /F1 24 Tf 10 50 Td (Built-in font!) Tj ET\n";
@@ -1226,9 +1215,10 @@ fn qa_text_unicode_via_tounicode_cmap_paints_red_glyph() {
 // ============================================================================
 
 /// Probe 21 — `Tj` followed by `re` + `f` of the same colour. The text
-/// runs through the wave-2 pipeline (fill side); the rectangle fill runs
-/// through the wave-1 pipeline. Both arms must agree off vs on, AND the
-/// page must contain both the glyph ink AND the rectangle ink.
+/// runs through the text-side pipeline helper (fill side); the
+/// rectangle fill runs through the path-side helper. Both arms must
+/// paint, AND the page must contain both the glyph ink AND the
+/// rectangle ink in the expected colour.
 #[test]
 fn qa_text_tj_followed_by_path_fill_paints_both_regions() {
     let content = "BT 1 0 0 rg /F1 30 Tf 5 70 Td (T) Tj ET\n\
@@ -1246,9 +1236,9 @@ fn qa_text_tj_followed_by_path_fill_paints_both_regions() {
 
 /// Probe 22 — `Tj` inside `q ... Q` save/restore. The save pushes the
 /// current `GraphicsState` onto the stack and restores it on `Q`. The
-/// pipeline's spliced GS clone is transient — it's owned locally by the
-/// operator arm and dropped at end-of-statement, so `q/Q` shouldn't see
-/// it at all. Toggle parity must hold.
+/// pipeline's spliced GS clone is transient — it's owned locally by
+/// the operator arm and dropped at end-of-statement, so `q/Q` shouldn't
+/// see it at all.
 #[test]
 fn qa_text_tj_inside_q_q_restores_outer_color() {
     let content = "1 0 0 rg \
@@ -1351,10 +1341,10 @@ fn qa_text_tj_under_active_clip_paints_inside_only() {
 // Adversarial-input probes — empty / whitespace / extreme TJ offsets.
 // ============================================================================
 
-/// Probe 26 — Empty `Tj ()` paints no glyphs. The pipeline helper still
-/// runs (the operator-arm dispatch fires); the spliced GS clone might
-/// happen, but the rasteriser has zero glyphs to paint. Toggle parity
-/// must hold and the page must remain white.
+/// Probe 26 — Empty `Tj ()` paints no glyphs. The pipeline helper
+/// still runs (the operator-arm dispatch fires); the spliced GS clone
+/// might happen, but the rasteriser has zero glyphs to paint. The
+/// page must remain white.
 #[test]
 fn qa_text_empty_tj_paints_zero_pixels() {
     let content = "BT 1 0 0 rg /F1 30 Tf 10 30 Td () Tj ET\n";
@@ -1366,7 +1356,7 @@ fn qa_text_empty_tj_paints_zero_pixels() {
 
 /// Probe 27 — Whitespace-only Tj string. Tw word-spacing affects only
 /// `0x20` glyphs in the rasteriser; with Tw=0 and a single space, no
-/// visible ink lands (space glyph has zero bbox). Parity must hold.
+/// visible ink lands (space glyph has zero bbox).
 #[test]
 fn qa_text_whitespace_only_tj_paints_zero_pixels() {
     let content = "BT 1 0 0 rg /F1 30 Tf 10 30 Td (   ) Tj ET\n";
@@ -1381,9 +1371,9 @@ fn qa_text_whitespace_only_tj_paints_zero_pixels() {
     );
 }
 
-/// Probe 28 — TJ with an extreme negative numeric offset that would push
-/// the text cursor far off the page. The pipeline migration must not
-/// crash AND parity must hold.
+/// Probe 28 — TJ with an extreme negative numeric offset that would
+/// push the text cursor far off the page. The pipeline path must not
+/// crash on the off-page cursor.
 #[test]
 fn qa_text_tj_extreme_negative_offset_no_panic() {
     // -32767 in TJ units is -32.767 × fontSize × Tz/100 ~ -491 pt at
@@ -1396,9 +1386,9 @@ fn qa_text_tj_extreme_negative_offset_no_panic() {
     assert!(on.is_some(), "extreme TJ offset must not panic the renderer");
 }
 
-/// Probe 29 — TJ array containing only numeric kerning offsets (no string
-/// segments). The array advances the text cursor but paints no glyphs.
-/// Parity must hold and no ink should appear.
+/// Probe 29 — TJ array containing only numeric kerning offsets (no
+/// string segments). The array advances the text cursor but paints no
+/// glyphs; no ink should appear.
 #[test]
 fn qa_text_tj_all_numeric_array_paints_zero_pixels() {
     let content = "BT 1 0 0 rg /F1 30 Tf 10 50 Td [-100 -200 -300] TJ ET\n";
@@ -1414,24 +1404,17 @@ fn qa_text_tj_all_numeric_array_paints_zero_pixels() {
 }
 
 // ============================================================================
-// Performance probes — pipeline-on must not blow up vs pipeline-off, AND the
-// claimed "one resolve per Tj" invariant must hold (1000 glyphs spread across
-// 10 Tj calls should see ~10× the resolve cost, not 1000×).
+// Performance probes — the "one resolve per Tj" invariant must hold (1000
+// glyphs spread across 10 Tj calls should see ~10× the resolve cost, not
+// 1000×).
 // ============================================================================
 
-/// Probe 30 — 1000-glyph render under both toggle states. Wall-clock
-/// comparison ensures the pipeline path stays within a sane multiplier
-/// of the inline path (we pick 6× as the bound: the toggle introduces
-/// one resolver-construction + one GS clone per Tj call; with 10 Tj
-/// calls each painting 100 glyphs, that's 10 resolver calls and 10
-/// clones, dwarfed by 1000 glyph rasterisations).
-///
-/// This is a sanity bound, not a tight benchmark — runner schedule
-/// jitter would make a tight bound flake. The bound catches the
-/// "pipeline accidentally resolves per glyph" regression.
-/// Allocation pressure pin: a 1000-glyph pipeline render must complete
-/// within a generous wall-clock budget. Coarse check that catches O(N)
-/// per-glyph allocation spirals without flaking on shared CI runners.
+/// Probe 30 — 1000-glyph render through the pipeline. Wall-clock budget
+/// catches the "pipeline accidentally resolves per glyph" regression
+/// without flaking on shared CI runners: one resolver-construction +
+/// one GS clone per Tj call, with 10 Tj calls each painting 100 glyphs,
+/// is 10 resolver calls and 10 clones, dwarfed by 1000 glyph
+/// rasterisations.
 #[test]
 fn qa_text_perf_thousand_glyphs_completes_within_budget() {
     let mut content = String::from("BT 0 0 1 rg /F1 6 Tf 5 90 Td ");
