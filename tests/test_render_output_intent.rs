@@ -1707,6 +1707,83 @@ fn qa_round3_cache_keys_include_rendering_intent() {
     );
 }
 
+/// Pin that 1000 same-colour bare `/DeviceRGB` paints routed through a
+/// page-level `/DefaultRGB [/ICCBased N=3]` override build the qcms
+/// `Transform` exactly once. The cache is keyed on
+/// `(profile.content_hash(), intent)` — n_components-agnostic by
+/// design — so an N=3 profile routed through the resolver MUST hit the
+/// cache after the first build, exactly as the N=4 CMYK path does.
+///
+/// Without the cache wiring, every bare `rg` paint reparses the
+/// embedded profile and rebuilds the qcms transform; the per-page
+/// counter would land at 1000 instead of 1. This probe is the
+/// structural counterpart of `output_intent_thousand_cmyk_paints_*`
+/// for the N=3 arm of `resolve_iccbased`.
+///
+/// Fixture: a one-page PDF whose `/Resources /ColorSpace /DefaultRGB`
+/// is `[/ICCBased <constant-CLUT N=3 LUT8>]` and whose content stream
+/// emits 1000 identical `0.8 0.2 0.5 rg` + `re` + `f` triples.
+#[cfg(feature = "test-support")]
+#[test]
+fn qa_round4_thousand_rgb_paints_through_default_rgb_build_one_transform() {
+    use pdf_oxide::rendering::{PageRenderer, RenderOptions};
+
+    let profile = build_minimal_rgb_to_lab_lut8_profile(PROFILE_B_TARGET_L_BYTE);
+    let mut ops = String::new();
+    for i in 0..1000 {
+        let y = i % 100;
+        ops.push_str(&format!("0.8 0.2 0.5 rg\n0 {y} 1 1 re\nf\n"));
+    }
+
+    // Fixture: bake the /DefaultRGB override into a one-page PDF
+    // whose ICC stream carries the N=3 profile we just built. Mirror
+    // the shape of `build_pdf_default_rgb_overrides_bare_device_rgb`
+    // but parameterise the content stream so the 1000-paint loop
+    // composes here.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /DefaultRGB [/ICCBased 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_off = buf.len();
+    let icc_hdr = format!("5 0 obj\n<< /N 3 /Length {} >>\nstream\n", profile.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(&profile);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(buf).expect("open");
+    let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72));
+    let _ = renderer.render_page(&doc, 0).expect("render");
+
+    let built = renderer.cmyk_transform_cache_build_count();
+    assert_eq!(
+        built, 1,
+        "1000 same-colour bare /DeviceRGB paints routed through a page-level \
+         /DefaultRGB [/ICCBased N=3] override must build qcms::Transform \
+         exactly once. Built {built} times — the N=3 arm of resolve_iccbased \
+         is bypassing the per-page transform cache (a build_count of 1000 means \
+         every paint reparsed the profile and rebuilt the transform; the cache \
+         exists to amortise this)."
+    );
+}
+
 // ===========================================================================
 // Phase 8: rendering-intent dispatch — qcms 0.3.0 limitation pin
 // ===========================================================================
