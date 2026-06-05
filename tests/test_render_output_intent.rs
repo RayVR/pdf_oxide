@@ -40,14 +40,13 @@ const OUTPUT_INTENT_DEFER_PHASE_7_CACHING: &str =
     "OUTPUT_INTENT_DEFER_PHASE_7_CACHING: plan phase 7 will cache compiled qcms transforms; \
      until then per-paint transform construction is the baseline";
 
-/// Page-level `/DefaultCMYK` override (§8.6.5.6) is threaded onto the
-/// `ResolutionContext` but the colour stage does not yet consume it; the
-/// plan defers the consumer to phase 9. The probe lives here so the
-/// future phase 9 commit deletes the `#[ignore]` rather than having to
-/// invent the test from scratch.
-const OUTPUT_INTENT_DEFER_PHASE_9_DEFAULT_CMYK: &str =
-    "OUTPUT_INTENT_DEFER_PHASE_9_DEFAULT_CMYK: plan phase 9 will route /DefaultCMYK page-level \
-     overrides ahead of the document /OutputIntents profile";
+/// Form XObject inheritance of /OutputIntents was originally tagged
+/// against the same marker as /DefaultCMYK (round 1); the placeholder
+/// probe lives below and stays ignored until a Form-XObject fixture
+/// helper lands.
+const OUTPUT_INTENT_DEFER_FORM_XOBJECT_INHERITANCE: &str =
+    "OUTPUT_INTENT_DEFER_FORM_XOBJECT_INHERITANCE: needs a Form XObject test-fixture helper \
+     before the inheritance probe can be wired";
 
 // ===========================================================================
 // Minimal CMYK ICC profile synthesis
@@ -260,6 +259,103 @@ fn build_minimal_cmyk_to_rgb_lut8_profile_with_version(
     // A2B0 tag data.
     profile.extend_from_slice(&lut);
 
+    profile
+}
+
+/// Build a minimal valid ICC v2 RGB→Lab profile whose A2B0 LUT8 maps
+/// every RGB input to a fixed Lab tuple. Mirrors the CMYK builder's
+/// constant-CLUT trick at `in_chan=3` so the qcms reference is a
+/// stable point: whichever RGB the renderer feeds through the profile,
+/// the output is the same near-neutral grey at L*=target_l_byte/255*100.
+///
+/// Used by the Phase 9 `/DefaultRGB` precedence probe: the override
+/// declared as `[/ICCBased <stream>]` against bare /DeviceRGB paint
+/// routes the components through this profile; the rendered pixel
+/// matches the qcms reference RGB regardless of the painted RGB value.
+///
+/// qcms 0.3.0's LUT8 parser at `iccread.rs:760` accepts `in_chan ∈ {3,
+/// 4}` only; this builder targets the `in_chan=3` slot. The synthesised
+/// device class is `prtr` and the PCS is `Lab ` so the same Lab→sRGB
+/// decoder runs for both CMYK and RGB fixture profiles — only the
+/// input-channel count and CLUT-grid power differ.
+fn build_minimal_rgb_to_lab_lut8_profile(target_l_byte: u8) -> Vec<u8> {
+    // LUT8 tag body for in=3 out=3 grid=2.
+    // Sizes:
+    //   header: 48
+    //   input tables: 3 * 256 = 768
+    //   CLUT: 2^3 * 3 = 24
+    //   output tables: 3 * 256 = 768
+    //   total: 1608 bytes
+    let in_chan: u8 = 3;
+    let out_chan: u8 = 3;
+    let grid: u8 = 2;
+    let mut lut = Vec::with_capacity(1608);
+
+    // Type signature 'mft1'.
+    lut.extend_from_slice(&0x6d66_7431u32.to_be_bytes());
+    // Reserved.
+    lut.extend_from_slice(&0u32.to_be_bytes());
+    lut.push(in_chan);
+    lut.push(out_chan);
+    lut.push(grid);
+    lut.push(0); // padding
+
+    // 9 × s15Fixed16 matrix entries (identity matrix). For RGB inputs
+    // qcms applies this matrix to the raw input components before the
+    // CLUT lookup; identity preserves them.
+    let identity: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+    for v in identity {
+        lut.extend_from_slice(&(v as u32).to_be_bytes());
+    }
+
+    // Input tables — identity 0..255 for each of 3 input channels.
+    for _ in 0..in_chan {
+        for i in 0..256u16 {
+            lut.push(i as u8);
+        }
+    }
+
+    // CLUT: 2^3 = 8 grid points × 3 output channels. Every grid point
+    // outputs Lab(target_L, 0, 0) — the constant-CLUT trick that makes
+    // the qcms reference unambiguous.
+    let grid_size = (grid as usize).pow(in_chan as u32);
+    for _ in 0..grid_size {
+        lut.push(target_l_byte);
+        lut.push(128);
+        lut.push(128);
+    }
+
+    // Output tables — identity 0..255 for each of 3 output channels.
+    for _ in 0..out_chan {
+        for i in 0..256u16 {
+            lut.push(i as u8);
+        }
+    }
+
+    debug_assert_eq!(lut.len(), 1608, "RGB LUT8 body size mismatch");
+
+    // ICC profile envelope: 128-byte header + 4 (count) + 12 (one tag
+    // entry) + 1608 (A2B0 data) = 1752 bytes.
+    let mut profile = vec![0u8; 128];
+    let total_size: u32 = 128 + 4 + 12 + lut.len() as u32;
+    profile[0..4].copy_from_slice(&total_size.to_be_bytes());
+    profile[8..12].copy_from_slice(&IccProfileVersion::V2.header_bytes());
+    profile[12..16].copy_from_slice(b"prtr");
+    // Colour space: 'RGB ' — three-channel input.
+    profile[16..20].copy_from_slice(b"RGB ");
+    // PCS: 'Lab ' — same Lab→sRGB decoder as the CMYK fixture.
+    profile[20..24].copy_from_slice(b"Lab ");
+    profile[36..40].copy_from_slice(b"acsp");
+    profile[64..68].copy_from_slice(&0u32.to_be_bytes());
+    profile[68..72].copy_from_slice(&0x0000_F6D6u32.to_be_bytes()); // X 0.9642
+    profile[72..76].copy_from_slice(&0x0001_0000u32.to_be_bytes()); // Y 1.0
+    profile[76..80].copy_from_slice(&0x0000_D32Du32.to_be_bytes()); // Z 0.8249
+
+    profile.extend_from_slice(&1u32.to_be_bytes());
+    profile.extend_from_slice(&0x4132_4230u32.to_be_bytes()); // 'A2B0'
+    profile.extend_from_slice(&144u32.to_be_bytes()); // offset
+    profile.extend_from_slice(&(lut.len() as u32).to_be_bytes()); // size
+    profile.extend_from_slice(&lut);
     profile
 }
 
@@ -570,6 +666,219 @@ fn build_pdf_embedded_iccbased_with_different_output_intent(
     for off in [
         cat_off, pages_off, page_off, stream_off, icc_a_off, icc_b_off,
     ] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    buf
+}
+
+/// Build a PDF whose page declares BOTH `/OutputIntents` profile A and
+/// page Resources `/ColorSpace /DefaultCMYK [/ICCBased <profile B>]`,
+/// then paints a bare `/DeviceCMYK` (`0.25 0 0 0 k`) rectangle.
+///
+/// ISO 32000-1:2008 §8.6.5.6: the `/DefaultCMYK` override redirects
+/// bare /DeviceCMYK paint through the override's colour space —
+/// independently of any document-level /OutputIntents profile. The
+/// override therefore wins on the rendered pixel.
+///
+/// Object layout:
+///   1 — Catalog (with /OutputIntents → 5 0 R)
+///   2 — Pages
+///   3 — Page (with Resources /ColorSpace /DefaultCMYK → ICCBased
+///       referencing 6 0 R)
+///   4 — Content stream
+///   5 — OutputIntent profile A stream
+///   6 — DefaultCMYK embedded profile B stream
+fn build_pdf_default_cmyk_overrides_output_intent(
+    output_intent_profile_a: &[u8],
+    default_cmyk_profile_b: &[u8],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    let catalog = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK A) /DestOutputProfile 5 0 R >>] >>\nendobj\n";
+    buf.extend_from_slice(catalog.as_bytes());
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    // /DefaultCMYK is a named entry in /Resources /ColorSpace per
+    // §8.6.5.6. Its value is an ICCBased colour space wrapping profile B.
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /DefaultCMYK [/ICCBased 6 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    // Bare /DeviceCMYK paint via `k` — the canonical case §8.6.5.6
+    // redirects through /DefaultCMYK.
+    let content = "0.25 0 0 0 k\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_a_off = buf.len();
+    let icc_a_hdr =
+        format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", output_intent_profile_a.len());
+    buf.extend_from_slice(icc_a_hdr.as_bytes());
+    buf.extend_from_slice(output_intent_profile_a);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_b_off = buf.len();
+    let icc_b_hdr =
+        format!("6 0 obj\n<< /N 4 /Length {} >>\nstream\n", default_cmyk_profile_b.len());
+    buf.extend_from_slice(icc_b_hdr.as_bytes());
+    buf.extend_from_slice(default_cmyk_profile_b);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let obj_count = 7;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [
+        cat_off, pages_off, page_off, stream_off, icc_a_off, icc_b_off,
+    ] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    buf
+}
+
+/// Build a PDF whose page declares `/Resources /ColorSpace /DefaultRGB
+/// [/ICCBased <stream>]` and paints bare `/DeviceRGB` with `rg`.
+/// §8.6.5.6 redirects the bare paint through the /DefaultRGB override.
+///
+/// No /OutputIntents declared — RGB OutputIntents aren't carried by the
+/// pipeline at all (only CMYK /N=4), so the only thing that can
+/// influence bare-DeviceRGB rendering through this fixture is the
+/// /DefaultRGB consumer the resolver gains in this phase.
+///
+/// Object layout:
+///   1 — Catalog
+///   2 — Pages
+///   3 — Page (with Resources /ColorSpace /DefaultRGB → ICCBased
+///       referencing 5 0 R)
+///   4 — Content stream
+///   5 — DefaultRGB embedded N=3 profile stream
+fn build_pdf_default_rgb_overrides_bare_device_rgb(default_rgb_profile: &[u8]) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /DefaultRGB [/ICCBased 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    // Bare /DeviceRGB paint via `rg` — `0.8 0.2 0.5 rg` is RGB(204, 51, 128)
+    // in raw bytes. With the override active the renderer routes the
+    // three components through the override profile; without it, the
+    // raw bytes land on the canvas directly.
+    let content = "0.8 0.2 0.5 rg\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_off = buf.len();
+    // RGB ICC profile stream: /N 3 (not 4 — this is a 3-channel input
+    // profile).
+    let icc_hdr = format!("5 0 obj\n<< /N 3 /Length {} >>\nstream\n", default_rgb_profile.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(default_rgb_profile);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let obj_count = 6;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    buf
+}
+
+/// Build a PDF whose page declares `/Resources /ColorSpace /DefaultGray
+/// [/Separation /MagentaSpot /DeviceCMYK <Type-4>]` and paints bare
+/// `/DeviceGray` with `g`. §8.6.5.6 redirects the bare paint through the
+/// /DefaultGray override.
+///
+/// The Separation tint transform `{ 0.0 exch 0.0 0.0 }` consumes the
+/// single gray input and emits CMYK(0, gray, 0, 0). For gray=0.5 the
+/// alternate is CMYK(0, 0.5, 0, 0); §10.3.5 projects that to
+/// RGB(255, 127, 255) — a magenta that's clearly distinct from the
+/// literal grey RGB(127, 127, 127) the bare paint would produce
+/// without the override.
+///
+/// Object layout:
+///   1 — Catalog
+///   2 — Pages
+///   3 — Page (with Resources /ColorSpace /DefaultGray → Separation
+///       array referencing 5 0 R)
+///   4 — Content stream
+///   5 — Tint-transform Type-4 stream
+fn build_pdf_default_gray_routes_bare_device_gray() -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    // /DefaultGray is a Separation that lifts the gray input into the
+    // M channel; the alternate is /DeviceCMYK so §10.3.5 yields a
+    // magenta-channel-only pixel.
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /DefaultGray [/Separation /MagentaSpot /DeviceCMYK 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    // Bare /DeviceGray paint via `g` at gray=0.5.
+    let content = "0.5 g\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let tint_off = buf.len();
+    let tint_program: &[u8] = b"{ 0.0 exch 0.0 0.0 }";
+    let tint_hdr = format!(
+        "5 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n",
+        tint_program.len()
+    );
+    buf.extend_from_slice(tint_hdr.as_bytes());
+    buf.extend_from_slice(tint_program);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let obj_count = 6;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [cat_off, pages_off, page_off, stream_off, tint_off] {
         buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
     }
     buf.extend_from_slice(
@@ -1069,19 +1378,224 @@ fn output_intent_does_not_leak_into_subsequent_rgb_overpaint() {
 /// Currently `#[ignore]`-ed pending a Form-XObject test-fixture helper;
 /// the marker captures the gap so a follow-up audit picks it up.
 #[test]
-#[ignore = "OUTPUT_INTENT_DEFER_PHASE_9_DEFAULT_CMYK"]
+#[ignore = "OUTPUT_INTENT_DEFER_FORM_XOBJECT_INHERITANCE"]
 fn output_intent_inherited_by_form_xobject_paint() {
     panic!("placeholder: needs a Form XObject test-fixture helper");
 }
 
-/// Pin the page-level `/DefaultCMYK` override precedence. With the field
-/// threaded onto `ResolutionContext` but no consumer yet, this probe is
-/// deferred. The marker exists so the phase 9 commit knows where to
-/// turn the probe on.
+/// Pin the page-level `/DefaultCMYK` override precedence over the
+/// document `/OutputIntents` profile for bare `/DeviceCMYK` paint.
+///
+/// ISO 32000-1:2008 §8.6.5.6 says: when a page declares
+/// `/Resources /ColorSpace /DefaultCMYK <override>`, any bare
+/// `/DeviceCMYK` paint operator (`k`/`K`/`scn` against a DeviceCMYK
+/// alias) MUST be interpreted as if it specified `<override>` instead
+/// of the device family default. The override therefore wins over the
+/// document-level `/OutputIntents` profile when present, because the
+/// override IS the page's declared CMYK colour space and OutputIntent
+/// only applies as the default when no override has been declared.
+///
+/// Fixture geometry:
+///   - Catalog declares /OutputIntents → profile A (target_l_byte=135 →
+///     qcms reference RGB(126,126,126)).
+///   - Page Resources /ColorSpace /DefaultCMYK → [/ICCBased <stream B>]
+///     where profile B has target_l_byte=200 → qcms reference
+///     RGB(194,194,194).
+///   - Content stream: `0.25 0 0 0 k   20 20 60 60 re   f`. The `k`
+///     operator paints bare /DeviceCMYK, exactly the case §8.6.5.6
+///     redirects through /DefaultCMYK.
+///
+/// Three observable outcomes:
+///   - (194, 194, 194, 255): /DefaultCMYK override won — pass.
+///   - (126, 126, 126, 255): OutputIntent won — fail (precedence inverted;
+///     §8.6.5.6 says /DefaultCMYK takes precedence over the document
+///     default).
+///   - (191, 255, 255, 255): §10.3.5 additive-clamp fired — neither
+///     profile consulted (an even worse regression).
 #[test]
-#[ignore = "OUTPUT_INTENT_DEFER_PHASE_9_DEFAULT_CMYK"]
 fn page_level_default_cmyk_takes_precedence_over_output_intent() {
-    panic!("placeholder: not yet implemented — phase 9 consumer pending");
+    let profile_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let profile_b = build_minimal_cmyk_to_rgb_lut8_profile(PROFILE_B_TARGET_L_BYTE);
+
+    // Sanity-pin both profiles compile through qcms and produce the
+    // expected byte-exact references — without this gate a regression
+    // in profile B's transform would make the integration assertion
+    // fire for the wrong reason.
+    {
+        use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+        use std::sync::Arc;
+        let prof_a = Arc::new(IccProfile::parse(profile_a.clone(), 4).expect("parse A"));
+        let prof_b = Arc::new(IccProfile::parse(profile_b.clone(), 4).expect("parse B"));
+        let t_a = Transform::new_srgb_target(prof_a, RenderingIntent::RelativeColorimetric);
+        let t_b = Transform::new_srgb_target(prof_b, RenderingIntent::RelativeColorimetric);
+        assert_eq!(
+            t_a.convert_cmyk_pixel(64, 0, 0, 0),
+            [126u8, 126, 126],
+            "profile A reference must be (126,126,126); fixture is invalid otherwise"
+        );
+        assert_eq!(
+            t_b.convert_cmyk_pixel(64, 0, 0, 0),
+            [194u8, 194, 194],
+            "profile B reference must be (194,194,194); fixture is invalid otherwise"
+        );
+    }
+
+    let pdf = build_pdf_default_cmyk_overrides_output_intent(&profile_a, &profile_b);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    assert!(
+        doc.output_intent_cmyk_profile().is_some(),
+        "fixture must declare a CMYK OutputIntent so the precedence is actually contested"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    let (br, bg, bb) = PROFILE_B_RGB_AT_FIXTURE_INPUT;
+    assert_eq!(
+        (r, g, b, a),
+        (br, bg, bb, 255),
+        "page-level /DefaultCMYK override must take precedence over /OutputIntents \
+         on bare /DeviceCMYK paint; expected B's qcms reference {:?}; got ({r},{g},{b},{a}). \
+         (126,126,126,_) means OutputIntent won — §8.6.5.6 precedence is inverted. \
+         (191,255,255,_) means neither profile was consulted and §10.3.5 fired.",
+        (br, bg, bb, 255u8)
+    );
+}
+
+/// Negative pin: when the page declares NO `/DefaultCMYK` override,
+/// bare `/DeviceCMYK` paint must fall through to the document
+/// `/OutputIntents` profile (the round-1 behaviour). This is the
+/// contrapositive of the precedence test above — it pins that the
+/// override consumer doesn't fire spuriously when no override is
+/// declared, otherwise a regression that always routed through some
+/// hard-coded path would pass the positive test by coincidence.
+#[test]
+fn no_default_cmyk_falls_through_to_output_intent() {
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let pdf = build_pdf_cmyk_with_output_intent(&icc);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (126u8, 126, 126, 255),
+        "no /DefaultCMYK declared → bare DeviceCMYK paint must route through \
+         /OutputIntents (round-1 behaviour); got ({r},{g},{b},{a})"
+    );
+}
+
+/// Pin the page-level `/DefaultRGB` override drives bare `/DeviceRGB`
+/// paint through the override's colour space, even when no `/OutputIntents`
+/// is present. §8.6.5.6 redirects bare device-family paint through the
+/// /Default<DeviceFamily> override; for RGB this is the only place an
+/// override can influence rendering (OutputIntent in our pipeline only
+/// carries CMYK).
+///
+/// Fixture: /DefaultRGB → [/ICCBased <stream>] where the embedded N=3
+/// LUT8 profile maps every RGB input to constant `Lab(target_l_byte=200,
+/// 0, 0)` → qcms reference RGB(194, 194, 194). Content paints
+/// `0.8 0.2 0.5 rg`. Without the override the rendered pixel would be
+/// the literal RGB(0.8, 0.2, 0.5) = (204, 51, 128). With the override
+/// active the rendered pixel must be the qcms reference value.
+#[test]
+fn page_level_default_rgb_routes_bare_device_rgb_through_override() {
+    let profile = build_minimal_rgb_to_lab_lut8_profile(PROFILE_B_TARGET_L_BYTE);
+
+    // Sanity-pin the synthesised RGB profile actually compiles and
+    // produces the expected reference. Without this gate the integration
+    // assertion below could fail for the wrong reason (e.g. profile
+    // rejected → resolver fall-through → literal RGB observed).
+    let rgb_ref = {
+        use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+        use std::sync::Arc;
+        let prof = Arc::new(IccProfile::parse(profile.clone(), 3).expect("RGB profile parses"));
+        let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
+        assert!(
+            t.has_cmm(),
+            "synthesised RGB LUT8 profile must compile into a real qcms CMM; \
+             without it the /DefaultRGB test degrades to additive fall-through and \
+             asserts the wrong thing"
+        );
+        // For RGB input qcms uses convert_rgb_buffer (3 bytes in → 3 bytes
+        // out). Get the reference for a representative input.
+        let mut out = [0u8; 3];
+        out.copy_from_slice(&t.convert_rgb_buffer(&[204u8, 51, 128]));
+        out
+    };
+
+    let pdf = build_pdf_default_rgb_overrides_bare_device_rgb(&profile);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (rgb_ref[0], rgb_ref[1], rgb_ref[2], 255),
+        "page-level /DefaultRGB override must route bare /DeviceRGB paint \
+         through the override profile; expected qcms reference {:?}; \
+         got ({r},{g},{b},{a}). (204,51,128,_) means the override was not \
+         consulted and the literal RGB landed on the canvas directly.",
+        rgb_ref
+    );
+}
+
+/// Pin the page-level `/DefaultGray` override drives bare `/DeviceGray`
+/// paint through the override's colour space.
+///
+/// Fixture: /DefaultGray → [/Separation /MagentaSpot /DeviceCMYK <Type-4
+/// tint transform>] that lifts the gray input into the M channel:
+/// `gray → CMYK(0, gray, 0, 0)`. Painting `0.5 g` (bare DeviceGray)
+/// without the override would produce literal RGB(127, 127, 127). With
+/// the override active, the gray value routes through the Separation,
+/// produces CMYK(0, 0.5, 0, 0), and projects to RGB(255, 127, 255) via
+/// §10.3.5 (no OutputIntent declared in this fixture). The colour
+/// change is visible and discriminates the routes.
+///
+/// Why not an ICC Gray profile? qcms 0.3.0's LUT8 (`mft1`) parser
+/// (`iccread.rs:760`) only accepts in_chan ∈ {3, 4}; a 1-channel LUT8
+/// would be rejected at compile time. Real Gray ICC profiles use TRC
+/// (Tone Reproduction Curve) tags, which require richer fixture
+/// construction. The Separation/Type-4 override exercises the same
+/// dispatch path the /DefaultGray consumer needs to drive — when the
+/// override is declared, the resolver MUST hand the gray component to
+/// the override's space rather than emitting bare gray RGBA — without
+/// rebuilding a Gray ICC fixture.
+#[test]
+fn page_level_default_gray_routes_bare_device_gray_through_override() {
+    let pdf = build_pdf_default_gray_routes_bare_device_gray();
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "fixture must declare no /OutputIntents — the override drives the route \
+         entirely; an OutputIntent in play would confound the assertion"
+    );
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    // The Separation tint transform `{ 0.0 exch 0.0 0.0 }` consumes the
+    // single gray-component input and emits CMYK(0, gray, 0, 0). For
+    // gray=0.5 the alternate is CMYK(0, 0.5, 0, 0) → §10.3.5 produces
+    // R=1, G=1-0.5=0.5, B=1. The 0.5 channel rounds to 128 (round-half-
+    // up via Rust f32 → u8 cast at the pixel-writer boundary). The
+    // R=255, B=255 channels and the M-only behaviour are the
+    // discriminating signal — they are byte-exact and would be
+    // ABSENT if the override was bypassed (literal gray would produce
+    // RGB(128, 128, 128) with no magenta channel).
+    assert_eq!(
+        r, 255,
+        "/DefaultGray override → Separation magenta projection must produce R=255 \
+         (additive-clamp of CMYK(0,0.5,0,0) leaves R=1.0); got ({r},{g},{b},{a}). \
+         (128,*,*) means the override was bypassed and the literal gray landed."
+    );
+    assert_eq!(
+        b, 255,
+        "/DefaultGray override → Separation magenta projection must produce B=255; \
+         got ({r},{g},{b},{a})"
+    );
+    assert!(
+        (120..=130).contains(&g),
+        "/DefaultGray override → Separation magenta projection must produce \
+         G ≈ 127-128 (1.0 - 0.5 = 0.5 → 127.5 rounded); got G={g}, full pixel \
+         ({r},{g},{b},{a}). G=255 would mean no magenta — override bypassed."
+    );
+    assert_eq!(a, 255, "alpha=1 paint must be fully opaque; got a={a}");
 }
 
 /// Pin that 1000 same-colour `/DeviceCMYK` paint operators on a single
