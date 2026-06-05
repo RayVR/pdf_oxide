@@ -30,13 +30,7 @@
 
 use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
-use std::sync::Mutex;
 use std::time::Instant;
-
-/// Process-wide lock retained as scaffolding so the `render_with_pipeline`
-/// helpers keep a single serialisation point if a future probe needs to
-/// mutate process-global rendering state.
-static PIPELINE_TOGGLE_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // PDF construction helpers — self-contained so a fix-pass to the wave-1 QA
@@ -260,7 +254,6 @@ fn build_pdf_text_with_devicen_type4(
 /// test bodies keep compiling after wave 5 collapsed the off/on split; the
 /// pipeline is the only path now.
 fn render_with_pipeline(doc: &PdfDocument, _enabled: bool) -> Vec<u8> {
-    let _guard = PIPELINE_TOGGLE_LOCK.lock().unwrap();
     let opts = RenderOptions::with_dpi(72).as_raw();
     let img = render_page(doc, 0, &opts).expect("render_page succeeds");
     assert_eq!(img.format, ImageFormat::RawRgba8);
@@ -271,7 +264,6 @@ fn render_with_pipeline(doc: &PdfDocument, _enabled: bool) -> Vec<u8> {
 /// adversarial-input probes whose invariant is "no panic", not "render
 /// succeeds".
 fn render_with_pipeline_allow_fail(doc: &PdfDocument, _enabled: bool) -> Option<Vec<u8>> {
-    let _guard = PIPELINE_TOGGLE_LOCK.lock().unwrap();
     let opts = RenderOptions::with_dpi(72).as_raw();
     render_page(doc, 0, &opts).ok().map(|img| img.data)
 }
