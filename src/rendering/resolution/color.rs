@@ -112,6 +112,25 @@ impl ColorResolver {
         let Some(space) = override_obj else {
             return Ok(None);
         };
+
+        // §8.6.5.6 requires the override entry to be a colour space:
+        // either a Name (device-family alias such as `/DeviceCMYK`,
+        // `/CalGray`) or an Array (`[/ICCBased ...]`, `[/Separation
+        // ...]`, etc.). A malformed entry (string, integer, bool,
+        // dictionary…) is structurally indistinguishable from the
+        // entry being absent — honouring it would silently
+        // mis-render through `resolve_spaced`'s `first_as_gray`
+        // catch-all (a quarter-tint CMYK paint coming out as 25%
+        // gray is worse than the spec-fallback / OutputIntent
+        // render). Return None so the caller falls through to the
+        // device-family path (`device_to_rgba`), which routes CMYK
+        // through `cmyk_to_rgb_via_intent` and so consults
+        // `/OutputIntents` when present, or §10.3.5 additive-clamp
+        // when not.
+        if space.as_name().is_none() && space.as_array().is_none() {
+            return Ok(None);
+        }
+
         // The override resolves via the same colour-space pipeline
         // as an explicit `cs <space>` paint — that's the whole point
         // of §8.6.5.6: the override colour space stands in for the
