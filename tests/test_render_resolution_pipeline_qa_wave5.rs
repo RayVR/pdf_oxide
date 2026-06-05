@@ -168,6 +168,173 @@ fn center_pixel(rgba: &[u8]) -> (u8, u8, u8, u8) {
 }
 
 // ===========================================================================
+// PROBE 2, 8: SeparationBackend / separation_renderer parity at the public API
+//
+// Wave 5 added an in-process `SeparationBackend` implementing `PaintBackend`
+// for per-plate output, with a byte-for-byte equivalence unit test against
+// the inline `fill_separation` helper for one specific CMYK fill. Here we
+// probe the same equivalence at the public surface — `render_separation` /
+// `render_separations` — for a richer set of inputs:
+//
+// - DeviceCMYK k operator at (0.5, 0.0, 0.0, 0.0) — pin Cyan plate ≈ 0.5,
+//   other process plates at zero (knock-out under default OP=false).
+// - Multi-plate routing at (0.5, 0.25, 0.1, 0.7): pin each process plate
+//   independently.
+// - Type-4 Separation `scn` at full tint — pin the spot plate is painted
+//   and the process plates aren't (the wave-5 separation_renderer
+//   still uses `tint_for_ink` here per the documented deferral; this is
+//   the existing capability, not a wave-5 capability gain).
+// ===========================================================================
+
+fn build_pdf_cmyk_fill_rect(c: f32, m: f32, y: f32, k: f32) -> Vec<u8> {
+    // `c m y k k` operator + 10×10 rect at (10, 10).
+    let content = format!("{} {} {} {} k\n10 10 80 80 re\nf\n", c, m, y, k);
+    build_pdf(&content, "")
+}
+
+/// Probe 8a — DeviceCMYK pure cyan: only the Cyan plate carries ink at
+/// the rect, all other process plates are zero across the rect (no
+/// knock-out painted on inks the source colour doesn't name, because
+/// the default OP=false would knock them out — but the per-plate
+/// shipping renderer's behaviour is "untouched if value is zero" via
+/// `tint_for_ink`; we pin whatever the shipping behaviour is).
+#[test]
+fn qa_wave5_separation_cmyk_pure_cyan_plate_carries_tint() {
+    use pdf_oxide::rendering::render_separation;
+    let bytes = build_pdf_cmyk_fill_rect(0.5, 0.0, 0.0, 0.0);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let cyan = render_separation(&doc, 0, "Cyan", 72).expect("render Cyan plate");
+    let magenta = render_separation(&doc, 0, "Magenta", 72).expect("render Magenta plate");
+    let yellow = render_separation(&doc, 0, "Yellow", 72).expect("render Yellow plate");
+    let black = render_separation(&doc, 0, "Black", 72).expect("render Black plate");
+    // Sample inside the rect (PDF user-units = 100×100 → 72-DPI = 100px).
+    // The rect is at (10, 10, 90, 90). PDF y-axis is bottom-up; the
+    // separation renderer's base transform maps that to image-space.
+    // Pick a point safely inside the rect at (50, 50) image-space.
+    let idx = (50 * cyan.width as usize) + 50;
+    let cyan_value = cyan.data[idx];
+    let magenta_value = magenta.data[idx];
+    let yellow_value = yellow.data[idx];
+    let black_value = black.data[idx];
+    // Cyan tint = 0.5 → 127 or 128 (rounding).
+    assert!(
+        (126..=129).contains(&cyan_value),
+        "Cyan plate must carry tint ~0.5 (127/128); got {cyan_value}"
+    );
+    // Per shipping `tint_for_ink`: zero CMYK components paint zero.
+    // Zero is "no ink", which is the same as "untouched" in plate
+    // grayscale (0 = no ink coverage).
+    assert_eq!(magenta_value, 0, "Magenta plate untouched (tint 0)");
+    assert_eq!(yellow_value, 0, "Yellow plate untouched (tint 0)");
+    assert_eq!(black_value, 0, "Black plate untouched (tint 0)");
+}
+
+/// Probe 8b — Multi-plate routing: DeviceCMYK fill at (0.5, 0.25, 0.0,
+/// 0.7). All four process plates should carry their respective tints.
+#[test]
+fn qa_wave5_separation_cmyk_mixed_routes_each_plate_independently() {
+    use pdf_oxide::rendering::render_separations;
+    let bytes = build_pdf_cmyk_fill_rect(0.5, 0.25, 0.0, 0.7);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let plates = render_separations(&doc, 0, 72).expect("render separations");
+    let by_ink: std::collections::HashMap<String, &pdf_oxide::rendering::SeparationPlate> =
+        plates.iter().map(|p| (p.ink_name.clone(), p)).collect();
+    let cyan = by_ink["Cyan"];
+    let magenta = by_ink["Magenta"];
+    let yellow = by_ink["Yellow"];
+    let black = by_ink["Black"];
+    let idx = (50 * cyan.width as usize) + 50;
+    let cyan_value = cyan.data[idx];
+    let magenta_value = magenta.data[idx];
+    let yellow_value = yellow.data[idx];
+    let black_value = black.data[idx];
+    assert!((126..=129).contains(&cyan_value), "Cyan ~0.5; got {cyan_value}");
+    // 0.25 → 63 or 64 (.25 * 255 = 63.75).
+    assert!((63..=65).contains(&magenta_value), "Magenta ~0.25; got {magenta_value}");
+    assert_eq!(yellow_value, 0, "Yellow at tint 0 → no ink");
+    // 0.7 → 178 or 179 (.7 * 255 = 178.5).
+    assert!((177..=180).contains(&black_value), "Black ~0.7; got {black_value}");
+}
+
+/// Probe 8c — Multi-plate routing: full black `0 0 0 1 k` paints only
+/// the Black plate at full coverage. Process inks other than Black are
+/// untouched.
+#[test]
+fn qa_wave5_separation_cmyk_full_black_paints_only_black_plate() {
+    use pdf_oxide::rendering::render_separations;
+    let bytes = build_pdf_cmyk_fill_rect(0.0, 0.0, 0.0, 1.0);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let plates = render_separations(&doc, 0, 72).expect("render separations");
+    let by_ink: std::collections::HashMap<String, &pdf_oxide::rendering::SeparationPlate> =
+        plates.iter().map(|p| (p.ink_name.clone(), p)).collect();
+    let black = by_ink["Black"];
+    let cyan = by_ink["Cyan"];
+    let idx = (50 * black.width as usize) + 50;
+    let black_value = black.data[idx];
+    let cyan_value = cyan.data[idx];
+    assert_eq!(black_value, 255, "Black plate at full tint = 255");
+    assert_eq!(cyan_value, 0, "Cyan plate untouched");
+}
+
+/// Probe 2 — CMYK PDF with a Type-4 Separation spot color, pin the
+/// deferral. The wave-5 commit message for 6f5aede lists the
+/// separation_renderer.rs operator walker integration as a documented
+/// deferral — the shipping per-plate path still uses `tint_for_ink`,
+/// which only resolves Type-2 tint transforms.
+///
+/// At the public `render_separation` surface, a Type-4 Separation spot
+/// at tint=1.0 should produce magenta on the Magenta plate. The
+/// shipping path can't reach the Type-4 evaluator from inside
+/// `tint_for_ink`, so the spot's alternate CMYK never resolves and the
+/// Magenta plate stays empty.
+///
+/// This test pins the current behaviour (Magenta plate stays 0) so the
+/// follow-up branch that wires `tint_for_ink` through the pipeline can
+/// remove the pin in the same commit. Pre-followup: 0. Post-followup
+/// (when separation_renderer.rs is migrated): expect ≥ 240.
+///
+/// Tracking name: WAVE5-DEFER-SEPARATION-RENDERER-TYPE4-VIA-TINT-FOR-INK.
+#[test]
+fn qa_wave5_defer_separation_renderer_type4_spot_via_tint_for_ink() {
+    let content = "/CS1 cs\n1 scn\n10 10 80 80 re\nf\n";
+    let resources = "/ColorSpace << /CS1 [/Separation /MagentaSpot /DeviceCMYK 5 0 R] >>";
+    let bytes = build_pdf_with_type4(content, TYPE4_MAGENTA, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    use pdf_oxide::rendering::render_separation;
+    let magenta = render_separation(&doc, 0, "Magenta", 72).expect("render Magenta plate");
+    let idx = (50 * magenta.width as usize) + 50;
+    let value = magenta.data[idx];
+    // Documented deferral: shipping path leaves the plate at 0.
+    assert_eq!(
+        value, 0,
+        "WAVE5-DEFER: separation_renderer.rs still uses tint_for_ink (Type-2 only); \
+         when it migrates onto the pipeline, the spot's alternate CMYK resolves to \
+         Magenta plate ~255. Today: 0. Flip this assertion when the deferral closes."
+    );
+}
+
+/// Probe 2b — Same Type-4 Separation under the *composite* (RGB)
+/// renderer must paint magenta. The composite path migrated to the
+/// pipeline in waves 1-4; this is the capability the wave-5 commit
+/// message describes as "the headline capability the migration
+/// closes". We pin it from the public composite-rendering API so a
+/// regression that re-introduces the `1.0 - tint` fallback would
+/// fail here.
+#[test]
+fn qa_wave5_type4_separation_composite_renders_magenta() {
+    let content = "/CS1 cs\n1 scn\n10 10 80 80 re\nf\n";
+    let resources = "/ColorSpace << /CS1 [/Separation /MagentaSpot /DeviceCMYK 5 0 R] >>";
+    let bytes = build_pdf_with_type4(content, TYPE4_MAGENTA, resources);
+    let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
+    let pixmap = render(&doc);
+    let (r, g, b, _) = center_pixel(&pixmap);
+    assert!(
+        r > 240 && g < 20 && b > 240,
+        "Type-4 Separation on composite path must render magenta; got ({r}, {g}, {b})"
+    );
+}
+
+// ===========================================================================
 // PROBE 9-11: Toggle removal sanity
 //
 // Wave-5 deleted both `PDF_OXIDE_RESOLUTION_PIPELINE` reads and the
