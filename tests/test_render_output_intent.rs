@@ -1721,7 +1721,8 @@ fn qa_round4_default_gray_iccbased_n1_routes_through_qcms() {
         use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
         use std::sync::Arc;
         let prof = Arc::new(
-            IccProfile::parse(profile.clone(), 1).expect("Gray TRC profile parses through IccProfile::parse(_, 1)"),
+            IccProfile::parse(profile.clone(), 1)
+                .expect("Gray TRC profile parses through IccProfile::parse(_, 1)"),
         );
         let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
         assert!(
