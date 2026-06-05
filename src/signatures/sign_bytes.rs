@@ -19,8 +19,6 @@
 //! 5. Extract the two signed byte ranges; call `PdfSigner::sign`; insert
 //!    the hex-encoded signature into the `/Contents` placeholder.
 
-#![cfg(feature = "signatures")]
-
 use super::signer::PdfSigner;
 use super::types::{SignOptions, SigningCredentials};
 use crate::error::{Error, Result};
