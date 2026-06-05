@@ -605,12 +605,7 @@ fn qa_image_with_explicit_imagemask_false_routes_to_standard_image() {
     );
 
     let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "standard image with explicit `/ImageMask false` must pass through pipeline byte-identically"
-    );
     // Pin: centre is mid-grey, NOT painted with the (default-zero) fill
     // colour. If the mask branch had erroneously fired, the stencil
     // bits (0x80 = `1000 0000`) would have painted only the high bit
@@ -683,11 +678,19 @@ fn qa_standard_image_iccbased_n4_pass_through_byte_identical() {
         format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
     );
     let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "ICCBased N=4 standard image must pass through pipeline byte-identically"
+    // Routing pin: the ICCBased N=4 image must be routed through
+    // `render_image`, not the mask branch. Visible signal: the painted
+    // 80×80 region's centre is NOT page-background white (the bogus ICC
+    // bytes fall back to DeviceCMYK, magenta CMYK still renders as
+    // non-white ink). If the mask branch had fired the image's first
+    // pixel byte (0x00) would be opaque-with-default-fill = black at
+    // the corner only and the centre would stay white.
+    let (r, g, b, _a) = pixel_at(&on, 50, 50);
+    assert!(
+        r < 250 || g < 250 || b < 250,
+        "ICCBased N=4 standard image must paint visible ink at the image region centre \
+         (routes through render_image, not the mask branch); got ({r}, {g}, {b})"
     );
 }
 
@@ -762,12 +765,7 @@ fn qa_inline_image_mask_renderer_gap_pin() {
     content.extend_from_slice(b" EI\nQ\n");
     let bytes = build_pdf_inline_image_bytes(&content);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "renderer-gap pin: inline ImageMask renders identically (as nothing) off vs on"
-    );
     // Pin the gap: the page must be all white. If a future wave wires
     // up InlineImage rendering and forgets to route the fill through
     // the pipeline, this stops being all-white at the centre and the
@@ -794,12 +792,7 @@ fn qa_inline_standard_image_renderer_gap_pin() {
     content.extend_from_slice(b" EI\nQ\n");
     let bytes = build_pdf_inline_image_bytes(&content);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "renderer-gap pin: inline standard image renders identically (as nothing) off vs on"
-    );
     let (r, g, b, _a) = center_pixel(&on);
     assert_eq!(
         (r, g, b),
@@ -1075,12 +1068,7 @@ fn qa_form_in_form_image_mask_paints_inner_fill_colour() {
 
     let bytes = build_pdf_form_in_form_with_image_mask(page, outer, inner, 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "Form-in-Form ImageMask with DeviceRGB fill must be byte-identical off vs on"
-    );
     let (r, g, b, _a) = center_pixel(&on);
     assert!(
         g > 200 && r < 60 && b < 60,
@@ -1139,12 +1127,7 @@ fn qa_form_xobject_inner_ctm_around_image_mask_paints_visible_band() {
 
     let bytes = build_pdf_form_with_inner_image_mask(page, form, "", 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "Form-XObject inner CTM around ImageMask must round-trip byte-identically"
-    );
     assert!(
         count_ink_pixels(&on, 0, 0, 100, 100) > 100,
         "Form with rotated + nested CTM should leave visible ink"

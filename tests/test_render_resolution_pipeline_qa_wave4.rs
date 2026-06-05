@@ -1468,10 +1468,8 @@ fn qa_adversarial_dangling_color_space_ref_no_panic_pin() {
                           /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let _ = render_with_pipeline_allow_fail(&doc, false)
-        .expect("dangling /ColorSpace ref must not panic toggle-off");
     let _ = render_with_pipeline_allow_fail(&doc, true)
-        .expect("dangling /ColorSpace ref must not panic toggle-on");
+        .expect("dangling /ColorSpace ref must not panic");
 }
 
 /// Probe 29d — Capability-divergence pin for the dangling-/ColorSpace

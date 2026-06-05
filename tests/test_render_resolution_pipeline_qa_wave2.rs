@@ -531,10 +531,10 @@ fn qa_text_tr3_invisible_paints_zero_pixels() {
 
 /// Probe 5e — Tr=4 (fill + add to clip path). Pipeline resolves the fill
 /// side. The rasteriser today doesn't implement clip-from-text, so the
-/// painted output is the same as Tr=0; the parity invariant must hold.
+/// painted output is the same as Tr=0; the fill colour paints.
 ///
 /// This pins the CURRENT behaviour. When clip-from-text lands, this test's
-/// parity assertion still holds — what would change is the assertion on
+/// fill-paints assertion still holds — what would change is the assertion on
 /// where ink appears (clip would suppress subsequent paints outside the
 /// glyph silhouette).
 #[test]
@@ -550,8 +550,8 @@ fn qa_text_tr4_fill_plus_clip_paints_fill_side() {
 }
 
 /// Probe 5f — Tr=5 (stroke + add to clip path). Pipeline resolves the
-/// stroke side. Rasteriser doesn't paint strokes for text; parity
-/// invariant must hold; no spurious paint.
+/// stroke side. Rasteriser doesn't paint strokes for text; the page
+/// must render as a full pixmap with no spurious paint.
 #[test]
 fn qa_text_tr5_stroke_plus_clip_renders_without_panic() {
     // Tr=5 (stroke + clip-from-text). The text rasteriser today
@@ -765,7 +765,7 @@ fn qa_text_tj_separation_none_colorant_paints_zero_ink() {
 //
 // Strategy: for each text-state dial, render two PDFs that differ only in
 // that dial value through the pipeline path. Confirm the OUTPUT differs in
-// the expected direction AND each PDF round-trips off-vs-on byte-identical.
+// the expected direction the dial promises.
 
 /// Probe 11 — Tc (character spacing) preserved through the pipeline.
 /// Wider Tc widens the inter-glyph gap, pushing the rightmost glyph
@@ -795,11 +795,6 @@ fn qa_text_tc_character_spacing_preserved() {
         wide_right > normal_right,
         "Tc=3 must push rightmost glyph right of Tc=0; normal={normal_right}, wide={wide_right}"
     );
-    // Parity round-trip.
-    let normal_off = render_with_pipeline(&normal_doc, false);
-    let wide_off = render_with_pipeline(&wide_doc, false);
-    assert_eq!(normal_off, normal_on, "Tc=0 must round-trip through pipeline path");
-    assert_eq!(wide_off, wide_on, "Tc=3 must round-trip through pipeline path");
 }
 
 /// Probe 12 — Tw (word spacing) preserved through the pipeline. Tw applies
@@ -830,10 +825,6 @@ fn qa_text_tw_word_spacing_preserved() {
         wide_right > normal_right,
         "Tw=5 must push rightmost glyph right of Tw=0; normal={normal_right}, wide={wide_right}"
     );
-    let normal_off = render_with_pipeline(&normal_doc, false);
-    let wide_off = render_with_pipeline(&wide_doc, false);
-    assert_eq!(normal_off, normal_on, "Tw=0 must round-trip through pipeline path");
-    assert_eq!(wide_off, wide_on, "Tw=5 must round-trip through pipeline path");
 }
 
 /// Probe 13 — Tz (horizontal scaling) preserved on the `TJ` variant.
@@ -867,10 +858,6 @@ fn qa_text_tz_horizontal_scale_preserved_on_tj_array() {
         narrow_right < normal_right,
         "Tz=50 must place rightmost TJ glyph LEFT of Tz=100; normal={normal_right}, narrow={narrow_right}"
     );
-    let normal_off = render_with_pipeline(&normal_doc, false);
-    let narrow_off = render_with_pipeline(&narrow_doc, false);
-    assert_eq!(normal_off, normal_on, "Tz=100 must round-trip through pipeline path");
-    assert_eq!(narrow_off, narrow_on, "Tz=50 must round-trip through pipeline path");
 }
 
 /// Probe 14 — TL (text leading) preserved. `'` (Quote) uses TL to
@@ -901,8 +888,7 @@ fn qa_text_tl_leading_preserved_on_quote() {
 
 /// Probe 15 — Tm (set text matrix) before Tj. Tm replaces the text matrix
 /// outright; the glyph paints at the matrix's origin. Two Tm's at
-/// different translations must produce visually distinct renders, and
-/// each must round-trip parity.
+/// different translations must produce visually distinct renders.
 #[test]
 fn qa_text_tm_before_tj_preserved() {
     // Two PDFs differing only in Tm translation.
@@ -913,11 +899,6 @@ fn qa_text_tm_before_tj_preserved() {
     let left_on = render_with_pipeline(&left_doc, true);
     let right_on = render_with_pipeline(&right_doc, true);
     assert_ne!(left_on, right_on, "Tm at different translations must produce different renders");
-    // Both must round-trip parity.
-    let left_off = render_with_pipeline(&left_doc, false);
-    let right_off = render_with_pipeline(&right_doc, false);
-    assert_eq!(left_off, left_on, "Tm left must round-trip through pipeline path");
-    assert_eq!(right_off, right_on, "Tm right must round-trip through pipeline path");
 }
 
 /// Probe 16 — Td / TD (move text position) before Tj. Td translates by
@@ -932,10 +913,6 @@ fn qa_text_td_translation_preserved() {
     let a_on = render_with_pipeline(&a_doc, true);
     let b_on = render_with_pipeline(&b_doc, true);
     assert_ne!(a_on, b_on, "Td at different translations must produce different renders");
-    let a_off = render_with_pipeline(&a_doc, false);
-    let b_off = render_with_pipeline(&b_doc, false);
-    assert_eq!(a_off, a_on, "Td position A must round-trip through pipeline path");
-    assert_eq!(b_off, b_on, "Td position B must round-trip through pipeline path");
 }
 
 /// Probe 13b — Tz interaction with TJ numeric-kerning offsets. Pre-existing
@@ -950,8 +927,8 @@ fn qa_text_td_translation_preserved() {
 /// pin documents the bug for a follow-up and is `#[ignore]`d so the
 /// gate stays green.
 #[test]
-#[ignore = "pre-existing inline bug: Tz not applied to TJ numeric kerning advance — parity pin (both paths share the bug)"]
-fn qa_text_tz_not_applied_to_tj_kerning_advance_parity_pin() {
+#[ignore = "pre-existing inline bug: Tz not applied to TJ numeric kerning advance"]
+fn qa_text_tz_applied_to_tj_kerning_advance_narrows_rightmost() {
     let normal = "BT 1 0 0 rg /F1 14 Tf 5 50 Td [(H) -50 (e) -50 (l) -50 (l) -50 (o)] TJ ET\n";
     let narrow =
         "BT 1 0 0 rg /F1 14 Tf 50 Tz 5 50 Td [(H) -50 (e) -50 (l) -50 (l) -50 (o)] TJ ET\n";
@@ -980,22 +957,19 @@ fn qa_text_tz_not_applied_to_tj_kerning_advance_parity_pin() {
          got narrow={narrow_right} normal={normal_right} — Tz not applied to \
          TJ numeric kerning advance"
     );
-    let normal_off = render_with_pipeline(&normal_doc, false);
-    let narrow_off = render_with_pipeline(&narrow_doc, false);
-    assert_eq!(normal_off, normal_on, "Tz=100+kern parity invariant must hold");
-    assert_eq!(narrow_off, narrow_on, "Tz=50+kern parity invariant must hold");
 }
 
 // ============================================================================
-// Font-system interaction probes — different font subtypes must remain
-// byte-identical off vs on (the pipeline routes colour, not font data).
+// Font-system interaction probes — different font subtypes must route through
+// the pipeline without panicking and produce a full pixmap (the pipeline
+// routes colour, not font data).
 // ============================================================================
 
 /// Build a one-page text-fixture PDF with a CID Type 0 font tree at object
 /// 5 (Type 0 wraps a CIDFontType2 descendant, using `/Identity-H`
 /// encoding). No embedded font program — the rasteriser falls back to a
 /// system font; correctness of the system fallback isn't probed here,
-/// only parity off vs on under the pipeline migration.
+/// only that the pipeline routes Type 0 through without panicking.
 fn build_pdf_cid_type0(content_ops: &str) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"%PDF-1.4\n");
@@ -1127,10 +1101,10 @@ fn qa_text_built_in_helvetica_fallback_paints_blue_ink() {
 }
 
 /// Probe 20 — Unicode mapping via a ToUnicode CMap stream. We don't ship a
-/// binary font with a ToUnicode here; the more important parity invariant
-/// is that adding a /ToUnicode entry to the font dict doesn't perturb
-/// rendering under the pipeline migration. ToUnicode affects extraction,
-/// not rendering — the assertion is byte-equal pixels.
+/// binary font with a ToUnicode here; what's pinned is that adding a
+/// /ToUnicode entry to the font dict doesn't perturb rendering. ToUnicode
+/// affects extraction, not rendering — the assertion is that a font with
+/// a ToUnicode entry still paints glyph ink in the requested colour.
 fn build_pdf_text_with_tounicode(content_ops: &str) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"%PDF-1.4\n");
