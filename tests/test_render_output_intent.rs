@@ -693,6 +693,139 @@ fn additive_clamp_consistency_between_extractors_helper_and_no_output_intent_arm
 }
 
 // ===========================================================================
+// QA: foundation coverage probes (q/Q, alpha edges, deferred placeholders)
+// ===========================================================================
+
+/// Pin that DeviceCMYK paint inside a `q ... Q` save-restore bracket
+/// still routes through the OutputIntent ICC.
+///
+/// `q`/`Q` push/pop the graphics state; a regression that re-built the
+/// resolution context inside the bracket without re-attaching the
+/// OutputIntent borrow would lose the ICC routing on the inner paint
+/// even though it's the same page.
+#[test]
+fn output_intent_survives_graphics_state_save_restore() {
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    // q / fill / Q bracket performing the CMYK paint inside a fresh
+    // graphics-state scope. The inner paint must still hit ICC.
+    let catalog_entries =
+        "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (S) /DestOutputProfile 5 0 R >>]";
+    let content = "q\n0.25 0 0 0 k\n20 20 60 60 re\nf\nQ\n";
+    let pdf = build_pdf_with_catalog_entries_and_content(catalog_entries, content, Some(&icc));
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (126u8, 126, 126, 255),
+        "DeviceCMYK paint inside q/Q must still route through OutputIntent ICC; got ({r},{g},{b},{a})"
+    );
+}
+
+/// Pin that a fully-opaque DeviceCMYK paint at the alpha=1 edge resolves
+/// to the qcms reference without any zero-coverage shortcut intercepting
+/// the conversion before it reaches the helper.
+///
+/// The composite path has multiple alpha-aware shortcuts (zero-alpha
+/// skip, fully-opaque skip, etc.). A regression that bypassed the
+/// colour stage on the opaque edge would silently produce the
+/// uncomposited additive-clamp value.
+#[test]
+fn output_intent_renders_at_alpha_one_edge() {
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    // Default content stream has no explicit alpha — that's alpha=1.
+    let pdf = build_pdf_cmyk_with_output_intent(&icc);
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(a, 255, "alpha=1 paint must produce fully-opaque pixel");
+    assert_eq!(
+        (r, g, b),
+        (126u8, 126, 126),
+        "alpha=1 paint must still route through OutputIntent ICC; got ({r},{g},{b})"
+    );
+}
+
+/// Pin that a subsequent opaque RGB over-paint obscures the prior CMYK
+/// ICC paint cleanly — the OutputIntent path doesn't leak ICC-converted
+/// pixels into a later non-CMYK paint scope.
+#[test]
+fn output_intent_does_not_leak_into_subsequent_rgb_overpaint() {
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let catalog_entries =
+        "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (S) /DestOutputProfile 5 0 R >>]";
+    // CMYK paint, then white RGB paint covering the same rect.
+    let content = "0.25 0 0 0 k\n20 20 60 60 re\nf\n1 1 1 rg\n20 20 60 60 re\nf\n";
+    let pdf = build_pdf_with_catalog_entries_and_content(catalog_entries, content, Some(&icc));
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (255u8, 255, 255, 255),
+        "white RGB over-paint must obscure the CMYK paint regardless of OutputIntent; \
+         got ({r},{g},{b},{a})"
+    );
+}
+
+/// Pin that DeviceCMYK painted inside a Form XObject inherits the
+/// document-level OutputIntent. Form XObjects share the document's
+/// colour-policy state by spec (§14.8.3) — a regression that built a
+/// fresh resolution context for the XObject scope without re-threading
+/// the OutputIntent borrow would lose the ICC routing on every spot
+/// CMYK paint nested inside the XObject.
+///
+/// Currently `#[ignore]`-ed pending a Form-XObject test-fixture helper;
+/// the marker captures the gap so a follow-up audit picks it up.
+#[test]
+#[ignore = "OUTPUT_INTENT_DEFER_PHASE_9_DEFAULT_CMYK"]
+fn output_intent_inherited_by_form_xobject_paint() {
+    panic!("placeholder: needs a Form XObject test-fixture helper");
+}
+
+/// Pin the page-level `/DefaultCMYK` override precedence. With the field
+/// threaded onto `ResolutionContext` but no consumer yet, this probe is
+/// deferred. The marker exists so the phase 9 commit knows where to
+/// turn the probe on.
+#[test]
+#[ignore = "OUTPUT_INTENT_DEFER_PHASE_9_DEFAULT_CMYK"]
+fn page_level_default_cmyk_takes_precedence_over_output_intent() {
+    panic!("placeholder: not yet implemented — phase 9 consumer pending");
+}
+
+/// Document the per-paint qcms-transform construction cost so the phase 7
+/// caching PR can show a measurable win. This probe is `#[ignore]`-ed in
+/// the default suite; running it with `--ignored` produces a baseline
+/// duration that phase 7 can compare against.
+///
+/// The probe paints 1000 same-colour `k`+`re`+`f` operators on a single
+/// page. Without caching the renderer builds 1000 qcms transforms;
+/// caching should reduce that to one.
+#[test]
+#[ignore = "OUTPUT_INTENT_DEFER_PHASE_7_CACHING"]
+fn output_intent_thousand_cmyk_paints_baseline_cost() {
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let mut ops = String::new();
+    for i in 0..1000 {
+        let y = i % 100;
+        ops.push_str(&format!("0.25 0 0 0 k\n0 {y} 1 1 re\nf\n"));
+    }
+    let catalog_entries =
+        "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (S) /DestOutputProfile 5 0 R >>]";
+    let pdf = build_pdf_with_catalog_entries_and_content(catalog_entries, &ops, Some(&icc));
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let start = std::time::Instant::now();
+    let _ = render_rgba(&doc);
+    let elapsed = start.elapsed();
+    eprintln!(
+        "OUTPUT_INTENT_PHASE_7_BASELINE: 1000 same-colour DeviceCMYK paints took {:?} \
+         (each rebuilds the qcms transform; phase 7 caches)",
+        elapsed
+    );
+    // No assertion — baseline-measurement probe.
+}
+
+// ===========================================================================
 // QA: TDD-discipline verification report (inline docstring)
 // ===========================================================================
 
