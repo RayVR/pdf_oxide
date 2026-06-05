@@ -2696,6 +2696,7 @@ impl PageRenderer {
     ///       * Malformed groups (e.g. `/CS /DeviceGray` with RGB paint
     ///         operators) get BT.601 on the actual RGB; see
     ///         `tests/test_smask_alpha.rs::ext_gstate_luminosity_smask_malformed_devicegray_with_rgb_paint_uses_bt601`.
+    ///
     ///     A proper `/CS` dispatch would need a non-RGB blend buffer
     ///     (separate gray / CMYK pixmaps) which the renderer does not
     ///     currently provide.
