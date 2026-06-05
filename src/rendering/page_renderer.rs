@@ -22,7 +22,7 @@ use crate::object::{Object, ObjectRef};
 use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState};
 use crate::rendering::path_rasterizer::PathRasterizer;
 use crate::rendering::resolution::{
-    CmykTransformCache, DeviceColor, LogicalColor, PaintIntent, PaintKind, PaintSide,
+    IccTransformCache, DeviceColor, LogicalColor, PaintIntent, PaintKind, PaintSide,
     ResolutionContext, ResolutionPipeline, ResolvedColor,
 };
 use crate::rendering::text_rasterizer::TextRasterizer;
@@ -219,7 +219,7 @@ pub struct PageRenderer {
     /// `Transform` for a given `(profile, intent)` pair. Cleared per
     /// page in `render_page_with_options`; lives across paint
     /// operators within the page.
-    pub(crate) cmyk_transform_cache: CmykTransformCache,
+    pub(crate) icc_transform_cache: IccTransformCache,
 }
 
 impl PageRenderer {
@@ -232,7 +232,7 @@ impl PageRenderer {
             fonts: HashMap::new(),
             color_spaces: HashMap::new(),
             excluded_layers_snapshot: None,
-            cmyk_transform_cache: CmykTransformCache::new(),
+            icc_transform_cache: IccTransformCache::new(),
         }
     }
 
@@ -243,8 +243,8 @@ impl PageRenderer {
     /// transform" without racing concurrent tests that might also
     /// trigger `Transform::new_srgb_target` via the global counter.
     #[cfg(feature = "test-support")]
-    pub fn cmyk_transform_cache_build_count(&self) -> usize {
-        self.cmyk_transform_cache.build_count()
+    pub fn icc_transform_cache_build_count(&self) -> usize {
+        self.icc_transform_cache.build_count()
     }
 
     /// Render a page to a raster image.
@@ -266,7 +266,7 @@ impl PageRenderer {
         // pages with distinct /OutputIntents profiles, while still
         // amortising transform construction across paints within a
         // single page.
-        self.cmyk_transform_cache.clear();
+        self.icc_transform_cache.clear();
 
         // Refresh the excluded-layers snapshot once per page. The effective
         // set combines (a) the PDF's default-off OCGs per /OCProperties/D
@@ -3250,7 +3250,7 @@ impl PageRenderer {
                 color_spaces.get("DefaultRGB"),
                 color_spaces.get("DefaultCMYK"),
             )
-            .with_cmyk_transform_cache(Some(&self.cmyk_transform_cache));
+            .with_icc_transform_cache(Some(&self.icc_transform_cache));
         // No geometry is needed: the colour stage only reads `color`
         // (and reads `gs` for the alpha fold). `ColorOnly` lets the
         // intent express that without conjuring a placeholder path.

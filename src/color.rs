@@ -267,7 +267,7 @@ impl Transform {
     /// a thin wrapper around the §10.3.5 additive-clamp fallback.
     ///
     /// Per-page caching of the compiled transform lives on
-    /// `crate::rendering::resolution::CmykTransformCache`; this method
+    /// `crate::rendering::resolution::IccTransformCache`; this method
     /// is the underlying builder the cache calls into on a miss.
     pub fn new_srgb_target(profile: Arc<IccProfile>, intent: RenderingIntent) -> Self {
         #[cfg(feature = "icc")]

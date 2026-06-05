@@ -1905,8 +1905,8 @@ fn qa_round4_malformed_default_cmyk_falls_through_to_output_intent() {
 /// precomputation that dominates the per-paint cost). With the cache
 /// the first paint builds; the remaining 999 hit.
 ///
-/// The build count comes from the `CmykTransformCache`'s own counter
-/// (`PageRenderer::cmyk_transform_cache_build_count`), gated on
+/// The build count comes from the `IccTransformCache`'s own counter
+/// (`PageRenderer::icc_transform_cache_build_count`), gated on
 /// `#[cfg(feature = "test-support")]`. Reading the per-instance
 /// counter avoids racing other concurrent integration tests that
 /// might also call `Transform::new_srgb_target` on the same process —
@@ -1942,7 +1942,7 @@ fn output_intent_thousand_cmyk_paints_build_one_transform() {
     let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72));
     let _ = renderer.render_page(&doc, 0).expect("render");
 
-    let built = renderer.cmyk_transform_cache_build_count();
+    let built = renderer.icc_transform_cache_build_count();
     assert_eq!(
         built, 1,
         "1000 same-colour /DeviceCMYK paints under one /OutputIntents profile \
@@ -1995,7 +1995,7 @@ fn qa_round3_cache_keys_include_rendering_intent() {
     let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72));
     let _ = renderer.render_page(&doc, 0).expect("render");
 
-    let built = renderer.cmyk_transform_cache_build_count();
+    let built = renderer.icc_transform_cache_build_count();
     assert_eq!(
         built, 2,
         "Two distinct rendering intents on one page + one OutputIntent profile \
@@ -2072,7 +2072,7 @@ fn qa_round4_thousand_rgb_paints_through_default_rgb_build_one_transform() {
     let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72));
     let _ = renderer.render_page(&doc, 0).expect("render");
 
-    let built = renderer.cmyk_transform_cache_build_count();
+    let built = renderer.icc_transform_cache_build_count();
     assert_eq!(
         built, 1,
         "1000 same-colour bare /DeviceRGB paints routed through a page-level \

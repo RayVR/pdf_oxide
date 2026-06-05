@@ -35,15 +35,14 @@ use crate::object::Object;
 
 /// Per-page cache of compiled qcms transforms.
 ///
-/// Naming note: the type is called `CmykTransformCache` for historical
-/// reasons — it was introduced to amortise the 17⁴ CLUT precomputation
-/// `qcms::Transform::new_to` runs for CMYK input. The cache key is
-/// `(profile.content_hash(), intent)` which is n_components-agnostic
-/// at the storage level, so the same cache also serves N=3 (RGB)
-/// `/ICCBased` profiles routed through `/DefaultRGB` overrides and any
-/// other ICC arm the resolver grows. The "Cmyk" in the name reflects
-/// where the perf trap was first measured, not a constraint on what
-/// the cache can hold.
+/// The cache is n_components-agnostic at the storage level: its key is
+/// `(profile.content_hash(), intent)`, so the same instance serves N=1
+/// (Gray TRC) profiles routed through `/DefaultGray`, N=3 (RGB) profiles
+/// routed through `/DefaultRGB`, and N=4 (CMYK) profiles routed through
+/// the document `/OutputIntents` or through embedded `/ICCBased` paint.
+/// The cache was first introduced to amortise the 17⁴ CLUT precomputation
+/// `qcms::Transform::new_to` runs for CMYK input — that's still its
+/// dominant payoff — but every ICC arm of the resolver shares it.
 ///
 /// Constructing a `Transform` runs `qcms::Transform::new_to` which
 /// precomputes a 17⁴ = 83 521-sample CLUT for CMYK input (see
@@ -86,7 +85,7 @@ use crate::object::Object;
 /// resolver call to thread mutable borrows through the colour stage).
 /// Single-threaded by construction — `ResolutionContext` is never
 /// shared across threads within a render call.
-pub(crate) struct CmykTransformCache {
+pub(crate) struct IccTransformCache {
     entries: RefCell<HashMap<(u64, RenderingIntent), Arc<Transform>>>,
     /// Test-support counter: every cache miss (i.e. every call that
     /// actually constructs a fresh `Transform`) increments this
@@ -98,7 +97,7 @@ pub(crate) struct CmykTransformCache {
     pub(crate) build_count: std::cell::Cell<usize>,
 }
 
-impl CmykTransformCache {
+impl IccTransformCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: RefCell::new(HashMap::new()),
@@ -146,7 +145,7 @@ impl CmykTransformCache {
     }
 }
 
-impl Default for CmykTransformCache {
+impl Default for IccTransformCache {
     fn default() -> Self {
         Self::new()
     }
@@ -183,7 +182,7 @@ pub(crate) struct ResolutionContext<'a> {
     /// resolver builds a fresh transform per paint, which is what the
     /// unit-test paths and the `cargo test --lib` resolver tests
     /// exercise.
-    pub(crate) cmyk_transform_cache: Option<&'a CmykTransformCache>,
+    pub(crate) icc_transform_cache: Option<&'a IccTransformCache>,
 }
 
 impl<'a> ResolutionContext<'a> {
@@ -204,7 +203,7 @@ impl<'a> ResolutionContext<'a> {
             default_gray: None,
             default_rgb: None,
             default_cmyk: None,
-            cmyk_transform_cache: None,
+            icc_transform_cache: None,
         }
     }
 
@@ -214,11 +213,11 @@ impl<'a> ResolutionContext<'a> {
     /// operator dispatcher builds inside a single render. `None`
     /// (the default) skips caching — appropriate for unit tests that
     /// only exercise a handful of conversions.
-    pub(crate) fn with_cmyk_transform_cache(
+    pub(crate) fn with_icc_transform_cache(
         mut self,
-        cache: Option<&'a CmykTransformCache>,
+        cache: Option<&'a IccTransformCache>,
     ) -> Self {
-        self.cmyk_transform_cache = cache;
+        self.icc_transform_cache = cache;
         self
     }
 

@@ -1037,7 +1037,7 @@ fn paint_through_pipeline(
     // so a single ColorResolver change can't silently diverge between
     // the two renderers.
     //
-    // HONEST_GAP: the per-page `CmykTransformCache` that amortises qcms
+    // HONEST_GAP: the per-page `IccTransformCache` that amortises qcms
     // transform construction across paint operators lives on
     // `PageRenderer`. The separation walker is a free function — it
     // would need a SeparationRendererState struct to hold the cache
