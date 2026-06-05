@@ -891,4 +891,53 @@ mod tests {
             _ => panic!("expected Rgba"),
         }
     }
+
+    #[test]
+    fn cmyk_to_rgb_via_intent_with_no_output_intent_matches_additive_clamp() {
+        // The fallback arm is the spec's §10.3.5 formula. Pin one
+        // representative quadruple byte-exact so a regression that
+        // re-routed the no-OutputIntent path through some other
+        // conversion would surface here.
+        let doc = fixture_doc();
+        let spaces = HashMap::new();
+        let ctx = ResolutionContext::new(&doc, &spaces);
+        // CMYK(0.25, 0, 0, 0) → R=0.75, G=1.0, B=1.0.
+        let (r, g, b) = super::cmyk_to_rgb_via_intent(0.25, 0.0, 0.0, 0.0, &ctx);
+        assert!((r - 0.75).abs() < 1e-6);
+        assert!((g - 1.0).abs() < 1e-6);
+        assert!((b - 1.0).abs() < 1e-6);
+    }
+
+    #[cfg(feature = "icc")]
+    #[test]
+    fn cmyk_to_rgb_via_intent_falls_back_when_profile_has_no_cmm() {
+        // The header-only stub profile parses (IccProfile::parse accepts
+        // the 128-byte header) but qcms refuses to build a Transform
+        // from it because there's no tag table. The wrapper devolves to
+        // §10.3.5 internally — the helper must agree byte-for-byte with
+        // the no-OutputIntent path on the same input. This is the
+        // shape a real but malformed /OutputIntents profile would take.
+        let doc = fixture_doc();
+        let spaces = HashMap::new();
+        let mut header_only = vec![0u8; 128];
+        header_only[8..12].copy_from_slice(&0x04000000u32.to_be_bytes());
+        header_only[12..16].copy_from_slice(b"prtr");
+        header_only[16..20].copy_from_slice(b"CMYK");
+        header_only[20..24].copy_from_slice(b"Lab ");
+        header_only[36..40].copy_from_slice(b"acsp");
+        let profile = std::sync::Arc::new(
+            crate::color::IccProfile::parse(header_only, 4).expect("stub parses"),
+        );
+        let ctx = ResolutionContext::new(&doc, &spaces).with_output_intent(Some(&profile));
+        let (r, g, b) = super::cmyk_to_rgb_via_intent(0.25, 0.0, 0.0, 0.0, &ctx);
+        // HONEST_GAP: this byte-exact agreement depends on
+        // crate::color::Transform::convert_cmyk_pixel matching
+        // crate::extractors::images::cmyk_pixel_to_rgb on the §10.3.5
+        // path. If those two diverge in the future the helper here
+        // could disagree with the no-OutputIntent arm even though
+        // both intended to run the spec fallback.
+        assert!((r - 0.75).abs() < 0.01, "got r={r}");
+        assert!((g - 1.0).abs() < 0.01, "got g={g}");
+        assert!((b - 1.0).abs() < 0.01, "got b={b}");
+    }
 }
