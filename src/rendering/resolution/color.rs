@@ -378,13 +378,8 @@ fn three_as_rgb(components: &[f32], alpha: f32) -> ResolvedColor {
 /// not the alternate's CMYK decomposition, so the alt is composite-
 /// only.
 fn four_as_cmyk(components: &[f32], alpha: f32, ctx: &ResolutionContext) -> ResolvedColor {
-    let (r, g, b) = cmyk_to_rgb_via_intent(
-        components[0],
-        components[1],
-        components[2],
-        components[3],
-        ctx,
-    );
+    let (r, g, b) =
+        cmyk_to_rgb_via_intent(components[0], components[1], components[2], components[3], ctx);
     ResolvedColor::Rgba { r, g, b, a: alpha }
 }
 
@@ -463,11 +458,7 @@ pub(crate) fn cmyk_to_rgb_via_intent(
             ctx.rendering_intent,
         );
         let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
-        return (
-            rgb[0] as f32 / 255.0,
-            rgb[1] as f32 / 255.0,
-            rgb[2] as f32 / 255.0,
-        );
+        return (rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0);
     }
     // No OutputIntent → spec fallback. The `ctx` borrow is held through
     // the cfg-gated branch above; under the no-icc build we explicitly

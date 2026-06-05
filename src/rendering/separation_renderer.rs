@@ -1039,9 +1039,7 @@ fn paint_through_pipeline(
     let output_intent = doc.output_intent_cmyk_profile();
     let ctx = ResolutionContext::new(doc, color_spaces)
         .with_output_intent(output_intent.as_ref())
-        .with_rendering_intent(crate::color::RenderingIntent::from_pdf_name(
-            &gs.rendering_intent,
-        ))
+        .with_rendering_intent(crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent))
         .with_defaults(
             color_spaces.get("DefaultGray"),
             color_spaces.get("DefaultRGB"),

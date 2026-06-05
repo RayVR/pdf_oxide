@@ -89,11 +89,7 @@ fn build_minimal_cmyk_to_rgb_lut8_profile(target_l_byte: u8) -> Vec<u8> {
     // off the LUT8 tag header at offsets 12..48 even for CMYK inputs;
     // they only matter for RGB inputs but qcms still parses them.
     // Identity matrix: 1.0 along diagonal.
-    let identity: [i32; 9] = [
-        0x0001_0000, 0, 0,
-        0, 0x0001_0000, 0,
-        0, 0, 0x0001_0000,
-    ];
+    let identity: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
     for v in identity {
         lut.extend_from_slice(&(v as u32).to_be_bytes());
     }
@@ -159,7 +155,7 @@ fn build_minimal_cmyk_to_rgb_lut8_profile(target_l_byte: u8) -> Vec<u8> {
     profile[68..72].copy_from_slice(&0x0000_F6D6u32.to_be_bytes()); // X 0.9642
     profile[72..76].copy_from_slice(&0x0001_0000u32.to_be_bytes()); // Y 1.0
     profile[76..80].copy_from_slice(&0x0000_D32Du32.to_be_bytes()); // Z 0.8249
-    // Creator at 80..84 — zero.
+                                                                    // Creator at 80..84 — zero.
 
     // Tag table: count = 1, then one entry (signature, offset, size).
     profile.extend_from_slice(&1u32.to_be_bytes());
@@ -193,10 +189,8 @@ fn build_pdf_with_catalog_entries_and_content(
     buf.extend_from_slice(b"%PDF-1.4\n");
 
     let cat_off = buf.len();
-    let catalog = format!(
-        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R {} >>\nendobj\n",
-        catalog_entries
-    );
+    let catalog =
+        format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R {} >>\nendobj\n", catalog_entries);
     buf.extend_from_slice(catalog.as_bytes());
 
     let pages_off = buf.len();
@@ -217,10 +211,7 @@ fn build_pdf_with_catalog_entries_and_content(
     let obj_count;
     if let Some(icc) = icc_profile_bytes {
         icc_off = buf.len();
-        let icc_hdr = format!(
-            "5 0 obj\n<< /N 4 /Length {} >>\nstream\n",
-            icc.len()
-        );
+        let icc_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", icc.len());
         buf.extend_from_slice(icc_hdr.as_bytes());
         buf.extend_from_slice(icc);
         buf.extend_from_slice(b"\nendstream\nendobj\n");

@@ -79,10 +79,7 @@ impl<'a> ResolutionContext<'a> {
     /// available. `None` is a no-op and leaves the additive-clamp
     /// fallback in place — the colour stage only consults the profile
     /// when it's `Some`.
-    pub(crate) fn with_output_intent(
-        mut self,
-        profile: Option<&'a Arc<IccProfile>>,
-    ) -> Self {
+    pub(crate) fn with_output_intent(mut self, profile: Option<&'a Arc<IccProfile>>) -> Self {
         self.output_intent_cmyk = profile;
         self
     }
@@ -180,8 +177,11 @@ mod tests {
         let color_spaces = HashMap::new();
         let gray = Object::Name("DeviceGray".to_string());
         let cmyk = Object::Name("DeviceCMYK".to_string());
-        let ctx = ResolutionContext::new(&doc, &color_spaces)
-            .with_defaults(Some(&gray), None, Some(&cmyk));
+        let ctx = ResolutionContext::new(&doc, &color_spaces).with_defaults(
+            Some(&gray),
+            None,
+            Some(&cmyk),
+        );
         assert!(ctx.default_gray.is_some());
         assert!(ctx.default_rgb.is_none());
         assert!(ctx.default_cmyk.is_some());
