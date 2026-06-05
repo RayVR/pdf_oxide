@@ -191,7 +191,7 @@ fn empty_image_mask_bytes(width: u32, height: u32) -> Vec<u8> {
 /// short-circuits, so the rasteriser reads `gs.fill_color_rgb`
 /// directly.
 #[test]
-fn qa_image_mask_1x1_solid_toggle_parity() {
+fn qa_image_mask_1x1_solid_paints_fill_colour() {
     let mask = solid_image_mask_bytes(1, 1); // 1 byte, all opaque
                                              // Stretch the 1×1 stencil over 60×60 in the centre of the page.
     let content = "q\n0 1 0 rg\n60 0 0 60 20 20 cm\n/IM1 Do\nQ\n";
@@ -238,7 +238,7 @@ fn qa_image_mask_width_not_byte_multiple_padding_does_not_paint() {
 /// Probe 3 — Tall ImageMask (height = 256). Parity at scale; also
 /// guards against an off-by-one in the row-loop or buffer-size maths.
 #[test]
-fn qa_image_mask_tall_height_toggle_parity() {
+fn qa_image_mask_tall_height_paints_centre_blue() {
     let mask = solid_image_mask_bytes(8, 256);
     let content = "q\n0 0 1 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 256, &mask);
@@ -316,7 +316,7 @@ fn qa_image_mask_malformed_decode_no_panic_default_polarity() {
 /// CTM must round-trip across the spliced GS clone so the stencil
 /// (8×1, all opaque) lands as a vertical band on the page.
 #[test]
-fn qa_image_mask_ctm_90deg_rotation_toggle_parity() {
+fn qa_image_mask_ctm_90deg_rotation_paints_visible_band() {
     let mask = solid_image_mask_bytes(8, 1);
     // Rotate 90° clockwise (a,b,c,d = 0,-1,1,0) then scale and translate
     // to land the band on the page.
@@ -339,7 +339,7 @@ fn qa_image_mask_ctm_90deg_rotation_toggle_parity() {
 /// composes correctly only if the helper's flip is applied in the
 /// right order.
 #[test]
-fn qa_image_mask_negative_scale_mirror_toggle_parity() {
+fn qa_image_mask_negative_scale_mirror_paints_visible_band() {
     let mask = solid_image_mask_bytes(8, 1);
     let content = "q\n0 0 1 rg\n-60 0 0 60 80 20 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 1, &mask);
@@ -358,7 +358,7 @@ fn qa_image_mask_negative_scale_mirror_toggle_parity() {
 /// user space"). Confirms the helper doesn't bake a flip assumption that
 /// breaks composed transforms.
 #[test]
-fn qa_image_mask_negative_determinant_ctm_toggle_parity() {
+fn qa_image_mask_negative_determinant_ctm_paints_visible_band() {
     let mask = solid_image_mask_bytes(8, 1);
     // det < 0: a*d - b*c = 60*-60 = -3600.
     let content = "q\n0.5 g\n60 0 0 -60 20 80 cm\n/IM1 Do\nQ\n";
@@ -1063,7 +1063,7 @@ fn qa_form_xobject_with_inner_image_mask_type4_separation_capability_gain() {
 /// rendered centre pixel must be the expected colour after the
 /// pipeline routes the mask through both Form recursions.
 #[test]
-fn qa_form_in_form_with_image_mask_toggle_parity() {
+fn qa_form_in_form_image_mask_paints_inner_fill_colour() {
     let mask = solid_image_mask_bytes(8, 8);
     let page = "q\n/Fm1 Do\nQ\n";
     let outer = "q\n/Fm2 Do\nQ\n"; // delegate straight to inner
@@ -1129,7 +1129,7 @@ fn qa_form_fill_inheritance_bug_pin() {
 /// Do ... Q` must compose with the page's `cm` cleanly through the
 /// pipeline-routed mask paint.
 #[test]
-fn qa_form_xobject_inner_ctm_around_image_mask_toggle_parity() {
+fn qa_form_xobject_inner_ctm_around_image_mask_paints_visible_band() {
     let mask = solid_image_mask_bytes(8, 8);
     // The page sets a 30° rotation; the form sets a translation and
     // scale around the mask. CTM stack correctness across the form
@@ -1280,7 +1280,7 @@ fn build_pdf_mask_plus_standard_image(
 /// paint must not see the first paint's spliced state. The two halves
 /// of the page should end up cleanly coloured.
 #[test]
-fn qa_two_image_masks_back_to_back_distinct_colours_toggle_parity() {
+fn qa_two_image_masks_back_to_back_paint_distinct_halves() {
     // Left half: red. Right half: blue. The `q ... Q` brackets isolate
     // each paint's CTM and fill state.
     let content = "q\n1 0 0 rg\n50 0 0 100 0 0 cm\n/IM1 Do\nQ\n\
@@ -1307,7 +1307,7 @@ fn qa_two_image_masks_back_to_back_distinct_colours_toggle_parity() {
 /// The standard image must not pick up the mask's spliced state, and
 /// vice versa.
 #[test]
-fn qa_image_mask_then_standard_then_mask_interleaved_toggle_parity() {
+fn qa_image_mask_then_standard_then_mask_interleaved_keep_state_isolated() {
     // 4x4 grey pixels for the standard image.
     let std_pixels = vec![0x60u8; 16];
     // Left strip: red mask. Middle: grey std image. Right strip: blue mask.
@@ -1335,7 +1335,7 @@ fn qa_image_mask_then_standard_then_mask_interleaved_toggle_parity() {
 /// the SMask to the paint; a DeviceRGB fill resolves through the
 /// pipeline and the spliced clone must carry the SMask through.
 #[test]
-fn qa_image_mask_under_active_smask_toggle_parity() {
+fn qa_image_mask_under_smask_none_still_paints() {
     // Page resources carry /GS1 in /ExtGState with `/SMask /None` set
     // explicitly. This is the "no smask" form but it exercises the
     // ExtGState plumbing without needing a full SMask dict (which
@@ -1359,7 +1359,7 @@ fn qa_image_mask_under_active_smask_toggle_parity() {
 /// clip must remain unpainted; the spliced GS clone must not drop the
 /// clip state.
 #[test]
-fn qa_image_mask_under_active_clip_toggle_parity_corner_unchanged() {
+fn qa_image_mask_under_active_clip_corner_remains_unpainted() {
     let mask = solid_image_mask_bytes(8, 8);
     // Clip to a 40×40 box around the page centre, then paint a full-page
     // stencil. Corners must remain white.
@@ -1385,7 +1385,7 @@ fn qa_image_mask_under_active_clip_toggle_parity_corner_unchanged() {
 /// via `pdf_blend_mode_to_skia`. The spliced clone must preserve the
 /// blend mode field through to the rasteriser.
 #[test]
-fn qa_image_mask_multiply_blend_mode_toggle_parity() {
+fn qa_image_mask_multiply_blend_mode_paints_against_white() {
     let mask = solid_image_mask_bytes(8, 8);
     let resources = "/ExtGState << /GS1 << /BM /Multiply >> >>";
     let content = "q\n/GS1 gs\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";

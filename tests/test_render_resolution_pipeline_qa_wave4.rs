@@ -242,7 +242,7 @@ fn count_ink_pixels(rgba: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> usize {
 /// same RGBA triple into the stop the renderer's `parse_color_array`
 /// would have produced.
 #[test]
-fn qa_axial_vertical_coords_toggle_parity() {
+fn qa_axial_vertical_coords_paints_top_blue_bottom_red() {
     // Red at top (y=10) → blue at bottom (y=90) in user space. PDF
     // user-space y axis points up, so y=10 is near the bottom of the
     // page in pixmap coordinates and y=90 is near the top.
@@ -282,7 +282,7 @@ fn qa_axial_vertical_coords_toggle_parity() {
 /// the axis ends with the endpoint colours — the assertions below
 /// sample inside that padded region.
 #[test]
-fn qa_axial_reversed_coords_toggle_parity() {
+fn qa_axial_reversed_coords_clamp_endpoint_colours() {
     // /C0 at (90, 50), /C1 at (10, 50). The "high x" side of the page
     // is C0 = green; the "low x" side is C1 = white.
     let content = "/Sh1 sh\n";
@@ -375,7 +375,7 @@ fn qa_axial_domain_other_than_unit_interval() {
 /// regression pin that catches a future Domain implementation that
 /// stops painting altogether.
 #[test]
-fn qa_axial_domain_other_than_unit_interval_toggle_parity() {
+fn qa_axial_domain_other_than_unit_interval_paints_axis_interior() {
     let content = "/Sh1 sh\n";
     let bytes = build_pdf_axial_shading(
         content,
@@ -406,7 +406,7 @@ fn qa_axial_domain_other_than_unit_interval_toggle_parity() {
 /// So the renderer's hard-coded Pad happens to do the right thing for
 /// `[true true]` — pin the parity and the visible-extension behaviour.
 #[test]
-fn qa_axial_extend_true_true_toggle_parity() {
+fn qa_axial_extend_true_true_pads_endpoint_colours() {
     // Axis is the middle 20% of the page (x=40 → x=60). With Extend
     // [true true], pixels at x=5 and x=95 should still be painted —
     // clamped to C0 and C1 respectively.
@@ -669,7 +669,7 @@ fn qa_radial_zero_radius_inner_at_distinct_point_renders_pixmap() {
 /// `SpreadMode::Pad` which happens to match the spec here — pin the
 /// visible behaviour.
 #[test]
-fn qa_radial_extend_true_true_toggle_parity_and_correctness() {
+fn qa_radial_extend_true_true_pads_endpoint_colours() {
     let content = "/Sh1 sh\n";
     let bytes = build_pdf_radial_shading(
         content,
@@ -1057,7 +1057,7 @@ fn qa_type4_as_shading_function_helper_returns_none_falls_back() {
 /// still paint its axis interior after the surrounding state is
 /// restored.
 #[test]
-fn qa_shading_inside_q_q_toggle_parity() {
+fn qa_shading_inside_q_q_paints_axis_interior() {
     // `q 0.8 g /Sh1 sh Q` — the inner `0.8 g` would leak fill state
     // forward if Q didn't restore. A regression in the splice that
     // perturbed the gs stack (e.g. mutated `gs` instead of the
@@ -1188,7 +1188,7 @@ fn qa_shading_under_smask_renders_without_panic() {
 /// clip: outside the triangle the page background must remain visible
 /// after the gradient paints inside.
 #[test]
-fn qa_shading_under_triangular_clip_toggle_parity() {
+fn qa_shading_under_triangular_clip_corner_remains_background() {
     // Triangle clip: corners at (10, 10), (90, 10), (50, 90).
     let content = "q\n10 10 m\n90 10 l\n50 90 l\nh\nW n\n/Sh1 sh\nQ\n";
     let bytes = build_pdf_axial_shading(
