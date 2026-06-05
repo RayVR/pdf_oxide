@@ -3218,15 +3218,16 @@ impl PageRenderer {
         let cmd = pipeline.resolve(&intent, &ctx, None).ok()?;
         match cmd.color {
             ResolvedColor::Rgba { r, g, b, a } => Some((r, g, b, a)),
-            // Compound spaces (Separation/DeviceN with a DeviceCMYK
-            // alternate) emit Cmyk so the per-plate backend has the
-            // channel decomposition. Project to RGBA via §10.3.5
-            // additive-clamp for the composite backend.
+            // Genuine DeviceCMYK / ICCBased N=4 sources, plus Separation
+            // and DeviceN with a DeviceCMYK alternate, emit Cmyk so the
+            // per-plate backend has the channel decomposition. Project
+            // to RGBA via the context-aware CMYK→RGB path: consult the
+            // document's /OutputIntents CMYK profile when present, fall
+            // back to §10.3.5 additive-clamp otherwise.
             ResolvedColor::Cmyk { c, m, y, k, a } => {
-                let r = 1.0 - (c + k).min(1.0);
-                let g = 1.0 - (m + k).min(1.0);
-                let b = 1.0 - (y + k).min(1.0);
-                Some((r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), a))
+                let (r, g, b) =
+                    crate::rendering::resolution::color::cmyk_to_rgb_via_intent(c, m, y, k, &ctx);
+                Some((r, g, b, a))
             },
             _ => None,
         }

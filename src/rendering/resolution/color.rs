@@ -261,7 +261,7 @@ impl ColorResolver {
         // the per-plate path.
         match alt_cs_name {
             Some("DeviceCMYK") | Some("CMYK") if altspace_values.len() >= 4 => {
-                Ok(four_as_cmyk(&altspace_values, alpha))
+                Ok(four_as_cmyk(&altspace_values, alpha, ctx))
             },
             Some("DeviceRGB") | Some("RGB") if altspace_values.len() >= 3 => {
                 Ok(three_as_rgb(&altspace_values, alpha))
@@ -370,13 +370,21 @@ fn three_as_rgb(components: &[f32], alpha: f32) -> ResolvedColor {
     }
 }
 
-/// Emit `ResolvedColor::Rgba` from a 4-component CMYK via §10.3.5
-/// additive-clamp. Used by the Separation / DeviceN alternate-CMYK
-/// projection — the per-plate routing for those sources is governed
-/// by the source colour space, not the alternate's CMYK decomposition,
-/// so the alt is composite-only.
-fn four_as_cmyk(components: &[f32], alpha: f32) -> ResolvedColor {
-    let (r, g, b) = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+/// Emit `ResolvedColor::Rgba` from a 4-component CMYK via the
+/// context-aware CMYK→RGB path: the document's `/OutputIntents` CMYK
+/// profile when present, otherwise §10.3.5 additive-clamp. Used by
+/// the Separation / DeviceN alternate-CMYK projection — the per-plate
+/// routing for those sources is governed by the source colour space,
+/// not the alternate's CMYK decomposition, so the alt is composite-
+/// only.
+fn four_as_cmyk(components: &[f32], alpha: f32, ctx: &ResolutionContext) -> ResolvedColor {
+    let (r, g, b) = cmyk_to_rgb_via_intent(
+        components[0],
+        components[1],
+        components[2],
+        components[3],
+        ctx,
+    );
     ResolvedColor::Rgba { r, g, b, a: alpha }
 }
 
@@ -406,6 +414,66 @@ fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
     let g = 1.0 - (m + k).min(1.0);
     let b = 1.0 - (y + k).min(1.0);
     (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
+}
+
+/// Context-aware CMYK → RGB convergence.
+///
+/// Precedence inside this function (callers handle the embedded-ICC
+/// case before reaching here — those paths route through
+/// `ColorResolver::resolve_iccbased` instead):
+///
+/// 1. `ctx.output_intent_cmyk` — when the document declares an
+///    `/OutputIntents` array with a `/N=4` `/DestOutputProfile`,
+///    convert the CMYK quadruple through that profile via the
+///    `crate::color::Transform` wrapper. The active rendering intent
+///    (`ctx.rendering_intent`, §10.7.3) gates which qcms intent the
+///    transform is built for. The 8-bit round-trip (quantise CMYK to
+///    `[u8; 4]`, run qcms, decode the resulting RGB to `f32`) is the
+///    same encoding the rest of `crate::color` uses — going wider
+///    here would diverge from the image-decoder path that already
+///    funnels through this CMM.
+///
+/// 2. `ctx.output_intent_cmyk` is `None` — the document didn't
+///    declare a CMYK OutputIntent (or one is present but couldn't be
+///    parsed). Falls through to the spec's §10.3.5 additive-clamp
+///    formula. This is the byte-for-byte fallback the renderer
+///    shipped before OutputIntent threading landed.
+///
+/// Without the `icc` feature `convert_cmyk_pixel` already devolves to
+/// §10.3.5 inside the CMM wrapper, so the OutputIntent path is
+/// non-destructive when no real CMM is linked in. The explicit
+/// `cfg(feature = "icc")` gate here is a micro-optimisation: skip
+/// building the `Transform` wrapper altogether when there's no
+/// chance of a real conversion.
+pub(crate) fn cmyk_to_rgb_via_intent(
+    c: f32,
+    m: f32,
+    y: f32,
+    k: f32,
+    ctx: &ResolutionContext<'_>,
+) -> (f32, f32, f32) {
+    #[cfg(feature = "icc")]
+    if let Some(profile) = ctx.output_intent_cmyk {
+        let c_u8 = (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let m_u8 = (m.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let y_u8 = (y.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let k_u8 = (k.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let transform = crate::color::Transform::new_srgb_target(
+            std::sync::Arc::clone(profile),
+            ctx.rendering_intent,
+        );
+        let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
+        return (
+            rgb[0] as f32 / 255.0,
+            rgb[1] as f32 / 255.0,
+            rgb[2] as f32 / 255.0,
+        );
+    }
+    // No OutputIntent → spec fallback. The `ctx` borrow is held through
+    // the cfg-gated branch above; under the no-icc build we explicitly
+    // discard it here so the compiler doesn't flag an unused parameter.
+    let _ = ctx;
+    cmyk_to_rgb(c, m, y, k)
 }
 
 /// Evaluate a Type 2 (exponential interpolation) function at a single input.
