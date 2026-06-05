@@ -31,9 +31,9 @@ use super::blend::BlendResolver;
 use super::clip::ClipResolver;
 use super::color::ColorResolver;
 use super::context::ResolutionContext;
-use super::intent::{PaintIntent, PaintSide};
+use super::intent::{LogicalColor, PaintIntent, PaintSide};
 use super::overprint::OverprintResolver;
-use super::resolved::ResolvedPaintCmd;
+use super::resolved::{InkSelector, ResolvedPaintCmd};
 
 /// Composable resolution pipeline. Holds one instance of each stage.
 ///
@@ -75,7 +75,13 @@ impl ResolutionPipeline {
         };
 
         let color = self.color.resolve(&intent.color, ctx, alpha)?;
-        let overprint = self.overprint.resolve(intent.gs, intent.side, &color);
+        let mut overprint = self.overprint.resolve(intent.gs, intent.side, &color);
+        // §8.6.6.3 reserved Separation colorant-name override: stamp the
+        // per-plate routing selector by inspecting the source colour
+        // space. The OverprintResolver doesn't see the colour space
+        // (only the resolved colour), so the override happens here on
+        // the composer where both are available.
+        apply_inks_selector_override(&intent.color, &mut overprint);
         let blend = self.blend.resolve(intent.gs);
         let clip = self.clip.resolve_with_mask(clip_mask);
 
@@ -91,6 +97,37 @@ impl ResolutionPipeline {
             clip,
             ctm: intent.ctm,
         })
+    }
+}
+
+/// Inspect the source [`LogicalColor`] for an ISO 32000-1 §8.6.6.3
+/// reserved Separation colorant name (`/All`, `/None`) and stamp the
+/// per-plate routing selector on the overprint plan. Composite (RGB)
+/// backends ignore the selector; the per-plate [`super::InkRouter`]
+/// honours it.
+fn apply_inks_selector_override(
+    color: &LogicalColor,
+    overprint: &mut super::resolved::OverprintPlan,
+) {
+    let LogicalColor::Spaced { space, components } = color else {
+        return;
+    };
+    let Some(arr) = space.as_array() else {
+        return;
+    };
+    if arr.first().and_then(|o| o.as_name()) != Some("Separation") {
+        return;
+    }
+    match arr.get(1).and_then(|o| o.as_name()) {
+        Some("All") => {
+            overprint.selector = InkSelector::All;
+            overprint.all_tint = components.first().copied().unwrap_or(0.0);
+        },
+        Some("None") => {
+            overprint.selector = InkSelector::None;
+            overprint.all_tint = 0.0;
+        },
+        _ => {},
     }
 }
 

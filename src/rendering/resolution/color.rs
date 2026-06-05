@@ -175,6 +175,23 @@ impl ColorResolver {
             });
         }
 
+        // §8.6.6.3 reserved name: `/None` produces no visible output.
+        // For composite output we emit a fully-transparent RGBA — the
+        // splice carries it through as a no-op. The per-plate route
+        // sees `InkSelector::None` via the OverprintPlan and skips
+        // every plate regardless of this colour value.
+        let type_name = arr.first().and_then(|o| o.as_name());
+        if matches!(type_name, Some("Separation"))
+            && arr.get(1).and_then(|o| o.as_name()) == Some("None")
+        {
+            return Ok(ResolvedColor::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            });
+        }
+
         // Determine alternate colour space and tint-transform function.
         // Separation: [/Separation name altCS tintTransform]
         // DeviceN: [/DeviceN names altCS tintTransform attrs?]
@@ -658,6 +675,39 @@ mod tests {
             !(r < 0.01 && g < 0.01 && b < 0.01),
             "full-tint Type-4 spot must not render solid black; got ({r}, {g}, {b})"
         );
+    }
+
+    #[test]
+    fn separation_none_resolves_to_fully_transparent_for_composite() {
+        // §8.6.6.3 reserved name `/None`: composite output is fully
+        // transparent so the splice carries no marks through, mirroring
+        // the per-plate `Skip` decision the InkRouter makes off the
+        // OverprintPlan's `selector: InkSelector::None`.
+        let arr = vec![
+            Object::Name("Separation".into()),
+            Object::Name("None".into()),
+            Object::Name("DeviceGray".into()),
+            Object::Dictionary({
+                let mut d = HashMap::new();
+                d.insert("FunctionType".into(), Object::Integer(2));
+                d
+            }),
+        ];
+        let space = Object::Array(arr);
+        let doc = fixture_doc();
+        let spaces = HashMap::new();
+        let resolver = ColorResolver::new();
+        let lc = LogicalColor::Spaced {
+            space: &space,
+            components: smallvec::smallvec![0.5],
+        };
+        let c = resolver.resolve(&lc, &ctx(&doc, &spaces), 0.9).unwrap();
+        match c {
+            ResolvedColor::Rgba { a, .. } => {
+                assert!((a - 0.0).abs() < 1e-6, "/None composite alpha must be 0");
+            },
+            other => panic!("expected Rgba; got {other:?}"),
+        }
     }
 
     #[test]

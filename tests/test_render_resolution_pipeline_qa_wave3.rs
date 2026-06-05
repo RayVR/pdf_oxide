@@ -1665,13 +1665,13 @@ fn qa_image_mask_separation_all_colorant_pipeline_paints_type4_output() {
 }
 
 /// Probe 26 — Separation `/None` colorant applied to an ImageMask.
-/// Per spec, `/None` should produce no marks. Today neither path
-/// honours that special case (wave-1/2 documented the same for paths
-/// and text). Pin OFF and ON ink counts as both > 0 (current shared
-/// non-conformant behaviour); the toggle gains capability for `/None`
-/// the same way it does for other Separations (no special case).
+/// Per ISO 32000-1 §8.6.6.3, `/None` produces no visible output. The
+/// pipeline's per-plate routing selector (`InkSelector::None`, stamped
+/// by the composer on the source colour space) makes the composite
+/// resolver hand back a fully-transparent RGBA, so the ImageMask
+/// rasteriser paints with alpha=0 and lays down zero ink.
 #[test]
-fn qa_image_mask_separation_none_colorant_parity_pin() {
+fn qa_image_mask_separation_none_colorant_paints_zero_ink() {
     let mask = solid_image_mask_bytes(8, 8);
     let type4 = "{ 0.0 exch 0.0 0.0 }";
     let content = "/None_CS cs 0.5 scn\n100 0 0 100 0 0 cm\n/IM1 Do\n";
@@ -1688,17 +1688,12 @@ fn qa_image_mask_separation_none_colorant_parity_pin() {
         &[0, 1],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    let off_ink = count_ink_pixels(&off, 0, 0, 100, 100);
     let on_ink = count_ink_pixels(&on, 0, 0, 100, 100);
-    // Current shared behaviour: both paint. When /None is honoured per
-    // spec this pin must be updated to require zero ink on both sides.
-    assert!(
-        off_ink > 0,
-        "inline /None ImageMask fill must paint SOMETHING today (no spec honor)"
+    assert_eq!(
+        on_ink, 0,
+        "/None ImageMask must paint zero ink per §8.6.6.3 (got {on_ink} ink pixels)"
     );
-    assert!(on_ink > 0, "pipeline /None ImageMask fill must paint SOMETHING today");
 }
 
 // ===========================================================================

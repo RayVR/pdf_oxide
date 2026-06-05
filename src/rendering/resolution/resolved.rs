@@ -74,6 +74,32 @@ pub(crate) enum ResolvedColor {
     },
 }
 
+/// Whether the per-plate router should walk participating channels
+/// normally, paint every plate at a single tint, or skip every plate.
+///
+/// Lives on [`OverprintPlan`] rather than on [`ResolvedColor`] so the
+/// composite (RGB) backend continues to consume the tint-transform-
+/// evaluated RGBA for `/All` Separation sources unchanged. The selector
+/// only affects the [`super::InkRouter`] decision; composite backends
+/// ignore it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum InkSelector {
+    /// Default: route per-plate by walking the participating set
+    /// against the target ink. This is the §11.7.4 per-channel
+    /// behaviour every non-reserved Separation / DeviceN source takes.
+    #[default]
+    Listed,
+    /// ISO 32000-1:2008 §8.6.6.3 `/All` Separation source: paint every
+    /// plate (process + spot) at the same single tint value, carried
+    /// alongside in [`OverprintPlan::all_tint`]. The participating
+    /// list is empty for these sources.
+    All,
+    /// ISO 32000-1:2008 §8.6.6.3 `/None` Separation source: skip every
+    /// plate; produce no visible output. The participating list is
+    /// empty for these sources.
+    None,
+}
+
 /// Per-channel overprint participation, as evaluated against the current
 /// graphics state per ISO 32000-1:2008 §11.7.4.
 #[derive(Debug, Clone)]
@@ -89,6 +115,15 @@ pub(crate) struct OverprintPlan {
     /// decide which plates to touch when overprint is enabled: channels in
     /// this list participate; channels outside it are left untouched.
     pub(crate) participating: SmallVec<[ParticipatingChannel; 8]>,
+    /// Per-plate routing selector (§8.6.6.3 reserved Separation colorant
+    /// names). The composite backend ignores this field; only the
+    /// per-plate [`super::InkRouter`] consumes it.
+    pub(crate) selector: InkSelector,
+    /// Tint to use when [`Self::selector`] is [`InkSelector::All`]. Carried
+    /// alongside the colour-resolution output because /All bypasses
+    /// alternate-space tint-transform evaluation for the per-plate path —
+    /// the operator's raw component value is what every plate receives.
+    pub(crate) all_tint: f32,
 }
 
 /// One element of an [`OverprintPlan::participating`] list. The component
@@ -172,6 +207,8 @@ mod tests {
             enabled: false,
             mode: 0,
             participating: SmallVec::new(),
+            selector: InkSelector::Listed,
+            all_tint: 0.0,
         };
         assert!(!plan.enabled);
     }
@@ -200,6 +237,8 @@ mod tests {
                     value: 0.1
                 },
             ],
+            selector: InkSelector::Listed,
+            all_tint: 0.0,
         };
         assert_eq!(plan.participating.len(), 4);
         assert!(!plan.participating.spilled());

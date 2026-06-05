@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 use crate::content::graphics_state::GraphicsState;
 
 use super::intent::PaintSide;
-use super::resolved::{InkName, OverprintPlan, ParticipatingChannel, ResolvedColor};
+use super::resolved::{InkName, InkSelector, OverprintPlan, ParticipatingChannel, ResolvedColor};
 
 pub(crate) struct OverprintResolver;
 
@@ -89,6 +89,13 @@ impl OverprintResolver {
             enabled,
             mode,
             participating,
+            // Default routing selector. The pipeline composer overrides
+            // this when the source colour space is `/Separation /All`
+            // or `/Separation /None` (ISO 32000-1 §8.6.6.3); that's the
+            // only place the reserved colorant names are recognised so
+            // the OverprintResolver stays stateless and source-agnostic.
+            selector: InkSelector::Listed,
+            all_tint: 0.0,
         }
     }
 }

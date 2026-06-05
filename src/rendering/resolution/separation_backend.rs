@@ -228,7 +228,8 @@ mod tests {
 
     use super::super::intent::{PaintKind, PaintSide};
     use super::super::resolved::{
-        BlendPlan, ClipPlan, OverprintPlan, ParticipatingChannel, ResolvedColor, ResolvedPaintCmd,
+        BlendPlan, ClipPlan, InkSelector, OverprintPlan, ParticipatingChannel, ResolvedColor,
+        ResolvedPaintCmd,
     };
 
     fn rect_path() -> tiny_skia::Path {
@@ -280,6 +281,8 @@ mod tests {
                         value: k,
                     },
                 ],
+                selector: InkSelector::Listed,
+                all_tint: 0.0,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -397,6 +400,8 @@ mod tests {
                         value: 0.1,
                     },
                 ],
+                selector: InkSelector::Listed,
+                all_tint: 0.0,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -438,6 +443,8 @@ mod tests {
                 enabled: false,
                 mode: 0,
                 participating: SmallVec::new(),
+                selector: InkSelector::Listed,
+                all_tint: 0.0,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -513,6 +520,8 @@ mod tests {
                     ink: InkName::new("Cyan"),
                     value: 1.0,
                 }],
+                selector: InkSelector::Listed,
+                all_tint: 0.0,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,
@@ -582,6 +591,109 @@ mod tests {
                 ink.as_str(),
             );
         }
+    }
+
+    #[test]
+    fn all_inks_paints_every_plate_at_same_tint() {
+        // §8.6.6.3 Separation /All: every plate (process + spot) carries
+        // the same tint. The override is carried on OverprintPlan; the
+        // colour-resolution output is the alternate-space-evaluated
+        // RGBA (composite-only), but the InkRouter consults the
+        // selector and ignores the colour for routing.
+        let path = rect_path();
+        let cmd = ResolvedPaintCmd {
+            kind: PaintKind::Path {
+                path: &path,
+                fill_rule: FillRule::Winding,
+            },
+            side: PaintSide::Fill,
+            color: ResolvedColor::Rgba {
+                r: 0.6,
+                g: 0.6,
+                b: 0.6,
+                a: 1.0,
+            },
+            overprint: OverprintPlan {
+                enabled: false,
+                mode: 0,
+                participating: SmallVec::new(),
+                selector: InkSelector::All,
+                all_tint: 0.6,
+            },
+            blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
+            clip: ClipPlan::None,
+            ctm: Matrix::identity(),
+        };
+        let mut plates = vec![
+            fresh_pixmap(),
+            fresh_pixmap(),
+            fresh_pixmap(),
+            fresh_pixmap(),
+        ];
+        let inks = [
+            InkName::new("Cyan"),
+            InkName::new("Magenta"),
+            InkName::new("PANTONE 185 C"),
+            InkName::new("Dieline"),
+        ];
+        let surface = SeparationSurface {
+            pixmaps: &mut plates,
+            inks: &inks,
+            base_transform: Transform::identity(),
+        };
+        let mut backend = SeparationBackend::new();
+        backend.paint(&cmd, surface).unwrap();
+        // 0.6 -> 153 (0.6 * 255 = 153.0).
+        for (i, ink) in inks.iter().enumerate() {
+            assert_eq!(
+                plates[i].data()[(5 * 16 + 5) * 4],
+                153,
+                "/All must paint plate {:?} at the single tint",
+                ink.as_str(),
+            );
+        }
+    }
+
+    #[test]
+    fn none_inks_paints_no_plates() {
+        // §8.6.6.3 Separation /None: nothing visible. Every plate stays
+        // at its initial zero value.
+        let path = rect_path();
+        let cmd = ResolvedPaintCmd {
+            kind: PaintKind::Path {
+                path: &path,
+                fill_rule: FillRule::Winding,
+            },
+            side: PaintSide::Fill,
+            color: ResolvedColor::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            },
+            overprint: OverprintPlan {
+                enabled: false,
+                mode: 0,
+                participating: SmallVec::new(),
+                selector: InkSelector::None,
+                all_tint: 0.0,
+            },
+            blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
+            clip: ClipPlan::None,
+            ctm: Matrix::identity(),
+        };
+        let mut plates = vec![fresh_pixmap(), fresh_pixmap()];
+        let inks = [InkName::new("Cyan"), InkName::new("PANTONE 185 C")];
+        let surface = SeparationSurface {
+            pixmaps: &mut plates,
+            inks: &inks,
+            base_transform: Transform::identity(),
+        };
+        let mut backend = SeparationBackend::new();
+        backend.paint(&cmd, surface).unwrap();
+        // Both plates untouched.
+        assert_eq!(plates[0].data()[(5 * 16 + 5) * 4], 0);
+        assert_eq!(plates[1].data()[(5 * 16 + 5) * 4], 0);
     }
 
     #[test]

@@ -60,7 +60,7 @@ mod tests {
     use smallvec::SmallVec;
 
     use super::super::intent::{PaintKind, PaintSide};
-    use super::super::resolved::{BlendPlan, ClipPlan, OverprintPlan, ResolvedColor};
+    use super::super::resolved::{BlendPlan, ClipPlan, InkSelector, OverprintPlan, ResolvedColor};
 
     /// A minimal in-memory backend used to exercise the trait surface.
     /// Captures the command sequence so tests can assert on what was
@@ -109,6 +109,8 @@ mod tests {
                 enabled: false,
                 mode: 0,
                 participating: SmallVec::new(),
+                selector: InkSelector::Listed,
+                all_tint: 0.0,
             },
             blend: BlendPlan::Native(tiny_skia::BlendMode::SourceOver),
             clip: ClipPlan::None,

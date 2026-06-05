@@ -723,13 +723,14 @@ fn qa_text_tj_separation_all_colorant() {
 }
 
 /// Probe 10 — Separation `/None` colorant on text fill. Per ISO 32000-1
-/// §8.6.6.4, `/None` should produce no marks. Neither the inline nor the
-/// pipeline path honours that today; the test pins off-vs-on parity so the
-/// pipeline isn't accidentally regressing whatever the inline behaviour
-/// is. When both paths fix together, this pin can be updated to require
-/// zero ink.
+/// §8.6.6.3, `/None` produces no visible output. The pipeline's per-plate
+/// routing selector (`InkSelector::None`, stamped by the composer when the
+/// source colour space is `/Separation /None`) makes the composite
+/// resolver hand back a fully-transparent RGBA, so the text rasteriser
+/// paints with alpha=0 and lays down zero ink — regardless of what the
+/// tint transform would have produced.
 #[test]
-fn qa_text_tj_separation_none_colorant_parity_pin() {
+fn qa_text_tj_separation_none_colorant_paints_zero_ink() {
     let type4_program = "{ 0.0 exch 0.0 0.0 }";
     let content = "/None_CS cs 0.5 scn \
                    BT /F1 60 Tf 10 30 Td (M) Tj ET\n";
@@ -737,14 +738,10 @@ fn qa_text_tj_separation_none_colorant_parity_pin() {
     let bytes = build_pdf_text_with_type4_separation(content, type4_program, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
-    // /None is not honoured today — the pipeline runs the Type 4
-    // program (CMYK(0, 0.5, 0, 0) → light magenta). Pin that the
-    // renderer paints SOMETHING; when /None handling lands the
-    // assertion can flip to "no ink".
     let on_ink = count_ink_pixels(&on, 0, 0, 100, 100);
-    assert!(
-        on_ink > 0,
-        "pipeline /None text fill must paint SOMETHING (no spec honor today)"
+    assert_eq!(
+        on_ink, 0,
+        "pipeline /None text fill must paint zero ink per §8.6.6.3 (got {on_ink} ink pixels)"
     );
 }
 

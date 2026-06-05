@@ -14,7 +14,7 @@
 
 use crate::content::graphics_state::GraphicsState;
 
-use super::resolved::{InkName, OverprintPlan, ResolvedColor};
+use super::resolved::{InkName, InkSelector, OverprintPlan, ResolvedColor};
 
 pub(crate) struct InkRouter;
 
@@ -35,17 +35,27 @@ impl InkRouter {
 
     /// Decide what to do with `target_ink` for the given resolved colour.
     ///
-    /// Implements the decision tree from ISO 32000-1:2008 §11.7.4:
+    /// Implements the decision tree from ISO 32000-1:2008 §11.7.4 plus
+    /// the `/All` and `/None` reserved-name handling from §8.6.6.3:
     ///
-    /// - If the colour's participating channel set names `target_ink`, paint
-    ///   with the channel value.
-    /// - If it doesn't and overprint is enabled, leave the plate untouched.
-    /// - If it doesn't and overprint is disabled (the spec default), paint
-    ///   0.0 — "areas of unspecified colorants are erased" (the per-plate
-    ///   knockout rule).
+    /// - [`InkSelector::All`] (Separation `/All`): paint *every* plate at
+    ///   the single tint value carried on [`OverprintPlan::all_tint`],
+    ///   including spot plates the source doesn't name. The spec calls
+    ///   out this is the one case where a single colorant operator
+    ///   targets every output separation.
+    /// - [`InkSelector::None`] (Separation `/None`): produce no visible
+    ///   output; skip every plate.
+    /// - [`InkSelector::Listed`] (every other case): if the colour's
+    ///   participating channel set names `target_ink`, paint with the
+    ///   channel value; if it doesn't and overprint is enabled, leave
+    ///   the plate untouched; if it doesn't and overprint is disabled
+    ///   (the spec default), paint 0.0 — "areas of unspecified
+    ///   colorants are erased" (the per-plate knockout rule).
     /// - For OPM=1 sources, a zero-valued channel for `target_ink` means
     ///   "colorant not specified" — leave the plate untouched even when
     ///   the channel is in the participating set.
+    /// - For DeviceN, a channel literally named `"None"` is dropped per
+    ///   §8.6.6.4 and never matches.
     pub(crate) fn route(
         &self,
         _gs: &GraphicsState,
@@ -53,6 +63,16 @@ impl InkRouter {
         color: &ResolvedColor,
         overprint: &OverprintPlan,
     ) -> InkAction {
+        // /All and /None are reserved Separation colorant names per
+        // §8.6.6.3 — the OverprintResolver marks them on the plan's
+        // `selector` so the router can short-circuit before walking
+        // the per-channel participating list.
+        match overprint.selector {
+            InkSelector::All => return InkAction::Paint(overprint.all_tint),
+            InkSelector::None => return InkAction::Skip,
+            InkSelector::Listed => {},
+        }
+
         // Pull the participating channels from the appropriate variant.
         let participating = &overprint.participating;
         if participating.is_empty() {
@@ -60,8 +80,13 @@ impl InkRouter {
             return InkAction::Skip;
         }
 
-        // Look for our target ink in the participating channels.
-        if let Some(ch) = participating.iter().find(|c| c.ink == *target_ink) {
+        // Look for our target ink in the participating channels. Per
+        // §8.6.6.4 a DeviceN channel named "None" is dropped — we don't
+        // even consider it a match.
+        if let Some(ch) = participating
+            .iter()
+            .find(|c| c.ink == *target_ink && c.ink.as_str() != "None")
+        {
             // OPM=1 "Adobe nonzero overprint": a zero channel value on
             // DeviceCMYK means "colorant not specified" → skip.
             // §11.7.4.3 limits OPM=1 to DeviceCMYK sources; we identify
@@ -126,6 +151,8 @@ mod tests {
                     value: 0.1
                 },
             ],
+            selector: InkSelector::Listed,
+            all_tint: 0.0,
         }
     }
 
@@ -207,6 +234,8 @@ mod tests {
             enabled: true,
             mode: 0,
             participating: smallvec![],
+            selector: InkSelector::Listed,
+            all_tint: 0.0,
         };
         let color = ResolvedColor::Rgba {
             r: 1.0,
@@ -216,6 +245,140 @@ mod tests {
         };
         let action = InkRouter::new().route(&gs, &InkName::new("Cyan"), &color, &plan);
         assert_eq!(action, InkAction::Skip);
+    }
+
+    #[test]
+    fn all_inks_paints_every_plate_at_single_tint() {
+        // §8.6.6.3: Separation /All names every output plate. Both
+        // process and spot plates receive the same tint, regardless of
+        // overprint state and regardless of whether participating
+        // happens to list them. The router consults the
+        // `selector: InkSelector::All` marker to short-circuit.
+        let gs = fresh_gs();
+        // Composite colour resolution may still produce gray-at-tint;
+        // the router does not read `color` when selector is All/None.
+        let color = ResolvedColor::Rgba {
+            r: 0.6,
+            g: 0.6,
+            b: 0.6,
+            a: 1.0,
+        };
+        let plan = OverprintPlan {
+            enabled: false,
+            mode: 0,
+            participating: smallvec![],
+            selector: InkSelector::All,
+            all_tint: 0.6,
+        };
+        let router = InkRouter::new();
+        for ink_name in [
+            "Cyan",
+            "Magenta",
+            "Yellow",
+            "Black",
+            "PANTONE 185 C",
+            "Dieline",
+        ] {
+            let action = router.route(&gs, &InkName::new(ink_name), &color, &plan);
+            assert_eq!(action, InkAction::Paint(0.6), "/All must paint plate {ink_name}");
+        }
+    }
+
+    #[test]
+    fn all_inks_paints_even_when_overprint_enabled() {
+        // /All is unconditional: spec doesn't carve out an overprint
+        // exception. Same tint, every plate, OP=true.
+        let gs = fresh_gs();
+        let color = ResolvedColor::Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        };
+        let plan = OverprintPlan {
+            enabled: true,
+            mode: 1, // even with OPM=1 active
+            participating: smallvec![],
+            selector: InkSelector::All,
+            all_tint: 1.0,
+        };
+        let router = InkRouter::new();
+        for ink_name in ["Cyan", "Magenta", "Yellow", "Black", "PANTONE Reflex Blue"] {
+            let action = router.route(&gs, &InkName::new(ink_name), &color, &plan);
+            assert_eq!(action, InkAction::Paint(1.0), "/All ignores overprint; plate {ink_name}");
+        }
+    }
+
+    #[test]
+    fn none_inks_skips_every_plate() {
+        // §8.6.6.3: Separation /None produces no visible output. Every
+        // plate skips, regardless of overprint state.
+        let gs = fresh_gs();
+        let color = ResolvedColor::Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        let plan = OverprintPlan {
+            enabled: false,
+            mode: 0,
+            participating: smallvec![],
+            selector: InkSelector::None,
+            all_tint: 0.0,
+        };
+        let router = InkRouter::new();
+        for ink_name in [
+            "Cyan",
+            "Magenta",
+            "Yellow",
+            "Black",
+            "PANTONE 185 C",
+            "Dieline",
+        ] {
+            let action = router.route(&gs, &InkName::new(ink_name), &color, &plan);
+            assert_eq!(action, InkAction::Skip, "/None must skip plate {ink_name}");
+        }
+    }
+
+    #[test]
+    fn devicen_channel_named_none_is_dropped() {
+        // §8.6.6.4: a DeviceN channel literally named "None" is dropped
+        // from per-plate routing. Even if a target plate happens to be
+        // named "None", the router does not treat that as a match — it
+        // falls through to the unspecified-plate path (knock out when
+        // overprint is off).
+        let gs = fresh_gs();
+        let plan = OverprintPlan {
+            enabled: false,
+            mode: 0,
+            participating: smallvec![
+                ParticipatingChannel {
+                    ink: InkName::new("None"),
+                    value: 0.5,
+                },
+                ParticipatingChannel {
+                    ink: InkName::new("PANTONE 185 C"),
+                    value: 0.75,
+                },
+            ],
+            selector: InkSelector::Listed,
+            all_tint: 0.0,
+        };
+        let color = ResolvedColor::PerChannel {
+            channels: Box::new(smallvec![
+                (InkName::new("None"), 0.5),
+                (InkName::new("PANTONE 185 C"), 0.75),
+            ]),
+            a: 1.0,
+        };
+        let router = InkRouter::new();
+        // "None" target falls through to other_plate_action — knock out.
+        let action = router.route(&gs, &InkName::new("None"), &color, &plan);
+        assert_eq!(action, InkAction::Paint(0.0));
+        // Real ink still routes normally.
+        let action = router.route(&gs, &InkName::new("PANTONE 185 C"), &color, &plan);
+        assert_eq!(action, InkAction::Paint(0.75));
     }
 
     #[test]
@@ -235,6 +398,8 @@ mod tests {
                     value: 0.1
                 },
             ],
+            selector: InkSelector::Listed,
+            all_tint: 0.0,
         };
         let color = ResolvedColor::PerChannel {
             channels: Box::new(smallvec![

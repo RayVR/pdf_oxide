@@ -164,7 +164,7 @@ pub(crate) use intent::{DeviceColor, LogicalColor, PaintIntent, PaintKind, Paint
 pub(crate) use overprint::OverprintResolver;
 pub(crate) use pipeline::ResolutionPipeline;
 pub(crate) use resolved::{
-    BlendPlan, ClipPlan, InkName, OverprintPlan, ParticipatingChannel, ResolvedColor,
+    BlendPlan, ClipPlan, InkName, InkSelector, OverprintPlan, ParticipatingChannel, ResolvedColor,
     ResolvedPaintCmd,
 };
 pub(crate) use separation_backend::{SeparationBackend, SeparationSurface};
