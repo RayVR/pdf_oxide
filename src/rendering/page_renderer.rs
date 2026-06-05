@@ -700,81 +700,23 @@ impl PageRenderer {
                                                 }
                                             },
                                             "Separation" | "DeviceN" => {
-                                                // Per PDF spec, Separation = [/Separation name altCS tintTransform]
-                                                // Evaluate tint transform against alternate color space
-                                                if !components.is_empty() {
-                                                    let tint = components[0];
-                                                    let alt_cs = arr
-                                                        .get(2)
-                                                        .and_then(|o| o.as_name())
-                                                        .unwrap_or("");
-                                                    if alt_cs == "DeviceCMYK" && arr.len() >= 4 {
-                                                        if let Some(func_obj) = arr.get(3) {
-                                                            if let Ok(func_res) =
-                                                                doc.resolve_object(func_obj)
-                                                            {
-                                                                if let Some(fd) = func_res.as_dict()
-                                                                {
-                                                                    if fd
-                                                                        .get("FunctionType")
-                                                                        .and_then(|o| {
-                                                                            o.as_integer()
-                                                                        })
-                                                                        == Some(2)
-                                                                    {
-                                                                        let c0 =
-                                                                            fd.get("C0").and_then(
-                                                                                |o| o.as_array(),
-                                                                            );
-                                                                        let c1 =
-                                                                            fd.get("C1").and_then(
-                                                                                |o| o.as_array(),
-                                                                            );
-                                                                        let get_f = |arr: Option<&Vec<Object>>, i: usize, def: f32| -> f32 {
-                                                                            arr.and_then(|a| a.get(i)).map(|o| match o { Object::Real(v) => *v as f32, Object::Integer(v) => *v as f32, _ => def }).unwrap_or(def)
-                                                                        };
-                                                                        let c = get_f(c0, 0, 0.0)
-                                                                            + tint
-                                                                                * (get_f(
-                                                                                    c1, 0, 0.0,
-                                                                                ) - get_f(
-                                                                                    c0, 0, 0.0,
-                                                                                ));
-                                                                        let m = get_f(c0, 1, 0.0)
-                                                                            + tint
-                                                                                * (get_f(
-                                                                                    c1, 1, 0.0,
-                                                                                ) - get_f(
-                                                                                    c0, 1, 0.0,
-                                                                                ));
-                                                                        let y = get_f(c0, 2, 0.0)
-                                                                            + tint
-                                                                                * (get_f(
-                                                                                    c1, 2, 0.0,
-                                                                                ) - get_f(
-                                                                                    c0, 2, 0.0,
-                                                                                ));
-                                                                        let k = get_f(c0, 3, 0.0)
-                                                                            + tint
-                                                                                * (get_f(
-                                                                                    c1, 3, 1.0,
-                                                                                ) - get_f(
-                                                                                    c0, 3, 0.0,
-                                                                                ));
-                                                                        gs.fill_color_rgb =
-                                                                            cmyk_to_rgb(c, m, y, k);
-                                                                        handled = true;
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    if !handled {
-                                                        let g = 1.0 - tint;
-                                                        gs.fill_color_rgb = (g, g, g);
-                                                    }
-                                                    handled = true;
-                                                }
+                                                // Inline Separation/DeviceN evaluation used to
+                                                // live here as a partial reimplementation of the
+                                                // colour-resolver's tint-transform path. Wave 5
+                                                // promoted the pipeline to the single source of
+                                                // truth — the pipeline runs the full Type 2 / 3 /
+                                                // 4 evaluator at paint time and splices the
+                                                // resulting RGBA via pipeline_resolve_paint_gs.
+                                                // The dispatcher just records the components on
+                                                // gs.fill_color_components above; the pipeline
+                                                // reads those when the paint op fires. Setting
+                                                // gs.fill_color_rgb here would only seed the
+                                                // rgba_matches short-circuit, and an inline
+                                                // approximation would be wrong for any Type 4 or
+                                                // Type 3 tint transform — pin it as "handled"
+                                                // (no fallback gray write) and let the pipeline
+                                                // own the colour.
+                                                handled = true;
                                             },
                                             "Indexed" => {
                                                 if !components.is_empty() {
@@ -949,36 +891,22 @@ impl PageRenderer {
                                                 }
                                             },
                                             "Separation" | "DeviceN" => {
-                                                if !components.is_empty() {
-                                                    let g = 1.0 - components[0];
-                                                    gs.fill_color_rgb = (g, g, g);
-                                                    handled = true;
-                                                }
+                                                // Pipeline owns the colour at paint time —
+                                                // see the matching comment in the SetFillColor
+                                                // arm above. The dispatcher just records the
+                                                // components for the pipeline to read.
+                                                handled = true;
                                             },
                                             "Indexed" => {
-                                                // Indexed: the component is
-                                                // a palette index 0..hival.
-                                                // Until the full palette
-                                                // lookup is wired (planned
-                                                // alongside the pipeline's
-                                                // resolve_indexed at
-                                                // src/rendering/resolution/
-                                                // color.rs:237), match the
-                                                // pipeline's index/255 gray
-                                                // fallback so the off/on
-                                                // toggle agrees. Without
-                                                // this branch the generic
-                                                // fallback below would
-                                                // forward the raw index
-                                                // (e.g. 1.0) as the gray
-                                                // value, producing white
-                                                // where the pipeline gives
-                                                // near-black.
-                                                if !components.is_empty() {
-                                                    let g = (components[0] / 255.0).clamp(0.0, 1.0);
-                                                    gs.fill_color_rgb = (g, g, g);
-                                                    handled = true;
-                                                }
+                                                // Pipeline's resolve_indexed handles index/255
+                                                // gray fallback at paint time. The inline path
+                                                // used to set gs.fill_color_rgb here to seed
+                                                // the rgba_matches short-circuit; the pipeline
+                                                // now produces the same value unconditionally,
+                                                // so the short-circuit either fires or the
+                                                // splice clone runs — either way the colour is
+                                                // correct.
+                                                handled = true;
                                             },
                                             _ => {},
                                         }
@@ -1062,32 +990,15 @@ impl PageRenderer {
                                                 }
                                             },
                                             "Separation" | "DeviceN" => {
-                                                // Mirror the fill-side
-                                                // `1.0 - tint` fallback so
-                                                // off-vs-on parity holds
-                                                // for legacy spot inks the
-                                                // pipeline hasn't fully
-                                                // wired yet. The toggled
-                                                // pipeline path still
-                                                // honours Type 2/4 tint
-                                                // transforms when present.
-                                                if !components.is_empty() {
-                                                    let g = 1.0 - components[0];
-                                                    gs.stroke_color_rgb = (g, g, g);
-                                                    handled = true;
-                                                }
+                                                // Pipeline owns the colour at paint time —
+                                                // see the matching comment in the SetFillColor
+                                                // arm.
+                                                handled = true;
                                             },
                                             "Indexed" => {
-                                                // Indexed stroke: match the
-                                                // pipeline's index/255 gray
-                                                // fallback. See the matching
-                                                // fill-side branch for the
-                                                // rationale.
-                                                if !components.is_empty() {
-                                                    let g = (components[0] / 255.0).clamp(0.0, 1.0);
-                                                    gs.stroke_color_rgb = (g, g, g);
-                                                    handled = true;
-                                                }
+                                                // Pipeline's resolve_indexed handles
+                                                // index/255 gray fallback at paint time.
+                                                handled = true;
                                             },
                                             _ => {},
                                         }
@@ -1839,7 +1750,6 @@ impl PageRenderer {
                 &shading,
                 transform,
                 gs,
-                doc,
                 clip_mask,
                 resolved_endpoints,
             ),
@@ -1848,7 +1758,6 @@ impl PageRenderer {
                 &shading,
                 transform,
                 gs,
-                doc,
                 clip_mask,
                 resolved_endpoints,
             ),
@@ -1915,9 +1824,7 @@ impl PageRenderer {
         // exponential interpolation — and Type 3 (stitching) — where
         // the first sub-function's `/C0` and the last sub-function's
         // `/C1` are taken at face value. Type 3 with non-trivial
-        // `/Encode` is not honoured (same gap as the inline
-        // `evaluate_shading_function` path); see the body comment
-        // below.
+        // `/Encode` is not honoured; see the body comment below.
         let func_obj = shading.get("Function")?;
         let resolved_func = doc.resolve_object(func_obj).ok()?;
         let func_dict = resolved_func.as_dict()?;
@@ -1965,8 +1872,7 @@ impl PageRenderer {
                 // sub-function's `/C0` and the last sub-function's
                 // `/C1` at face value — correct for the default
                 // `Domain [0 1]` with natural `Encode`, but ignores
-                // `Encode`-driven sub-domain remapping. Documented
-                // gap, same as `evaluate_shading_function`.
+                // `Encode`-driven sub-domain remapping. Documented gap.
                 let funcs = func_dict.get("Functions").and_then(|o| o.as_array())?;
                 let first = funcs.first()?;
                 let last = funcs.last().unwrap_or(first);
@@ -2012,16 +1918,15 @@ impl PageRenderer {
     /// values for the two gradient stops with `gs.fill_alpha` already
     /// folded in — the resolution-pipeline route produced by
     /// [`Self::pipeline_resolve_shading_endpoints`]. When `None`, the
-    /// function falls back to the legacy
-    /// [`Self::evaluate_shading_function`] path, which reads `/C0` and
-    /// `/C1` raw and assumes they are already RGB triples.
+    /// function falls back to a black-to-white default
+    /// (the safety net the legacy inline path used as its outermost
+    /// fallback before wave 5).
     fn render_axial_shading(
         &self,
         pixmap: &mut Pixmap,
         shading: &std::collections::HashMap<String, Object>,
         transform: Transform,
         gs: &GraphicsState,
-        doc: &PdfDocument,
         clip_mask: Option<&tiny_skia::Mask>,
         resolved_endpoints: Option<((f32, f32, f32, f32), (f32, f32, f32, f32))>,
     ) -> Result<()> {
@@ -2056,16 +1961,16 @@ impl PageRenderer {
             (false, false)
         };
 
-        // Build the two gradient-stop RGBAs. When the resolution
-        // pipeline pre-resolved the endpoints, use those directly
-        // (alpha already folded). Otherwise fall back to the legacy
-        // raw-`/C0`-as-RGB read; in that case alpha is folded here.
-        let (stop0, stop1) = if let Some(((r0, g0, b0, a0), (r1, g1, b1, a1))) = resolved_endpoints
-        {
-            ((r0, g0, b0, a0), (r1, g1, b1, a1))
-        } else {
-            let (c0, c1) = self.evaluate_shading_function(shading, doc)?;
-            ((c0.0, c0.1, c0.2, gs.fill_alpha), (c1.0, c1.1, c1.2, gs.fill_alpha))
+        // Build the two gradient-stop RGBAs from the pipeline's
+        // pre-resolved endpoint pair. When the resolver cannot produce
+        // an answer (missing /Function, unsupported sub-function type,
+        // non-RGBA resolver output) fall back to the
+        // black-to-white default that matches the legacy renderer's
+        // safety net — render with sensible defaults rather than
+        // panicking or rendering nothing.
+        let (stop0, stop1) = match resolved_endpoints {
+            Some(((r0, g0, b0, a0), (r1, g1, b1, a1))) => ((r0, g0, b0, a0), (r1, g1, b1, a1)),
+            None => ((0.0, 0.0, 0.0, gs.fill_alpha), (1.0, 1.0, 1.0, gs.fill_alpha)),
         };
 
         // Transform gradient endpoints
@@ -2146,16 +2051,15 @@ impl PageRenderer {
     /// values for the two gradient stops with `gs.fill_alpha` already
     /// folded in — the resolution-pipeline route produced by
     /// [`Self::pipeline_resolve_shading_endpoints`]. When `None`, the
-    /// function falls back to the legacy
-    /// [`Self::evaluate_shading_function`] path, which reads `/C0` and
-    /// `/C1` raw and assumes they are already RGB triples.
+    /// function falls back to a black-to-white default (the safety net
+    /// the legacy inline path used as its outermost fallback before
+    /// wave 5).
     fn render_radial_shading(
         &self,
         pixmap: &mut Pixmap,
         shading: &std::collections::HashMap<String, Object>,
         transform: Transform,
         gs: &GraphicsState,
-        doc: &PdfDocument,
         clip_mask: Option<&tiny_skia::Mask>,
         resolved_endpoints: Option<((f32, f32, f32, f32), (f32, f32, f32, f32))>,
     ) -> Result<()> {
@@ -2192,13 +2096,10 @@ impl PageRenderer {
 
         // Same pipeline-or-fallback dispatch as `render_axial_shading`
         // — see its docs for the rationale.
-        let (stop0, stop1) =
-            if let Some(((r0c, g0, b0, a0), (r1c, g1, b1, a1))) = resolved_endpoints {
-                ((r0c, g0, b0, a0), (r1c, g1, b1, a1))
-            } else {
-                let (c0, c1) = self.evaluate_shading_function(shading, doc)?;
-                ((c0.0, c0.1, c0.2, gs.fill_alpha), (c1.0, c1.1, c1.2, gs.fill_alpha))
-            };
+        let (stop0, stop1) = match resolved_endpoints {
+            Some(((r0c, g0, b0, a0), (r1c, g1, b1, a1))) => ((r0c, g0, b0, a0), (r1c, g1, b1, a1)),
+            None => ((0.0, 0.0, 0.0, gs.fill_alpha), (1.0, 1.0, 1.0, gs.fill_alpha)),
+        };
 
         // Per ISO 32000-1 §8.7.4.5.4, the radial gradient interpolates
         // between two circles `(x0, y0, r0)` (the inner / start circle,
@@ -2290,138 +2191,6 @@ impl PageRenderer {
         }
 
         Ok(())
-    }
-
-    /// Evaluate a shading function at the shading's `/Domain` endpoints
-    /// to get start/end colors. Per ISO 32000-1 §8.7.4.5.3 the gradient
-    /// parameter `t ∈ [0, 1]` maps to function input `x ∈ [Domain[0],
-    /// Domain[1]]` (default `[0, 1]`), so the start colour is
-    /// `f(Domain[0])` and the end colour is `f(Domain[1])`.
-    fn evaluate_shading_function(
-        &self,
-        shading: &std::collections::HashMap<String, Object>,
-        doc: &PdfDocument,
-    ) -> Result<((f32, f32, f32), (f32, f32, f32))> {
-        let (domain0, domain1) = shading
-            .get("Domain")
-            .and_then(|o| o.as_array())
-            .and_then(|arr| {
-                let parse = |o: &Object| -> Option<f32> {
-                    match o {
-                        Object::Real(v) => Some(*v as f32),
-                        Object::Integer(v) => Some(*v as f32),
-                        _ => None,
-                    }
-                };
-                Some((parse(arr.first()?)?, parse(arr.get(1)?)?))
-            })
-            .unwrap_or((0.0, 1.0));
-
-        // Try to parse a simple Type 2 (exponential interpolation) or Type 0 (sampled) function
-        let func_obj = shading.get("Function");
-        if let Some(func) = func_obj {
-            let resolved = doc.resolve_object(func)?;
-            if let Some(func_dict) = resolved.as_dict() {
-                let func_type = func_dict
-                    .get("FunctionType")
-                    .and_then(|o| o.as_integer())
-                    .unwrap_or(-1);
-
-                if func_type == 2 {
-                    // Type 2: Exponential interpolation f(x) = C0 + x^N * (C1 - C0).
-                    // Evaluate at the shading's /Domain endpoints, not
-                    // raw /C0 and /C1.
-                    let c0 = func_dict
-                        .get("C0")
-                        .and_then(|o| o.as_array())
-                        .map(|arr| Self::parse_color_array(arr))
-                        .unwrap_or((0.0, 0.0, 0.0));
-                    let c1 = func_dict
-                        .get("C1")
-                        .and_then(|o| o.as_array())
-                        .map(|arr| Self::parse_color_array(arr))
-                        .unwrap_or((1.0, 1.0, 1.0));
-                    let n = func_dict
-                        .get("N")
-                        .and_then(|o| match o {
-                            Object::Real(v) => Some(*v as f32),
-                            Object::Integer(v) => Some(*v as f32),
-                            _ => None,
-                        })
-                        .unwrap_or(1.0);
-                    let lerp = |x: f32| -> (f32, f32, f32) {
-                        let p = x.abs().powf(n) * x.signum();
-                        (
-                            c0.0 + p * (c1.0 - c0.0),
-                            c0.1 + p * (c1.1 - c0.1),
-                            c0.2 + p * (c1.2 - c0.2),
-                        )
-                    };
-                    return Ok((lerp(domain0), lerp(domain1)));
-                } else if func_type == 3 {
-                    // Type 3: Stitching function — wraps multiple
-                    // sub-functions. For gradient endpoints, read the
-                    // first sub-function's `/C0` and the last
-                    // sub-function's `/C1` at face value. Per ISO
-                    // 32000-1 §7.10.4, the stitching `/Domain` is
-                    // partitioned by `/Bounds` and remapped per
-                    // sub-function via `/Encode`. The path below
-                    // honours neither — correct for the default
-                    // `Domain [0 1]` with natural `Encode` arrays, but
-                    // misrepresents non-default `Encode`-driven
-                    // sub-domain remapping. Documented gap.
-                    if let Some(funcs) = func_dict.get("Functions").and_then(|o| o.as_array()) {
-                        if let Some(first_func) = funcs.first() {
-                            let sub_resolved = doc.resolve_object(first_func)?;
-                            if let Some(sub_dict) = sub_resolved.as_dict() {
-                                let sub_type = sub_dict
-                                    .get("FunctionType")
-                                    .and_then(|o| o.as_integer())
-                                    .unwrap_or(-1);
-                                if sub_type == 2 {
-                                    let c0 = sub_dict
-                                        .get("C0")
-                                        .and_then(|o| o.as_array())
-                                        .map(|arr| Self::parse_color_array(arr))
-                                        .unwrap_or((0.0, 0.0, 0.0));
-                                    // For last color, check last sub-function if multiple
-                                    let last_func_obj = funcs.last().unwrap_or(first_func);
-                                    let last_resolved = doc.resolve_object(last_func_obj)?;
-                                    let c1 = last_resolved
-                                        .as_dict()
-                                        .and_then(|d| d.get("C1"))
-                                        .and_then(|o| o.as_array())
-                                        .map(|arr| Self::parse_color_array(arr))
-                                        .unwrap_or((1.0, 1.0, 1.0));
-                                    return Ok((c0, c1));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
-    }
-
-    fn parse_color_array(arr: &[Object]) -> (f32, f32, f32) {
-        let get = |i: usize| -> f32 {
-            arr.get(i)
-                .map(|o| match o {
-                    Object::Real(v) => *v as f32,
-                    Object::Integer(v) => *v as f32,
-                    _ => 0.0,
-                })
-                .unwrap_or(0.0)
-        };
-        if arr.len() >= 3 {
-            (get(0), get(1), get(2))
-        } else if arr.len() == 1 {
-            let g = get(0);
-            (g, g, g) // Grayscale
-        } else {
-            (0.0, 0.0, 0.0)
-        }
     }
 
     /// Render an XObject (image or form).
@@ -3942,32 +3711,6 @@ mod tests {
         assert!((r - 0.0).abs() < 0.001);
         assert!((g - 1.0).abs() < 0.001);
         assert!((b - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_parse_color_array_rgb() {
-        let arr = vec![Object::Real(0.5), Object::Real(0.25), Object::Real(0.75)];
-        let (r, g, b) = PageRenderer::parse_color_array(&arr);
-        assert!((r - 0.5).abs() < 0.001);
-        assert!((g - 0.25).abs() < 0.001);
-        assert!((b - 0.75).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_parse_color_array_grayscale() {
-        let arr = vec![Object::Real(0.5)];
-        let (r, g, b) = PageRenderer::parse_color_array(&arr);
-        assert!((r - 0.5).abs() < 0.001);
-        assert_eq!(r, g);
-        assert_eq!(g, b);
-    }
-
-    #[test]
-    fn test_parse_color_array_integers() {
-        let arr = vec![Object::Integer(1), Object::Integer(0), Object::Integer(0)];
-        let (r, g, b) = PageRenderer::parse_color_array(&arr);
-        assert!((r - 1.0).abs() < 0.001);
-        assert!((g - 0.0).abs() < 0.001);
     }
 
     #[test]
