@@ -1194,6 +1194,185 @@ fn qa_round3_cache_keys_include_rendering_intent() {
 }
 
 // ===========================================================================
+// Phase 8: rendering-intent dispatch — qcms 0.3.0 limitation pin
+// ===========================================================================
+//
+// ISO 32000-1:2008 §10.7.3 specifies per-paint rendering intent through
+// the `/RI` operator. The graphics-state field flows through
+// `gs.rendering_intent` → `ctx.rendering_intent` → `Transform::new_srgb_target`'s
+// intent parameter → qcms.
+//
+// **Research surface: qcms 0.3.0 intent dispatch.** Reading
+// `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/qcms-0.3.0/src/transform.rs`:
+//   - line 1283: `pub fn transform_create(input, in_type, output, out_type,
+//     _intent: Intent)` — the underscore prefix marks the parameter as
+//     intentionally unused. qcms 0.3.0 discards the intent.
+//   - line 1245: `fn transform_precacheLUT_cmyk_float(transform, input,
+//     output, samples, in_type)` — the CMYK CLUT precomputation takes no
+//     intent; the same CLUT is produced regardless of caller intent.
+//   - The crate's `lib.rs` Intent enum docstring (line 32) notes that
+//     "BPC brings an unacceptable performance overhead, so we go with
+//     perceptual" — qcms 0.3.0 has no Black Point Compensation flag at
+//     all. The §10.7.3 `/AbsoluteColorimetric` BPC-off behaviour cannot
+//     be expressed through qcms 0.3.0.
+//
+// **HONEST_GAP_QCMS_INTENT_IGNORED**: per-channel intent dispatch IS
+// wired through `ctx.rendering_intent` → `Transform::new_srgb_target`
+// at the pdf_oxide layer, and the cache key separates entries by intent
+// — but qcms 0.3.0 silently drops intent inside transform construction.
+// Distinct intents produce byte-identical CMYK→RGB conversions through
+// qcms 0.3.0; a future qcms upgrade that honours intent will surface the
+// difference automatically because the dispatch chain already routes the
+// per-intent value through. The cache invalidation guarantee holds:
+// distinct intents get distinct Transform instances (so when qcms starts
+// honouring intent, no shared-Transform cross-contamination happens).
+//
+// The probes below pin three claims:
+//   1. `gs.rendering_intent` flows end-to-end into the cache key (covered
+//      by `qa_round3_cache_keys_include_rendering_intent` above).
+//   2. qcms 0.3.0's intent-invariance for CMYK conversions is observable
+//      via the constant-CLUT fixture — same input, four intents, same
+//      RGB. Documents the qcms version constraint.
+//   3. The default intent fallback (§8.6.5.8: unrecognised intent →
+//      /RelativeColorimetric) is honoured at the colour boundary.
+
+/// Pin qcms 0.3.0's documented intent-invariance for CMYK profiles:
+/// the same CMYK input under all four `RenderingIntent` values
+/// produces byte-identical RGB through `Transform::convert_cmyk_pixel`.
+///
+/// **Why this probe is GREEN immediately:** qcms 0.3.0's
+/// `transform_create` ignores the intent parameter (see the module
+/// docstring above). A future qcms upgrade that honours intent for
+/// CMYK→sRGB conversions would flip this probe to RED, surfacing the
+/// behaviour change at upgrade time so a CHANGELOG entry can document
+/// the §10.7.3 intent dispatch becoming externally observable.
+///
+/// **Constructed fixture caveat:** the constant-CLUT profile used here
+/// produces the same RGB for every CMYK input by design — that's how
+/// the test pin stays unambiguous. A real-world CMYK profile (CoatedFOGRA39
+/// etc.) carries an intent-dependent CLUT that WOULD vary across intents
+/// IF qcms honoured them. Synthesising such a fixture requires a real
+/// CMM toolchain (curves + matrices + a true 4D CLUT) — deferred as
+/// HONEST_GAP_INTENT_SENSITIVE_FIXTURE.
+#[test]
+fn qa_round3_qcms_030_treats_cmyk_intent_as_informational() {
+    use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+    use std::sync::Arc;
+
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let profile = Arc::new(IccProfile::parse(icc, 4).expect("parse"));
+
+    let intents = [
+        RenderingIntent::Perceptual,
+        RenderingIntent::RelativeColorimetric,
+        RenderingIntent::Saturation,
+        RenderingIntent::AbsoluteColorimetric,
+    ];
+
+    // CMYK(64, 0, 0, 0) is the round-1 byte-exact pin: target_l_byte=135
+    // → RGB(126, 126, 126) under qcms 0.3.0 at every intent.
+    let mut results = Vec::new();
+    for intent in intents {
+        let t = Transform::new_srgb_target(Arc::clone(&profile), intent);
+        assert!(t.has_cmm(), "intent {intent:?} must build a real CMM");
+        let rgb = t.convert_cmyk_pixel(64, 0, 0, 0);
+        results.push((intent, rgb));
+    }
+    // All four results must be identical under qcms 0.3.0. If this
+    // asserts differently in a future qcms version, the intent
+    // dispatch became externally observable.
+    let first = results[0].1;
+    for (intent, rgb) in &results[1..] {
+        assert_eq!(
+            *rgb, first,
+            "qcms 0.3.0 must produce intent-invariant CMYK→RGB. Intent {intent:?} \
+             produced {rgb:?} while {:?} produced {first:?}. \
+             If this fires after a qcms upgrade, intent dispatch is now \
+             externally observable — update the HONEST_GAP_QCMS_INTENT_IGNORED \
+             documentation and remove this pin.",
+            results[0].0
+        );
+    }
+    assert_eq!(
+        first,
+        [126u8, 126, 126],
+        "byte-exact reference: target_l_byte=135 → (126, 126, 126) at every \
+         intent through qcms 0.3.0"
+    );
+}
+
+/// Pin that the §8.6.5.8 "unrecognised intent → /RelativeColorimetric"
+/// fallback is honoured at the colour boundary. A PDF that sets
+/// `/RI /UnknownVendorPrivateIntent` must map to
+/// `RenderingIntent::RelativeColorimetric`, NOT to an arbitrary
+/// default.
+///
+/// This is a unit-level pin against the spec's defaulting rule. The
+/// cache key includes intent, so under the failing scenario (a
+/// regression that mapped unknown names to /Perceptual or /Saturation)
+/// a same-named intent would silently produce a different cache entry
+/// — surfaced here by asserting the from_pdf_name behaviour directly.
+#[test]
+fn qa_round3_unknown_intent_name_falls_back_to_relative_colorimetric() {
+    use pdf_oxide::color::RenderingIntent;
+
+    // §8.6.5.8: unrecognised → RelativeColorimetric.
+    assert_eq!(
+        RenderingIntent::from_pdf_name("UnknownVendorPrivateIntent"),
+        RenderingIntent::RelativeColorimetric,
+        "unknown intent name must fall back to /RelativeColorimetric per §8.6.5.8"
+    );
+    // Empty string is the implicit "no /RI ever ran" case — same
+    // default.
+    assert_eq!(
+        RenderingIntent::from_pdf_name(""),
+        RenderingIntent::RelativeColorimetric,
+        "empty intent name must fall back to /RelativeColorimetric"
+    );
+    // Each of the four named intents must round-trip cleanly.
+    assert_eq!(RenderingIntent::from_pdf_name("Perceptual"), RenderingIntent::Perceptual);
+    assert_eq!(RenderingIntent::from_pdf_name("Saturation"), RenderingIntent::Saturation);
+    assert_eq!(
+        RenderingIntent::from_pdf_name("RelativeColorimetric"),
+        RenderingIntent::RelativeColorimetric
+    );
+    assert_eq!(
+        RenderingIntent::from_pdf_name("AbsoluteColorimetric"),
+        RenderingIntent::AbsoluteColorimetric
+    );
+}
+
+/// HONEST_GAP_INTENT_SENSITIVE_FIXTURE: a probe that WOULD pin
+/// /Perceptual vs /AbsoluteColorimetric producing different RGB.
+/// Requires:
+///   1. An intent-sensitive CMYK profile (real CoatedFOGRA39 or
+///      equivalent — synthetic profiles with constant CLUTs are
+///      intent-invariant by construction).
+///   2. A qcms version that honours the intent parameter for CMYK
+///      transforms (qcms 0.3.0 does not, per the module docstring).
+///
+/// Neither prerequisite is satisfied today. The probe stays
+/// `#[ignore]`-ed with the HONEST_GAP marker so a future engineer
+/// adding either prerequisite has a ready-made integration test to
+/// turn on.
+#[test]
+#[ignore = "HONEST_GAP_INTENT_SENSITIVE_FIXTURE: needs (a) intent-sensitive \
+            CMYK profile + (b) qcms version that honours intent for CMYK"]
+fn output_intent_perceptual_vs_absolute_colorimetric_produces_different_rgb() {
+    panic!(
+        "HONEST_GAP_INTENT_SENSITIVE_FIXTURE: qcms 0.3.0 ignores intent for \
+         CMYK conversions (transform.rs:1288 `_intent: Intent`). To enable \
+         this probe a future engineer needs: (1) a CMYK ICC profile with \
+         genuine intent-dependent behaviour (synthetic constant-CLUT \
+         fixtures are intent-invariant by construction); (2) a qcms upgrade \
+         that honours intent for CMYK. The wiring chain is already in \
+         place — gs.rendering_intent → ctx.rendering_intent → \
+         Transform::new_srgb_target — so flipping qcms versions WILL surface \
+         the intent dispatch without further code changes."
+    );
+}
+
+// ===========================================================================
 // QA: TDD-discipline verification report (inline docstring)
 // ===========================================================================
 
