@@ -432,6 +432,102 @@ fn device_cmyk_paint_without_output_intent_renders_additive_clamp() {
 }
 
 // ===========================================================================
+// QA: byte-exact Lab→sRGB pin (replaces the ±10 hand-wave)
+// ===========================================================================
+
+/// Byte-exact pin of the qcms reference value the synthesised
+/// `target_l_byte=135` profile yields.
+///
+/// The existing positive test (`device_cmyk_paint_with_output_intent_*`)
+/// asserts the rendered pixel falls within `(128, 128, 128) ± 10` per
+/// channel — that's a hand-wave that hides up to a ~9-byte channel-by-
+/// channel drift. Derived against qcms 0.3.0 (the version pinned in
+/// Cargo.lock at this commit), the byte-exact reference for
+/// `target_l_byte=135` + CMYK(64,0,0,0) at `RelativeColorimetric` is
+/// `(126, 126, 126)`. The rendered pixel at (50, 50) through the
+/// composite pipeline is `(126, 126, 126, 255)`. We pin both — any
+/// drift in the qcms chain (Lab→XYZ→sRGB), the LUT8 tetra-interp, or
+/// the resolver's 8-bit round-trip surfaces here byte-for-byte.
+///
+/// If a future qcms upgrade shifts the reference, the right answer is
+/// to re-derive the value here, not to widen the tolerance — `±10` was
+/// the impl-agent's tolerance for an unmeasured target; this probe pins
+/// the actual measured target.
+#[test]
+fn output_intent_render_pixel_is_byte_exact_against_qcms_reference() {
+    use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+    use std::sync::Arc;
+
+    let target_l_byte: u8 = 135;
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(target_l_byte);
+
+    // Standalone transform: pin the qcms output byte-for-byte against
+    // the derived reference. CMYK(64, 0, 0, 0) is the input the
+    // positive integration test feeds for its sanity check.
+    {
+        let prof = Arc::new(IccProfile::parse(icc.clone(), 4).expect("parse"));
+        let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
+        let rgb = t.convert_cmyk_pixel(64, 0, 0, 0);
+        assert_eq!(
+            rgb,
+            [126u8, 126, 126],
+            "qcms 0.3.0 byte-exact reference for target_l_byte=135 + CMYK(64,0,0,0): \
+             expected (126, 126, 126); got {rgb:?}. Re-derive (see plan errata) if qcms \
+             ever changes its Lab→sRGB chain — do not widen tolerance."
+        );
+    }
+
+    // Through the composite renderer: pin the rendered pixel at the
+    // centre of the painted rect byte-for-byte.
+    let pdf = build_pdf_cmyk_with_output_intent(&icc);
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (126u8, 126, 126, 255),
+        "rendered pixel must match the qcms reference byte-for-byte; got ({r},{g},{b},{a}). \
+         (191,255,255,_) means the §10.3.5 fallback fired."
+    );
+}
+
+/// Pin the qcms reference value is intent-independent for the synthesised
+/// constant-CLUT profile.
+///
+/// The constant-CLUT shape of the synthesised profile means a CMM whose
+/// gamut compression depends on rendering intent (which is the whole
+/// point of having intents) should still produce the same value — there's
+/// no out-of-gamut excursion to compress. If qcms ever starts producing
+/// different values per intent on a constant CLUT that's a CMM bug
+/// worth surfacing.
+#[test]
+fn output_intent_constant_clut_is_invariant_across_rendering_intents() {
+    use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+    use std::sync::Arc;
+
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let prof = Arc::new(IccProfile::parse(icc, 4).expect("parse"));
+    let mut last: Option<[u8; 3]> = None;
+    for intent in [
+        RenderingIntent::Perceptual,
+        RenderingIntent::RelativeColorimetric,
+        RenderingIntent::Saturation,
+        RenderingIntent::AbsoluteColorimetric,
+    ] {
+        let t = Transform::new_srgb_target(Arc::clone(&prof), intent);
+        let rgb = t.convert_cmyk_pixel(64, 0, 0, 0);
+        if let Some(prev) = last {
+            assert_eq!(
+                prev, rgb,
+                "constant-CLUT qcms output must be identical across rendering intents; \
+                 first intent yielded {prev:?}, intent={intent:?} yielded {rgb:?}"
+            );
+        }
+        last = Some(rgb);
+    }
+}
+
+// ===========================================================================
 // QA: helper-level consistency (§10.3.5 source-of-truth probe)
 // ===========================================================================
 
