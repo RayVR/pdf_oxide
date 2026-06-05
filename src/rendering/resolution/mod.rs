@@ -129,16 +129,16 @@
 //! by feeding `GraphicsState` mocks. This is the payoff of the layering —
 //! capabilities become individually testable.
 
-// Several stages (the per-plate ink router, the explicit blend planner,
-// the dedicated PaintBackend trait) are scaffolding for future backends
-// that have zero callers today. The `dead_code` allow keeps the module
-// compiling clean under `-D warnings` while those callers come online;
-// remove it once every stage has at least one production caller. The
-// `unused_imports` allow covers the convenience re-exports below — the
-// pilot consumes a subset (`ResolutionPipeline`, `ResolutionContext`, the
-// intent + resolved types); the rest become live as follow-up branches
-// migrate operators.
-#![allow(dead_code, unused_imports)]
+// A handful of types and the `PaintBackend` trait surface are still
+// scaffolding for future backends (composite preflight, PDF/X-style
+// press preview) — they're plumbed through the module so the migration
+// surface stays stable, but only the per-plate `SeparationBackend` and
+// the pilot composite paths exercise every variant today. The narrowed
+// allow covers exactly those scaffolded items; production callers like
+// `ResolutionPipeline`, `SeparationBackend`, and the resolved-color
+// variants are referenced unconditionally and no longer need the blanket
+// dead-code suppression that was here during the migration.
+#![allow(dead_code)]
 
 pub(crate) mod backend;
 pub(crate) mod blend;
@@ -155,16 +155,8 @@ pub(crate) mod separation_backend;
 pub(crate) mod test_support;
 
 pub(crate) use backend::PaintBackend;
-pub(crate) use blend::BlendResolver;
-pub(crate) use clip::ClipResolver;
-pub(crate) use color::ColorResolver;
 pub(crate) use context::ResolutionContext;
-pub(crate) use ink::{InkAction, InkRouter};
 pub(crate) use intent::{DeviceColor, LogicalColor, PaintIntent, PaintKind, PaintSide};
-pub(crate) use overprint::OverprintResolver;
 pub(crate) use pipeline::ResolutionPipeline;
-pub(crate) use resolved::{
-    BlendPlan, ClipPlan, InkName, InkSelector, OverprintPlan, ParticipatingChannel, ResolvedColor,
-    ResolvedPaintCmd,
-};
+pub(crate) use resolved::{ClipPlan, InkName, ResolvedColor};
 pub(crate) use separation_backend::{SeparationBackend, SeparationSurface};

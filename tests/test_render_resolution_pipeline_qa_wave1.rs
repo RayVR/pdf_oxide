@@ -1099,7 +1099,7 @@ fn qa_corpus_simple_pdf_renders_without_panic() {
     let doc = PdfDocument::from_bytes(bytes).expect("simple.pdf parses");
     let on = render_with_pipeline(&doc, true);
     assert!(!on.is_empty(), "simple.pdf must produce a non-empty pixmap");
-    assert!(on.len() % 4 == 0, "pixmap must be RGBA8 aligned");
+    assert!(on.len().is_multiple_of(4), "pixmap must be RGBA8 aligned");
 }
 
 #[test]
@@ -1128,5 +1128,5 @@ fn qa_corpus_outline_pdf_renders_without_panic() {
     let doc = PdfDocument::from_bytes(bytes).expect("outline.pdf parses");
     let on = render_with_pipeline(&doc, true);
     assert!(!on.is_empty(), "outline.pdf must produce a non-empty pixmap");
-    assert!(on.len() % 4 == 0, "pixmap must be RGBA8 aligned");
+    assert!(on.len().is_multiple_of(4), "pixmap must be RGBA8 aligned");
 }
