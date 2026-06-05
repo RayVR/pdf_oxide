@@ -213,10 +213,7 @@ impl<'a> ResolutionContext<'a> {
     /// operator dispatcher builds inside a single render. `None`
     /// (the default) skips caching — appropriate for unit tests that
     /// only exercise a handful of conversions.
-    pub(crate) fn with_icc_transform_cache(
-        mut self,
-        cache: Option<&'a IccTransformCache>,
-    ) -> Self {
+    pub(crate) fn with_icc_transform_cache(mut self, cache: Option<&'a IccTransformCache>) -> Self {
         self.icc_transform_cache = cache;
         self
     }

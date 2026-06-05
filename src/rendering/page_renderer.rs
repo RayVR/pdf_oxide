@@ -22,7 +22,7 @@ use crate::object::{Object, ObjectRef};
 use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState};
 use crate::rendering::path_rasterizer::PathRasterizer;
 use crate::rendering::resolution::{
-    IccTransformCache, DeviceColor, LogicalColor, PaintIntent, PaintKind, PaintSide,
+    DeviceColor, IccTransformCache, LogicalColor, PaintIntent, PaintKind, PaintSide,
     ResolutionContext, ResolutionPipeline, ResolvedColor,
 };
 use crate::rendering::text_rasterizer::TextRasterizer;
