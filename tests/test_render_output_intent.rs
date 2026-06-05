@@ -1410,3 +1410,428 @@ fn devicen_type4_alt_devicecmyk_composite_routes_through_output_intent() {
          (255,0,255,_) means §10.3.5 additive-clamp fired."
     );
 }
+
+// ===========================================================================
+// QA round-2 edge probes
+// ===========================================================================
+//
+// Round-2 phase 4 changed `resolve_iccbased` for N=4 with parseable
+// embedded profile to emit `ResolvedColor::Rgba` directly (bypassing
+// OutputIntent). Edge cases the impl probes did not cover:
+//
+//   1. Embedded profile parses but qcms refuses to build a CMM
+//      (`has_cmm() == false`) — fallback path must kick in.
+//   2. Embedded profile is malformed bytes (`IccProfile::parse` returns
+//      None) — fallback path must kick in.
+//   3. ICCBased N=3 (RGB) with a document CMYK /OutputIntents — no
+//      interaction; RGB paint stays untouched.
+//   4. ICCBased N=1 (gray) with a document CMYK /OutputIntents — same.
+//   5. ICCBased N=4 paint inside a Form XObject — precedence survives
+//      the Form scope.
+//   6. **Per-plate regression**: the fix changes ICCBased N=4 from
+//      `ResolvedColor::Cmyk` to `ResolvedColor::Rgba`; per-plate
+//      consumers route by participating channels and `Rgba` produces an
+//      empty participating list. Probe what happens when the renderer
+//      is invoked for separations on the same fixture.
+
+/// Build a minimal "valid header but no usable tags" ICC profile: passes
+/// `IccProfile::parse`'s header / `acsp` / `/N` cross-check but qcms's
+/// `Profile::new_from_slice` rejects it (no `A2B0`, no matrix/curve
+/// tags), so `Transform::has_cmm()` returns false. Used to verify the
+/// fallback path in `resolve_iccbased` kicks in cleanly.
+fn build_iccbased_header_only_cmyk_profile() -> Vec<u8> {
+    let mut profile = vec![0u8; 128];
+    // Profile size at bytes 0..4. Header-only + 4-byte tag count of 0.
+    let total: u32 = 128 + 4;
+    profile[0..4].copy_from_slice(&total.to_be_bytes());
+    profile[8..12].copy_from_slice(&0x0240_0000u32.to_be_bytes());
+    profile[12..16].copy_from_slice(b"prtr");
+    profile[16..20].copy_from_slice(b"CMYK");
+    profile[20..24].copy_from_slice(b"Lab ");
+    profile[36..40].copy_from_slice(b"acsp");
+    profile[64..68].copy_from_slice(&0u32.to_be_bytes());
+    profile[68..72].copy_from_slice(&0x0000_F6D6u32.to_be_bytes());
+    profile[72..76].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    profile[76..80].copy_from_slice(&0x0000_D32Du32.to_be_bytes());
+    // Tag count = 0 — no tags at all.
+    profile.extend_from_slice(&0u32.to_be_bytes());
+    profile
+}
+
+/// Sanity-pin: the header-only profile parses through `IccProfile::parse`
+/// but produces a transform with no CMM. This is the precondition that
+/// makes the `resolve_iccbased` fallback path observable: if either
+/// branch flipped (parse failed OR has_cmm became true) the edge probes
+/// below would conflate two failure modes.
+#[test]
+fn qa_round2_header_only_cmyk_profile_parses_without_cmm() {
+    use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+    use std::sync::Arc;
+    let bytes = build_iccbased_header_only_cmyk_profile();
+    let prof = IccProfile::parse(bytes, 4).expect(
+        "header-only profile should pass IccProfile::parse — only IccHeader::parse and /N \
+         cross-check run there",
+    );
+    let prof = Arc::new(prof);
+    let t = Transform::new_srgb_target(prof, RenderingIntent::RelativeColorimetric);
+    assert!(
+        !t.has_cmm(),
+        "header-only profile must NOT compile to a usable qcms CMM; otherwise the fallback \
+         path in resolve_iccbased can't be probed"
+    );
+}
+
+/// Embedded /ICCBased N=4 whose profile parses through
+/// `IccProfile::parse` but is rejected by qcms (`has_cmm() == false`).
+/// `resolve_iccbased` must fall through to the device-family hint, which
+/// emits `ResolvedColor::Cmyk` for N=4, which the composite projection
+/// then runs through `cmyk_to_rgb_via_intent` against the document
+/// /OutputIntents profile. Expected pixel: (126, 126, 126, 255) — the
+/// OutputIntent profile A's constant CLUT.
+#[test]
+fn qa_round2_iccbased_n4_no_cmm_falls_through_to_output_intent() {
+    let profile_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let profile_b_no_cmm = build_iccbased_header_only_cmyk_profile();
+    let pdf =
+        build_pdf_embedded_iccbased_with_different_output_intent(&profile_a, &profile_b_no_cmm);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (126u8, 126, 126, 255),
+        "embedded ICCBased N=4 whose profile parses but has no CMM must fall through to \
+         the device-family path → ResolvedColor::Cmyk → cmyk_to_rgb_via_intent → \
+         document /OutputIntents profile A reference (126,126,126,255); got \
+         ({r},{g},{b},{a}). (191,255,255,_) means §10.3.5 additive-clamp fired (fallback \
+         path bypassed OutputIntent). (194,194,194,_) means the embedded profile's CMM \
+         compiled (precondition pin was wrong)."
+    );
+}
+
+/// Embedded /ICCBased N=4 with garbage bytes (no valid `acsp` header).
+/// `IccProfile::parse` returns None, so the fallback path emits
+/// `ResolvedColor::Cmyk` → routed through `cmyk_to_rgb_via_intent` →
+/// document /OutputIntents.
+#[test]
+fn qa_round2_iccbased_n4_unparseable_bytes_fall_through_to_output_intent() {
+    let profile_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    // 128 zero bytes — no `acsp` signature at bytes 36..40 → parse fails.
+    let garbage = vec![0u8; 128];
+    let pdf = build_pdf_embedded_iccbased_with_different_output_intent(&profile_a, &garbage);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (126u8, 126, 126, 255),
+        "embedded ICCBased N=4 with unparseable bytes must fall through to the \
+         device-family path → ResolvedColor::Cmyk → document /OutputIntents \
+         (126,126,126,255); got ({r},{g},{b},{a})."
+    );
+}
+
+/// **Per-plate regression probe.** The phase-4 fix changes
+/// `resolve_iccbased` for N=4 with parseable embedded profile to emit
+/// `ResolvedColor::Rgba`. The per-plate `OverprintResolver` produces an
+/// empty `participating` list for `Rgba`, and the `InkRouter` returns
+/// `InkAction::Skip` for every plate when `participating` is empty. So
+/// rendering the embedded-ICC fixture to separations produces NO ink
+/// coverage on any plate — even though the fixture's `0.25 0 0 0 scn`
+/// paint is logically 25% cyan.
+///
+/// This pin captures the regression vector the impl agent flagged in
+/// the round-2 report. The outcome it pins (all plates zero at the
+/// painted-rect centre) IS the current behaviour after phase 4; the pin
+/// is here so a future engineer fixing the per-plate path doesn't
+/// silently flip it without surfacing the design trade-off.
+///
+/// The trade-off: §8.6.5.5 says the embedded ICCBased profile is the
+/// conversion source. For composite output that means "use it for
+/// CMYK→RGB". For separations the question is "should we still emit
+/// per-plate ink coverage values, or should we treat the ICC-converted
+/// RGB as authoritative and skip the plate decomposition?". The current
+/// answer is the second; this probe pins it so the design choice is
+/// visible and overridable.
+#[test]
+#[ignore = "QA_ROUND2_OPEN_QUESTION_PER_PLATE_ROUTING_OF_ICCBASED_N4: phase-4 fix \
+            emits ResolvedColor::Rgba for ICCBased N=4 with parseable embedded \
+            profile; per-plate path consumes that as 'no ink coverage on any \
+            plate'. Design intent: §8.6.5.5 trumps per-plate channel \
+            decomposition. Pin here so a future engineer sees the design call \
+            instead of debugging silent zero-output plates."]
+fn qa_round2_iccbased_n4_with_embedded_profile_emits_no_separation_coverage() {
+    use pdf_oxide::rendering::render_separations;
+    let profile_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let profile_b = build_minimal_cmyk_to_rgb_lut8_profile(200);
+    let pdf = build_pdf_embedded_iccbased_with_different_output_intent(&profile_a, &profile_b);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    let plates = render_separations(&doc, 0, 72).expect("render_separations");
+    // Process plates always emit per the API contract — we just check
+    // ink coverage at the painted rect centre is zero on EVERY plate.
+    let sample = |p: &pdf_oxide::rendering::SeparationPlate| {
+        let w = p.width as usize;
+        p.data[50 * w + 50]
+    };
+    for p in &plates {
+        assert_eq!(
+            sample(p),
+            0,
+            "plate {} should carry ZERO ink coverage at the painted-rect centre because \
+             ICCBased N=4 with parseable embedded profile now produces ResolvedColor::Rgba \
+             on composite, which the per-plate path consumes as 'no participating channels' \
+             → InkAction::Skip on every plate. If this fails the per-plate path was \
+             updated to honour ICCBased N=4 channel decomposition — update the design \
+             documentation accordingly.",
+            p.ink_name
+        );
+    }
+}
+
+/// Counter-pin: bare /DeviceCMYK paint with no embedded ICC override
+/// continues to produce per-plate coverage as before. This guards
+/// against a regression where the round-2 fix accidentally widened to
+/// the bare /DeviceCMYK arm too.
+#[test]
+fn qa_round2_bare_devicecmyk_paint_still_produces_separation_coverage() {
+    use pdf_oxide::rendering::render_separations;
+    let pdf = build_pdf_cmyk_without_output_intent();
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    let plates = render_separations(&doc, 0, 72).expect("render_separations");
+    let sample = |p: &pdf_oxide::rendering::SeparationPlate| {
+        let w = p.width as usize;
+        p.data[50 * w + 50]
+    };
+    let by_name = |name: &str| {
+        plates
+            .iter()
+            .find(|p| p.ink_name == name)
+            .map(sample)
+            .unwrap_or(0)
+    };
+    // The renderer's f32→u8 path produces 63 for tint=0.25; the
+    // important point is non-zero ink coverage at the painted pixel —
+    // proving the bare DeviceCMYK arm still routes through the
+    // per-plate `ResolvedColor::Cmyk` decomposition.
+    let cyan = by_name("Cyan");
+    assert!(
+        (60..=68).contains(&cyan),
+        "Cyan plate should carry the ~0.25 tint from `0.25 0 0 0 k` (renderer quantises \
+         to ~63). Got {cyan}. If zero the bare DeviceCMYK arm regressed too."
+    );
+    assert_eq!(by_name("Magenta"), 0, "Magenta should be zero");
+    assert_eq!(by_name("Yellow"), 0, "Yellow should be zero");
+    assert_eq!(by_name("Black"), 0, "Black should be zero");
+}
+
+/// ICCBased **N=3** (RGB) with a document CMYK /OutputIntents declared:
+/// the OutputIntent applies only to CMYK conversion paths per §8.6.5.5;
+/// an RGB ICCBased space neither consults nor cares about the document
+/// OutputIntent. Pixel at the painted rect = direct sRGB-like
+/// pass-through of the 3 components (fallback path; the device-family
+/// hint at /N=3 emits `three_as_rgb`).
+#[test]
+fn qa_round2_iccbased_n3_with_cmyk_output_intent_ignores_output_intent() {
+    // Build a one-page PDF that declares a CMYK OutputIntent and paints
+    // a 3-component ICCBased rectangle. We use the existing builder for
+    // embedded-ICCBased fixtures but swap the colour-space dict's /N to
+    // 3 and use a 3-component `scn`. Easier: reuse
+    // `build_pdf_with_catalog_entries_and_content` and inline an
+    // ICCBased[3] resource via a custom catalog.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK) /DestOutputProfile 5 0 R >>] >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/ICCBased 6 0 R] >> >> /Contents 4 0 R >>\nendobj\n");
+    let stream_off = buf.len();
+    // Paint with RGB(0.5, 0.25, 0.75) via the 3-component ICCBased.
+    let content = "/CS1 cs\n0.5 0.25 0.75 scn\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let icc_a_off = buf.len();
+    let icc_a_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", icc_a.len());
+    buf.extend_from_slice(icc_a_hdr.as_bytes());
+    buf.extend_from_slice(&icc_a);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // ICCBased N=3 stream — we don't need a valid qcms-compilable profile
+    // for the N=3 case because the device-family hint at N=3 in
+    // resolve_iccbased emits three_as_rgb directly (the embedded-ICC
+    // branch is gated on N=4). Just declare /N 3 with empty stream
+    // bytes; parse will fail (no acsp) and the fallback path fires.
+    let icc_b_off = buf.len();
+    let bogus = vec![0u8; 128];
+    let icc_b_hdr = format!("6 0 obj\n<< /N 3 /Length {} >>\nstream\n", bogus.len());
+    buf.extend_from_slice(icc_b_hdr.as_bytes());
+    buf.extend_from_slice(&bogus);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    let obj_count = 7;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [
+        cat_off, pages_off, page_off, stream_off, icc_a_off, icc_b_off,
+    ] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    let doc = PdfDocument::from_bytes(buf).expect("open synthetic PDF");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    // The renderer's f32→u8 round produces 128 / 64 / 191 for the
+    // (0.5, 0.25, 0.75) triple.
+    assert_eq!(
+        (r, g, b, a),
+        (128u8, 64, 191, 255),
+        "ICCBased N=3 with document CMYK /OutputIntents declared must pass the three \
+         components through unchanged — the OutputIntent applies only to CMYK \
+         conversion paths. Got ({r},{g},{b},{a})."
+    );
+}
+
+/// ICCBased **N=1** (gray) with a document CMYK /OutputIntents declared:
+/// same as N=3 — no spec interaction. Fallback path at N=1 emits
+/// `first_as_gray`, so a single-component paint of 0.5 produces
+/// RGB(128,128,128).
+#[test]
+fn qa_round2_iccbased_n1_with_cmyk_output_intent_ignores_output_intent() {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK) /DestOutputProfile 5 0 R >>] >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_off = buf.len();
+    buf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/ICCBased 6 0 R] >> >> /Contents 4 0 R >>\nendobj\n");
+    let stream_off = buf.len();
+    let content = "/CS1 cs\n0.5 scn\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let icc_a_off = buf.len();
+    let icc_a_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", icc_a.len());
+    buf.extend_from_slice(icc_a_hdr.as_bytes());
+    buf.extend_from_slice(&icc_a);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_b_off = buf.len();
+    let bogus = vec![0u8; 128];
+    let icc_b_hdr = format!("6 0 obj\n<< /N 1 /Length {} >>\nstream\n", bogus.len());
+    buf.extend_from_slice(icc_b_hdr.as_bytes());
+    buf.extend_from_slice(&bogus);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    let obj_count = 7;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [
+        cat_off, pages_off, page_off, stream_off, icc_a_off, icc_b_off,
+    ] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    let doc = PdfDocument::from_bytes(buf).expect("open synthetic PDF");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (128u8, 128, 128, 255),
+        "ICCBased N=1 with document CMYK /OutputIntents declared must produce a neutral \
+         grey from the single component (0.5 → 128); OutputIntent is not consulted. \
+         Got ({r},{g},{b},{a})."
+    );
+}
+
+/// /ICCBased N=4 paint **inside a Form XObject**: precedence survives
+/// the Form scope. The embedded ICCBased CS1 is declared on the page,
+/// the Form XObject's content paints `/CS1 cs 0.25 0 0 0 scn ... f`,
+/// and the page invokes the Form with `q /Fm1 Do Q`. Expected pixel:
+/// profile B's reference (194, 194, 194, 255).
+#[test]
+fn qa_round2_iccbased_n4_precedence_survives_form_xobject_scope() {
+    let profile_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let profile_b = build_minimal_cmyk_to_rgb_lut8_profile(PROFILE_B_TARGET_L_BYTE);
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK A) /DestOutputProfile 5 0 R >>] >>\nendobj\n");
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    // Page declares ICCBased CS1 + form Fm1.
+    let page_off = buf.len();
+    buf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/ICCBased 6 0 R] >> /XObject << /Fm1 7 0 R >> >> /Contents 4 0 R >>\nendobj\n");
+    // Page content invokes the Form inside a q/Q scope.
+    let stream_off = buf.len();
+    let content = "q\n/Fm1 Do\nQ\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_a_off = buf.len();
+    let icc_a_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", profile_a.len());
+    buf.extend_from_slice(icc_a_hdr.as_bytes());
+    buf.extend_from_slice(&profile_a);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let icc_b_off = buf.len();
+    let icc_b_hdr = format!("6 0 obj\n<< /N 4 /Length {} >>\nstream\n", profile_b.len());
+    buf.extend_from_slice(icc_b_hdr.as_bytes());
+    buf.extend_from_slice(&profile_b);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    // Form XObject Fm1: BBox 0..100, identity matrix, inherits page
+    // resources via /Resources <<>> + content paints CS1.
+    let form_content = "/CS1 cs\n0.25 0 0 0 scn\n20 20 60 60 re\nf\n";
+    let form_off = buf.len();
+    let form_hdr = format!(
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/ICCBased 6 0 R] >> >> /Length {} >>\nstream\n",
+        form_content.len()
+    );
+    buf.extend_from_slice(form_hdr.as_bytes());
+    buf.extend_from_slice(form_content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_off = buf.len();
+    let obj_count = 8;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [
+        cat_off, pages_off, page_off, stream_off, icc_a_off, icc_b_off, form_off,
+    ] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    let doc = PdfDocument::from_bytes(buf).expect("open synthetic PDF");
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    let (br, bg, bb) = PROFILE_B_RGB_AT_FIXTURE_INPUT;
+    assert_eq!(
+        (r, g, b, a),
+        (br, bg, bb, 255),
+        "embedded /ICCBased N=4 precedence must survive Form XObject scope — Form paint \
+         routed through the page-declared CS1's embedded profile B, not the document \
+         /OutputIntents A. Expected ({br},{bg},{bb},255); got ({r},{g},{b},{a}). \
+         (126,126,126,_) means Form scope dropped the embedded-ICC routing and the \
+         document OutputIntent fired. (191,255,255,_) means neither profile was \
+         consulted."
+    );
+}
