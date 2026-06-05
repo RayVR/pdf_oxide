@@ -303,6 +303,55 @@ impl ColorResolver {
             }
         }
 
+        // ICCBased N=1 — Gray source profile. The embedded profile
+        // drives the conversion (§8.6.5.5) and is the path
+        // /DefaultGray [/ICCBased <N=1 TRC stream>] consumes for bare
+        // /DeviceGray paint. qcms 0.3.0 reads Gray ICC profiles via
+        // the `kTRC` (gray Tone Reproduction Curve) tag —
+        // `iccread.rs:1712-1714` — and runs a dedicated
+        // gray-to-RGB transform path at `transform.rs:437-475`. The
+        // input is one byte, the output is three RGB bytes; we read
+        // the first three of `convert_gray_buffer`'s output.
+        //
+        // No per-plate routing complication — a Gray override emits
+        // a single ink and lands on the K plate via the InkRouter's
+        // gray-as-K handling; the composite RGB is what consumers
+        // see, so ResolvedColor::Rgba is the right variant. The
+        // per-page transform cache is consulted exactly as for N=3
+        // and N=4 — the key is (profile.content_hash(), intent), no
+        // n_components in the key, so the same cache amortises Gray
+        // ICC alongside RGB and CMYK.
+        #[cfg(feature = "icc")]
+        if n == 1 && !components.is_empty() {
+            if let Ok(bytes) = resolved_stream.decode_stream_data() {
+                if let Some(profile) = crate::color::IccProfile::parse(bytes, 1) {
+                    let profile = std::sync::Arc::new(profile);
+                    let transform: std::sync::Arc<crate::color::Transform> =
+                        if let Some(cache) = ctx.cmyk_transform_cache {
+                            cache.get_or_build(&profile, ctx.rendering_intent)
+                        } else {
+                            std::sync::Arc::new(crate::color::Transform::new_srgb_target(
+                                std::sync::Arc::clone(&profile),
+                                ctx.rendering_intent,
+                            ))
+                        };
+                    if transform.has_cmm() {
+                        let g = components[0].clamp(0.0, 1.0);
+                        let g_u8 = (g * 255.0).round() as u8;
+                        let rgb = transform.convert_gray_buffer(&[g_u8]);
+                        if rgb.len() >= 3 {
+                            return Ok(ResolvedColor::Rgba {
+                                r: rgb[0] as f32 / 255.0,
+                                g: rgb[1] as f32 / 255.0,
+                                b: rgb[2] as f32 / 255.0,
+                                a: alpha,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // No usable embedded profile — fall through to the device-family
         // hint. For N=4 this emits ResolvedColor::Cmyk so per-plate
         // backends still see the channel decomposition, and the
