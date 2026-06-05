@@ -1962,7 +1962,12 @@ fn measure_text_advance(
 }
 
 /// Fill a path into the separation pixmap with the given tint value.
-fn fill_separation(
+///
+/// `pub(crate)` so the resolution pipeline's [`super::resolution::SeparationBackend`]
+/// can take it as a parity reference in its byte-for-byte equivalence test.
+/// The shipping per-plate walker calls it directly; production callers
+/// outside the renderer should not.
+pub(crate) fn fill_separation(
     pixmap: &mut Pixmap,
     path: &tiny_skia::Path,
     transform: Transform,

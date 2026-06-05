@@ -531,33 +531,132 @@ mod tests {
         assert_eq!(plates[0].data()[(5 * 16 + 5) * 4], 0);
     }
 
-    #[test]
-    fn matches_inline_fill_separation_byte_for_byte_for_cmyk_cyan() {
-        // Equivalence check: a Cyan-only fill through the backend must
-        // produce the same R-channel byte pattern as the existing inline
-        // `fill_separation` helper for the same path / transform / tint.
-        // We invoke both and assert pixmap data equality on the targeted
-        // plate.
-        let path = rect_path();
-        let cmd = cmyk_cmd(&path, 0.5, 0.0, 0.0, 0.0);
-        let mut backend_pixmap = fresh_pixmap();
-        let mut inline_pixmap = fresh_pixmap();
-
-        // Backend route.
-        let inks = [InkName::new("Cyan")];
-        let mut bp = vec![backend_pixmap.clone()];
+    /// Drive the per-plate fill through `SeparationBackend::fill_plate` and
+    /// in parallel through `separation_renderer::fill_separation`, then
+    /// assert each plate's pixel buffer matches byte-for-byte.
+    ///
+    /// `inks` and `tints` are parallel slices: `tints[i]` is the value the
+    /// backend would have routed to `inks[i]`. The caller computes them so
+    /// the test specifies exactly what the comparison reference is, instead
+    /// of trusting an internal copy of the routing logic.
+    fn assert_backend_matches_inline(
+        path: &tiny_skia::Path,
+        ctm: Matrix,
+        cmd: ResolvedPaintCmd<'_>,
+        inks: &[InkName],
+        tints: &[f32],
+        fill_rule: FillRule,
+    ) {
+        assert_eq!(inks.len(), tints.len());
+        // Backend route: call into the real public `paint` API.
+        let mut backend_plates: Vec<Pixmap> = (0..inks.len()).map(|_| fresh_pixmap()).collect();
         let surface = SeparationSurface {
-            pixmaps: &mut bp,
-            inks: &inks,
+            pixmaps: &mut backend_plates,
+            inks,
             base_transform: Transform::identity(),
         };
         let mut backend = SeparationBackend::new();
         backend.paint(&cmd, surface).unwrap();
-        backend_pixmap = bp.into_iter().next().unwrap();
 
-        // Inline route: same path, same tint, same identity transform.
-        fill_plate(&mut inline_pixmap, &path, Transform::identity(), 0.5, FillRule::Winding, None);
+        // Reference route: call `separation_renderer::fill_separation`
+        // directly for each plate with the expected per-ink tint and
+        // the same composed transform the backend would have used.
+        let transform = combine_transforms(Transform::identity(), &ctm);
+        let mut inline_plates: Vec<Pixmap> = (0..inks.len()).map(|_| fresh_pixmap()).collect();
+        for (i, &tint) in tints.iter().enumerate() {
+            crate::rendering::separation_renderer::fill_separation(
+                &mut inline_plates[i],
+                path,
+                transform,
+                tint,
+                fill_rule,
+                None,
+            );
+        }
 
-        assert_eq!(backend_pixmap.data(), inline_pixmap.data());
+        for (i, ink) in inks.iter().enumerate() {
+            assert_eq!(
+                backend_plates[i].data(),
+                inline_plates[i].data(),
+                "plate {:?} (index {i}) must match separation_renderer::fill_separation byte-for-byte",
+                ink.as_str(),
+            );
+        }
+    }
+
+    #[test]
+    fn cmyk_cyan_only_matches_fill_separation_byte_for_byte() {
+        // Single Cyan-only plate: backend paints Cyan at 0.5, knock-outs
+        // other process plates at 0.0 (OP=false). Reference is
+        // separation_renderer::fill_separation for each.
+        let path = rect_path();
+        let cmd = cmyk_cmd(&path, 0.5, 0.0, 0.0, 0.0);
+        let inks = [
+            InkName::new("Cyan"),
+            InkName::new("Magenta"),
+            InkName::new("Yellow"),
+            InkName::new("Black"),
+        ];
+        let tints = [0.5, 0.0, 0.0, 0.0];
+        assert_backend_matches_inline(
+            &path,
+            Matrix::identity(),
+            cmd,
+            &inks,
+            &tints,
+            FillRule::Winding,
+        );
+    }
+
+    #[test]
+    fn cmyk_mixed_fill_matches_fill_separation_byte_for_byte() {
+        // DeviceCMYK fill at (0.5, 0.25, 0.0, 0.7). Every process plate
+        // must match its independent fill_separation invocation.
+        let path = rect_path();
+        let cmd = cmyk_cmd(&path, 0.5, 0.25, 0.0, 0.7);
+        let inks = [
+            InkName::new("Cyan"),
+            InkName::new("Magenta"),
+            InkName::new("Yellow"),
+            InkName::new("Black"),
+        ];
+        let tints = [0.5, 0.25, 0.0, 0.7];
+        assert_backend_matches_inline(
+            &path,
+            Matrix::identity(),
+            cmd,
+            &inks,
+            &tints,
+            FillRule::Winding,
+        );
+    }
+
+    #[test]
+    fn cmyk_rotated_ctm_matches_fill_separation_byte_for_byte() {
+        // Non-identity CTM: 30-degree rotation about origin, applied via
+        // the command's `ctm` field. The backend composes ctm with
+        // `base_transform`; the reference uses the same composition.
+        // Mirrors the wave 5 inline-path rotated-rect probe.
+        let path = rect_path();
+        let theta = 30.0_f32.to_radians();
+        let (s, c) = theta.sin_cos();
+        let rotation = Matrix {
+            a: c,
+            b: s,
+            c: -s,
+            d: c,
+            e: 0.0,
+            f: 0.0,
+        };
+        let mut cmd = cmyk_cmd(&path, 0.5, 0.25, 0.0, 0.7);
+        cmd.ctm = rotation;
+        let inks = [
+            InkName::new("Cyan"),
+            InkName::new("Magenta"),
+            InkName::new("Yellow"),
+            InkName::new("Black"),
+        ];
+        let tints = [0.5, 0.25, 0.0, 0.7];
+        assert_backend_matches_inline(&path, rotation, cmd, &inks, &tints, FillRule::Winding);
     }
 }
