@@ -136,6 +136,14 @@ impl ColorResolver {
         // N=4, which the composite projection then converts through
         // ctx.output_intent_cmyk: the document OutputIntent becomes the
         // default when the embedded profile can't actually drive a CMM.
+        //
+        // We emit the dual-payload `IccCmyk` variant so the per-plate
+        // router still sees the four channel decomposition. The composite
+        // backend reads the pre-computed RGB; the separation backend
+        // reads the original CMYK quadruple. The ICC conversion is a
+        // composite-surface concern — the plates ARE the press-target
+        // ink coverage, so dropping the CMYK channel values for a
+        // monolithic Rgba would zero out every plate.
         #[cfg(feature = "icc")]
         if n == 4 && components.len() >= 4 {
             if let Ok(bytes) = resolved_stream.decode_stream_data() {
@@ -145,15 +153,23 @@ impl ColorResolver {
                         ctx.rendering_intent,
                     );
                     if transform.has_cmm() {
-                        let c_u8 = (components[0].clamp(0.0, 1.0) * 255.0).round() as u8;
-                        let m_u8 = (components[1].clamp(0.0, 1.0) * 255.0).round() as u8;
-                        let y_u8 = (components[2].clamp(0.0, 1.0) * 255.0).round() as u8;
-                        let k_u8 = (components[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let c = components[0].clamp(0.0, 1.0);
+                        let m = components[1].clamp(0.0, 1.0);
+                        let y = components[2].clamp(0.0, 1.0);
+                        let k = components[3].clamp(0.0, 1.0);
+                        let c_u8 = (c * 255.0).round() as u8;
+                        let m_u8 = (m * 255.0).round() as u8;
+                        let y_u8 = (y * 255.0).round() as u8;
+                        let k_u8 = (k * 255.0).round() as u8;
                         let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
-                        return Ok(ResolvedColor::Rgba {
+                        return Ok(ResolvedColor::IccCmyk {
                             r: rgb[0] as f32 / 255.0,
                             g: rgb[1] as f32 / 255.0,
                             b: rgb[2] as f32 / 255.0,
+                            c,
+                            m,
+                            y,
+                            k,
                             a: alpha,
                         });
                     }

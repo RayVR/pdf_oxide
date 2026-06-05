@@ -3218,10 +3218,10 @@ impl PageRenderer {
         let cmd = pipeline.resolve(&intent, &ctx, None).ok()?;
         match cmd.color {
             ResolvedColor::Rgba { r, g, b, a } => Some((r, g, b, a)),
-            // Genuine DeviceCMYK / ICCBased N=4 sources, plus Separation
-            // and DeviceN with a DeviceCMYK alternate, emit Cmyk so the
-            // per-plate backend has the channel decomposition. Project
-            // to RGBA via the context-aware CMYK→RGB path: consult the
+            // Genuine DeviceCMYK sources, plus Separation and DeviceN
+            // with a DeviceCMYK alternate, emit `Cmyk` so the per-plate
+            // backend has the channel decomposition. Project to RGBA
+            // via the context-aware CMYK→RGB path: consult the
             // document's /OutputIntents CMYK profile when present, fall
             // back to §10.3.5 additive-clamp otherwise.
             ResolvedColor::Cmyk { c, m, y, k, a } => {
@@ -3229,6 +3229,13 @@ impl PageRenderer {
                     crate::rendering::resolution::color::cmyk_to_rgb_via_intent(c, m, y, k, &ctx);
                 Some((r, g, b, a))
             },
+            // /ICCBased N=4 with a parseable embedded profile that
+            // compiled a usable CMM. Per §8.6.5.5 the embedded profile
+            // is THE conversion source for this colour space — it
+            // overrides the document /OutputIntents — so the RGB on
+            // this variant is already the right composite output. The
+            // CMYK side-payload is for the per-plate router only.
+            ResolvedColor::IccCmyk { r, g, b, a, .. } => Some((r, g, b, a)),
             _ => None,
         }
     }
