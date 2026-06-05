@@ -528,6 +528,100 @@ fn output_intent_constant_clut_is_invariant_across_rendering_intents() {
 }
 
 // ===========================================================================
+// QA: qcms validation fragility — bad-profile fall-through
+// ===========================================================================
+
+/// Pin that a syntactically-shaped but tag-table-truncated CMYK profile
+/// declared on `/OutputIntents` does not crash the renderer and produces
+/// the §10.3.5 fallback colour byte-for-byte.
+///
+/// This is the impl-agent's open-question #1 surfaced as a probe: when
+/// qcms refuses to compile the OutputIntent profile, `Transform::
+/// convert_cmyk_pixel` devolves internally — but the renderer-level
+/// behaviour must be (a) no panic and (b) the same RGB the no-
+/// OutputIntent fixture produces, so a malformed `/OutputIntents`
+/// degrades gracefully.
+#[test]
+fn output_intent_with_unparseable_profile_falls_through_to_additive_clamp() {
+    // Header-only profile: parses through `IccProfile::parse` (which
+    // only validates the 128-byte header), but qcms refuses at build
+    // time because there's no tag table. Mirrors the stub the in-source
+    // unit test in color.rs uses but reaches the rasteriser end-to-end.
+    let mut header_only = vec![0u8; 128];
+    header_only[8..12].copy_from_slice(&0x0400_0000u32.to_be_bytes());
+    header_only[12..16].copy_from_slice(b"prtr");
+    header_only[16..20].copy_from_slice(b"CMYK");
+    header_only[20..24].copy_from_slice(b"Lab ");
+    header_only[36..40].copy_from_slice(b"acsp");
+
+    let pdf = build_pdf_cmyk_with_output_intent(&header_only);
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+
+    // Sanity-pin: the document-level accessor still hands back the
+    // parsed-header profile, so the renderer DOES see a Some on
+    // `ctx.output_intent_cmyk` — the fall-through has to happen inside
+    // `convert_cmyk_pixel`, not by the accessor returning None.
+    assert!(
+        doc.output_intent_cmyk_profile().is_some(),
+        "header-only stub must parse through IccProfile::parse; fall-through must \
+         happen inside Transform::convert_cmyk_pixel, not at the accessor"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (191u8, 255, 255, 255),
+        "unparseable OutputIntent profile must fall through to §10.3.5 byte-exact; \
+         got ({r},{g},{b},{a})"
+    );
+}
+
+/// Pin that an OutputIntent profile whose ICC header declares a non-CMYK
+/// colour space (`RGB `, `GRAY`, `Lab `) is filtered out by
+/// `IccProfile::parse`'s cross-check, even though the stream dict's
+/// `/N 4` would otherwise let it through the accessor.
+///
+/// `IccProfile::parse(bytes, declared_n)` at `src/color.rs:159` requires
+/// that the ICC header's implied component count match the stream
+/// dict's `/N`. An `RGB ` header implies `n=3`; `declared_n=4` → reject.
+/// `output_intent_cmyk_profile` then returns `None`, and the renderer
+/// falls back to §10.3.5 byte-for-byte.
+///
+/// This is the strongest gate: a malformed profile that lied about
+/// colour space in the ICC header gets rejected before reaching qcms.
+/// A regression that loosened the cross-check would let the qcms layer
+/// see CMYK bytes through an RGB profile — at best garbage, at worst a
+/// panic in the CMM.
+#[test]
+fn output_intent_with_mismatched_icc_header_colour_space_is_rejected_at_parse() {
+    let mut header_only = vec![0u8; 128];
+    header_only[8..12].copy_from_slice(&0x0400_0000u32.to_be_bytes());
+    header_only[12..16].copy_from_slice(b"prtr");
+    header_only[16..20].copy_from_slice(b"RGB "); // intentionally mismatched
+    header_only[20..24].copy_from_slice(b"Lab ");
+    header_only[36..40].copy_from_slice(b"acsp");
+
+    let pdf = build_pdf_cmyk_with_output_intent(&header_only);
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+    // IccProfile::parse rejects the mismatch (header→n=3 vs declared_n=4);
+    // the accessor surfaces None.
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "IccProfile::parse must reject when ICC header colour-space \
+         tag implies a different component count than the stream's /N"
+    );
+    // Renderer falls through to §10.3.5 byte-for-byte.
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b, a),
+        (191u8, 255, 255, 255),
+        "mismatched-header OutputIntent must fall through to §10.3.5; got ({r},{g},{b},{a})"
+    );
+}
+
+// ===========================================================================
 // QA: helper-level consistency (§10.3.5 source-of-truth probe)
 // ===========================================================================
 
