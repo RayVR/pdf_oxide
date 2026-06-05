@@ -476,8 +476,8 @@ fn qa_text_tr0_fill_only_paints_red() {
 
 /// Probe 5b — Tr=1 (stroke-only). Pipeline resolves the stroke side only.
 /// The current text rasteriser doesn't emit per-glyph strokes, so the
-/// painted page is blank either way; the invariant is byte-identical
-/// parity (no spurious paint introduced by the pipeline path).
+/// painted page is blank; the invariant is no-panic plus a full pixmap
+/// (no spurious paint introduced by the pipeline path).
 #[test]
 fn qa_text_tr1_stroke_only_no_panic() {
     // Tr=1 stroke-only: the current text rasteriser doesn't emit
@@ -492,7 +492,8 @@ fn qa_text_tr1_stroke_only_no_panic() {
 }
 
 /// Probe 5c — Tr=2 (fill+stroke). Pipeline resolves BOTH sides; the
-/// rasteriser today only paints the fill side. Parity invariant holds.
+/// rasteriser today only paints the fill side. Painted ink must be the
+/// FILL colour.
 #[test]
 fn qa_text_tr2_fill_and_stroke_paints_fill_color() {
     // Tr=2 fill+stroke: pipeline resolves BOTH sides but the
@@ -511,8 +512,8 @@ fn qa_text_tr2_fill_and_stroke_paints_fill_color() {
 }
 
 /// Probe 5d — Tr=3 (invisible). Pipeline short-circuits to None — no
-/// clone of `gs` happens. Parity invariant must hold AND the page must
-/// stay at the white background (the rasteriser zeroes alpha for Tr=3).
+/// clone of `gs` happens. The page must stay at the white background
+/// (the rasteriser zeroes alpha for Tr=3).
 #[test]
 fn qa_text_tr3_invisible_paints_zero_pixels() {
     let content = "BT 1 0 0 rg /F1 40 Tf 3 Tr 10 30 Td (M) Tj ET\n";
@@ -568,8 +569,8 @@ fn qa_text_tr5_stroke_plus_clip_renders_without_panic() {
 }
 
 /// Probe 5g — Tr=6 (fill + stroke + add to clip path). Pipeline resolves
-/// BOTH sides; rasteriser paints fill only. Parity invariant must hold;
-/// painted ink is the fill colour.
+/// BOTH sides; rasteriser paints fill only. Painted ink must be the
+/// fill colour, not the stroke colour.
 #[test]
 fn qa_text_tr6_fill_stroke_plus_clip_paints_fill_color() {
     let content = "BT 1 0 0 rg 0 0 1 RG /F1 40 Tf 6 Tr 10 30 Td (M) Tj ET\n";
@@ -589,8 +590,8 @@ fn qa_text_tr6_fill_stroke_plus_clip_paints_fill_color() {
 /// Probe 5h — Tr=7 (add to clip path only). Per the spec Tr=7 is a
 /// clip-only mode that paints nothing. The pipeline helper's `matches!`
 /// rules don't include 7 for either fills or strokes — so the helper
-/// returns None and no GS clone happens. Parity invariant must hold;
-/// no ink should appear.
+/// returns None and no GS clone happens. The page must render as a
+/// full pixmap without panicking.
 #[test]
 fn qa_text_tr7_clip_only_renders_without_panic() {
     // Tr=7 (add-to-clip-only) — the pipeline helper returns None for
@@ -1059,11 +1060,11 @@ fn qa_text_cid_type0_font_no_panic_full_pixmap() {
 /// Probe 18 — "Embedded subset" stand-in: simple Type 1 font with no
 /// /FontFile / FontFile2 / FontFile3 reference (the rasteriser treats it
 /// as a non-embedded standard font). The actual embedded-subset code path
-/// requires shipping binary font data; the wave-2 migration's parity
-/// invariant doesn't depend on the *kind* of font data the rasteriser
-/// loads, so the proxy here is sufficient to pin parity. A future suite
-/// shipping an embedded subset can tighten this to byte-identical pixels
-/// on a known subset font.
+/// requires shipping binary font data; the pipeline's colour-routing
+/// dispatch doesn't depend on the *kind* of font data the rasteriser
+/// loads, so the proxy here is sufficient to pin "blue fill reaches the
+/// pixmap through the fallback font path". A future suite shipping an
+/// embedded subset can tighten this with a known-subset glyph match.
 #[test]
 fn qa_text_embedded_subset_stand_in_paints_blue() {
     // Simple Type 1 with no FontFile reference — rasteriser routes

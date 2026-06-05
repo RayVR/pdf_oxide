@@ -228,12 +228,11 @@ fn count_ink_pixels(rgba: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> usize {
 //
 // `render_axial_shading` parses `/Coords [x0 y0 x1 y1]` and hands the
 // transformed endpoints to a `tiny_skia::LinearGradient` with two stops
-// at t=0 and t=1. The wave-4 splice only changes the two stop *colours*;
-// the geometry (Coords, Domain, Extend, SpreadMode) is untouched. So
-// every probe here keeps the colour fixed under a Device family (off-vs-on
-// parity must hold byte-for-byte) and varies only the geometric parameter.
-// A mismatch flags a renderer state that the pipeline accidentally
-// perturbs.
+// at t=0 and t=1. The pipeline only changes the two stop *colours*; the
+// geometry (Coords, Domain, Extend, SpreadMode) is untouched. So every
+// probe here keeps the colour fixed under a Device family and varies
+// only the geometric parameter, asserting the painted pixmap matches
+// what the geometric change should produce.
 // ===========================================================================
 
 /// Probe 1 — Vertical `/Coords` (`[x0 y0 x0 y1]`). The axis runs
@@ -404,7 +403,7 @@ fn qa_axial_domain_other_than_unit_interval_paints_axis_interior() {
 /// shading extends past the geometric endpoints with the endpoint
 /// colour, exactly what tiny-skia's `SpreadMode::Pad` already does.
 /// So the renderer's hard-coded Pad happens to do the right thing for
-/// `[true true]` — pin the parity and the visible-extension behaviour.
+/// `[true true]` — pin the visible-extension behaviour.
 #[test]
 fn qa_axial_extend_true_true_pads_endpoint_colours() {
     // Axis is the middle 20% of the page (x=40 → x=60). With Extend

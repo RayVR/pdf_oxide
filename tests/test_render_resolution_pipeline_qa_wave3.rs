@@ -235,7 +235,7 @@ fn qa_image_mask_width_not_byte_multiple_padding_does_not_paint() {
     );
 }
 
-/// Probe 3 — Tall ImageMask (height = 256). Parity at scale; also
+/// Probe 3 — Tall ImageMask (height = 256). Capability at scale; also
 /// guards against an off-by-one in the row-loop or buffer-size maths.
 #[test]
 fn qa_image_mask_tall_height_paints_centre_blue() {

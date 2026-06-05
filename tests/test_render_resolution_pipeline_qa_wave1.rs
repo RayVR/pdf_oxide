@@ -304,7 +304,7 @@ fn qa_stroke_hairline_width_parity() {
 
 /// Probe 5 — Zero-width stroke. PDF spec ISO 32000-1 §8.4.3.2 says width 0
 /// means "thinnest line the device can render"; the renderer's existing
-/// behaviour is what we pin. Either way, off-vs-on must match.
+/// behaviour is what we pin — the page must render without panicking.
 #[test]
 fn qa_stroke_zero_width_parity() {
     let content = "1 0 0 RG\n0 w\n20 50 m\n80 50 l\nS\n";
@@ -340,8 +340,8 @@ fn qa_stroke_negative_width_parity_no_panic() {
 ///
 /// The pipeline reads `gs.stroke_alpha` after the `gs` operator has applied
 /// `/CA` to the graphics state. The fold into `ResolvedColor::Rgba.a`
-/// happens inside `device_to_rgba`. Off-vs-on parity confirms the alpha
-/// is sourced from the same place and folded identically.
+/// happens inside `device_to_rgba`. The painted stroke must blend to a
+/// faded red, confirming the alpha was sourced and folded as expected.
 #[test]
 fn qa_stroke_alpha_ca_extgstate_parity() {
     let content = "/Half gs\n1 0 0 RG\n10 w\n20 20 60 60 re\nS\n";
@@ -467,10 +467,9 @@ fn qa_combo_under_rotated_scaled_ctm_parity() {
     );
 }
 
-/// Probe 11 — Soft-mask `/SMask` set via ExtGState; while not always
-/// implemented end-to-end, the pipeline must at minimum not diverge from
-/// the inline path when the graphics state carries an `/SMask` entry.
-/// This pins the off-vs-on parity for that case.
+/// Probe 11 — Soft-mask `/SMask` set via ExtGState. With `/SMask /None`
+/// (the no-op form) the stroke must still reach the pixmap; the
+/// ExtGState plumbing accepts the entry without suppressing paint.
 #[test]
 fn qa_stroke_under_extgstate_with_smask_no_divergence() {
     // We don't fully wire an SMask (the bytes are deliberately simple);
@@ -500,7 +499,7 @@ fn qa_combo_under_active_clip_parity() {
     // Set up a clip that's a small horizontal band across the page, then
     // do `B` of a rectangle that extends well past the band on top and
     // bottom. Only the in-band fraction of the fill and stroke is
-    // painted. Off-vs-on parity confirms both sides see the same clip.
+    // painted.
     let content = "\
         0 40 100 20 re\nW\nn\n\
         0 1 0 rg\n1 0 0 RG\n6 w\n\
@@ -595,8 +594,8 @@ fn qa_indexed_scn_stroke_index_as_gray_fallback() {
 
 /// Probe 14 — ICCBased colour space with 4 components (CMYK profile).
 ///
-/// Both paths inspect `/N` and dispatch to the device-family fallback.
-/// Off-vs-on parity should hold.
+/// The pipeline inspects `/N` and dispatches to the device-family
+/// fallback; the painted fill must reach the pixmap.
 #[test]
 fn qa_iccbased_cmyk_n4_fill_parity() {
     // Embed a minimal ICCBased stream with /N 4. We don't ship a real
@@ -904,8 +903,8 @@ fn qa_bug_malformed_separation_array_diverges() {
 }
 
 /// Probe 22b — Same shape, no panic guarantee for malformed input.
-/// Independent of parity: the render must not crash regardless of how
-/// each path chooses to fall back.
+/// The render must not crash on a malformed Separation array regardless
+/// of how the fallback path chooses to handle it.
 #[test]
 fn qa_malformed_separation_array_no_panic() {
     let resources = "/ColorSpace << /Spot [/Separation /SpotName] >>";
