@@ -1531,61 +1531,62 @@ fn qa_round2_iccbased_n4_unparseable_bytes_fall_through_to_output_intent() {
     );
 }
 
-/// **Per-plate regression probe.** The phase-4 fix changes
-/// `resolve_iccbased` for N=4 with parseable embedded profile to emit
-/// `ResolvedColor::Rgba`. The per-plate `OverprintResolver` produces an
-/// empty `participating` list for `Rgba`, and the `InkRouter` returns
-/// `InkAction::Skip` for every plate when `participating` is empty. So
-/// rendering the embedded-ICC fixture to separations produces NO ink
-/// coverage on any plate — even though the fixture's `0.25 0 0 0 scn`
-/// paint is logically 25% cyan.
+/// **Per-plate routing under embedded-ICCBased N=4.** §8.6.5.5 says the
+/// ICCBased profile is the conversion source — but for *composite* output
+/// only. The per-plate output is the press-target ink coverage: the four
+/// raw CMYK components are exactly what the C/M/Y/K plates must carry.
+/// Stripping the channel decomposition because the composite path
+/// happens to want ICC-converted RGB would make plate output unusable
+/// for prepress workflows shipping packaging artwork with embedded-ICC-
+/// tagged CMYK.
 ///
-/// This pin captures the regression vector the impl agent flagged in
-/// the round-2 report. The outcome it pins (all plates zero at the
-/// painted-rect centre) IS the current behaviour after phase 4; the pin
-/// is here so a future engineer fixing the per-plate path doesn't
-/// silently flip it without surfacing the design trade-off.
+/// Fixture paints `0.25 0 0 0 scn` against an embedded ICCBased N=4
+/// space. The cyan plate must carry the 0.25 tint (≈ 63 in byte space —
+/// the renderer's f32→u8 path produces the same value as the bare
+/// `/DeviceCMYK` counter-pin below); magenta/yellow/black plates must
+/// stay at zero.
 ///
-/// The trade-off: §8.6.5.5 says the embedded ICCBased profile is the
-/// conversion source. For composite output that means "use it for
-/// CMYK→RGB". For separations the question is "should we still emit
-/// per-plate ink coverage values, or should we treat the ICC-converted
-/// RGB as authoritative and skip the plate decomposition?". The current
-/// answer is the second; this probe pins it so the design choice is
-/// visible and overridable.
+/// If the cyan plate is zero, the per-plate path saw `ResolvedColor::Rgba`
+/// from the resolver, the `OverprintResolver` produced an empty
+/// participating list, and `InkRouter` returned `Skip` for every plate
+/// — that's the regression vector. The resolver must emit a variant that
+/// carries BOTH the composite-side ICC-converted RGB (for §8.6.5.5) and
+/// the per-plate CMYK decomposition (for press output).
 #[test]
-#[ignore = "QA_ROUND2_OPEN_QUESTION_PER_PLATE_ROUTING_OF_ICCBASED_N4: phase-4 fix \
-            emits ResolvedColor::Rgba for ICCBased N=4 with parseable embedded \
-            profile; per-plate path consumes that as 'no ink coverage on any \
-            plate'. Design intent: §8.6.5.5 trumps per-plate channel \
-            decomposition. Pin here so a future engineer sees the design call \
-            instead of debugging silent zero-output plates."]
-fn qa_round2_iccbased_n4_with_embedded_profile_emits_no_separation_coverage() {
+fn qa_round2_iccbased_n4_with_embedded_profile_routes_cmyk_to_plates() {
     use pdf_oxide::rendering::render_separations;
     let profile_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
     let profile_b = build_minimal_cmyk_to_rgb_lut8_profile(200);
     let pdf = build_pdf_embedded_iccbased_with_different_output_intent(&profile_a, &profile_b);
     let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
     let plates = render_separations(&doc, 0, 72).expect("render_separations");
-    // Process plates always emit per the API contract — we just check
-    // ink coverage at the painted rect centre is zero on EVERY plate.
     let sample = |p: &pdf_oxide::rendering::SeparationPlate| {
         let w = p.width as usize;
         p.data[50 * w + 50]
     };
-    for p in &plates {
-        assert_eq!(
-            sample(p),
-            0,
-            "plate {} should carry ZERO ink coverage at the painted-rect centre because \
-             ICCBased N=4 with parseable embedded profile now produces ResolvedColor::Rgba \
-             on composite, which the per-plate path consumes as 'no participating channels' \
-             → InkAction::Skip on every plate. If this fails the per-plate path was \
-             updated to honour ICCBased N=4 channel decomposition — update the design \
-             documentation accordingly.",
-            p.ink_name
-        );
-    }
+    let by_name = |name: &str| {
+        plates
+            .iter()
+            .find(|p| p.ink_name == name)
+            .map(sample)
+            .unwrap_or_else(|| panic!("plate {name} should be present in the result"))
+    };
+    let cyan = by_name("Cyan");
+    assert!(
+        (60..=68).contains(&cyan),
+        "Cyan plate should carry the ~0.25 tint from `0.25 0 0 0 scn` through the \
+         embedded /ICCBased N=4 space — same per-plate path the bare /DeviceCMYK \
+         counter-pin exercises (renderer quantises to ~63). Got {cyan}. \
+         Zero means the embedded-ICC arm of resolve_iccbased dropped the CMYK \
+         channel decomposition: the per-plate `OverprintResolver` saw \
+         `ResolvedColor::Rgba` and produced an empty participating list, so \
+         `InkRouter` returned `Skip` for every plate. The fix is to emit a \
+         variant that carries both the composite-side ICC-converted RGB AND \
+         the original CMYK quadruple for the per-plate router."
+    );
+    assert_eq!(by_name("Magenta"), 0, "Magenta plate should be zero for `0.25 0 0 0`");
+    assert_eq!(by_name("Yellow"), 0, "Yellow plate should be zero for `0.25 0 0 0`");
+    assert_eq!(by_name("Black"), 0, "Black plate should be zero for `0.25 0 0 0`");
 }
 
 /// Counter-pin: bare /DeviceCMYK paint with no embedded ICC override
