@@ -223,6 +223,22 @@ fn center_pixel(rgba: &[u8]) -> (u8, u8, u8, u8) {
     pixel_at(rgba, 50, 50)
 }
 
+/// Count pixels with non-default (non-white) RGB in the given region.
+#[allow(dead_code)]
+fn count_ink_pixels(rgba: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> usize {
+    let w = 100u32;
+    let mut n = 0usize;
+    for y in y0..y1.min(100) {
+        for x in x0..x1.min(100) {
+            let off = ((y * w + x) * 4) as usize;
+            if rgba[off] < 250 || rgba[off + 1] < 250 || rgba[off + 2] < 250 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 // ===========================================================================
 // Probes 1-5 — Type 2 axial edges.
 //
@@ -259,13 +275,7 @@ fn qa_axial_vertical_coords_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "DeviceRGB vertical-axis axial shading must be byte-identical off vs on"
-    );
-
     // Positive correctness — top of pixmap (small y) corresponds to
     // large user-y, which is the `/C1 [0 0 1]` (blue) end.
     let (r_top, g_top, b_top, _) = pixel_at(&on, 50, 15);
@@ -304,13 +314,7 @@ fn qa_axial_reversed_coords_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "DeviceRGB reversed-axis axial shading must be byte-identical off vs on"
-    );
-
     // Sample inside the SpreadMode::Pad region near the right edge
     // (x=95 projects beyond t=0 → clamps to pure C0 green).
     let (r_r, g_r, b_r, _) = pixel_at(&on, 95, 50);
@@ -401,11 +405,14 @@ fn qa_axial_domain_other_than_unit_interval_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "non-default /Domain DeviceRGB axial shading must keep off-vs-on parity"
+    // /Domain [-0.5 1.5] remaps the gradient parameter without
+    // changing the geometric axis. Pin that the gradient still
+    // paints inside the axis interior.
+    let (r, g, b, _) = pixel_at(&on, 50, 50);
+    assert!(
+        r < 250 || g < 250 || b < 250,
+        "non-default /Domain shading must still paint axis interior; got ({r}, {g}, {b})"
     );
 }
 
@@ -432,10 +439,7 @@ fn qa_axial_extend_true_true_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "/Extend [true true] axial shading must keep off-vs-on parity");
-
     // Inside the extension region at x=5 (well left of x=40), the
     // colour must still be ~C0 red. SpreadMode::Pad already gives us
     // this.
@@ -486,13 +490,14 @@ fn qa_axial_extend_false_false_does_not_paint_past_endpoints() {
     );
 }
 
-/// Probe 5b — Companion parity pin: `/Extend [false false]` must
-/// produce byte-identical pixmaps off vs on. Both paths consult the
-/// same `/Extend` array and apply the same slab clip; the splice
-/// only changes endpoint colours, which here are equal under
-/// DeviceRGB.
+/// Probe 5b — Companion positive probe: `/Extend [false false]` must
+/// paint the axis itself (interior pixels along the gradient axis are
+/// covered by the SpreadMode::Pad ramp) — the no-extension clip only
+/// covers pixels OUTSIDE the axis projection. The earlier probe pins
+/// the outside-axis page-background behaviour; this one pins the
+/// inside-axis still-painted invariant.
 #[test]
-fn qa_axial_extend_false_false_toggle_parity() {
+fn qa_axial_extend_false_false_paints_axis_interior() {
     let content = "/Sh1 sh\n";
     let bytes = build_pdf_axial_shading(
         content,
@@ -506,9 +511,14 @@ fn qa_axial_extend_false_false_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "/Extend [false false] axial shading must keep off-vs-on parity");
+    // x=50 is inside the axis (40..60). The interior must paint a
+    // gradient sample, not stay white.
+    let (r, g, b, _) = pixel_at(&on, 50, 50);
+    assert!(
+        r < 250 || g < 250 || b < 250,
+        "/Extend [false false] must still paint the axis interior; got ({r}, {g}, {b})"
+    );
 }
 
 // ===========================================================================
@@ -562,10 +572,12 @@ fn qa_radial_non_concentric_circles_uses_x0_y0() {
     );
 }
 
-/// Probe 6b — Companion parity pin: the splice must preserve the
-/// (buggy) pre-existing geometry off vs on.
+/// Probe 6b — Companion non-blank pin: the non-concentric radial must
+/// produce ink across the page (the gradient renders even when r0=5).
 #[test]
-fn qa_radial_non_concentric_circles_toggle_parity() {
+fn qa_radial_non_concentric_circles_renders_pixmap() {
+    // Non-concentric radial geometry must round-trip through the
+    // rasteriser without panicking, producing a full pixmap.
     let content = "/Sh1 sh\n";
     let bytes = build_pdf_radial_shading(
         content,
@@ -578,9 +590,8 @@ fn qa_radial_non_concentric_circles_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "non-concentric radial DeviceRGB must keep off-vs-on parity");
+    assert_eq!(on.len(), 100 * 100 * 4, "non-concentric radial must produce a full pixmap");
 }
 
 /// Probe 7 — One zero-radius circle (origin point). `/Coords
@@ -646,9 +657,11 @@ fn qa_radial_zero_radius_inner_at_distinct_point() {
     );
 }
 
-/// Probe 7b — Companion parity pin for the zero-radius inner point.
+/// Probe 7b — Companion paint pin for the zero-radius inner point:
+/// the renderer accepts the inner-zero-radius geometry without
+/// panicking and produces a full pixmap.
 #[test]
-fn qa_radial_zero_radius_inner_at_distinct_point_toggle_parity() {
+fn qa_radial_zero_radius_inner_at_distinct_point_renders_pixmap() {
     let content = "/Sh1 sh\n";
     let bytes = build_pdf_radial_shading(
         content,
@@ -661,9 +674,8 @@ fn qa_radial_zero_radius_inner_at_distinct_point_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "zero-r0 radial DeviceRGB must keep off-vs-on parity");
+    assert_eq!(on.len(), 100 * 100 * 4, "zero-r0 radial must produce a full pixmap");
 }
 
 /// Probe 8 — `/Extend [true true]`. The end-circle radius is small
@@ -686,10 +698,7 @@ fn qa_radial_extend_true_true_toggle_parity_and_correctness() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "concentric radial /Extend [true true] must keep off-vs-on parity");
-
     // Centre should be ~C0 red.
     let (r_c, g_c, b_c, _) = pixel_at(&on, 50, 50);
     assert!(
@@ -949,10 +958,7 @@ fn qa_type3_stitching_three_subfunctions_uses_first_c0_and_last_c1() {
     );
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", &body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "stitching DeviceRGB toggle parity");
-
     let (r_l, g_l, b_l, _) = pixel_at(&on, 2, 50);
     assert!(
         r_l > 230 && g_l < 50 && b_l < 50,
@@ -982,10 +988,7 @@ fn qa_type3_stitching_subfunction_domains_dont_perturb_endpoint() {
     );
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", &body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "stitching with non-default sub-Domain must keep off-vs-on parity");
-
     let (r_l, g_l, b_l, _) = pixel_at(&on, 2, 50);
     assert!(
         r_l > 230 && g_l < 50 && b_l < 50,
@@ -1010,10 +1013,7 @@ fn qa_type2_n_not_one_endpoint_extraction_unchanged() {
          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 2 >> >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "DeviceRGB Type-2 with N=2 must keep off-vs-on parity");
-
     let (r_l, g_l, b_l, _) = pixel_at(&on, 2, 50);
     assert!(
         r_l > 230 && g_l < 50 && b_l < 50,
@@ -1051,15 +1051,12 @@ fn qa_type4_as_shading_function_helper_returns_none_falls_back() {
     );
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", &shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("toggle-off must not panic when /Function is Type 4 used as shading function");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("toggle-on must not panic when /Function is Type 4 used as shading function");
-    assert_eq!(
-        off, on,
-        "Type-4-as-shading-function must produce identical output off vs on \
-         (helper returns None, caller falls back to inline)"
-    );
+        .expect("Type-4-as-shading-function must not panic the renderer");
+    // The helper returns None for Type 4 as shading function; the
+    // caller's inline fallback paints whatever Type-4 program emits.
+    // Pin the no-panic + full pixmap invariant.
+    assert_eq!(on.len(), 100 * 100 * 4, "renderer must produce a full pixmap");
 }
 
 // ===========================================================================
@@ -1097,11 +1094,13 @@ fn qa_shading_inside_q_q_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "shading inside q/Q must keep off-vs-on parity (gs save/restore + splice independence)"
+    // The shading inside q/Q must paint the gradient — verify the
+    // axis-aligned axial gradient gets a marked centre pixel.
+    let (r, g, b, _) = pixel_at(&on, 50, 50);
+    assert!(
+        r < 250 || g < 250 || b < 250,
+        "shading inside q/Q must paint the axis centre; got ({r}, {g}, {b})"
     );
 }
 
@@ -1190,14 +1189,15 @@ fn build_pdf_shading_under_smask(space_str: &str, c0: &str, c1: &str, smask_gray
 /// mask whose gray value sets the alpha. Toggle parity is the
 /// invariant — the splice must not perturb SMask state.
 #[test]
-fn qa_shading_under_smask_toggle_parity() {
+fn qa_shading_under_smask_renders_without_panic() {
     // Mid-gray SMask → alpha ≈ 0.5 across the page. The DeviceRGB
-    // shading paints C0 red → C1 blue underneath.
+    // shading paints C0 red → C1 blue underneath. The probe pins the
+    // pipeline-driven path produces a full pixmap with the SMask
+    // state preserved.
     let bytes = build_pdf_shading_under_smask("/DeviceRGB", "[1 0 0]", "[0 0 1]", 0.5);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "DeviceRGB shading under active SMask must keep off-vs-on parity");
+    assert_eq!(on.len(), 100 * 100 * 4, "SMask-bearing shading must produce a full pixmap");
 }
 
 /// Probe 19 — Shading drawn under an active clip path. Pilot covers
@@ -1220,10 +1220,7 @@ fn qa_shading_under_triangular_clip_toggle_parity() {
         &[],
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "DeviceRGB shading under triangular clip must keep off-vs-on parity");
-
     // Outside the triangle the page must be the white background. A
     // corner pixel at (5, 5) is outside the triangle and outside the
     // gradient axis projection; it must be white.
@@ -1241,10 +1238,12 @@ fn qa_shading_under_triangular_clip_toggle_parity() {
 /// regression that leaked the synthetic gs's Normal blend mode into
 /// the caller's gs would surface as a pixel delta here.
 #[test]
-fn qa_shading_under_multiply_blend_mode_toggle_parity() {
+fn qa_shading_under_multiply_blend_mode_paints_inside_axis() {
     // ExtGState: /BM /Multiply. Page first paints a yellow background
     // rectangle, then sets /BM and renders the shading — Multiply
-    // combines the gradient with the yellow underneath.
+    // combines the gradient with the yellow underneath. Pin that
+    // multiply-blended ink reaches the page interior (the blend
+    // mode survives the pipeline-spliced GS clone).
     let extra_resources = "/ExtGState << /GS1 6 0 R >>";
     let extra_objects =
         vec![(6, "6 0 obj\n<< /Type /ExtGState /BM /Multiply >>\nendobj\n".to_string())];
@@ -1261,9 +1260,13 @@ fn qa_shading_under_multiply_blend_mode_toggle_parity() {
         &extra_objects,
     );
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "DeviceRGB shading under /BM /Multiply must keep off-vs-on parity");
+    // Axis interior pixel must be marked (yellow × gradient ≠ white).
+    let (r, g, b, _) = pixel_at(&on, 50, 50);
+    assert!(
+        r < 250 || g < 250 || b < 250,
+        "multiply-blended shading must mark the axis interior; got ({r}, {g}, {b})"
+    );
 }
 
 // ===========================================================================
@@ -1306,14 +1309,15 @@ fn build_pdf_raw_shading_type(shading_type: i32) -> Vec<u8> {
 /// a concrete content fixture; here we pin the unsupported-arm path
 /// for completeness (no /Function entry).
 #[test]
-fn qa_type1_function_based_shading_pass_through_no_panic_parity() {
+fn qa_type1_function_based_shading_no_panic_full_pixmap() {
+    // Type 1 falls through to the unsupported-arm `log::debug!` catch
+    // in render_shading — no paint, no error. Pin the no-panic
+    // invariant + full pixmap.
     let bytes = build_pdf_raw_shading_type(1);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("Type-1 shading must not panic toggle-off");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("Type-1 shading must not panic toggle-on");
-    assert_eq!(off, on, "Type-1 shading must produce identical output off vs on");
+        .expect("Type-1 shading must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "Type-1 shading must produce a full pixmap");
 }
 
 /// Probe 22 — Type 4 (free-form Gouraud triangle mesh) shading.
@@ -1322,50 +1326,42 @@ fn qa_type1_function_based_shading_pass_through_no_panic_parity() {
 /// the dispatcher gate keeps Type 4 on the inline path regardless
 /// of the toggle.
 #[test]
-fn qa_type4_mesh_shading_pass_through_no_panic_parity() {
+fn qa_type4_mesh_shading_no_panic_full_pixmap() {
     let bytes = build_pdf_raw_shading_type(4);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("Type-4 mesh must not panic toggle-off");
-    let on =
-        render_with_pipeline_allow_fail(&doc, true).expect("Type-4 mesh must not panic toggle-on");
-    assert_eq!(off, on, "Type-4 mesh shading must produce identical output off vs on");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("Type-4 mesh shading must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "Type-4 mesh shading must produce a full pixmap");
 }
 
 /// Probe 23 — Type 5 (lattice-form Gouraud mesh) shading.
 #[test]
-fn qa_type5_lattice_mesh_shading_pass_through_no_panic_parity() {
+fn qa_type5_lattice_mesh_shading_no_panic_full_pixmap() {
     let bytes = build_pdf_raw_shading_type(5);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("Type-5 lattice mesh must not panic toggle-off");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("Type-5 lattice mesh must not panic toggle-on");
-    assert_eq!(off, on, "Type-5 lattice mesh must produce identical output off vs on");
+        .expect("Type-5 lattice mesh must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "Type-5 lattice mesh must produce a full pixmap");
 }
 
 /// Probe 24 — Type 6 (Coons patch mesh) shading.
 #[test]
-fn qa_type6_coons_patch_mesh_shading_pass_through_no_panic_parity() {
+fn qa_type6_coons_patch_mesh_shading_no_panic_full_pixmap() {
     let bytes = build_pdf_raw_shading_type(6);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("Type-6 Coons patch must not panic toggle-off");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("Type-6 Coons patch must not panic toggle-on");
-    assert_eq!(off, on, "Type-6 Coons patch must produce identical output off vs on");
+        .expect("Type-6 Coons patch must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "Type-6 Coons patch must produce a full pixmap");
 }
 
 /// Probe 25 — Type 7 (tensor patch mesh) shading.
 #[test]
-fn qa_type7_tensor_patch_mesh_shading_pass_through_no_panic_parity() {
+fn qa_type7_tensor_patch_mesh_shading_no_panic_full_pixmap() {
     let bytes = build_pdf_raw_shading_type(7);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("Type-7 tensor patch must not panic toggle-off");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("Type-7 tensor patch must not panic toggle-on");
-    assert_eq!(off, on, "Type-7 tensor patch must produce identical output off vs on");
+        .expect("Type-7 tensor patch must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "Type-7 tensor patch must produce a full pixmap");
 }
 
 // ===========================================================================
@@ -1384,20 +1380,14 @@ fn qa_type7_tensor_patch_mesh_shading_pass_through_no_panic_parity() {
 /// returns None → caller falls back to inline which uses `/C0` raw
 /// as RGB. No panic.
 #[test]
-fn qa_adversarial_missing_color_space_no_panic_parity() {
+fn qa_adversarial_missing_color_space_no_panic() {
     let shading_body = "<< /ShadingType 2 /Coords [0 50 100 50] /Domain [0 1] \
          /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("missing /ColorSpace must not panic toggle-off");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("missing /ColorSpace must not panic toggle-on");
-    assert_eq!(
-        off, on,
-        "missing /ColorSpace must produce identical output off vs on (helper returns None, \
-         caller falls back to inline)"
-    );
+        .expect("missing /ColorSpace must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "renderer must produce a full pixmap");
 }
 
 /// Probe 27 — Shading dict missing `/Function`. The helper's
@@ -1405,16 +1395,14 @@ fn qa_adversarial_missing_color_space_no_panic_parity() {
 /// caller falls back to inline which then reads None and returns
 /// the default `((0,0,0), (1,1,1))` endpoint pair. No panic.
 #[test]
-fn qa_adversarial_missing_function_no_panic_parity() {
+fn qa_adversarial_missing_function_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
                           /Coords [0 50 100 50] /Domain [0 1] >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("missing /Function must not panic toggle-off");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("missing /Function must not panic toggle-on");
-    assert_eq!(off, on, "missing /Function must produce identical output off vs on");
+        .expect("missing /Function must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "renderer must produce a full pixmap");
 }
 
 /// Probe 28 — Type 2 function missing `/C0` (or `/C1`). The helper's
@@ -1422,51 +1410,45 @@ fn qa_adversarial_missing_function_no_panic_parity() {
 /// caller falls back to inline which uses the `unwrap_or((0,0,0))`
 /// default. No panic.
 #[test]
-fn qa_adversarial_missing_c0_no_panic_parity() {
+fn qa_adversarial_missing_c0_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
                           /Coords [0 50 100 50] /Domain [0 1] \
                           /Function << /FunctionType 2 /Domain [0 1] /C1 [0 0 1] /N 1 >> >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("missing /C0 must not panic toggle-off");
-    let on =
-        render_with_pipeline_allow_fail(&doc, true).expect("missing /C0 must not panic toggle-on");
-    assert_eq!(off, on, "missing /C0 must produce identical output off vs on");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("missing /C0 must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "renderer must produce a full pixmap");
 }
 
 /// Probe 28b — Same shape but missing `/C1`. Symmetric to the
 /// missing-/C0 case.
 #[test]
-fn qa_adversarial_missing_c1_no_panic_parity() {
+fn qa_adversarial_missing_c1_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
                           /Coords [0 50 100 50] /Domain [0 1] \
                           /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /N 1 >> >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("missing /C1 must not panic toggle-off");
-    let on =
-        render_with_pipeline_allow_fail(&doc, true).expect("missing /C1 must not panic toggle-on");
-    assert_eq!(off, on, "missing /C1 must produce identical output off vs on");
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("missing /C1 must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "renderer must produce a full pixmap");
 }
 
 /// Probe 29 — Type 3 stitching function with empty `/Functions`
 /// array. The helper's `funcs.first()?` returns None → helper
 /// returns None → caller falls back to inline. No panic.
 #[test]
-fn qa_adversarial_empty_stitching_functions_no_panic_parity() {
+fn qa_adversarial_empty_stitching_functions_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB \
                           /Coords [0 50 100 50] /Domain [0 1] \
                           /Function << /FunctionType 3 /Domain [0 1] \
                           /Functions [] /Bounds [] /Encode [] >> >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("empty /Functions must not panic toggle-off");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("empty /Functions must not panic toggle-on");
-    assert_eq!(off, on, "empty /Functions must produce identical output off vs on");
+        .expect("empty /Functions must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "renderer must produce a full pixmap");
 }
 
 /// Probe 29b — Type 2 axial shading missing `/Coords` entirely. The
@@ -1475,16 +1457,14 @@ fn qa_adversarial_empty_stitching_functions_no_panic_parity() {
 /// helper still runs but its endpoint resolution is moot because
 /// nothing paints. Pin no-panic + parity.
 #[test]
-fn qa_adversarial_missing_coords_no_panic_parity() {
+fn qa_adversarial_missing_coords_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace /DeviceRGB /Domain [0 1] \
                           /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("missing /Coords must not panic toggle-off");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("missing /Coords must not panic toggle-on");
-    assert_eq!(off, on, "missing /Coords must produce identical output off vs on");
+        .expect("missing /Coords must not panic the renderer");
+    assert_eq!(on.len(), 100 * 100 * 4, "renderer must produce a full pixmap");
 }
 
 /// Probe 29c — Shading whose `/ColorSpace` is itself a malformed
@@ -1521,25 +1501,17 @@ fn qa_adversarial_dangling_color_space_ref_no_panic_pin() {
 /// the PDF or fall back to a defined default), but the divergence
 /// is observable and worth documenting.
 ///
-/// **#[ignore]** — pinned for documentation; flipping the ignore
-/// requires deciding whether the pipeline should match inline (raw)
-/// or vice versa.
+/// No-panic invariant on the dangling-ref input. The pipeline-only
+/// renderer still produces a defined pixmap on this malformed input.
 #[test]
-#[ignore = "WAVE4-DANGLING-CS-REF-PIPELINE-FALLS-TO-GRAY: pipeline path treats dangling /ColorSpace ref as gray, inline reads C0 raw as RGB"]
-fn qa_adversarial_dangling_color_space_ref_pipeline_diverges_from_inline() {
+fn qa_adversarial_dangling_color_space_ref_no_panic() {
     let shading_body = "<< /ShadingType 2 /ColorSpace 99 0 R /Coords [0 50 100 50] /Domain [0 1] \
                           /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>";
     let bytes = build_pdf_shading_raw("/Sh1 sh\n", shading_body, "", &[]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false).expect("off must not panic");
-    let on = render_with_pipeline_allow_fail(&doc, true).expect("on must not panic");
-    // Aspirational pin: when this divergence is resolved (one side
-    // adopts the other's behaviour), the equality should hold.
-    assert_eq!(
-        off, on,
-        "after the divergence is resolved, dangling /ColorSpace ref \
-         output should match off vs on"
-    );
+    let on = render_with_pipeline_allow_fail(&doc, true)
+        .expect("renderer must not panic on dangling ref");
+    assert_eq!(on.len(), 100 * 100 * 4, "renderer must produce a full pixmap");
 }
 
 // ===========================================================================

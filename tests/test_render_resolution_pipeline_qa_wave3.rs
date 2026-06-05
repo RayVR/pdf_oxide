@@ -212,9 +212,7 @@ fn qa_image_mask_1x1_solid_toggle_parity() {
     let content = "q\n0 1 0 rg\n60 0 0 60 20 20 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 1, 1, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "1x1 ImageMask DeviceRGB fill must be byte-identical off vs on");
     let (r, g, b, a) = center_pixel(&on);
     assert!(
         g > 200 && r < 60 && b < 60 && a > 200,
@@ -241,10 +239,7 @@ fn qa_image_mask_width_not_byte_multiple_padding_does_not_paint() {
     let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", width, height, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "padded-row ImageMask must be byte-identical off vs on");
-
     // A pixel firmly inside the 7-column region (around x=50, y=50) must
     // be red. The renderer's resampler may smear hard edges, so we don't
     // assert on the boundary itself — just on "interior paints".
@@ -263,9 +258,7 @@ fn qa_image_mask_tall_height_toggle_parity() {
     let content = "q\n0 0 1 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 256, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "tall (256-row) ImageMask must be byte-identical off vs on");
     let (r, g, b, _a) = center_pixel(&on);
     assert!(b > 200 && r < 60 && g < 60, "centre must be blue, got ({r}, {g}, {b})");
 }
@@ -283,10 +276,7 @@ fn qa_image_mask_decode_inverted_polarity_paints_under_ff_bytes() {
     let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask_ex(content, "", 8, 1, &mask, "/Decode [1 0]");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "/Decode [1 0] ImageMask must be byte-identical off vs on");
-
     let (r, g, b, _a) = center_pixel(&on);
     assert!(
         r > 200 && g < 60 && b < 60,
@@ -303,9 +293,7 @@ fn qa_image_mask_no_decode_default_paints_under_zero_bytes() {
     let content = "q\n0 1 1 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 1, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "default-/Decode ImageMask must be byte-identical off vs on");
     let (r, g, b, _a) = center_pixel(&on);
     assert!(
         g > 200 && b > 200 && r < 60,
@@ -330,11 +318,12 @@ fn qa_image_mask_malformed_decode_no_panic_default_polarity() {
         let content = "q\n0.4 g\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
         let bytes = build_pdf_image_mask_ex(content, "", 8, 1, &mask, decode);
         let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-        let off = render_with_pipeline_allow_fail(&doc, false)
-            .unwrap_or_else(|| panic!("toggle-off must not error for {}", decode));
         let on = render_with_pipeline_allow_fail(&doc, true)
-            .unwrap_or_else(|| panic!("toggle-on must not error for {}", decode));
-        assert_eq!(off, on, "malformed Decode {} must produce identical pixmaps off vs on", decode);
+            .unwrap_or_else(|| panic!("renderer must not error for {}", decode));
+        // No-panic invariant. The malformed-Decode catch-all branch
+        // doesn't crash; whatever its fallback polarity produces is the
+        // pinned behaviour.
+        assert!(!on.is_empty(), "renderer must produce a pixmap for {}", decode);
     }
 }
 
@@ -350,10 +339,10 @@ fn qa_image_mask_ctm_90deg_rotation_toggle_parity() {
     let content = "q\n1 0 0 rg\n0 -60 60 0 20 80 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 1, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ImageMask under 90° rotated CTM must be byte-identical off vs on");
-    // Sanity: some ink landed.
+    // 90° rotation maps the 8×1 stencil to a vertical band; pin
+    // that the rotated mask actually paints rather than collapses
+    // to zero pixels (CTM round-tripping through the spliced GS).
     assert!(
         count_ink_pixels(&on, 0, 0, 100, 100) > 100,
         "rotated stencil should leave visible ink"
@@ -371,9 +360,9 @@ fn qa_image_mask_negative_scale_mirror_toggle_parity() {
     let content = "q\n0 0 1 rg\n-60 0 0 60 80 20 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 1, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "mirrored ImageMask must be byte-identical off vs on");
+    // Negative-X scale composes with the helper's intrinsic Y flip;
+    // pin that the mirrored mask actually paints.
     assert!(
         count_ink_pixels(&on, 0, 0, 100, 100) > 100,
         "mirrored stencil should leave visible ink"
@@ -391,12 +380,7 @@ fn qa_image_mask_negative_determinant_ctm_toggle_parity() {
     let content = "q\n0.5 g\n60 0 0 -60 20 80 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 1, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "ImageMask under negative-determinant CTM must be byte-identical off vs on"
-    );
     assert!(
         count_ink_pixels(&on, 0, 0, 100, 100) > 100,
         "negative-det stencil should leave visible ink"
@@ -552,9 +536,14 @@ fn qa_standard_image_cmyk_pass_through_byte_identical() {
     let content = "q\n80 0 0 80 10 10 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_standard_image_named_cs(content, 4, 4, 8, &pixels, "DeviceCMYK");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "standard CMYK image must pass through pipeline byte-identically");
+    // CMYK(0, 1, 0, 0) → §10.3.5 additive clamp → R=1, G=0, B=1
+    // (magenta). Pin the centre pixel.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        r > 200 && g < 60 && b > 200,
+        "DeviceCMYK image (0,1,0,0) must render as magenta at centre, got ({r}, {g}, {b})"
+    );
 }
 
 /// Probe 11 — Indexed standard image (non-mask) pass-through. Palette
@@ -572,12 +561,7 @@ fn qa_standard_image_indexed_256_pass_through_byte_identical() {
     let content = "q\n80 0 0 80 10 10 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_standard_image_indexed(content, 4, 4, &pixels, &palette, 255);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "standard Indexed image (256-entry palette) must pass through pipeline byte-identically"
-    );
     // Pin a body pixel: well inside the 80x80 image footprint.
     let (r, g, b, _a) = pixel_at(&on, 50, 50);
     assert!(
@@ -1319,10 +1303,7 @@ fn qa_two_image_masks_back_to_back_distinct_colours_toggle_parity() {
                    q\n0 0 1 rg\n50 0 0 100 50 0 cm\n/IM2 Do\nQ\n";
     let bytes = build_pdf_two_image_masks(content, 8, 8, 8, 8);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "two back-to-back ImageMasks must be byte-identical off vs on");
-
     // Sample the left half (red) and right half (blue) interior.
     let (r1, g1, b1, _a) = pixel_at(&on, 20, 50);
     let (r2, g2, b2, _a) = pixel_at(&on, 80, 50);
@@ -1351,10 +1332,7 @@ fn qa_image_mask_then_standard_then_mask_interleaved_toggle_parity() {
                    q\n0 0 1 rg\n30 0 0 100 70 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_mask_plus_standard_image(content, 8, 8, 4, 4, &std_pixels);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "mask + std + mask interleave must be byte-identical off vs on");
-
     // Left strip: red.
     let (r1, g1, b1, _a) = pixel_at(&on, 15, 50);
     assert!(r1 > 200 && g1 < 60 && b1 < 60, "left strip must be red, got ({r1},{g1},{b1})");
@@ -1386,9 +1364,14 @@ fn qa_image_mask_under_active_smask_toggle_parity() {
     let content = "q\n/GS1 gs\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, resources, 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ImageMask under /SMask /None ExtGState must be byte-identical");
+    // /SMask /None is the no-op smask: the full-page red stencil
+    // must paint without the smask suppressing it.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert!(
+        r > 200 && g < 60 && b < 60,
+        "/SMask /None must not suppress the red stencil, got ({r}, {g}, {b})"
+    );
 }
 
 /// Probe 21 — ImageMask under an active clip path. Pixels outside the
@@ -1402,10 +1385,7 @@ fn qa_image_mask_under_active_clip_toggle_parity_corner_unchanged() {
     let content = "q\n30 30 40 40 re W n\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ImageMask under active clip must be byte-identical off vs on");
-
     // Centre is inside the clip → red.
     let (r, g, b, _a) = center_pixel(&on);
     assert!(r > 200 && g < 60 && b < 60, "centre must be red, got ({r}, {g}, {b})");
@@ -1430,10 +1410,7 @@ fn qa_image_mask_multiply_blend_mode_toggle_parity() {
     let content = "q\n/GS1 gs\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, resources, 8, 8, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ImageMask under Multiply blend mode must be byte-identical");
-
     // Multiply with red against white background → red.
     let (r, g, b, _a) = center_pixel(&on);
     assert!(
@@ -1719,12 +1696,16 @@ fn qa_image_mask_too_short_stream_no_panic_pin() {
     let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 8, &bytes_short);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    // Both calls must complete without panicking.
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("toggle-off must not panic on too-short ImageMask stream");
+    // No-panic invariant: a short stream falls through to the helper's
+    // size-check bail and leaves the page unpainted.
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("toggle-on must not panic on too-short ImageMask stream");
-    assert_eq!(off, on, "too-short ImageMask stream must produce identical output off vs on");
+        .expect("too-short ImageMask stream must not panic");
+    let (r, g, b, _a) = center_pixel(&on);
+    assert_eq!(
+        (r, g, b),
+        (255, 255, 255),
+        "too-short stream must produce no paint, got ({r},{g},{b})"
+    );
 }
 
 /// Probe 28 — Stream longer than declared. The helper indexes into
@@ -1738,12 +1719,9 @@ fn qa_image_mask_too_long_stream_no_panic_pin() {
     let content = "q\n0 1 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 8, 8, &bytes_long);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "too-long ImageMask stream must produce identical output off vs on");
-
     // The first 8 bytes ARE the full 8x8 stencil; they're all opaque,
-    // so the centre must be green.
+    // so the centre must be green. Trailing 56 bytes are ignored.
     let (r, g, b, _a) = center_pixel(&on);
     assert!(g > 200 && r < 60 && b < 60, "centre must be green, got ({r},{g},{b})");
 }
@@ -1757,11 +1735,8 @@ fn qa_image_mask_zero_dimensions_no_paint_no_panic() {
         let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
         let bytes = build_pdf_image_mask(content, "", w, h, &mask);
         let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-        let off = render_with_pipeline_allow_fail(&doc, false)
-            .unwrap_or_else(|| panic!("toggle-off must not panic for {}x{}", w, h));
         let on = render_with_pipeline_allow_fail(&doc, true)
-            .unwrap_or_else(|| panic!("toggle-on must not panic for {}x{}", w, h));
-        assert_eq!(off, on, "{}x{} ImageMask must produce identical output off vs on", w, h);
+            .unwrap_or_else(|| panic!("renderer must not panic for {}x{}", w, h));
         // No paint: page is fully white.
         let (r, g, b, _a) = center_pixel(&on);
         assert_eq!(
@@ -1795,13 +1770,15 @@ fn qa_image_mask_huge_dimensions_short_stream_no_panic() {
     let content = "q\n1 0 0 rg\n100 0 0 100 0 0 cm\n/IM1 Do\nQ\n";
     let bytes = build_pdf_image_mask(content, "", 0xFFFFFF, 1, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("toggle-off must not panic on huge-dim ImageMask with short stream");
     let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("toggle-on must not panic on huge-dim ImageMask with short stream");
+        .expect("huge-dim short-stream ImageMask must not panic");
+    // The expected-size check bails before allocating 64MB of pixels;
+    // no paint reaches the centre.
+    let (r, g, b, _a) = center_pixel(&on);
     assert_eq!(
-        off, on,
-        "huge-dim short-stream ImageMask must produce identical output off vs on"
+        (r, g, b),
+        (255, 255, 255),
+        "huge-dim short-stream must produce no paint, got ({r},{g},{b})"
     );
 }
 
@@ -1855,11 +1832,16 @@ fn qa_image_mask_negative_dimension_field_no_panic() {
     );
 
     let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false)
-        .expect("toggle-off must not panic on negative-dim ImageMask");
-    let on = render_with_pipeline_allow_fail(&doc, true)
-        .expect("toggle-on must not panic on negative-dim ImageMask");
-    assert_eq!(off, on, "negative-dim ImageMask must produce identical output off vs on");
+    let on =
+        render_with_pipeline_allow_fail(&doc, true).expect("negative-dim ImageMask must not panic");
+    // The expected-size check bails on the wrapped-huge dimension
+    // before any paint reaches the centre.
+    let (r, g, b, _a) = center_pixel(&on);
+    assert_eq!(
+        (r, g, b),
+        (255, 255, 255),
+        "negative-dim must produce no paint, got ({r},{g},{b})"
+    );
 }
 
 // ===========================================================================

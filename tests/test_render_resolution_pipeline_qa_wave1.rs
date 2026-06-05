@@ -162,6 +162,17 @@ fn pixel_at(rgba: &[u8], x: u32, y: u32) -> (u8, u8, u8, u8) {
     (rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3])
 }
 
+/// Count non-default-background pixels (R, G, or B differs from white).
+/// Used as a positive probe that the operator stream actually painted
+/// something — converted from earlier off-vs-on parity checks after the
+/// pipeline toggle was removed.
+#[allow(dead_code)]
+fn count_marked_pixels(rgba: &[u8]) -> usize {
+    rgba.chunks_exact(4)
+        .filter(|c| c[0] < 250 || c[1] < 250 || c[2] < 250)
+        .count()
+}
+
 // ===========================================================================
 // PROBE AREA: Toggle-on parity at scale (probes 1, 2, 3)
 // ===========================================================================
@@ -194,11 +205,14 @@ fn qa_long_stream_repeated_fill_stroke_byte_identical() {
     }
     let bytes = build_pdf(&content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "pipeline must remain byte-identical after a long sequence of repeated migrated operators"
+    // 200 iterations of the six migrated operators × four rectangles
+    // per iteration must reach the rasteriser without per-call state
+    // leaking — a positive probe that the page is heavily marked.
+    let marked = count_marked_pixels(&on);
+    assert!(
+        marked > 1000,
+        "200 repeated migrated operators must produce a heavily-marked page; got {marked} marked pixels"
     );
 }
 
@@ -227,9 +241,16 @@ fn qa_mixed_all_paint_operators_byte_identical() {
     }
     let bytes = build_pdf(&content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "interleaved migrated + prior-wave operators must be byte-identical");
+    // The interleaved op stream paints 7 horizontally-tiled rectangles
+    // (one per op), each with a distinct per-iteration colour. Verify
+    // the page is marked across the horizontal axis — every operator
+    // family reached the rasteriser without skipping.
+    let marked = count_marked_pixels(&on);
+    assert!(
+        marked > 500,
+        "interleaved migrated + prior-wave operators must paint visible marks across the page; got {marked} marked pixels"
+    );
 }
 
 /// Probe 3 — Graphics-state operators (`q`/`Q`/`cm`/`w`/`J`/`j`/`gs`)
@@ -251,11 +272,13 @@ fn qa_interleaved_graphics_state_changes_byte_identical() {
     ";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "graphics-state changes interleaved with migrated operators must keep parity"
+    // q/Q must preserve state across migrated operators — both rect
+    // blocks should reach the rasteriser. Verify by counting marks.
+    let marked = count_marked_pixels(&on);
+    assert!(
+        marked > 500,
+        "graphics-state changes interleaved with migrated operators must keep marks reaching the rasteriser; got {marked}"
     );
 }
 
@@ -272,12 +295,23 @@ fn qa_interleaved_graphics_state_changes_byte_identical() {
 /// off and on pixmaps would diverge.
 #[test]
 fn qa_stroke_hairline_width_parity() {
+    // 0.25-px stroke at 72 DPI is below the sub-pixel anti-alias
+    // threshold the rasteriser uses, so the on-paper output is
+    // effectively zero coverage — the spec doesn't guarantee
+    // visibility below 1 device pixel. The capability under test is
+    // that the operator round-trips through the renderer without
+    // panicking and the line-width survives the splice (the
+    // pipeline's clone doesn't promote width). We pin the no-panic /
+    // full-pixmap invariant.
     let content = "1 0 0 RG\n0.25 w\n20 50 m\n80 50 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "hairline stroke must be byte-identical");
+    assert_eq!(
+        on.len(),
+        100 * 100 * 4,
+        "hairline render must produce a full 100×100 RGBA pixmap"
+    );
 }
 
 /// Probe 5 — Zero-width stroke. PDF spec ISO 32000-1 §8.4.3.2 says width 0
@@ -288,9 +322,12 @@ fn qa_stroke_zero_width_parity() {
     let content = "1 0 0 RG\n0 w\n20 50 m\n80 50 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
+    // Zero-width stroke per §8.4.3.2: thinnest line the device can
+    // render. The render must not panic, and the renderer's defined
+    // behaviour is observable on the output. We probe the no-panic
+    // invariant by reaching this assertion at all.
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "zero-width stroke must be byte-identical");
+    assert_eq!(on.len(), 100 * 100 * 4, "zero-width stroke must produce a full pixmap");
 }
 
 /// Probe 6 — Negative line width (malformed PDF).
@@ -303,16 +340,11 @@ fn qa_stroke_negative_width_parity_no_panic() {
     let content = "1 0 0 RG\n-3 w\n20 50 m\n80 50 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    // First invariant: no panic on either side.
-    let off = render_with_pipeline_allow_fail(&doc, false);
+    // No-panic invariant: the renderer must accept the malformed
+    // negative width and either render or fail cleanly.
     let on = render_with_pipeline_allow_fail(&doc, true);
-    // Second invariant: same outcome shape.
-    match (off, on) {
-        (Some(a), Some(b)) => assert_eq!(a, b, "negative line width must render identically"),
-        (None, None) => {},
-        (None, Some(_)) | (Some(_), None) => {
-            panic!("toggle changed render-success vs render-failure outcome on malformed input");
-        },
+    if let Some(data) = on {
+        assert_eq!(data.len(), 100 * 100 * 4, "negative width render must produce a full pixmap");
     }
 }
 
@@ -328,9 +360,15 @@ fn qa_stroke_alpha_ca_extgstate_parity() {
     let resources = "/ExtGState << /Half << /Type /ExtGState /CA 0.5 >> >>";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "stroke alpha via /CA ExtGState must be byte-identical");
+    // /CA 0.5 with full-opaque red over white bg → the stroke pixels
+    // should be a midpoint red (R high but not 255, G/B around 127).
+    // Sample the top-edge mid-stroke (x=50, y=20).
+    let (r, g, b, _) = pixel_at(&on, 50, 20);
+    assert!(
+        r > 150 && g > 80 && g < 200 && b > 80 && b < 200,
+        "stroke /CA 0.5 red over white must blend to a faded-red top edge; got ({r},{g},{b})"
+    );
 }
 
 /// Probe 8 — Stroke with a dash pattern set via `d`.
@@ -343,9 +381,26 @@ fn qa_stroke_dash_pattern_parity() {
     let content = "1 0 0 RG\n4 w\n[6 3] 0 d\n10 50 m\n90 50 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "dashed stroke must be byte-identical");
+    // Dash pattern [6 3] means 6-on / 3-off; the horizontal stroke at
+    // PDF y=50 with width 4 produces alternating segments. Sweep the
+    // band of rows the 4-wide stroke crosses (image-y around 47..52
+    // after the PDF→image flip) and count red pixels. Dashed
+    // coverage is between zero and a continuous stroke (~80 px).
+    let mut marked = 0usize;
+    for y in 46..=54 {
+        for x in 10..=90 {
+            let (r, g, b, _) = pixel_at(&on, x, y);
+            // Red stroke pixel: R distinctly above G and B.
+            if r > 150 && g < 150 && b < 150 {
+                marked += 1;
+            }
+        }
+    }
+    assert!(
+        marked > 0 && marked < 720,
+        "dashed stroke must produce partial coverage (some marks, not every pixel); got {marked}"
+    );
 }
 
 /// Probe 9 — Miter limit at an extreme value, applied to a sharp corner.
@@ -357,9 +412,25 @@ fn qa_stroke_extreme_miter_limit_parity() {
     let content = "1 0 0 RG\n6 w\n0 J\n0 j\n100 M\n20 80 m\n50 50 l\n20 20 l\nS\n";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "extreme miter-limit stroke must be byte-identical");
+    // The two segments meet around the page midpoint with a sharp
+    // join under M=100, so the miter spike extends outward. Sweep a
+    // band around the join location and confirm at least one red
+    // pixel — pinning that miter rendering reached the rasteriser.
+    let mut found = false;
+    for y in 45..=55 {
+        for x in 45..=70 {
+            let (r, g, b, _) = pixel_at(&on, x, y);
+            if r > 200 && g < 100 && b < 100 {
+                found = true;
+                break;
+            }
+        }
+        if found {
+            break;
+        }
+    }
+    assert!(found, "miter join area must contain a red stroke pixel under M=100");
 }
 
 // ===========================================================================
@@ -384,9 +455,28 @@ fn qa_combo_under_rotated_scaled_ctm_parity() {
     ";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "`B` under a rotated + scaled CTM must be byte-identical");
+    // Both fill (green) and stroke (red) must reach the rasteriser
+    // under the rotated CTM — count marked pixels and decompose to
+    // confirm both green and red channels show up.
+    let mut green_marks = 0usize;
+    let mut red_marks = 0usize;
+    for c in on.chunks_exact(4) {
+        if c[1] > c[0].saturating_add(40) && c[1] > c[2].saturating_add(40) {
+            green_marks += 1;
+        }
+        if c[0] > c[1].saturating_add(40) && c[0] > c[2].saturating_add(40) {
+            red_marks += 1;
+        }
+    }
+    assert!(
+        green_marks > 50,
+        "rotated `B` fill (green) must reach the rasteriser; got {green_marks} green pixels"
+    );
+    assert!(
+        red_marks > 20,
+        "rotated `B` stroke (red) must reach the rasteriser; got {red_marks} red pixels"
+    );
 }
 
 /// Probe 11 — Soft-mask `/SMask` set via ExtGState; while not always
@@ -404,9 +494,14 @@ fn qa_stroke_under_extgstate_with_smask_no_divergence() {
     let resources = "/ExtGState << /Sm << /Type /ExtGState /SMask /None >> >>";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "/SMask entry on stroke must not introduce off-vs-on divergence");
+    // /SMask /None is a no-op soft mask; the stroke must still paint
+    // the rectangle outline. Sample a top-edge pixel that should be red.
+    let (r, g, b, _) = pixel_at(&on, 50, 20);
+    assert!(
+        r > 200 && g < 100 && b < 100,
+        "/SMask /None must not suppress the red stroke; got ({r},{g},{b})"
+    );
 }
 
 /// Probe 12 — Independent clip paths active when fill and stroke happen
@@ -426,9 +521,21 @@ fn qa_combo_under_active_clip_parity() {
     ";
     let bytes = build_pdf(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "`B` under an active clip path must be byte-identical");
+    // Clip is a horizontal band y=40..60; the rect outside that band
+    // (e.g. y=15) must be unclipped (still white), and the centre of
+    // the band (y=50) must be marked by the fill or stroke.
+    let (r_above, g_above, b_above, _) = pixel_at(&on, 50, 15);
+    assert!(
+        r_above > 240 && g_above > 240 && b_above > 240,
+        "outside clip band must stay white; got ({r_above},{g_above},{b_above})"
+    );
+    let (r_in, _, _, _) = pixel_at(&on, 50, 50);
+    assert!(
+        r_in < 250 || pixel_at(&on, 50, 50).1 < 250,
+        "inside clip band must be marked by `B`; got {:?}",
+        pixel_at(&on, 50, 50)
+    );
 }
 
 // ===========================================================================
@@ -458,25 +565,20 @@ fn qa_combo_under_active_clip_parity() {
 /// agreed direction is up to the design pass; the divergence today is
 /// the bug.
 #[test]
-fn qa_bug_indexed_scn_fill_pipeline_diverges() {
-    // Wave-1 fix: the inline `scn` Indexed branch now mirrors the
+fn qa_indexed_scn_fill_index_as_gray_fallback() {
+    // Wave-1 fix: the inline `scn` Indexed branch mirrors the
     // pipeline's `g = index / 255` fallback (until the full palette
-    // lookup is wired). Off-vs-on toggle parity is restored.
+    // lookup is wired). For index 1 that is near-black.
     let resources = "/ColorSpace << /Pal [/Indexed /DeviceRGB 1 <FF0000 0000FF>] >>";
     let content = "/Pal cs\n1 scn\n20 20 60 60 re\nf\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    // Both paths now render index/255 — for index 1 that is near-black.
+    // index/255 fallback → near-black at the centre.
     let (r_on, g_on, b_on, _) = center_pixel(&on);
     assert!(
         r_on < 50 && g_on < 50 && b_on < 50,
         "Indexed `scn`: index/255 fallback must produce near-black, got ({r_on}, {g_on}, {b_on})"
-    );
-    assert_eq!(
-        off, on,
-        "Indexed `scn` must render identically off vs on (both paths use index/255)"
     );
 }
 
@@ -487,16 +589,21 @@ fn qa_bug_indexed_scn_fill_pipeline_diverges() {
 /// Same divergence pattern, stroke side. Inline `SetStrokeColorN` has no
 /// `Indexed` branch; pipeline's `resolve_indexed` divides by 255.
 #[test]
-fn qa_bug_indexed_scn_stroke_pipeline_diverges() {
-    // Wave-1 fix: symmetric to the fill-side QA test above. The inline
-    // `SCN` Indexed branch now matches the pipeline.
+fn qa_indexed_scn_stroke_index_as_gray_fallback() {
+    // Wave-1 fix: symmetric to the fill-side QA test above. The
+    // `SCN` Indexed stroke uses index/255 — for index 1 that's a
+    // near-black stroke around a 60×60 rectangle at (20,20).
     let resources = "/ColorSpace << /Pal [/Indexed /DeviceRGB 1 <FF0000 0000FF>] >>";
     let content = "/Pal CS\n1 SCN\n10 w\n20 20 60 60 re\nS\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "Indexed `SCN` (stroke) must render identically off vs on");
+    // Sample mid-top-edge pixel (50, 20) — should be near-black stroke.
+    let (r, g, b, _) = pixel_at(&on, 50, 20);
+    assert!(
+        r < 80 && g < 80 && b < 80,
+        "Indexed `SCN` stroke: index/255 fallback must paint near-black top edge; got ({r},{g},{b})"
+    );
 }
 
 /// Probe 14 — ICCBased colour space with 4 components (CMYK profile).
@@ -543,9 +650,15 @@ fn qa_iccbased_cmyk_n4_fill_parity() {
         format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
     );
     let doc = PdfDocument::from_bytes(buf).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "ICCBased N=4 (CMYK) fill must be byte-identical");
+    // ICCBased N=4 reads /N=4 and treats components as CMYK. The fill
+    // here is (1,0,0,0) = pure cyan → §10.3.5 additive-clamp gives
+    // R=0, G=1, B=1 (cyan). Pin that the rect centre is cyan.
+    let (r, g, b, _) = center_pixel(&on);
+    assert!(
+        r < 30 && g > 220 && b > 220,
+        "ICCBased N=4 cyan fill must paint cyan at centre; got ({r},{g},{b})"
+    );
 }
 
 /// Probe 15 — DeviceN with a multi-output Type 4 tint transform.
@@ -678,9 +791,10 @@ fn qa_pattern_colour_space_falls_back_to_inline_parity() {
     let content = "/MyPattern cs\n20 20 60 60 re\nf\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(off, on, "Pattern colour space must fall back to inline path identically");
+    // Bare `/Pattern cs` with no concrete pattern is degenerate; the
+    // renderer must not panic. Pin the pixmap size invariant.
+    assert_eq!(on.len(), 100 * 100 * 4, "Pattern degenerate `cs` must not crash the renderer");
 }
 
 // ===========================================================================
@@ -797,11 +911,15 @@ fn qa_bug_malformed_separation_array_diverges() {
     let content = "/Spot cs\n0.7 scn\n20 20 60 60 re\nf\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "malformed Separation must degrade identically off vs on (both paths use `1.0 - tint`)"
+    // Malformed Separation (no altCS, no tint transform) falls back to
+    // `g = 1.0 - tint` per the long-standing inline behaviour the
+    // pipeline mirrors. For tint=0.7 that's g=0.3, painted as gray
+    // (76, 76, 76) at the rect centre.
+    let (r, g, b, _) = center_pixel(&on);
+    assert!(
+        (r as i32 - 76).abs() < 15 && (g as i32 - 76).abs() < 15 && (b as i32 - 76).abs() < 15,
+        "malformed Separation tint=0.7 must fall back to gray≈76; got ({r},{g},{b})"
     );
 }
 
@@ -814,10 +932,8 @@ fn qa_malformed_separation_array_no_panic() {
     let content = "/Spot cs\n0.7 scn\n20 20 60 60 re\nf\n";
     let bytes = build_pdf(content, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false);
     let on = render_with_pipeline_allow_fail(&doc, true);
-    assert!(off.is_some(), "malformed Separation array must not panic the inline path");
-    assert!(on.is_some(), "malformed Separation array must not panic the pipeline path");
+    assert!(on.is_some(), "malformed Separation array must not panic the renderer");
 }
 
 /// Probe 23 — `scn` invoked with more components than the colour space
@@ -836,17 +952,16 @@ fn qa_scn_too_many_components_for_space_parity() {
     let content = "/Spot cs\n0.5 0.2 0.9 0.1 scn\n20 20 60 60 re\nf\n";
     let bytes = build_pdf_with_type4_separation(content, type4_program, resources);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    // Both must NOT panic and produce valid pixmaps.
-    assert_eq!(off.len(), on.len());
-    // The parity assertion: off-vs-on agree (or at minimum, both produce
-    // SOME output — separation Type 4 is a capability case where they
-    // differ legitimately; pin both into the "rendered" state).
-    let (r_on, _, _, _) = center_pixel(&on);
+    // No-panic invariant: too many components on the stack for a
+    // single-channel Separation must still produce a pixmap. The
+    // resolver keys off `components[0]` (tint=0.5 → CMYK(0, 0.5, 0, 0)
+    // → faint magenta). Pin the rendered state at non-blank.
+    let (r, g, b, _) = center_pixel(&on);
+    let any_marked = r < 250 || g < 250 || b < 250;
     assert!(
-        r_on > 0 || off != on,
-        "too-many-components Separation must either render via pipeline or differ from inline"
+        any_marked,
+        "too-many-components Separation must render the centre with marks; got ({r},{g},{b})"
     );
 }
 
@@ -866,10 +981,8 @@ fn qa_scn_too_few_components_no_panic() {
     let bytes =
         build_devicen_pdf(content, type4_program, resources, "[0 1 0 1 0 1 0 1]", &[0, 1, 0, 1]);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline_allow_fail(&doc, false);
     let on = render_with_pipeline_allow_fail(&doc, true);
-    assert!(off.is_some(), "DeviceN with too-few components must not panic the inline path");
-    assert!(on.is_some(), "DeviceN with too-few components must not panic the pipeline path");
+    assert!(on.is_some(), "DeviceN with too-few components must not panic the renderer");
 }
 
 // ===========================================================================
@@ -891,7 +1004,7 @@ fn qa_scn_too_few_components_no_panic() {
 /// over 10× should warrant investigation. The bound is therefore
 /// generous (20×).
 #[test]
-fn qa_perf_thousand_fills_toggle_on_within_bound() {
+fn qa_perf_thousand_fills_within_bound() {
     let mut content = String::with_capacity(20_000);
     content.push_str("1 0 0 rg\n");
     for i in 0..1000 {
@@ -902,33 +1015,21 @@ fn qa_perf_thousand_fills_toggle_on_within_bound() {
     let bytes = build_pdf(&content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
 
-    // Warm up to amortise the first-call overhead in tiny_skia / font
-    // init etc.
-    let _ = render_with_pipeline(&doc, false);
+    // Warm up to amortise tiny_skia init.
     let _ = render_with_pipeline(&doc, true);
 
-    let t_off = std::time::Instant::now();
-    let _ = render_with_pipeline(&doc, false);
-    let d_off = t_off.elapsed();
-
-    let t_on = std::time::Instant::now();
+    let t = std::time::Instant::now();
     let _ = render_with_pipeline(&doc, true);
-    let d_on = t_on.elapsed();
+    let d = t.elapsed();
 
-    // Print the ratio so cargo test output carries the perf signal.
-    println!(
-        "perf-1000-fills: off={:?}, on={:?}, ratio={:.2}x",
-        d_off,
-        d_on,
-        d_on.as_secs_f64() / d_off.as_secs_f64().max(1e-9)
-    );
+    println!("perf-1000-fills: {:?}", d);
 
-    // Generous bound — only catches catastrophic regression.
-    let ratio = d_on.as_secs_f64() / d_off.as_secs_f64().max(1e-9);
+    // 1000 trivial 1x1 fills must finish well under a second on any
+    // modern system. A 5s ceiling catches catastrophic regression
+    // without flaking on slow CI.
     assert!(
-        ratio < 20.0,
-        "pipeline-on must not exceed 20x of pipeline-off wall-clock on 1000 fills; got {ratio:.2}x \
-         (off={d_off:?}, on={d_on:?})"
+        d < std::time::Duration::from_secs(5),
+        "1000 fills must finish under 5s; took {d:?}"
     );
 }
 
@@ -963,13 +1064,14 @@ fn qa_perf_combo_alloc_pressure_does_not_break_correctness() {
     }
     let bytes = build_pdf(&content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    // 500 combo operators × 2 pipeline calls each = 1000 ResolutionPipeline
-    // builds. Both renders must succeed and produce identical output.
-    assert_eq!(
-        off, on,
-        "500 combo operators under heavy pipeline alloc pressure must produce identical output"
+    // 500 combo operators × 2 pipeline calls each = 1000 pipeline
+    // builds. Verify the render succeeded and produced a heavily
+    // marked page (every 3×3 fill+stroke reaches the rasteriser).
+    let marked = count_marked_pixels(&on);
+    assert!(
+        marked > 1000,
+        "500 combo operators under heavy alloc pressure must produce a marked page; got {marked}"
     );
 }
 
@@ -987,41 +1089,44 @@ fn qa_perf_combo_alloc_pressure_does_not_break_correctness() {
 /// operators. Other corpus PDFs are also worth pinning; we use one as
 /// a representative.
 #[test]
-fn qa_corpus_simple_pdf_toggle_parity() {
+fn qa_corpus_simple_pdf_renders_without_panic() {
+    // simple.pdf is a deliberately blank fixture — the probe here is
+    // that the pipeline-driven renderer accepts it without panicking
+    // and produces a full-page pixmap. Marks count is not pinned
+    // because the source page is empty.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple.pdf");
     let bytes = std::fs::read(&path).expect("simple.pdf fixture present");
     let doc = PdfDocument::from_bytes(bytes).expect("simple.pdf parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "tests/fixtures/simple.pdf must render byte-identically under toggle on vs off"
-    );
+    assert!(!on.is_empty(), "simple.pdf must produce a non-empty pixmap");
+    assert!(on.len() % 4 == 0, "pixmap must be RGBA8 aligned");
 }
 
 #[test]
-fn qa_corpus_hello_structure_pdf_toggle_parity() {
+fn qa_corpus_hello_structure_pdf_renders_with_text_marks() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello_structure.pdf");
     let bytes = std::fs::read(&path).expect("hello_structure.pdf fixture present");
     let doc = PdfDocument::from_bytes(bytes).expect("hello_structure.pdf parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "tests/fixtures/hello_structure.pdf must render byte-identically under toggle on vs off"
+    // The fixture contains "Hello" text — pin at least a few marked
+    // pixels to verify text rendering reaches the rasteriser.
+    let marked = count_marked_pixels(&on);
+    assert!(
+        marked > 0,
+        "hello_structure.pdf must render with visible text marks; got {marked} marked pixels"
     );
 }
 
 #[test]
-fn qa_corpus_outline_pdf_toggle_parity() {
+fn qa_corpus_outline_pdf_renders_without_panic() {
+    // outline.pdf is a fixture used elsewhere for outline-structure
+    // parsing; the page content is sparse. Pin no-panic + non-empty
+    // pixmap rather than marks-count.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/outline.pdf");
     let bytes = std::fs::read(&path).expect("outline.pdf fixture present");
     let doc = PdfDocument::from_bytes(bytes).expect("outline.pdf parses");
-    let off = render_with_pipeline(&doc, false);
     let on = render_with_pipeline(&doc, true);
-    assert_eq!(
-        off, on,
-        "tests/fixtures/outline.pdf must render byte-identically under toggle on vs off"
-    );
+    assert!(!on.is_empty(), "outline.pdf must produce a non-empty pixmap");
+    assert!(on.len() % 4 == 0, "pixmap must be RGBA8 aligned");
 }
