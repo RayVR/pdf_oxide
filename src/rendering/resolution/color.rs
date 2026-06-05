@@ -57,11 +57,71 @@ impl ColorResolver {
         alpha: f32,
     ) -> Result<ResolvedColor> {
         match color {
-            LogicalColor::Device(dev) => Ok(device_to_rgba(*dev, alpha)),
+            LogicalColor::Device(dev) => {
+                // ISO 32000-1:2008 §8.6.5.6: when the page declares a
+                // /DefaultGray, /DefaultRGB, or /DefaultCMYK entry in
+                // its /Resources /ColorSpace dict, any bare device-family
+                // paint operator (the canonical `g`/`rg`/`k`/`K` and
+                // their stroking siblings) MUST be interpreted as if it
+                // had named the override colour space instead of the
+                // device family. The override therefore takes
+                // precedence over the document /OutputIntents profile
+                // for bare device paint — OutputIntent is only the
+                // fallback default when no override has been declared.
+                if let Some(resolved) = self.resolve_device_default_override(*dev, ctx, alpha)? {
+                    return Ok(resolved);
+                }
+                Ok(device_to_rgba(*dev, alpha))
+            },
             LogicalColor::Spaced { space, components } => {
                 self.resolve_spaced(space, components, ctx, alpha)
             },
         }
+    }
+
+    /// §8.6.5.6 dispatch for bare device-family paint. Returns `Some`
+    /// when the active page has declared a matching `/Default<Family>`
+    /// override AND that override resolves successfully; otherwise
+    /// returns `None` so the caller emits the device-family default.
+    ///
+    /// The override is resolved by recursively calling `resolve_spaced`
+    /// on the override object with the original paint components. That
+    /// reuses the existing colour-space machinery (ICCBased N=3/N=4,
+    /// Separation, DeviceN, …) so a `/DefaultCMYK [/ICCBased ...]`
+    /// override goes through the embedded-ICC path, picks up the
+    /// per-page transform cache via `ctx.cmyk_transform_cache`, and
+    /// emits `ResolvedColor::IccCmyk` exactly as for an explicit
+    /// `[/ICCBased N=4]` colour space paint.
+    ///
+    /// Precedence note: this fires BEFORE the OutputIntent-aware CMYK
+    /// projection at `cmyk_to_rgb_via_intent` because the override is
+    /// the page's declared colour space and OutputIntent only fills
+    /// in for the device family when no override is present.
+    fn resolve_device_default_override(
+        &self,
+        dev: DeviceColor,
+        ctx: &ResolutionContext,
+        alpha: f32,
+    ) -> Result<Option<ResolvedColor>> {
+        let (override_obj, components): (Option<&Object>, smallvec::SmallVec<[f32; 4]>) = match dev
+        {
+            DeviceColor::Gray(g) => (ctx.default_gray, smallvec::smallvec![g]),
+            DeviceColor::Rgb(r, g, b) => (ctx.default_rgb, smallvec::smallvec![r, g, b]),
+            DeviceColor::Cmyk(c, m, y, k) => (ctx.default_cmyk, smallvec::smallvec![c, m, y, k]),
+        };
+        let Some(space) = override_obj else {
+            return Ok(None);
+        };
+        // The override resolves via the same colour-space pipeline
+        // as an explicit `cs <space>` paint — that's the whole point
+        // of §8.6.5.6: the override colour space stands in for the
+        // device family. If the override object is just another Name
+        // (e.g. `/DefaultCMYK /DeviceCMYK`, an identity declaration),
+        // resolve_spaced's Name arm folds back to the device-family
+        // default — returning Some is still correct because we've
+        // honoured the override; it just produces the same value as
+        // the no-override path.
+        Ok(Some(self.resolve_spaced(space, &components, ctx, alpha)?))
     }
 
     fn resolve_spaced(
@@ -187,6 +247,51 @@ impl ColorResolver {
                             k,
                             a: alpha,
                         });
+                    }
+                }
+            }
+        }
+
+        // ICCBased N=3 — RGB source profile. The embedded profile
+        // drives the conversion (§8.6.5.5); the §10.3.5 fallback only
+        // fires when qcms refuses to compile the profile. This branch
+        // is also the path the §8.6.5.6 /DefaultRGB override consumes:
+        // declaring `/DefaultRGB [/ICCBased <N=3 stream>]` and painting
+        // bare /DeviceRGB sends the three components through this arm.
+        //
+        // No per-plate routing complication here — RGB never lands on
+        // CMYK plates — so we emit ResolvedColor::Rgba directly. The
+        // per-page CMYK transform cache is not consulted (it's keyed on
+        // CMYK transforms; an RGB profile would have a different
+        // n_components and the cache invariant wouldn't hold). N=3
+        // overrides are rarer than N=4, so the per-paint Transform
+        // construction is acceptable until a follow-up generalises the
+        // cache.
+        #[cfg(feature = "icc")]
+        if n == 3 && components.len() >= 3 {
+            if let Ok(bytes) = resolved_stream.decode_stream_data() {
+                if let Some(profile) = crate::color::IccProfile::parse(bytes, 3) {
+                    let profile = std::sync::Arc::new(profile);
+                    let transform = crate::color::Transform::new_srgb_target(
+                        std::sync::Arc::clone(&profile),
+                        ctx.rendering_intent,
+                    );
+                    if transform.has_cmm() {
+                        let r = components[0].clamp(0.0, 1.0);
+                        let g = components[1].clamp(0.0, 1.0);
+                        let b = components[2].clamp(0.0, 1.0);
+                        let r_u8 = (r * 255.0).round() as u8;
+                        let g_u8 = (g * 255.0).round() as u8;
+                        let b_u8 = (b * 255.0).round() as u8;
+                        let rgb = transform.convert_rgb_buffer(&[r_u8, g_u8, b_u8]);
+                        if rgb.len() >= 3 {
+                            return Ok(ResolvedColor::Rgba {
+                                r: rgb[0] as f32 / 255.0,
+                                g: rgb[1] as f32 / 255.0,
+                                b: rgb[2] as f32 / 255.0,
+                                a: alpha,
+                            });
+                        }
                     }
                 }
             }
