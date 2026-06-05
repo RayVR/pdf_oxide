@@ -40,7 +40,7 @@ use tiny_skia::{Color, PathBuilder, Pixmap, PixmapPaint, Transform};
 /// `Option<ResolvedColors>` rather than `Option<GraphicsState>` so the
 /// text rasteriser's internal `current_gs` clone (the one that advances
 /// `text_matrix` per glyph or per `TJ` element) is the only
-/// `GraphicsState` allocation on the toggle-on text path.
+/// `GraphicsState` allocation on the text path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PipelinePaintKind {
     /// `f`, `F`, `f*` — path-fill only.
@@ -70,7 +70,7 @@ pub(crate) enum PipelinePaintKind {
 /// `render_text` / `render_tj_array`. The rasteriser already clones the
 /// `GraphicsState` to advance `text_matrix` per glyph or per `TJ`
 /// element, so it splices the overrides into that clone — no
-/// operator-arm-side allocation happens on the toggle-on text path.
+/// operator-arm-side allocation happens on the text path.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ResolvedColors {
     /// Fill RGBA, populated when `gs.render_mode` selects the fill side
@@ -1100,13 +1100,12 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
-                            // Pilot routing: stroke side mirrors the path-fill
-                            // routing — toggle on routes through the pipeline
-                            // so Type 4 Separation strokes resolve correctly;
-                            // toggle off keeps the existing behaviour
-                            // byte-for-byte. Line width / cap / join / dash
-                            // come from the cloned `gs` unchanged, so the
-                            // stroke geometry is identical either way.
+                            // Stroke side mirrors the path-fill routing —
+                            // route through the pipeline so Type 4 Separation
+                            // strokes resolve correctly. Line width / cap /
+                            // join / dash come from the cloned `gs`
+                            // unchanged, so the stroke geometry is unaffected
+                            // by the colour splice.
                             let spliced = self.pipeline_resolve_paint_gs(
                                 doc,
                                 gs,
@@ -1134,12 +1133,11 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         if let Some(path) = current_path.finish() {
                             let gs = gs_stack.current();
-                            // Pilot routing: when the resolution-pipeline toggle
-                            // is on, evaluate the active fill colour through the
-                            // pipeline (which handles Type 4 tint transforms) and
-                            // splice the resulting RGBA into a transient
-                            // GraphicsState copy that the rasteriser consumes.
-                            // Off → no behaviour change.
+                            // Resolve the active fill colour through the
+                            // pipeline (PostScript Type 4 tint transforms,
+                            // ICCBased N=4, etc.) and splice the resulting
+                            // RGBA into a transient GraphicsState copy the
+                            // rasteriser consumes.
                             let spliced = self.pipeline_resolve_paint_gs(
                                 doc,
                                 gs,
@@ -1195,15 +1193,13 @@ impl PageRenderer {
                             };
                             // Combos resolve fill and stroke independently
                             // through the pipeline (two `PaintIntent`s per
-                            // operator). Each side falls back to the inline
-                            // path if its colour can't be resolved to RGBA,
-                            // so a Type 4 Separation on the fill side and a
-                            // plain DeviceRGB on the stroke side route
-                            // correctly without entangling the two.
+                            // operator). Each side falls back to the
+                            // GraphicsState's existing RGBA if its colour
+                            // can't be resolved, so a Type 4 Separation on
+                            // the fill side and a plain DeviceRGB on the
+                            // stroke side route correctly without
+                            // entangling the two.
                             //
-                            // Off-toggle keeps `gs` borrowed directly (no
-                            // clone) so the parity invariant is preserved
-                            // and the off-path stays alloc-free.
                             // Single splice for both sides — the rasteriser
                             // reads fill fields for the fill pass and stroke
                             // fields for the stroke pass, so one clone with
@@ -1262,9 +1258,9 @@ impl PageRenderer {
                             );
                             if matches!(op, Operator::FillStrokeEvenOdd) {
                                 // Stroke side: Type 4 Separation on the
-                                // stroke colour is honoured when the pilot
-                                // toggle is on; the spliced `render_gs`
-                                // carries the resolved stroke fields.
+                                // stroke colour is honoured — the spliced
+                                // `render_gs` carries the resolved stroke
+                                // fields.
                                 self.path_rasterizer
                                     .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                             }
@@ -1336,15 +1332,13 @@ impl PageRenderer {
                         let advance = if excluded_layer_depth == 0 {
                             let clip = clip_stack.last().and_then(|c| c.as_ref());
                             let transform = combine_transforms(base_transform, &gs.ctm);
-                            // Pilot routing for text-showing operators: when
-                            // the resolution-pipeline toggle is on, resolve the
-                            // fill (and/or stroke per Tr mode) once for the
-                            // whole `Tj` call and hand the resolved RGBA to
-                            // the rasteriser. The rasteriser already clones
-                            // `gs` to advance `text_matrix` per element, so it
-                            // splices the override into that clone — no
-                            // operator-arm-side clone needed. Off → helper
-                            // returns None, gs borrowed directly.
+                            // Resolve the fill (and/or stroke per Tr mode)
+                            // once for the whole `Tj` call and hand the
+                            // resolved RGBA to the rasteriser. The rasteriser
+                            // already clones `gs` to advance `text_matrix`
+                            // per element, so it splices the override into
+                            // that clone — no operator-arm-side clone
+                            // needed.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
@@ -1388,10 +1382,10 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
-                            // Pilot routing — same shape as `Tj`. `'` is
-                            // `T* Tj` per ISO 32000-1; the resolved colour
-                            // depends only on the prior colour-setting ops,
-                            // so the resolve happens here, not inside `T*`.
+                            // Same shape as `Tj`. `'` is `T* Tj` per
+                            // ISO 32000-1; the resolved colour depends only
+                            // on the prior colour-setting ops, so the resolve
+                            // happens here, not inside `T*`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
@@ -1428,11 +1422,11 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
-                            // Pilot routing for `TJ`. Resolve once for the
-                            // whole array — the numeric offsets inside `array`
-                            // only adjust positioning; they cannot alter the
-                            // active colour mid-string. The rasteriser threads
-                            // the override into the per-element `render_text`
+                            // Resolve once for the whole `TJ` array — the
+                            // numeric offsets inside `array` only adjust
+                            // positioning; they cannot alter the active
+                            // colour mid-string. The rasteriser threads the
+                            // override into the per-element `render_text`
                             // calls so the colour propagates without an
                             // operator-arm-side clone of `gs`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
@@ -1486,11 +1480,11 @@ impl PageRenderer {
                                 gs.text_matrix.e,
                                 gs.text_matrix.f
                             );
-                            // Pilot routing — `"` is equivalent to setting Tw,
-                            // Tc, then `T* Tj`. Tw/Tc are state-only and don't
+                            // `"` is equivalent to setting Tw, Tc, then
+                            // `T* Tj`. Tw/Tc are state-only and don't
                             // influence the resolved colour, so the resolve
-                            // happens immediately before painting just like in
-                            // `Tj` / `'`.
+                            // happens immediately before painting just like
+                            // in `Tj` / `'`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
                             self.text_rasterizer.render_text(
                                 pixmap,
@@ -1721,8 +1715,8 @@ impl PageRenderer {
             .unwrap_or(0);
 
         // Pre-resolve gradient endpoint colours through the resolution
-        // pipeline when the toggle is on and the shading type is one we
-        // migrate (axial=2, radial=3). For both types the endpoint
+        // pipeline for the shading types we migrate (axial=2, radial=3).
+        // For both types the endpoint
         // colours live in the shading's `/Function` (Type 2 exponential
         // interpolation puts the endpoints directly in `/C0` and
         // `/C1`; Type 3 stitching wraps a sub-function whose first /
@@ -1773,12 +1767,11 @@ impl PageRenderer {
     /// dict's `/ColorSpace` selects the colour space; `/Function` (a
     /// Type 2 exponential or a Type 3 stitching wrapper) carries the
     /// endpoint component arrays. Returns `None` when either endpoint
-    /// can't be resolved (toggle off, missing `/Function`, unsupported
-    /// sub-function type, non-RGBA resolver output, etc.) — the caller
-    /// falls back to the existing inline behaviour in that case.
+    /// can't be resolved (missing `/Function`, unsupported sub-function
+    /// type, non-RGBA resolver output, etc.) — the caller falls back to
+    /// the existing inline behaviour in that case.
     ///
-    /// This is the wave-4 hook into the resolution pipeline: it splits
-    /// the "what colour" decision (now pipeline-resolved) from the
+    /// Splits the "what colour" decision (pipeline-resolved) from the
     /// "how to interpolate" decision (still owned by the gradient
     /// backend). The interpolation math is untouched — only the two
     /// fixed endpoint colours are routed through the pipeline.
@@ -2234,10 +2227,10 @@ impl PageRenderer {
                                         // ImageMask XObjects (1-bit stencil painted with
                                         // the current fill colour) take their fill from
                                         // graphics state, not from the pixel data. Route
-                                        // that fill through the resolution pipeline
-                                        // (toggle-on) so a Type 4 Separation fill paints
-                                        // the mask with the function-evaluated tint
-                                        // rather than the inline `1 - tint` fallback.
+                                        // that fill through the resolution pipeline so a
+                                        // Type 4 Separation fill paints the mask with the
+                                        // function-evaluated tint rather than the legacy
+                                        // `1 - tint` fallback.
                                         //
                                         // Standard images (`/ImageMask` absent or false)
                                         // carry their colour in the pixel data and do
@@ -2579,9 +2572,8 @@ impl PageRenderer {
     /// reverses the polarity. There is no `/ColorSpace`; the colour
     /// comes from `gs.fill_color_rgb` / `gs.fill_alpha`. The caller (the
     /// `Do` arm in `render_page_with_options`) is responsible for
-    /// routing that fill through the resolution pipeline when the
-    /// toggle is on, so this helper consumes whatever `gs` it is handed
-    /// without re-resolving.
+    /// routing that fill through the resolution pipeline, so this
+    /// helper consumes whatever `gs` it is handed without re-resolving.
     ///
     /// Only the minimum necessary to make the stencil paintable is
     /// implemented here: 1-bit raw samples (no CCITT decode), default
@@ -2973,9 +2965,9 @@ impl PageRenderer {
     /// Resolve the colours a path operator needs through the resolution
     /// pipeline and return a `GraphicsState` clone with the resolved RGBA
     /// spliced into the fields the rasteriser reads. Returns `None` when
-    /// the toggle is off or when no side produced an RGBA the composite
-    /// backend can consume directly — letting the caller borrow the
-    /// original `gs` and keep the off-path allocation-free.
+    /// no side produced an RGBA the composite backend can consume
+    /// directly — letting the caller borrow the original `gs` without
+    /// allocating a clone.
     ///
     /// Path-fill (`f`/`F`/`f*`), path-stroke (`S`), and path
     /// fill-stroke combos (`B`/`b`/`B*`/`b*`) all flow through this;
@@ -2989,8 +2981,7 @@ impl PageRenderer {
     /// [`Self::pipeline_resolve_text_colors`] — the text rasteriser
     /// already clones `gs` to advance `text_matrix`, so handing it
     /// colour overrides rather than a pre-cloned `GraphicsState` keeps
-    /// the toggle-on text path to one clone per operator instead of
-    /// two.
+    /// the text path to one clone per operator instead of two.
     pub(crate) fn pipeline_resolve_paint_gs(
         &self,
         doc: &PdfDocument,
@@ -3012,8 +3003,8 @@ impl PageRenderer {
         // Device-family inputs the resolver always returns Some but
         // the answer is the same colour the inline path would read,
         // so a clone here is wasted work. Skipping it keeps the
-        // toggle-on Device case allocation-free — the common path
-        // most PDFs take.
+        // Device-family case allocation-free — the common path most
+        // PDFs take.
         let fill_rgba = if fills {
             self.pipeline_resolve_rgba(doc, gs, PaintSide::Fill)
                 .filter(|c| !rgba_matches(*c, gs.fill_color_rgb, gs.fill_alpha))
@@ -3044,10 +3035,10 @@ impl PageRenderer {
     /// Resolve the text-painting colours through the resolution
     /// pipeline and return them as side-tagged RGBA tuples for the text
     /// rasteriser to splice into its own `current_gs` clone. Returns
-    /// `None` when the toggle is off, when the active `Tr` mode does
-    /// not require any resolved side, or when neither side produced an
-    /// RGBA the composite backend can consume directly — letting the
-    /// caller hand the rasteriser the unmodified `gs` reference.
+    /// `None` when the active `Tr` mode does not require any resolved
+    /// side, or when neither side produced an RGBA the composite backend
+    /// can consume directly — letting the caller hand the rasteriser
+    /// the unmodified `gs` reference.
     ///
     /// Mirrors the side-selection logic of
     /// [`Self::pipeline_resolve_paint_gs`] but returns colours rather
@@ -3242,7 +3233,7 @@ const RGBA_MATCH_EPSILON: f32 = 1.0e-6;
 /// for Device-family inputs the pipeline always produces an RGBA, but
 /// the value is the same one the inline path would have read from
 /// `gs.*_color_rgb` directly. Skipping the splice in that case keeps
-/// the toggle-on path allocation-free for the common case where no
+/// the resolution path allocation-free for the common case where no
 /// Separation/DeviceN colour space is in play.
 fn rgba_matches(resolved: (f32, f32, f32, f32), rgb: (f32, f32, f32), alpha: f32) -> bool {
     let (r, g, b, a) = resolved;
@@ -3263,8 +3254,9 @@ fn build_logical_color<'a>(
 ) -> LogicalColor<'a> {
     // Device families fold directly into `LogicalColor::Device` — the
     // resolver's spec-conformance for these is verified by colour-stage
-    // unit tests; routing through the same Device path keeps the pilot's
-    // behaviour identical to the inline path for the non-Separation cases.
+    // unit tests; routing through the same Device path keeps the
+    // pipeline's behaviour identical to the inline path for the
+    // non-Separation cases.
     //
     // Component-count mismatch (e.g. `/ColorSpace /DeviceCMYK` with only
     // 1 component on the stack) falls through to the `_ =>` arm below,
@@ -3729,19 +3721,20 @@ mod tests {
     // Helper-level pins for the text-resolution splice.
     //
     // The text-side integration tests in
-    // `tests/test_render_resolution_pipeline_pilot.rs` exercise the full
-    // renderer end-to-end, but two properties are not directly observable
-    // from there today:
+    // `tests/test_render_resolution_pipeline_qa_wave*.rs` exercise the
+    // full renderer end-to-end, but two properties are not directly
+    // observable from there today:
     //
     //   * Stroke-side resolution. The text rasteriser does not currently
     //     paint stroked glyphs, so the spliced stroke colour never reaches
     //     the pixmap. We probe it here by inspecting the
     //     `GraphicsState` the helper returns.
     //
-    //   * Helper-returns-`None` on the off-toggle path. The integration
-    //     test asserts byte-equal output between off and on for a no-op
-    //     splice, which holds whether the helper returns `None` or
-    //     `Some(clone)`. We probe the return value directly here.
+    //   * Helper-returns-`None` on the no-op-splice path. The
+    //     integration test asserts the rendered output is unchanged when
+    //     the resolved RGBA equals the GS field already set, which holds
+    //     whether the helper returns `None` or `Some(clone)`. We probe
+    //     the return value directly here.
     //
     // Both probes call `pipeline_resolve_text_colors` directly. The
     // wider integration coverage stays untouched.
@@ -3828,13 +3821,12 @@ mod tests {
 
     #[test]
     fn pipeline_resolve_paint_gs_short_circuits_when_resolved_matches_gs() {
-        // D-3 short-circuit. With the toggle on and a DeviceRGB fill
-        // already set on `gs`, the pipeline resolves to the same
-        // (r, g, b, alpha) as `gs.fill_color_rgb` / `gs.fill_alpha`.
-        // The helper must skip the GraphicsState clone in that case
-        // and return `None` — the caller borrows `gs` directly. This
-        // keeps the toggle-on Device-family path (the common case)
-        // allocation-free.
+        // D-3 short-circuit. With a DeviceRGB fill already set on `gs`,
+        // the pipeline resolves to the same (r, g, b, alpha) as
+        // `gs.fill_color_rgb` / `gs.fill_alpha`. The helper must skip
+        // the GraphicsState clone in that case and return `None` — the
+        // caller borrows `gs` directly. This keeps the Device-family
+        // path (the common case) allocation-free.
         let renderer = PageRenderer::new(RenderOptions::default());
 
         let mut gs = GraphicsState::new();
@@ -3881,14 +3873,12 @@ mod tests {
 
     #[test]
     fn pipeline_resolve_paint_gs_image_mask_resolves_type4_separation_fill() {
-        // Wave 3 capability pin. With the toggle on and a
-        // Separation/DeviceCMYK Type 4 colour space on the fill side,
-        // the `ImageMask` variant must produce a spliced
-        // `GraphicsState` whose `fill_color_rgb` is the Type 4 program
-        // output (magenta), NOT the legacy `1 - tint = 0` black. This
-        // is the wave-1-class bug regression check for the ImageMask
-        // routing — same helper, same colour-stage path, just driven
-        // by the new variant.
+        // ImageMask capability pin. With a Separation/DeviceCMYK Type 4
+        // colour space on the fill side, the `ImageMask` variant must
+        // produce a spliced `GraphicsState` whose `fill_color_rgb` is
+        // the Type 4 program output (magenta), NOT the legacy
+        // `1 - tint = 0` black. Same helper, same colour-stage path,
+        // just driven by the ImageMask variant.
         let mut renderer = PageRenderer::new(RenderOptions::default());
         renderer
             .color_spaces
@@ -3958,14 +3948,14 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Wave 4 — `pipeline_resolve_components` helper unit pins.
+    // `pipeline_resolve_components` helper unit pins.
     //
     // The shading integration tests in
-    // `tests/test_render_resolution_pipeline_pilot.rs` probe the helper
-    // through the renderer. These unit pins probe the helper's own
-    // contract directly, so a regression in routing (e.g. Device-family
-    // short-circuit vs Spaced dispatch) shows up at the helper level
-    // before any pixel-comparison machinery is involved.
+    // `tests/test_render_resolution_pipeline_qa_wave*.rs` probe the
+    // helper through the renderer. These unit pins probe the helper's
+    // own contract directly, so a regression in routing (e.g.
+    // Device-family short-circuit vs Spaced dispatch) shows up at the
+    // helper level before any pixel-comparison machinery is involved.
     // ---------------------------------------------------------------------
 
     #[test]
