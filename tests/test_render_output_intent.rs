@@ -291,6 +291,80 @@ fn build_pdf_cmyk_without_output_intent() -> Vec<u8> {
     build_pdf_with_catalog_entries_and_content("", content_ops, None)
 }
 
+/// Build a PDF that declares BOTH an `/OutputIntents` CMYK profile A and
+/// a page-resources `/ColorSpace /CS1 [/ICCBased <stream>]` colour space
+/// whose embedded N=4 profile B is a DIFFERENT minimal CMYK profile. The
+/// content stream sets fill colour space to `/CS1` and paints with
+/// `0.25 0 0 0 scn`.
+///
+/// Object layout:
+///   1 — Catalog (with /OutputIntents → 5 0 R)
+///   2 — Pages
+///   3 — Page (with Resources /ColorSpace /CS1 → ICCBased referencing 6 0 R)
+///   4 — Content stream
+///   5 — OutputIntent profile A stream
+///   6 — ICCBased embedded profile B stream
+fn build_pdf_embedded_iccbased_with_different_output_intent(
+    output_intent_profile_a: &[u8],
+    embedded_iccbased_profile_b: &[u8],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    let catalog = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic CMYK A) /DestOutputProfile 5 0 R >>] >>\nendobj\n";
+    buf.extend_from_slice(catalog.as_bytes());
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    // Resources declare an `ICCBased` colour space CS1 whose stream is
+    // object 6 — the alternate profile B. Painting `0.25 0 0 0 scn`
+    // against CS1 feeds the four components into the embedded profile.
+    let page = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/ICCBased 6 0 R] >> >> /Contents 4 0 R >>\nendobj\n";
+    buf.extend_from_slice(page.as_bytes());
+
+    let stream_off = buf.len();
+    // Set fill colour space to CS1, then paint a 60×60 rect at the centre
+    // with the four CMYK components via `scn`. The integer-form fill
+    // operator `cs` selects the named colour space.
+    let content = "/CS1 cs\n0.25 0 0 0 scn\n20 20 60 60 re\nf\n";
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_a_off = buf.len();
+    let icc_a_hdr =
+        format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", output_intent_profile_a.len());
+    buf.extend_from_slice(icc_a_hdr.as_bytes());
+    buf.extend_from_slice(output_intent_profile_a);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_b_off = buf.len();
+    let icc_b_hdr =
+        format!("6 0 obj\n<< /N 4 /Length {} >>\nstream\n", embedded_iccbased_profile_b.len());
+    buf.extend_from_slice(icc_b_hdr.as_bytes());
+    buf.extend_from_slice(embedded_iccbased_profile_b);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let obj_count = 7;
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", obj_count).as_bytes());
+    for off in [cat_off, pages_off, page_off, stream_off, icc_a_off, icc_b_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            obj_count, xref_off
+        )
+        .as_bytes(),
+    );
+    buf
+}
+
 fn render_rgba(doc: &PdfDocument) -> Vec<u8> {
     let opts = RenderOptions::with_dpi(72).as_raw();
     let img = render_page(doc, 0, &opts).expect("render_page");
@@ -876,3 +950,106 @@ fn qa_tdd_discipline_verification_report() {
     let _ = device_cmyk_paint_with_output_intent_renders_via_icc_not_additive_clamp;
     let _ = device_cmyk_paint_without_output_intent_renders_additive_clamp;
 }
+
+// ===========================================================================
+// Phase 4: embedded /ICCBased N=4 trumps document /OutputIntents
+// ===========================================================================
+//
+// ISO 32000-1:2008 §8.6.5.5 (and §14.11.5): an `/ICCBased` colour space
+// carries its own `DestOutputProfile`-equivalent stream; that stream IS
+// the conversion source, and the document-level `/OutputIntents` profile
+// is only the default for `/DeviceCMYK` paint that lacks any embedded
+// override. Embedded ICC always wins.
+//
+// The byte-exact references baked into the assertions below come from
+// the discovery harness (run once, output captured) — see the plan
+// errata. They are intent-invariant because the synthesised LUT8
+// profile uses a constant CLUT.
+
+/// Byte-exact qcms 0.3.0 reference for the `target_l_byte=200` profile
+/// at CMYK(64,0,0,0) under RelativeColorimetric (intent-invariant by
+/// construction). Distinct from the round-1 profile A reference of
+/// (126,126,126) so the precedence assertion is unambiguous.
+const PROFILE_B_TARGET_L_BYTE: u8 = 200;
+const PROFILE_B_RGB_AT_FIXTURE_INPUT: (u8, u8, u8) = (194, 194, 194);
+
+/// Pin that an `/ICCBased` N=4 colour space paint operator routes through
+/// the colour-space-embedded profile B and NOT through the document-level
+/// `/OutputIntents` profile A.
+///
+/// Fixture geometry:
+///   - Catalog declares /OutputIntents → profile A (target_l_byte=135 →
+///     qcms reference RGB(126,126,126)).
+///   - Page Resources /ColorSpace /CS1 → [/ICCBased <stream B>] where
+///     profile B has target_l_byte=200 → qcms reference RGB(194,194,194).
+///   - Content stream: `/CS1 cs   0.25 0 0 0 scn   20 20 60 60 re   f`.
+///
+/// Spec rule: §8.6.5.5 — the ICCBased colour space carries the conversion
+/// source and overrides any document-level default. The renderer must
+/// route the four `scn` components through profile B's qcms transform.
+///
+/// What this test catches:
+///   - If the rendered pixel is (126,126,126), profile A won — the
+///     embedded ICC route is being shadowed by the OutputIntent route
+///     (the spec-precedence bug this phase exists to fix).
+///   - If the rendered pixel is (191,255,255), neither profile was
+///     consulted and §10.3.5 additive-clamp fired (an even worse
+///     regression).
+///   - If the rendered pixel is (194,194,194), profile B's CMM
+///     compiled-and-ran through `Transform::convert_cmyk_pixel` and the
+///     precedence is correct.
+#[test]
+fn embedded_iccbased_n4_trumps_document_output_intent() {
+    let profile_a = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let profile_b = build_minimal_cmyk_to_rgb_lut8_profile(PROFILE_B_TARGET_L_BYTE);
+
+    // Sanity-pin both profiles compile through qcms and produce the
+    // expected byte-exact references. Without this gate a regression
+    // that broke profile B's transform would make the integration
+    // assertion below fire for the wrong reason.
+    {
+        use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+        use std::sync::Arc;
+        let prof_a = Arc::new(IccProfile::parse(profile_a.clone(), 4).expect("parse A"));
+        let prof_b = Arc::new(IccProfile::parse(profile_b.clone(), 4).expect("parse B"));
+        let t_a = Transform::new_srgb_target(prof_a, RenderingIntent::RelativeColorimetric);
+        let t_b = Transform::new_srgb_target(prof_b, RenderingIntent::RelativeColorimetric);
+        assert_eq!(
+            t_a.convert_cmyk_pixel(64, 0, 0, 0),
+            [126u8, 126, 126],
+            "profile A reference must be (126,126,126); fixture is invalid otherwise"
+        );
+        assert_eq!(
+            t_b.convert_cmyk_pixel(64, 0, 0, 0),
+            [194u8, 194, 194],
+            "profile B reference must be (194,194,194); fixture is invalid otherwise"
+        );
+    }
+
+    let pdf =
+        build_pdf_embedded_iccbased_with_different_output_intent(&profile_a, &profile_b);
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+    // Cross-check the OutputIntent accessor sees profile A. If it didn't
+    // the test would conflate "OI not seen" with "OI seen but bypassed
+    // for embedded ICC" — both produce the expected pixel but only the
+    // latter actually probes the precedence we care about.
+    assert!(
+        doc.output_intent_cmyk_profile().is_some(),
+        "fixture must declare a CMYK OutputIntent so the precedence is actually contested"
+    );
+
+    let rgba = render_rgba(&doc);
+    let (r, g, b, a) = pixel_at(&rgba, 50, 50);
+    let (br, bg, bb) = PROFILE_B_RGB_AT_FIXTURE_INPUT;
+    assert_eq!(
+        (r, g, b, a),
+        (br, bg, bb, 255),
+        "embedded /ICCBased profile B must take precedence over /OutputIntents \
+         profile A on CMYK paint through the ICCBased space; expected B's qcms \
+         reference {:?}; got ({r},{g},{b},{a}). (126,126,126,_) means profile A won \
+         — the spec precedence (§8.6.5.5) is inverted. (191,255,255,_) means neither \
+         profile was consulted and §10.3.5 fired.",
+        (br, bg, bb, 255u8)
+    );
+}
+
