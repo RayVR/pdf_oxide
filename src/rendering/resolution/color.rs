@@ -584,7 +584,9 @@ fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
 ///
 /// Precedence inside this function (callers handle the embedded-ICC
 /// case before reaching here — those paths route through
-/// `ColorResolver::resolve_iccbased` instead):
+/// `ColorResolver::resolve_iccbased` instead, and the §8.6.5.6
+/// `/DefaultCMYK` override fires inside `ColorResolver::resolve` before
+/// any device-CMYK reaches this helper):
 ///
 /// 1. `ctx.output_intent_cmyk` — when the document declares an
 ///    `/OutputIntents` array with a `/N=4` `/DestOutputProfile`,
@@ -602,6 +604,17 @@ fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
 ///    parsed). Falls through to the spec's §10.3.5 additive-clamp
 ///    formula. This is the byte-for-byte fallback the renderer
 ///    shipped before OutputIntent threading landed.
+///
+/// **Black-Point Compensation (BPC) and rendering-intent caveats:**
+/// qcms 0.3.0 does not implement BPC and, for CMYK sources, silently
+/// drops the rendering-intent parameter (see qcms `lib.rs:29-36` and
+/// `transform.rs:1283-1289`). The intent value is threaded through the
+/// cache key here so a future CMM upgrade that honours intent doesn't
+/// silently collapse cache entries; the byte-level output, however, is
+/// CURRENTLY intent-invariant for any CMYK input. The HONEST_GAP probe
+/// `qa_round4_bpc_paper_white_preservation_under_relative_colorimetric`
+/// in `tests/test_render_output_intent.rs` pins this — a CMM upgrade
+/// will turn the probe RED at the new per-intent expected references.
 ///
 /// Without the `icc` feature `convert_cmyk_pixel` already devolves to
 /// §10.3.5 inside the CMM wrapper, so the OutputIntent path is

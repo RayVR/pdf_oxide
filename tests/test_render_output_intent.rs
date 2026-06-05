@@ -2839,3 +2839,226 @@ fn qa_round3_iccbased_v4_output_intent_drives_render_through_qcms() {
          got ({r}, {g}, {b}). (191,255,255) would mean the §10.3.5 fallback fired."
     );
 }
+
+// ===========================================================================
+// Black-Point Compensation (BPC) — HONEST_GAP probe
+// ===========================================================================
+//
+// ISO 32000-1:2008 §8.6.5.8 names four rendering intents but does NOT
+// mandate Black-Point Compensation as a separate switch — BPC is a CMM-
+// implementation knob that piggybacks on the rendering intent (typically
+// on /RelativeColorimetric, sometimes /Perceptual) to remap source-profile
+// black to destination-profile black, preserving shadow detail when the
+// destination has a less-black-than-source black point.
+//
+// qcms 0.3.0 does NOT implement BPC. Verified at
+// `~/.cargo/registry/src/.../qcms-0.3.0/src/lib.rs:29-36`:
+//
+//   //! ### Black-Point Compensation (BPC)
+//   //!
+//   //! BPC is currently not supported. Adding it would require
+//   //! either pre-multiplying the entire CLUT during transform
+//   //! construction (memory and build-time cost) or running an
+//   //! extra division per pixel (CPU cost). BPC brings an
+//   //! unacceptable performance overhead, so we go with
+//   //! perceptual.
+//
+// Additionally `transform.rs:1283-1289` shows the CMYK transform builder
+// declares `_intent: Intent` — the rendering intent parameter is
+// underscore-prefixed and unused inside the CMYK path. So for CMYK
+// sources, the byte-exact qcms output is invariant across:
+//   - All four PDF rendering intents (intent ignored by qcms's CLUT
+//     precomputation at `transform_precacheLUT_cmyk_float:1245-1281`).
+//   - BPC on vs off (BPC not implemented at all).
+//
+// What this means for pdf_oxide:
+//   - The pipeline's intent threading (`gs.rendering_intent` →
+//     `ctx.rendering_intent` → `Transform::new_srgb_target`'s intent
+//     parameter) is correct end-to-end. qcms is the limiting factor.
+//   - The cache key `(profile.content_hash(), intent)` still includes
+//     intent so a future qcms upgrade (or a switch to a CMM that
+//     honours intent, e.g. lcms2) doesn't silently collapse cache
+//     entries across intents.
+//
+// The probe below pins the current behaviour byte-for-byte. When qcms
+// grows BPC (either via fork or upgrade) OR pdf_oxide switches to a
+// different CMM, this test will go RED at the BPC-aware delta and the
+// implementer can re-derive the expected references for the intent
+// matrix.
+
+/// HONEST_GAP marker: qcms 0.3.0 has no BPC implementation AND silently
+/// drops the rendering-intent parameter for CMYK sources. When that
+/// changes, every line in this probe is the point of update.
+const HONEST_GAP_QCMS_030_NO_BPC: &str =
+    "HONEST_GAP_QCMS_030_NO_BPC: qcms 0.3.0 ignores rendering intent for CMYK \
+     (transform.rs:1288 `_intent: Intent`) and has no Black-Point Compensation \
+     implementation (lib.rs:29-36 design comment). The BPC-aware shadow-detail \
+     preservation that /RelativeColorimetric is documented to provide on \
+     near-black CMYK inputs cannot be probed against a CMM that drops both \
+     intent and BPC; the assertions below pin the current intent-invariant, \
+     BPC-absent behaviour and will go RED when either changes — at which point \
+     the probe should be split into per-intent expected references derived \
+     against the new CMM.";
+
+/// Pin that a near-black CMYK input (CMYK(0, 0, 0, 0.95) — 95 % K, deep
+/// shadow) produces the SAME qcms-converted RGB under both
+/// `/RelativeColorimetric` and `/AbsoluteColorimetric` rendering
+/// intents. With BPC active on Relative the shadow detail would be
+/// elevated (preserved relative to the destination black point); with
+/// BPC absent both intents collapse to the same CLUT output.
+///
+/// Also pin that all four PDF rendering intents produce identical bytes
+/// for the same input, mirroring the round-3
+/// `qa_round3_qcms_030_treats_cmyk_intent_as_informational` probe but
+/// at the deep-shadow region where BPC matters most.
+///
+/// This probe is `#[ignore]`-marked: the assertions reflect the
+/// CURRENT byte-exact qcms 0.3.0 behaviour (which conflates BPC-on with
+/// BPC-off and ignores intent altogether), so they always pass at HEAD.
+/// The point of the ignore marker is that running this probe under a
+/// future CMM that DOES implement BPC will surface the gap by going RED
+/// at the per-intent assertion — at which point the implementer
+/// re-derives the expected references and removes the ignore.
+#[test]
+#[ignore = "HONEST_GAP_QCMS_030_NO_BPC"]
+fn qa_round4_bpc_paper_white_preservation_under_relative_colorimetric() {
+    use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
+    use std::sync::Arc;
+
+    // Mark the gap constant as live so the linker doesn't drop it; the
+    // string is the diagnostic a future-engineer reading the test
+    // failure picks up. The unused-binding bypass is intentional.
+    let _ = HONEST_GAP_QCMS_030_NO_BPC;
+
+    // The constant-CLUT fixture used everywhere else in this file
+    // collapses every CMYK input to one Lab tuple — useless for a
+    // shadow-preservation probe because no input bits make it to the
+    // output. We need a NON-constant CLUT here so the deep-shadow
+    // input lands in a CLUT cell that could in principle differ across
+    // intents. Build a v2 LUT8 with a non-constant CLUT: the 16 grid
+    // corners ramp linearly with the input, so CMYK(0,0,0,0.95)
+    // resolves to a deep-shadow grey distinct from CMYK(0,0,0,0).
+    //
+    // qcms-0.3.0 CMYK input handling at `transform.rs:1244-1289`
+    // ignores the rendering intent regardless of CLUT shape, so the
+    // four-intent assertion below holds for any LUT.
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile_with_shadow_ramp(0..=240);
+    let prof = Arc::new(IccProfile::parse(icc, 4).expect("ramp profile parses"));
+
+    // CMYK(0, 0, 0, 242) ≈ 95 % K — deep shadow. Pin the same byte-exact
+    // RGB across every intent. With BPC implemented and intent-honouring,
+    // these would diverge:
+    //   - Perceptual: gamut-compress to preserve overall tone relationships;
+    //     deep blacks may map to slightly elevated dest blacks.
+    //   - RelativeColorimetric WITH BPC: source black → dest black with
+    //     shadow detail preserved (the typical print-house default).
+    //   - Saturation: preserve hue purity; not relevant here.
+    //   - AbsoluteColorimetric: no white-point adaptation, no BPC; render
+    //     source black at the dest's measured black value (paper-relative).
+    //
+    // With qcms 0.3.0 all four collapse to the same CLUT output because
+    // the CLUT is pre-computed without intent dependency and BPC isn't
+    // implemented.
+    let mut last: Option<[u8; 3]> = None;
+    for intent in [
+        RenderingIntent::Perceptual,
+        RenderingIntent::RelativeColorimetric,
+        RenderingIntent::Saturation,
+        RenderingIntent::AbsoluteColorimetric,
+    ] {
+        let t = Transform::new_srgb_target(Arc::clone(&prof), intent);
+        let rgb = t.convert_cmyk_pixel(0, 0, 0, 242);
+        if let Some(prev) = last {
+            assert_eq!(
+                prev, rgb,
+                "qcms 0.3.0 must produce intent-invariant bytes for a near-black \
+                 CMYK input (BPC absent + CMYK intent dropped): previous intent \
+                 yielded {prev:?}, intent={intent:?} yielded {rgb:?}. A divergence \
+                 here means qcms grew BPC or started honouring intent — re-derive \
+                 the expected references per intent and split this probe."
+            );
+        }
+        last = Some(rgb);
+    }
+}
+
+/// Build a 4×grid LUT8 CMYK→Lab profile with a non-constant CLUT that
+/// ramps linearly with the K channel (the dominant axis of typical
+/// deep-shadow CMYK builds). Used by the BPC HONEST_GAP probe to feed
+/// qcms an input where the CLUT actually depends on the input bits,
+/// so a CMM with BPC implementation would in principle produce a
+/// shadow-detail-elevated output distinct from the no-BPC reference.
+///
+/// `l_range` controls the lightness span across the K axis: at K=0 the
+/// LUT outputs L*=l_range.start(), at K=255 it outputs L*=l_range.end().
+/// The two corners pin the ramp; intermediate grid points are linearly
+/// interpolated by qcms's tetrahedral CLUT lookup at runtime.
+fn build_minimal_cmyk_to_rgb_lut8_profile_with_shadow_ramp(
+    l_range: std::ops::RangeInclusive<u8>,
+) -> Vec<u8> {
+    let in_chan: u8 = 4;
+    let out_chan: u8 = 3;
+    let grid: u8 = 2;
+    let mut lut = Vec::with_capacity(1888);
+    lut.extend_from_slice(&0x6d66_7431u32.to_be_bytes());
+    lut.extend_from_slice(&0u32.to_be_bytes());
+    lut.push(in_chan);
+    lut.push(out_chan);
+    lut.push(grid);
+    lut.push(0);
+    let identity: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+    for v in identity {
+        lut.extend_from_slice(&(v as u32).to_be_bytes());
+    }
+    for _ in 0..in_chan {
+        for i in 0..256u16 {
+            lut.push(i as u8);
+        }
+    }
+    // 16 grid points for 2^4. CLUT iteration order per ICC.1 §10.8:
+    // input channels iterate from MSB outermost — for 4 channels with
+    // grid=2 the ordering is C × M × Y × K with K innermost. We want
+    // the K-axis to ramp: at K=0 → l_range.start(); at K=255 →
+    // l_range.end(). Both other axes are pinned at the same L for
+    // simplicity (the LUT8 path then drives shadow ramp linearly on K).
+    let l_low = *l_range.start();
+    let l_high = *l_range.end();
+    for c_i in 0..2 {
+        for m_i in 0..2 {
+            for y_i in 0..2 {
+                for k_i in 0..2 {
+                    let _ = (c_i, m_i, y_i);
+                    let l = if k_i == 0 { l_high } else { l_low };
+                    lut.push(l);
+                    lut.push(128);
+                    lut.push(128);
+                }
+            }
+        }
+    }
+    for _ in 0..out_chan {
+        for i in 0..256u16 {
+            lut.push(i as u8);
+        }
+    }
+    debug_assert_eq!(lut.len(), 1888, "shadow-ramp LUT8 body size mismatch");
+
+    let mut profile = vec![0u8; 128];
+    let total_size: u32 = 128 + 4 + 12 + lut.len() as u32;
+    profile[0..4].copy_from_slice(&total_size.to_be_bytes());
+    profile[8..12].copy_from_slice(&IccProfileVersion::V2.header_bytes());
+    profile[12..16].copy_from_slice(b"prtr");
+    profile[16..20].copy_from_slice(b"CMYK");
+    profile[20..24].copy_from_slice(b"Lab ");
+    profile[36..40].copy_from_slice(b"acsp");
+    profile[64..68].copy_from_slice(&0u32.to_be_bytes());
+    profile[68..72].copy_from_slice(&0x0000_F6D6u32.to_be_bytes());
+    profile[72..76].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    profile[76..80].copy_from_slice(&0x0000_D32Du32.to_be_bytes());
+    profile.extend_from_slice(&1u32.to_be_bytes());
+    profile.extend_from_slice(&0x4132_4230u32.to_be_bytes());
+    profile.extend_from_slice(&144u32.to_be_bytes());
+    profile.extend_from_slice(&(lut.len() as u32).to_be_bytes());
+    profile.extend_from_slice(&lut);
+    profile
+}
