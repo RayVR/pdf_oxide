@@ -131,13 +131,14 @@
 
 // A handful of types and the `PaintBackend` trait surface are still
 // scaffolding for future backends (composite preflight, PDF/X-style
-// press preview) — they're plumbed through the module so the migration
+// press preview) — they're plumbed through the module so the consumer
 // surface stays stable, but only the per-plate `SeparationBackend` and
-// the pilot composite paths exercise every variant today. The narrowed
-// allow covers exactly those scaffolded items; production callers like
-// `ResolutionPipeline`, `SeparationBackend`, and the resolved-color
-// variants are referenced unconditionally and no longer need the blanket
-// dead-code suppression that was here during the migration.
+// the composite renderer paths exercise every variant today. The
+// narrowed allow covers exactly those scaffolded items; production
+// callers like `ResolutionPipeline`, `SeparationBackend`, and the
+// resolved-color variants are referenced unconditionally and no longer
+// need the blanket dead-code suppression that was here during the
+// migration.
 #![allow(dead_code)]
 
 pub(crate) mod backend;

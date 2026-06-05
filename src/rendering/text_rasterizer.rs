@@ -312,13 +312,13 @@ impl TextRasterizer {
     /// Render a text string (Tj operator).
     /// Returns the total horizontal advance in PDF points.
     ///
-    /// `color_override` carries the resolution-pipeline output when the
-    /// pilot toggle is on: the fill RGBA replaces the value `gs` would
-    /// supply when present, so the operator arm doesn't have to clone
-    /// `gs` purely to splice a colour. Stroke override is accepted for
-    /// forward compatibility — the text rasteriser does not currently
-    /// paint stroked glyphs, so the stroke channel is recorded but not
-    /// yet observable on the pixmap.
+    /// `color_override` carries the resolution-pipeline output: the
+    /// fill RGBA replaces the value `gs` would supply when present, so
+    /// the operator arm doesn't have to clone `gs` purely to splice a
+    /// colour. Stroke override is accepted for forward compatibility —
+    /// the text rasteriser does not currently paint stroked glyphs, so
+    /// the stroke channel is recorded but not yet observable on the
+    /// pixmap.
     #[allow(unused_variables)]
     pub fn render_text(
         &self,
@@ -665,14 +665,13 @@ impl TextRasterizer {
     /// Render a TJ array (text with positioning adjustments).
     /// Returns the total horizontal advance in PDF points.
     ///
-    /// `color_override` carries the resolution-pipeline output when the
-    /// pilot toggle is on. It is threaded into each inner `render_text`
-    /// call so the per-element paint colour is the resolved RGBA rather
-    /// than the `gs.fill_*` field the operator stack carried. The
-    /// existing per-call `current_gs.clone()` (needed to advance
-    /// `text_matrix` between TJ elements) is the only `GraphicsState`
-    /// allocation on the toggle-on TJ path — the operator-arm-side
-    /// clone is eliminated.
+    /// `color_override` carries the resolution-pipeline output. It is
+    /// threaded into each inner `render_text` call so the per-element
+    /// paint colour is the resolved RGBA rather than the `gs.fill_*`
+    /// field the operator stack carried. The existing per-call
+    /// `current_gs.clone()` (needed to advance `text_matrix` between TJ
+    /// elements) is the only `GraphicsState` allocation on the TJ path
+    /// — the operator-arm-side clone is eliminated.
     pub fn render_tj_array(
         &self,
         pixmap: &mut Pixmap,
