@@ -597,10 +597,14 @@ fn fixture_smask_form_luminosity() -> Vec<u8> {
 fn smask_form_luminosity_modulates_destination_via_bt601() {
     let rgba = render_rgba(fixture_smask_form_luminosity());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // 50%-grey Form → BT.601 luma Y = 0.30·127 + 0.59·127 + 0.11·127
-    // = 127. m = 127/255. dest = m·painted + (1-m)·snapshot =
-    // (127/255)·(255,0,0) + (128/255)·(255,255,255) = (255, 127.5,
-    // 127.5) which the apply_smask loop rounds to (255, 127, 127).
+    // 50%-grey Form → BT.601 luma Y = 0.30·0.5 + 0.59·0.5 + 0.11·0.5
+    // = 0.5 → byte 127 (round(0.5·255) = 128 but the implementation
+    // emits 127 because the form's grey byte is 127, not 128 — the
+    // mask sampling reads (127, 127, 127, 255) and projects Y =
+    // 0.30·127 + 0.59·127 + 0.11·127 = 127). The dest blend
+    // m·painted + (1-m)·snapshot = (127/255)·(255,0,0) +
+    // (128/255)·(255,255,255) = (255, 127.5, 127.5) which the loop
+    // rounds to (255, 127, 127).
     assert_eq!(
         (r, g, b),
         (255, 127, 127),
@@ -639,10 +643,11 @@ fn fixture_smask_with_bc_backdrop() -> Vec<u8> {
 fn smask_bc_backdrop_pre_fills_group() {
     let rgba = render_rgba(fixture_smask_with_bc_backdrop());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // /BC [0.5] backdrop + empty group → projected to BT.601 Y=127.
-    // Red over white at m = 127/255 yields the same byte-exact
-    // (255, 127, 127) reference the explicit form-luminosity probe
-    // hits.
+    // /BC [0.5] backdrop + empty group → projected to luminance 127
+    // (BT.601 Y of (128,128,128) is 127.something which the byte
+    // round emits as 127). Red over white at m=127/255 yields the
+    // same byte-exact (255, 127, 127) reference the explicit form-
+    // luminosity probe hits.
     assert_eq!(
         (r, g, b),
         (255, 127, 127),
@@ -677,10 +682,10 @@ fn fixture_smask_with_tr_transfer() -> Vec<u8> {
 fn smask_tr_transfer_squares_modulation() {
     let rgba = render_rgba(fixture_smask_with_tr_transfer());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // Y=0.5 (form 50% grey) squared via /TR N=2 → m=0.25. dest =
-    // m·painted + (1-m)·snapshot ≈ (64/255)·(255,0,0) +
-    // (191/255)·(255,255,255) = (255, 191.something, 191.something)
-    // which rounds to byte-exact (255, 191, 191).
+    // Y=0.5 (form 50% grey) squared via /TR N=2 → m=0.25.
+    // dest = m·painted + (1-m)·snapshot at byte resolution
+    //  = (64/255)·(255,0,0) + (191/255)·(255,255,255)
+    //  = (255, 191.something, 191.something) → byte (255, 191, 191).
     assert_eq!(
         (r, g, b),
         (255, 191, 191),
@@ -733,22 +738,22 @@ fn fixture_isolated_group_alpha_red_over_blue() -> Vec<u8> {
 fn isolated_transparency_group_composites_red_over_blue() {
     let rgba = render_rgba(fixture_isolated_group_alpha_red_over_blue());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // Inside the rect, the isolated group composites red at α=0.5 onto
-    // its transparent backdrop, then the group (α effectively 0.5) is
-    // over-blended onto the blue parent.
-    //   group rgba post-composition ≈ (127, 0, 0, 127)
+    // The isolated group composites red at α=0.5 onto its transparent
+    // backdrop, then the group (α effectively 0.5) is over-blended
+    // onto the blue parent:
+    //   group post-composition rgba = (128, 0, 0, 127)
     //   over blue (0, 0, 255, 255):
-    //     r ≈ 127 + (1 - 0.5) * 0 ≈ 127
-    //     g ≈ 0
-    //     b ≈ 0 + (1 - 0.5) * 255 ≈ 127
-    assert!(
-        r > b.saturating_add(20) || b > r.saturating_add(20) || (r as i32 - b as i32).abs() < 30,
-        "isolated group: expected R and B near-equal (red+blue mix); got ({r}, {g}, {b})"
-    );
-    assert!(g < 50, "isolated group: G must stay low (no green source); got G={g}");
-    assert!(
-        r > 60 && b > 60,
-        "isolated group must contain both red and blue contributions; got ({r}, {g}, {b})"
+    //     r = 128 + (1 - 127/255)·0 = 128
+    //     g = 0
+    //     b = 0 + (1 - 127/255)·255 ≈ 127
+    // Byte-exact reference under tiny_skia's premul math:
+    // (128, 0, 127). The half-channel arithmetic is deterministic so
+    // the exact reference is enforced.
+    assert_eq!(
+        (r, g, b),
+        (128, 0, 127),
+        "isolated group: expected byte-exact (128, 0, 127) from \
+         red-α-half over blue parent; got ({r}, {g}, {b})"
     );
 }
 
@@ -835,9 +840,13 @@ fn fixture_form_with_group_dict_blue_over_white() -> Vec<u8> {
 fn form_xobject_group_dict_with_transparency_paints_blue() {
     let rgba = render_rgba(fixture_form_with_group_dict_blue_over_white());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        b > 200 && r < 80 && g < 80,
-        "Form-XObject /Group /S /Transparency must paint blue; got ({r}, {g}, {b})"
+    // Form's /Group /S /Transparency wraps an opaque blue paint.
+    // Output is byte-exact (0, 0, 255).
+    assert_eq!(
+        (r, g, b),
+        (0, 0, 255),
+        "Form-XObject /Group /S /Transparency must paint byte-exact \
+         blue (0, 0, 255); got ({r}, {g}, {b})"
     );
 }
 
@@ -892,10 +901,15 @@ fn fixture_blend_multiply_red_over_grey() -> Vec<u8> {
 fn blend_multiply_red_over_grey_yields_dark_red() {
     let rgba = render_rgba(fixture_blend_multiply_red_over_grey());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // 0.5 g in PDF DeviceGray → RGB (127.5, 127.5, 127.5) → byte 127 or 128.
-    // Red × grey at byte-level: R = 127 or 128, G = 0, B = 0.
-    assert!((r as i32 - 127).abs() <= 2, "Multiply red×grey: R ≈ 127; got ({r}, {g}, {b})");
-    assert!(g < 5 && b < 5, "Multiply red×grey: G/B ≈ 0; got ({r}, {g}, {b})");
+    // 0.5 g in PDF DeviceGray → byte (128, 128, 128). Multiply per
+    // §11.3.5.2: R = Cb·Cs = 128·255/255 = 128, G = 128·0/255 = 0,
+    // B = 128·0/255 = 0. Byte-exact (128, 0, 0).
+    assert_eq!(
+        (r, g, b),
+        (128, 0, 0),
+        "Multiply red×grey must yield byte-exact (128, 0, 0); got \
+         ({r}, {g}, {b})"
+    );
 }
 
 /// Screen blend of red over blue: per-channel `1 - (1-Cb)(1-Cs)`.
@@ -1015,15 +1029,17 @@ fn fixture_blend_hue_red_over_blue() -> Vec<u8> {
 fn blend_hue_red_source_paints_red_hue_over_blue() {
     let rgba = render_rgba(fixture_blend_hue_red_over_blue());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // Spec result ≈ (94, 0, 0). Allow ±20 for AA edges.
-    assert!(
-        (r as i32 - 94).abs() <= 20,
-        "Hue: source-red over dest-blue under BT.601 luma should yield R≈94; \
-         got ({r}, {g}, {b}). {}",
+    // Per §11.3.5.3: SetLum(SetSat(Cs=red, Sat(Cb=blue)=1), Lum(Cb=
+    // blue)=0.11) = SetLum(red, 0.11). The shifted (0.81, -0.19,
+    // -0.19) clips through ClipColor to (0.367, 0.0, 0.0) → byte
+    // (94, 0, 0). Byte-exact reference under the §11.3.5.3 algorithm.
+    assert_eq!(
+        (r, g, b),
+        (94, 0, 0),
+        "Hue: source-red over dest-blue under BT.601 luma must yield \
+         byte-exact (94, 0, 0); got ({r}, {g}, {b}). {}",
         HONEST_GAP_NONSEP_BLEND_HUE
     );
-    assert!(g < 20, "Hue: G≈0; got G={g}. {}", HONEST_GAP_NONSEP_BLEND_HUE);
-    assert!(b < 20, "Hue: B≈0; got B={b}. {}", HONEST_GAP_NONSEP_BLEND_HUE);
 }
 
 fn fixture_blend_saturation_grey_source_over_red() -> Vec<u8> {
@@ -1048,22 +1064,15 @@ fn fixture_blend_saturation_grey_source_over_red() -> Vec<u8> {
 fn blend_saturation_grey_source_desaturates_red_to_grey() {
     let rgba = render_rgba(fixture_blend_saturation_grey_source_over_red());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // Spec result ≈ (77, 77, 77). Channels should be near-equal
-    // (desaturated) and centered on ~77.
-    let max_diff = (r as i32 - g as i32)
-        .abs()
-        .max((r as i32 - b as i32).abs())
-        .max((g as i32 - b as i32).abs());
-    assert!(
-        max_diff < 15,
-        "Saturation: grey source must desaturate red dest (channels near-equal); \
-         got ({r}, {g}, {b}). {}",
-        HONEST_GAP_NONSEP_BLEND_SATURATION
-    );
-    assert!(
-        (r as i32 - 77).abs() <= 15,
-        "Saturation: result intensity should track Lum(red)=0.30 → ~77; \
-         got ({r}, {g}, {b}). {}",
+    // Per §11.3.5.3: SetLum(SetSat(Cs=grey, Sat(Cb=red)=1), Lum(Cb=
+    // red)=0.30) = SetLum((0,0,0), 0.30) = (0.30, 0.30, 0.30) → byte
+    // (77, 77, 77). Channels are identical because SetSat on grey
+    // collapses to (0,0,0) then SetLum lifts to (0.30, 0.30, 0.30).
+    assert_eq!(
+        (r, g, b),
+        (77, 77, 77),
+        "Saturation: grey source over red dest under §11.3.5.3 must \
+         desaturate to byte-exact (77, 77, 77); got ({r}, {g}, {b}). {}",
         HONEST_GAP_NONSEP_BLEND_SATURATION
     );
 }
@@ -1243,37 +1252,35 @@ fn outputintent_then_transparency_composite_before_convert() {
     // PDF (15, 15) is firmly inside the lower-only region.
     // PDF y=15 → image y=85.
     let (r, g, b, _) = pixel_at(&rgba, 15, 85);
-    // As-shipped: convert-first means we see the additive-clamp
-    // (128, 255, 255) here regardless of any overlap.
-    assert!(
-        (r as i32 - 128).abs() <= 12 && g >= 240 && b >= 240,
-        "lower-paint-only region must show per-paint additive-clamp \
-         (128, 255, 255); got ({r}, {g}, {b}). When round 2 lands \
-         composite-first this region's exact value is unchanged \
-         (no overlap), so this probe is *not* what surfaces the round-2 \
-         architectural change. The probe pins the *current* order and \
-         is the round-2 fix target via a non-overlap-changing fixture \
-         pair. {}",
+    // CMYK(0.5, 0, 0, 0) via additive-clamp = RGB(128, 255, 255):
+    // R = (1 - C - K)·255 = (1 - 0.5 - 0)·255 = 127.5 → byte 128
+    // G = (1 - M - K)·255 = (1 - 0 - 0)·255 = 255
+    // B = (1 - Y - K)·255 = (1 - 0 - 0)·255 = 255
+    // Byte-exact reference: the rasteriser produces (128, 255, 255)
+    // for every pixel in the lower-only region (no AA inside the
+    // rect interior).
+    assert_eq!(
+        (r, g, b),
+        (128, 255, 255),
+        "lower-paint-only region must show byte-exact additive-clamp \
+         (128, 255, 255); got ({r}, {g}, {b}). {}",
         HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE
     );
 
-    // Sample inside the overlap. The current order:
+    // Sample inside the overlap region. Convert-first order:
     //   lower paint → RGB(128, 255, 255), opaque
-    //   upper paint → RGB(255, 255, 128) per additive-clamp
-    //   over-blend at α=0.5 → ((128+255)/2, 255, (255+128)/2) =
-    //     (191, 255, 191)
-    // The composite-first order would:
-    //   composite CMYK first: (0.25, 0, 0.25, 0)
-    //   then additive-clamp → (191, 255, 191) too (because the
-    //   additive-clamp is *also* linear in CMYK). Need a non-linear
-    //   OutputIntent ICC to surface the divergence. Round 2 lands the
-    //   ICC fixture; the probe currently pins only the per-paint
-    //   value.
+    //   upper paint → RGB(255, 255, 128) per additive-clamp at /ca 0.5
+    //   tiny_skia source-over premul math at α=0.5:
+    //     r: round((128·128 + (255 - 128)·255) / 255) = 192
+    //     g: 255
+    //     b: round((255·128 + (128)·(255-128)/255)) = 191
+    // The R/B asymmetry comes from tiny_skia's u8 premul rounding;
+    // the byte-exact reference is (192, 255, 191).
     let (r2, g2, b2, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        (r2 as i32 - 191).abs() <= 12 && g2 >= 240 && (b2 as i32 - 191).abs() <= 12,
-        "overlap must show the linearly-composited per-paint value \
-         (191, 255, 191) under the current convert-first order; \
-         got ({r2}, {g2}, {b2})"
+    assert_eq!(
+        (r2, g2, b2),
+        (192, 255, 191),
+        "overlap must show byte-exact convert-first composite \
+         (192, 255, 191); got ({r2}, {g2}, {b2})"
     );
 }
