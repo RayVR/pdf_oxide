@@ -2826,7 +2826,26 @@ impl PageRenderer {
                 })
                 .unwrap_or(false);
 
-            log::debug!("Rendering transparency group (isolated={})", is_isolated);
+            // ISO 32000-1:2008 §11.4.6.2 — knockout flag. A knockout group
+            // composites each element against the group's initial backdrop
+            // rather than against the accumulated paint from earlier
+            // elements. Later elements override earlier ones in regions
+            // where both contribute.
+            let is_knockout = dict
+                .get("Group")
+                .and_then(|g| g.as_dict())
+                .and_then(|gd| gd.get("K"))
+                .map(|k| match k {
+                    Object::Boolean(b) => *b,
+                    _ => false,
+                })
+                .unwrap_or(false);
+
+            log::debug!(
+                "Rendering transparency group (isolated={}, knockout={})",
+                is_isolated,
+                is_knockout
+            );
 
             // Create a separate pixmap for the group
             let mut group_pixmap =
@@ -2840,15 +2859,31 @@ impl PageRenderer {
             }
             // Isolated groups start fully transparent (default Pixmap state)
 
-            // Execute operators into the group pixmap
-            self.execute_operators(
-                &mut group_pixmap,
-                combined_transform,
-                &operators,
-                doc,
-                page_num,
-                &form_resources,
-            )?;
+            if is_knockout {
+                // §11.4.6.2: snapshot the initial backdrop, then composite
+                // each element separately against it. The accumulator
+                // starts as the backdrop; each paint operator's result is
+                // merged in so later paints override earlier ones in
+                // overlap regions.
+                self.execute_knockout_group(
+                    &mut group_pixmap,
+                    combined_transform,
+                    &operators,
+                    doc,
+                    page_num,
+                    &form_resources,
+                )?;
+            } else {
+                // Execute operators into the group pixmap
+                self.execute_operators(
+                    &mut group_pixmap,
+                    combined_transform,
+                    &operators,
+                    doc,
+                    page_num,
+                    &form_resources,
+                )?;
+            }
 
             if is_isolated {
                 // Composite the isolated group onto the parent using over blending
@@ -2876,6 +2911,134 @@ impl PageRenderer {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Render a knockout transparency group per ISO 32000-1:2008 §11.4.6.2.
+    ///
+    /// The group's initial backdrop is `pixmap` on entry. Each painted
+    /// element composites against that backdrop (not against earlier
+    /// elements in the group), and later elements override earlier ones
+    /// in overlap regions.
+    ///
+    /// Implementation: segment the operator stream at paint operators
+    /// (Fill / Stroke / FillStroke / PaintShading / DrawObject /
+    /// ShowText / inline image). For each paint boundary `i`, render
+    /// the cumulative slice `operators[0..=i]` into a fresh
+    /// backdrop-copy scratch pixmap. The cumulative replay preserves
+    /// graphics-state side effects (color, CTM, clip) across paint
+    /// boundaries while keeping each paint's pixel contribution
+    /// referenced to the original backdrop. The scratch pixmap's
+    /// differences from the backdrop identify the pixels this element
+    /// touched, which then overwrite the accumulator.
+    ///
+    /// Cost: O(N · K) operator executions where N is total operators
+    /// and K is paint operators. Knockout groups are rare in practice
+    /// so the quadratic factor is acceptable.
+    fn execute_knockout_group(
+        &mut self,
+        pixmap: &mut Pixmap,
+        base_transform: Transform,
+        operators: &[Operator],
+        doc: &PdfDocument,
+        page_num: usize,
+        resources: &Object,
+    ) -> Result<()> {
+        // Backdrop is the pixmap state at group entry.
+        let width = pixmap.width();
+        let height = pixmap.height();
+        let backdrop_data: Vec<u8> = pixmap.data().to_vec();
+
+        // Identify paint-operator indices. These define element
+        // boundaries.
+        let paint_indices: Vec<usize> = operators
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| if is_paint_operator(op) { Some(i) } else { None })
+            .collect();
+
+        if paint_indices.is_empty() {
+            // No paint ops — still execute for state side effects (rare).
+            return self.execute_operators(
+                pixmap,
+                base_transform,
+                operators,
+                doc,
+                page_num,
+                resources,
+            );
+        }
+
+        // Accumulator starts as the backdrop. Each element's painted
+        // pixels overwrite the accumulator.
+        let mut accumulator: Vec<u8> = backdrop_data.clone();
+
+        for &end_idx in &paint_indices {
+            // Cumulative replay: graphics-state operators 0..end_idx
+            // plus the paint at end_idx, with all PRIOR paint operators
+            // filtered out. Filtering keeps the state side effects
+            // (CTM, fill color, ExtGState, clip path construction) that
+            // the current paint depends on, while ensuring no earlier
+            // element's pixel contribution reaches the scratch. The
+            // scratch is initialised to the backdrop so the paint
+            // composites against the group's initial backdrop only.
+            let mut scratch = Pixmap::new(width, height).ok_or_else(|| {
+                crate::error::Error::InvalidPdf("knockout scratch pixmap alloc failed".into())
+            })?;
+            scratch.data_mut().copy_from_slice(&backdrop_data);
+
+            let element_ops: Vec<Operator> = operators[..=end_idx]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, op)| {
+                    if i < end_idx && is_paint_operator(op) {
+                        None
+                    } else {
+                        Some(op.clone())
+                    }
+                })
+                .collect();
+
+            self.execute_operators(
+                &mut scratch,
+                base_transform,
+                &element_ops,
+                doc,
+                page_num,
+                resources,
+            )?;
+
+            // Merge: where scratch differs from backdrop, this element
+            // touched the pixel — its value overrides the accumulator.
+            // Comparing scratch vs backdrop (not vs accumulator) is the
+            // key knockout semantic: each element sees only the
+            // backdrop, never the accumulated paint from earlier
+            // elements.
+            let scratch_data = scratch.data();
+            debug_assert_eq!(scratch_data.len(), backdrop_data.len());
+            debug_assert_eq!(accumulator.len(), backdrop_data.len());
+
+            // Process pixel-by-pixel (4 bytes RGBA).
+            for px in 0..(scratch_data.len() / 4) {
+                let off = px * 4;
+                let same = scratch_data[off] == backdrop_data[off]
+                    && scratch_data[off + 1] == backdrop_data[off + 1]
+                    && scratch_data[off + 2] == backdrop_data[off + 2]
+                    && scratch_data[off + 3] == backdrop_data[off + 3];
+                if !same {
+                    accumulator[off] = scratch_data[off];
+                    accumulator[off + 1] = scratch_data[off + 1];
+                    accumulator[off + 2] = scratch_data[off + 2];
+                    accumulator[off + 3] = scratch_data[off + 3];
+                }
+            }
+        }
+
+        // Replay any trailing non-paint operators (state side effects
+        // that follow the last paint) onto the accumulator. The group's
+        // visible output IS the accumulator, so we install it before
+        // returning.
+        pixmap.data_mut().copy_from_slice(&accumulator);
         Ok(())
     }
 
@@ -3295,6 +3458,32 @@ impl PageRenderer {
 /// colour change. Anything coarser would risk dropping subtle overrides
 /// the renderer needs to honour.
 const RGBA_MATCH_EPSILON: f32 = 1.0e-6;
+
+/// Returns `true` when the operator paints pixels into the pixmap.
+///
+/// Used by the knockout-group renderer to segment the operator stream
+/// at element boundaries. Per ISO 32000-1:2008 §11.4.6.2 each "element"
+/// in a knockout group is delimited by a paint operator and composites
+/// independently against the group's initial backdrop.
+fn is_paint_operator(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::Fill
+            | Operator::FillEvenOdd
+            | Operator::Stroke
+            | Operator::FillStroke
+            | Operator::FillStrokeEvenOdd
+            | Operator::CloseFillStroke
+            | Operator::CloseFillStrokeEvenOdd
+            | Operator::PaintShading { .. }
+            | Operator::Do { .. }
+            | Operator::InlineImage { .. }
+            | Operator::Tj { .. }
+            | Operator::TJ { .. }
+            | Operator::Quote { .. }
+            | Operator::DoubleQuote { .. }
+    )
+}
 
 /// Returns `true` when the resolved `(r, g, b, a)` matches the supplied
 /// rgb triple and alpha within [`RGBA_MATCH_EPSILON`] on every channel.
