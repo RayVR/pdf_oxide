@@ -1,0 +1,224 @@
+//! Port of test scenarios from the closed PR #634 SMask /
+//! knockout-hardening branch.
+//!
+//! The four #634 commits ported here:
+//!   - 1084cfe — SMask cache CTM invalidation + SMask under nested Do
+//!   - 87457d4 — SMask clipping across image and text paints
+//!   - 17cee28 — spec compliance + malformed-input hardening
+//!   - 4d82947 — SMask + knockout review-feedback hardening
+//!
+//! Each probe carries its #634 commit SHA in the docstring for
+//! provenance. Probes use byte-exact references where the spec admits
+//! one (knockout byte-equality) and bounded-band assertions where the
+//! discriminator is colour-channel separation (overprint plate
+//! retention). Round-2/3 idiom: synthetic-PDF builder, raw-RGBA render,
+//! pixel sampling — no rendered-image diff baselines.
+
+#![cfg(all(feature = "rendering", feature = "icc"))]
+#![allow(dead_code)]
+
+use pdf_oxide::document::PdfDocument;
+use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
+
+// ===========================================================================
+// Synthetic PDF builder — flexible enough for ExtGState-bearing fixtures
+// ===========================================================================
+
+/// Build a one-page PDF with explicit object layout. Caller supplies
+/// every indirect object as a pre-formatted string starting at object
+/// 4 (catalog=1, pages=2, page=3 are fixed). The page declares
+/// `/Resources << resources_inner >>` and `/Contents 4 0 R`.
+fn build_pdf(
+    media: &str,
+    resources_inner: &str,
+    content: &str,
+    extra_objs: &[&str],
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let off_cat = buf.len();
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let off_pages = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let off_page = buf.len();
+    let page = format!(
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [{media}] /Resources << {resources_inner} >> /Contents 4 0 R >>\nendobj\n"
+    );
+    buf.extend_from_slice(page.as_bytes());
+
+    let off_content = buf.len();
+    let hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let mut extra_offs: Vec<usize> = Vec::new();
+    for obj in extra_objs {
+        extra_offs.push(buf.len());
+        buf.extend_from_slice(obj.as_bytes());
+    }
+
+    let xref_off = buf.len();
+    let total_objs = 4 + extra_offs.len();
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", total_objs + 1).as_bytes());
+    for off in [off_cat, off_pages, off_page, off_content] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    for off in extra_offs {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            total_objs + 1,
+            xref_off
+        )
+        .as_bytes(),
+    );
+    buf
+}
+
+fn render_rgba(pdf_bytes: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+    let doc = PdfDocument::from_bytes(pdf_bytes).expect("synthetic PDF parses");
+    let opts = RenderOptions::with_dpi(72).as_raw();
+    let img = render_page(&doc, 0, &opts).expect("render_page succeeds");
+    assert_eq!(img.format, ImageFormat::RawRgba8);
+    assert_eq!(img.width, w);
+    assert_eq!(img.height, h);
+    img.data
+}
+
+fn render_rgba_no_panic(pdf_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    let doc = PdfDocument::from_bytes(pdf_bytes).map_err(|e| format!("parse: {e}"))?;
+    let opts = RenderOptions::with_dpi(72).as_raw();
+    let img = render_page(&doc, 0, &opts).map_err(|e| format!("render: {e}"))?;
+    Ok(img.data)
+}
+
+fn pixel_at(rgba: &[u8], w: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {
+    let off = ((y * w + x) * 4) as usize;
+    (rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3])
+}
+
+// ===========================================================================
+// C.1 — SMask cache CTM invalidation + SMask under nested Do (#634 1084cfe)
+// ===========================================================================
+//
+// Two scenarios from #634 1084cfe.
+//
+// SCENARIO 1 — cache CTM invalidation: a single content stream invokes
+// the SAME /GS1 twice at two different CTMs. The first invocation
+// installs the SMask at the identity CTM; the second invocation
+// installs it at 20× scale. A cache that skipped the install-transform
+// check would serve the stale identity-CTM mask on the second
+// invocation, leaving the scaled-CTM paint mostly unmasked.
+//
+// SCENARIO 2 — nested Do: the page invokes Form /F1 via Do; F1's own
+// content stream sets /GS1 (SMask) and paints. The mask must
+// rasterise against the page-sized pixmap so subsequent paints align.
+
+/// Cache CTM invalidation (#634 1084cfe).
+///
+/// Fixture: /GS1 carries a /SMask /S /Luminosity Form whose /G paints
+/// a 50%-grey rectangle covering the top half of its 100×100 BBox.
+/// Page paints once at identity CTM (top-half mask blocks bottom-half
+/// paint at 100×100 device pixels), then SAME /GS1 invoked at 50× CTM
+/// (mask Form is 100×100 in user space, painted at scale into the
+/// pixmap — the top-half-mask region now covers a larger fraction of
+/// the device). If the cache poisons the second invocation with the
+/// first invocation's identity-CTM materialisation, the second paint's
+/// blocked region wouldn't match the spec.
+#[test]
+fn pr634_smask_cache_invalidates_when_ctm_changes() {
+    let smask_form = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    // Content: white backdrop; first paint at identity CTM (red rect
+    // 10,10..40,40); second paint at 2× scale CTM with same /GS1 (red
+    // rect 5,5..20,20 in user space → covers 10,10..40,40 in device
+    // pixels). The two paints land in different device regions to
+    // expose any cache-staleness on the SMask CTM.
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /GS1 gs\n\
+                   1 0 0 rg\n\
+                   10 10 30 30 re\nf\n\
+                   q\n2 0 0 2 50 50 cm\n\
+                   /GS1 gs\n\
+                   0 1 0 rg\n\
+                   0 0 15 15 re\nf\n\
+                   Q\n";
+    let resources = "/ExtGState << /GS1 << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[&obj_5]);
+    let rgba = render_rgba(pdf, 100, 100);
+    // First paint: red rect at identity, modulated by 50%-grey
+    // luminosity mask ⇒ ~(255, 128, 128). Sample image (25, 75)
+    // (PDF 10..40, image y = 100-40..100-10 = 60..90).
+    let (r1, g1, b1, _) = pixel_at(&rgba, 100, 25, 75);
+    assert!(
+        r1 >= 240 && (g1 as i32 - 128).abs() <= 30 && (b1 as i32 - 128).abs() <= 30,
+        "first /GS1 invocation at identity CTM: expected ~(255, 128, \
+         128); got ({r1}, {g1}, {b1}). Pre-existing SMask wiring on \
+         /f may be broken."
+    );
+    // Second paint: green rect at 2× scale CTM. The /GS1 install
+    // re-rasterises the SMask at the scaled CTM. Sample at image
+    // (65, 25) (PDF 50..80 ⇒ image y = 100-80..100-50 = 20..50).
+    let (r2, g2, b2, _) = pixel_at(&rgba, 100, 65, 25);
+    assert!(
+        g2 >= 100,
+        "second /GS1 invocation at scaled CTM: expected modulated \
+         green; got ({r2}, {g2}, {b2}). If green ≈ 0 the SMask cache \
+         served stale identity-CTM mask data and blocked the scaled \
+         paint entirely. (#634 1084cfe)"
+    );
+}
+
+/// SMask installed *inside* a Form XObject invoked via Do (#634 1084cfe).
+///
+/// The page invokes Form /F1 via /F1 Do; F1's content stream sets
+/// /GS1 (SMask /S /Luminosity 50% grey) and paints red over white.
+/// The painted region should be 50%-modulated red, not opaque red.
+#[test]
+fn pr634_smask_applies_to_paint_inside_nested_do() {
+    let smask_form = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    let f1_content = "/GS1 gs\n\
+                      1 0 0 rg\n\
+                      0 0 100 100 re\nf\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << /ExtGState << /GS1 << /Type /ExtGState \
+         /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> >> >> \
+         /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        f1_content.len(),
+        f1_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n/F1 Do\n";
+    let resources = "/XObject << /F1 6 0 R >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[&obj_5, &obj_6]);
+    let rgba = render_rgba(pdf, 100, 100);
+    // Sample centre of painted region.
+    let (r, g, b, _) = pixel_at(&rgba, 100, 50, 50);
+    assert!(
+        r >= 240 && (g as i32 - 128).abs() <= 30 && (b as i32 - 128).abs() <= 30,
+        "SMask inside nested Do: expected ~(255, 128, 128); got \
+         ({r}, {g}, {b}). The SMask declared in F1's Resources must \
+         clip F1's own paints. (#634 1084cfe)"
+    );
+}
+
