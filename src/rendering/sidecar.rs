@@ -881,6 +881,40 @@ pub(crate) fn extract_paint_spot_inks(
             // tint, or skip every plate).
             vec![(ink.to_string(), components[0])]
         },
+        "Pattern" => {
+            // ISO 32000-1 §8.7.3.1: a Pattern colour space may declare
+            // an underlying colour space at array index 1 (uncoloured
+            // tiling pattern usage). The `scn` operator carries colour
+            // components for the underlying space (before the pattern
+            // name); a /Separation or /DeviceN underlying space brings
+            // spot-colorant identity into the paint. The spot mirror
+            // needs to walk into the underlying space so a paint
+            // through a Pattern with a Separation alternate writes the
+            // correct spot lane.
+            //
+            // The `components` slice carries the underlying space's
+            // tints. For uncoloured Tiling, `name` (in SetFillColorN /
+            // SetStrokeColorN) provides the pattern object, but the
+            // tint is the underlying space's. For Shading patterns
+            // (which use the /Shading object's own /ColorSpace), the
+            // `scn` typically has no components — the underlying space
+            // doesn't apply to shading patterns. We rely on the
+            // recursive call's behaviour: a Shading-pattern usage with
+            // no underlying space (array length 1) takes the
+            // `arr.get(1)` branch as None and returns empty.
+            let underlying = match arr.get(1) {
+                Some(o) => deref(o),
+                None => return Vec::new(),
+            };
+            // Recurse into the underlying space. The components passed
+            // through unchanged — for an uncoloured Tiling pattern,
+            // they are the underlying space's source tints. For
+            // patterns whose underlying is itself an array form
+            // (e.g. /Pattern [/Separation /PMS185 /DeviceCMYK
+            // <tint>]), the recursive call handles the /Separation
+            // arm and surfaces (PMS185, components[0]).
+            extract_paint_spot_inks(&underlying, components, doc)
+        },
         "DeviceN" => {
             let names_obj = match arr.get(1) {
                 Some(o) => deref(o),
@@ -895,26 +929,18 @@ pub(crate) fn extract_paint_spot_inks(
             // names are PROCESS colorants. Filter them out so the spot
             // lane mirror does not write spot lanes for /Cyan,
             // /Magenta, /Yellow, /Black on a /DeviceN /Process source.
-            let process_names: std::collections::HashSet<String> = arr
-                .get(4)
-                .map(deref)
-                .as_ref()
-                .and_then(Object::as_dict)
-                .and_then(|attrs| attrs.get("Process"))
-                .map(deref)
-                .as_ref()
-                .and_then(Object::as_dict)
-                .and_then(|proc_dict| proc_dict.get("Components"))
-                .map(deref)
-                .as_ref()
-                .and_then(Object::as_array)
-                .map(|comps| {
-                    comps
-                        .iter()
-                        .filter_map(|o| o.as_name().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            //
+            // Round 5: when /Components contains any name not present
+            // in /Names, the /Process attribution is malformed per
+            // §8.6.6.5 ('leading prefix' requirement). Treat /Process
+            // as inert in that case — no filtering — so the spot
+            // extractor returns the same result it would for a DeviceN
+            // without /Process attribution. This matches the
+            // `extract_process_paint_cmyk` policy (which returns None
+            // and falls through). HONEST_GAP_DEVICEN_PROCESS_MISMATCHED
+            // _NAMES documents the open question.
+            let process_names: std::collections::HashSet<String> =
+                process_names_if_valid_prefix(arr, names, &deref);
 
             let mut out = Vec::with_capacity(names.len());
             for (i, ink_obj) in names.iter().enumerate() {
@@ -936,6 +962,56 @@ pub(crate) fn extract_paint_spot_inks(
             out
         },
         _ => Vec::new(),
+    }
+}
+
+/// Return the set of /Process /Components names ONLY when /Components
+/// is a valid leading-prefix subset of /Names (§8.6.6.5). When any
+/// /Components name is absent from /Names the attribution is
+/// malformed; round 5 treats it as inert and returns an empty set so
+/// the spot extractor surfaces every /Names entry as a spot colorant
+/// — matching the no-/Process behaviour and keeping the dispatcher's
+/// later RGB-inverse fallback (`extract_process_paint_cmyk` also
+/// returns None on mismatched names) symmetric.
+fn process_names_if_valid_prefix(
+    cs_arr: &[Object],
+    names: &[Object],
+    deref: &impl Fn(&Object) -> Object,
+) -> std::collections::HashSet<String> {
+    let proc_components = cs_arr
+        .get(4)
+        .map(deref)
+        .as_ref()
+        .and_then(Object::as_dict)
+        .and_then(|attrs| attrs.get("Process"))
+        .map(deref)
+        .as_ref()
+        .and_then(Object::as_dict)
+        .and_then(|proc_dict| proc_dict.get("Components"))
+        .map(deref)
+        .as_ref()
+        .and_then(Object::as_array)
+        .map(|comps| {
+            comps
+                .iter()
+                .filter_map(|o| o.as_name().map(str::to_string))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    if proc_components.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let names_set: std::collections::HashSet<String> = names
+        .iter()
+        .filter_map(|o| o.as_name().map(str::to_string))
+        .collect();
+    if proc_components.iter().all(|c| names_set.contains(c)) {
+        proc_components.into_iter().collect()
+    } else {
+        // Malformed /Process /Components: at least one name absent
+        // from /Names. Treat /Process as inert per
+        // HONEST_GAP_DEVICEN_PROCESS_MISMATCHED_NAMES.
+        std::collections::HashSet::new()
     }
 }
 
@@ -961,10 +1037,25 @@ pub(crate) fn extract_paint_spot_inks(
 ///  - DeviceN without `/Process` attribution (the paint is a pure spot
 ///    paint; the process-side overprint rule is "preserve backdrop" per
 ///    Table 149 row 3, handled by the `SeparationOrDeviceN` class),
-///  - DeviceN with `/Process /ColorSpace /ICCBased <ref>` — see
-///    `HONEST_GAP_DEVICEN_PROCESS_ICC_OVERPRINT`. The fallback at the
-///    call site computes the source CMYK from the existing
-///    fill-RGB / §10.3.5 inverse path.
+///  - DeviceN with a `/Process /ColorSpace` whose array form is neither
+///    `/ICCBased` (N=1/3/4) nor `/Cal*` (the latter falls through to
+///    the §10.3.5 RGB inverse). Real PDFs use the four device-family
+///    names and `/ICCBased` overwhelmingly; the rare CalRGB/CalGray
+///    cases keep the existing fallback path.
+///  - DeviceN with a `/Process /Components` entry that is not present
+///    in `/Names` (malformed source per §8.6.6.5; logged + None per
+///    `HONEST_GAP_DEVICEN_PROCESS_MISMATCHED_NAMES`).
+///
+/// `/Process /ColorSpace [/ICCBased <stream>]` with N=4 takes the
+/// source tints as destination CMYK directly per §8.6.6.5's "natural
+/// form" wording. N=3 and N=1 follow the same shape as the named
+/// `/DeviceRGB` / `/DeviceGray` arms (§10.3.5 inverse). The
+/// alternate reading — round-tripping through the embedded profile's
+/// CMM into sRGB and then back to destination CMYK via §10.3.5 — is
+/// declined as lossy (it destroys K) and qcms 0.3.0 does not support
+/// CMYK→CMYK transforms anyway. See
+/// `HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH` for the
+/// embedded-vs-OutputIntent divergence question.
 ///
 /// The component pairing follows §8.6.6.5: `/Process /Components`
 /// entries map name-by-position to the channels of the process
@@ -1012,10 +1103,28 @@ pub(crate) fn extract_process_paint_cmyk(
 
     // Pull the source tint corresponding to each /Process /Components
     // entry by looking the name up in the parent /Names array.
+    //
+    // §8.6.6.5 mandates that /Components names appear in /Names as a
+    // leading prefix; a name absent from /Names violates the spec and
+    // is unspecified reader behaviour. Round 5 fails closed (returns
+    // None, the call site falls through to the §10.3.5 RGB inverse)
+    // and emits a log warning so downstream tooling can flag the
+    // malformed source. The matching gap constant is
+    // HONEST_GAP_DEVICEN_PROCESS_MISMATCHED_NAMES in
+    // `tests/test_46_round5_devicen_process_polish.rs`.
     let mut proc_tints: Vec<f32> = Vec::with_capacity(proc_components.len());
     for c in proc_components {
         let name = c.as_name()?;
-        let idx = name_index(name)?;
+        let Some(idx) = name_index(name) else {
+            log::warn!(
+                "DeviceN /Process /Components entry {:?} is not present in /Names; \
+                 source violates ISO 32000-1 §8.6.6.5 ('leading prefix' requirement). \
+                 Falling through to the §10.3.5 RGB-inverse path. See \
+                 HONEST_GAP_DEVICEN_PROCESS_MISMATCHED_NAMES.",
+                name
+            );
+            return None;
+        };
         // Malformed sources with short component vectors pin missing
         // positions to 0 (no ink) — same conservative rule the spot
         // extractor uses.
@@ -1023,52 +1132,119 @@ pub(crate) fn extract_process_paint_cmyk(
     }
 
     // Resolve the process /ColorSpace into a CMYK quadruple per
-    // §10.3.5 / §8.6.4. Names may be a direct name or an array form
-    // (e.g. /ICCBased indirect-ref); handle the four documented cases
-    // and route the rest to the caller's fallback.
-    match cs_obj.as_name() {
-        Some("DeviceCMYK") | Some("CMYK") => {
-            // §8.6.4.4: subtractive (c, m, y, k) — the source tints ARE
-            // the source CMYK in their natural form per §8.6.6.5
-            // ("values associated with the process components shall be
-            // stored in their natural form").
-            if proc_tints.len() < 4 {
-                return None;
-            }
-            Some((proc_tints[0], proc_tints[1], proc_tints[2], proc_tints[3]))
-        },
-        Some("DeviceRGB") | Some("RGB") => {
-            // §10.3.5 additive-clamp inverse: C = 1-R, M = 1-G,
-            // Y = 1-B, K = 0. Per §8.6.6.5 the process tints are stored
-            // in their natural (additive) form for RGB, matching
-            // §10.3.5's input convention.
-            if proc_tints.len() < 3 {
-                return None;
-            }
-            let c = (1.0 - proc_tints[0]).clamp(0.0, 1.0);
-            let m = (1.0 - proc_tints[1]).clamp(0.0, 1.0);
-            let y = (1.0 - proc_tints[2]).clamp(0.0, 1.0);
-            Some((c, m, y, 0.0))
-        },
-        Some("DeviceGray") | Some("G") => {
-            // Gray → CMYK convention used by every device-space arm in
-            // the renderer: K = 1 − g, C = M = Y = 0.
-            if proc_tints.is_empty() {
-                return None;
-            }
-            let k = (1.0 - proc_tints[0]).clamp(0.0, 1.0);
-            Some((0.0, 0.0, 0.0, k))
-        },
-        _ => {
-            // ICCBased / CalRGB / CalGray / other array-form. Routing
-            // these through the proper ICC transform is out of the
-            // round-4 scope (the renderer's overprint dispatcher
-            // doesn't carry an ICC evaluator). The call site falls back
-            // to the §10.3.5 inverse from the rasterised RGB —
-            // HONEST_GAP_DEVICEN_PROCESS_ICC_OVERPRINT documents this.
-            None
-        },
+    // §10.3.5 / §8.6.4. Names may be a direct name (e.g. /DeviceCMYK)
+    // or an array form (e.g. [/ICCBased <indirect-ref>]); handle the
+    // four named device-family cases plus /ICCBased N=4 directly, and
+    // route the rest to the caller's fallback.
+    if let Some(name) = cs_obj.as_name() {
+        return match name {
+            "DeviceCMYK" | "CMYK" => {
+                // §8.6.4.4: subtractive (c, m, y, k) — the source tints
+                // ARE the source CMYK in their natural form per §8.6.6.5
+                // ("values associated with the process components shall
+                // be stored in their natural form").
+                if proc_tints.len() < 4 {
+                    return None;
+                }
+                Some((proc_tints[0], proc_tints[1], proc_tints[2], proc_tints[3]))
+            },
+            "DeviceRGB" | "RGB" => {
+                // §10.3.5 additive-clamp inverse: C = 1-R, M = 1-G,
+                // Y = 1-B, K = 0. Per §8.6.6.5 the process tints are
+                // stored in their natural (additive) form for RGB,
+                // matching §10.3.5's input convention.
+                if proc_tints.len() < 3 {
+                    return None;
+                }
+                let c = (1.0 - proc_tints[0]).clamp(0.0, 1.0);
+                let m = (1.0 - proc_tints[1]).clamp(0.0, 1.0);
+                let y = (1.0 - proc_tints[2]).clamp(0.0, 1.0);
+                Some((c, m, y, 0.0))
+            },
+            "DeviceGray" | "G" => {
+                // Gray → CMYK convention used by every device-space arm
+                // in the renderer: K = 1 − g, C = M = Y = 0.
+                if proc_tints.is_empty() {
+                    return None;
+                }
+                let k = (1.0 - proc_tints[0]).clamp(0.0, 1.0);
+                Some((0.0, 0.0, 0.0, k))
+            },
+            _ => None,
+        };
     }
+
+    // Array-form /Process /ColorSpace. /ICCBased is the case round 4
+    // explicitly deferred (HONEST_GAP_DEVICEN_PROCESS_ICC_OVERPRINT).
+    // Round 5 wires the ICCBased N=4 path: per §8.6.6.5, the process
+    // tints are stored "in their natural form" — for an ICCBased CMYK
+    // (N=4) process colour space the tints are subtractive CMYK in
+    // the profile's CMYK space. The §11.7.4.3 dispatcher consumes
+    // those tints under Table 149 row 2 ("any other process colour
+    // space"). The natural-form reading preserves K and matches the
+    // common production case where the embedded process profile IS
+    // the document OutputIntent profile.
+    //
+    // The alternate reading — round-tripping through sRGB via the
+    // embedded profile to recover destination CMYK via §10.3.5 —
+    // destroys K and only fires when the embedded profile genuinely
+    // differs from the OutputIntent. qcms 0.3.0 does not support
+    // CMYK→CMYK transforms (CMYK→RGB only), so a profile-to-profile
+    // retargetting is not currently available through the linked
+    // CMM. HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH names the
+    // open question.
+    //
+    // N=3 (ICCBased RGB) and N=1 (ICCBased Gray) process colour
+    // spaces follow the analogous device-family paths: tints in the
+    // profile's source space are converted by §10.3.5 (R→C=1-R for
+    // N=3; G→K=1-G for N=1). The embedded profile's tone-curve
+    // adjustments are NOT applied because the round-5 reading
+    // accepts tints as natural-form — exactly the spec text. This is
+    // the same simplification the named /DeviceRGB and /DeviceGray
+    // arms make above.
+    if let Some(cs_arr) = cs_obj.as_array() {
+        if cs_arr.first().and_then(Object::as_name) == Some("ICCBased") {
+            let n_components = cs_arr
+                .get(1)
+                .map(deref)
+                .as_ref()
+                .and_then(Object::as_dict)
+                .and_then(|d| d.get("N"))
+                .and_then(Object::as_integer)
+                .unwrap_or(0);
+            return match n_components {
+                4 => {
+                    if proc_tints.len() < 4 {
+                        return None;
+                    }
+                    Some((proc_tints[0], proc_tints[1], proc_tints[2], proc_tints[3]))
+                },
+                3 => {
+                    if proc_tints.len() < 3 {
+                        return None;
+                    }
+                    let c = (1.0 - proc_tints[0]).clamp(0.0, 1.0);
+                    let m = (1.0 - proc_tints[1]).clamp(0.0, 1.0);
+                    let y = (1.0 - proc_tints[2]).clamp(0.0, 1.0);
+                    Some((c, m, y, 0.0))
+                },
+                1 => {
+                    if proc_tints.is_empty() {
+                        return None;
+                    }
+                    let k = (1.0 - proc_tints[0]).clamp(0.0, 1.0);
+                    Some((0.0, 0.0, 0.0, k))
+                },
+                _ => None,
+            };
+        }
+    }
+
+    // CalRGB / CalGray / other array-form. These are uncommon
+    // in DeviceN /Process attribution; routing them through the
+    // proper colour transform is out of scope. The call site falls
+    // back to the §10.3.5 inverse from the rasterised RGB.
+    None
 }
 
 /// Initial colour values for a colour space per ISO 32000-1 §8.6.8
@@ -1284,10 +1460,22 @@ pub(crate) fn initial_colour_for_space(
                 .collect();
             // §8.6.8: initial tint is 1.0 for every colorant.
             let components = vec![1.0_f32; names.len().max(1)];
+            // §8.6.6.5 + §11.7.4.3: when /Process attribution is
+            // declared, the initial-tint vector feeds the process
+            // /ColorSpace exactly like an `scn` would. The overprint
+            // dispatcher reads `cmyk` for the §11.7.4.3 source CMYK;
+            // without this population the initial-colour CMYK would
+            // be lost (the call site would fall through to the
+            // §10.3.5 RGB inverse from `fill_color_rgb = (0,0,0)`,
+            // producing source CMYK (1, 1, 1, 0) — K dropped). Run
+            // the same evaluator the paint-time path uses so the
+            // mapping (named device families + ICCBased N=1/3/4) is
+            // identical to the post-`scn` behaviour.
+            let cmyk = extract_process_paint_cmyk(resolved_space.unwrap(), &components, doc);
             InitialColour {
                 components,
                 rgb: (0.0, 0.0, 0.0),
-                cmyk: None,
+                cmyk,
                 spot_inks,
             }
         },
@@ -1552,6 +1740,185 @@ mod tests {
             "expected log::warn! naming page 42 and 'spot inks' on the \
              deep-walk error path; captured records since start: {:?}",
             new_records
+        );
+    }
+
+    /// Round 5 / B2: `extract_paint_spot_inks` for a Pattern colour
+    /// space with a /Separation underlying. The Pattern array form is
+    /// `[/Pattern <underlying-cs>]`; the underlying may be any colour
+    /// space (uncoloured Tiling). When the underlying is a /Separation
+    /// or /DeviceN with a spot colorant, the spot identity MUST
+    /// propagate to the dispatcher so the spot mirror writes the
+    /// correct lane.
+    ///
+    /// Spec citations:
+    ///  - §8.7.3.1 — Pattern colour space (uncoloured Tiling carries
+    ///    the underlying colour space's tints)
+    ///  - §8.6.6.3 — /Separation spot identity
+    ///  - §11.7.3   — single shape/opacity per pixel across lanes
+    #[test]
+    fn extract_paint_spot_inks_pattern_with_separation_underlying() {
+        // Build the colour-space object: [/Pattern [/Separation
+        // /PMS185 /DeviceCMYK <stub tint fn>]]. The stub tint fn is a
+        // bare dict — the extractor does not consult it; the
+        // dispatcher only reads /Separation's index-1 name and uses
+        // the components vector for the tint.
+        let tint_fn = Object::Dictionary(
+            [
+                ("FunctionType".to_string(), Object::Integer(2)),
+                (
+                    "Domain".to_string(),
+                    Object::Array(vec![Object::Integer(0), Object::Integer(1)]),
+                ),
+                ("C0".to_string(), Object::Array(vec![Object::Integer(0); 4])),
+                ("C1".to_string(), Object::Array(vec![Object::Integer(1); 4])),
+                ("N".to_string(), Object::Integer(1)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let underlying = Object::Array(vec![
+            Object::Name("Separation".to_string()),
+            Object::Name("PMS185".to_string()),
+            Object::Name("DeviceCMYK".to_string()),
+            tint_fn,
+        ]);
+        let pattern_cs = Object::Array(vec![Object::Name("Pattern".to_string()), underlying]);
+
+        // Minimal PDF for the doc context. The extractor only calls
+        // resolve_object on indirect refs; the inline objects above
+        // need no resolution.
+        let pdf: Vec<u8> = b"%PDF-1.4\n\
+                             1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+                             2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+                             3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n\
+                             xref\n0 4\n\
+                             0000000000 65535 f \n\
+                             0000000010 00000 n \n\
+                             0000000059 00000 n \n\
+                             0000000110 00000 n \n\
+                             trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n175\n%%EOF\n"
+            .to_vec();
+        let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF parses");
+
+        // Components: the underlying /Separation expects one tint.
+        let components = [0.6_f32];
+        let spots = extract_paint_spot_inks(&pattern_cs, &components, &doc);
+
+        assert_eq!(
+            spots.len(),
+            1,
+            "ISO 32000-1 §8.7.3.1: Pattern[/Separation /PMS185 …] must \
+             surface PMS185 via the underlying-space recursion. Got \
+             {} entries; expected 1.",
+            spots.len()
+        );
+        assert_eq!(spots[0].0, "PMS185", "spot identity propagation");
+        assert_eq!(spots[0].1, 0.6_f32, "spot tint propagation (0.6_f32 is exact in f32)");
+    }
+
+    /// Round 5 / A5: the `process_names_if_valid_prefix` helper
+    /// returns the /Components set ONLY when every name appears in
+    /// /Names; otherwise it returns empty (treating the /Process
+    /// attribution as inert per
+    /// HONEST_GAP_DEVICEN_PROCESS_MISMATCHED_NAMES). Probe pins both
+    /// arms.
+    #[test]
+    fn process_names_if_valid_prefix_returns_set_for_valid_prefix() {
+        let deref = |o: &Object| -> Object { o.clone() };
+        let names = vec![
+            Object::Name("Cyan".to_string()),
+            Object::Name("Magenta".to_string()),
+            Object::Name("Yellow".to_string()),
+            Object::Name("Black".to_string()),
+            Object::Name("PMS185".to_string()),
+        ];
+        let attrs = Object::Dictionary(
+            [(
+                "Process".to_string(),
+                Object::Dictionary(
+                    [
+                        ("ColorSpace".to_string(), Object::Name("DeviceCMYK".to_string())),
+                        (
+                            "Components".to_string(),
+                            Object::Array(vec![
+                                Object::Name("Cyan".to_string()),
+                                Object::Name("Magenta".to_string()),
+                                Object::Name("Yellow".to_string()),
+                                Object::Name("Black".to_string()),
+                            ]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let cs_arr = vec![
+            Object::Name("DeviceN".to_string()),
+            Object::Array(names.clone()),
+            Object::Name("DeviceCMYK".to_string()),
+            // tint transform placeholder
+            Object::Null,
+            attrs,
+        ];
+        let result = process_names_if_valid_prefix(&cs_arr, &names, &deref);
+        let expected: std::collections::HashSet<String> = ["Cyan", "Magenta", "Yellow", "Black"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(result, expected, "valid prefix returns the /Components set");
+    }
+
+    #[test]
+    fn process_names_if_valid_prefix_returns_empty_for_invalid_prefix() {
+        let deref = |o: &Object| -> Object { o.clone() };
+        let names = vec![
+            Object::Name("Cyan".to_string()),
+            Object::Name("Magenta".to_string()),
+            Object::Name("Yellow".to_string()),
+            Object::Name("Black".to_string()),
+        ];
+        let attrs = Object::Dictionary(
+            [(
+                "Process".to_string(),
+                Object::Dictionary(
+                    [
+                        ("ColorSpace".to_string(), Object::Name("DeviceCMYK".to_string())),
+                        (
+                            "Components".to_string(),
+                            Object::Array(vec![
+                                Object::Name("Cyan".to_string()),
+                                Object::Name("Magenta".to_string()),
+                                Object::Name("Yellow".to_string()),
+                                // /Iridescent NOT in /Names → malformed
+                                Object::Name("Iridescent".to_string()),
+                            ]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let cs_arr = vec![
+            Object::Name("DeviceN".to_string()),
+            Object::Array(names.clone()),
+            Object::Name("DeviceCMYK".to_string()),
+            Object::Null,
+            attrs,
+        ];
+        let result = process_names_if_valid_prefix(&cs_arr, &names, &deref);
+        assert!(
+            result.is_empty(),
+            "ISO 32000-1 §8.6.6.5 violation (one name not in /Names) \
+             must return empty per HONEST_GAP_DEVICEN_PROCESS_MISMATCHED\
+             _NAMES. Got {:?}.",
+            result
         );
     }
 }

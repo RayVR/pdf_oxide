@@ -6495,38 +6495,48 @@ fn source_for_overprint(gs: &GraphicsState, fill_side: bool) -> Option<Overprint
             // Composite-named space — Separation, DeviceN, ICCBased,
             // Indexed, Pattern. The spot lanes (if any) are mirrored
             // separately by `mirror_spot_paint_into_sidecar_with_coverage`;
-            // here we only need to know that the process-side rule is
-            // "preserve backdrop" for Separation/DeviceN, and "B = c_s
-            // for every process colour component" otherwise.
-            if !spot_inks.is_empty() {
-                // Separation or non-process DeviceN — the gs records the
-                // colorant identity. Process lanes preserve backdrop;
-                // the c_s value here is unused for process channels.
-                Some(OverprintSource {
-                    class: SourceCsClass::SeparationOrDeviceN,
-                    cmyk: (0.0, 0.0, 0.0, 0.0),
-                })
-            } else if let Some(cmyk) = color_cmyk {
-                // DeviceN /Process attribution (§8.6.6.5): `SetFillColorN`
-                // resolved the process tints through the /Process
-                // /ColorSpace and pinned the result on the GS CMYK
-                // identity. Use that directly under Table 149 row 4/5
-                // "any other process colour space" — preserves the K
-                // channel and any non-RGB precision a §10.3.5 inverse
-                // would discard.
+            // here we only need to know the process-side rule for the
+            // four CMYK channels.
+            //
+            // Dispatch precedence:
+            //
+            // 1. `color_cmyk` populated — DeviceN /Process attribution
+            //    (§8.6.6.5) is in play and the source CMYK was
+            //    reconstructed in `SetFillColorN`. Process lanes follow
+            //    Table 149 row 2 "any other process colour space"
+            //    regardless of whether a spot tail is also present:
+            //    the spot tail's tints land via the spot mirror, but
+            //    the process tail's tints still drive the process
+            //    channels via `B = c_s`. Mixed DeviceN /Process+spot
+            //    must NOT preserve backdrop on the process lanes — the
+            //    process tints are sourced from the same `scn` and
+            //    contribute to the C/M/Y/K plates.
+            //
+            // 2. `spot_inks` non-empty (no process CMYK) — pure
+            //    Separation or DeviceN with NO process attribution.
+            //    Process lanes preserve backdrop per Table 149 row 3;
+            //    the named spot lanes are handled by the spot mirror.
+            //
+            // 3. Otherwise — ICCBased / Pattern / Indexed / DeviceN
+            //    /Process whose /Process /ColorSpace the dispatcher
+            //    could not resolve (CalRGB / CalGray array forms,
+            //    malformed /Components per
+            //    HONEST_GAP_DEVICEN_PROCESS_MISMATCHED_NAMES). Falls
+            //    under Table 149 row 2; recover CMYK from the
+            //    convert-from-RGB additive-clamp inverse so the
+            //    per-process-channel `B = c_s` rule has a defensible
+            //    source value.
+            if let Some(cmyk) = color_cmyk {
                 Some(OverprintSource {
                     class: SourceCsClass::OtherProcess,
                     cmyk,
                 })
+            } else if !spot_inks.is_empty() {
+                Some(OverprintSource {
+                    class: SourceCsClass::SeparationOrDeviceN,
+                    cmyk: (0.0, 0.0, 0.0, 0.0),
+                })
             } else {
-                // ICCBased / Pattern / Indexed / DeviceN /Process with a
-                // /Process /ColorSpace the dispatcher could not resolve
-                // (ICCBased — HONEST_GAP_DEVICEN_PROCESS_ICC_OVERPRINT)
-                // — falls under Table 149 row 2 "any other process
-                // colour space". Recover CMYK from the convert-from-RGB
-                // additive-clamp inverse so the per-process-channel
-                // `B = c_s` rule has a defensible source value. This is
-                // the same conversion the no-OutputIntent fallback uses.
                 let (r, g, b) = color_rgb;
                 let c = (1.0 - r).clamp(0.0, 1.0);
                 let m = (1.0 - g).clamp(0.0, 1.0);
