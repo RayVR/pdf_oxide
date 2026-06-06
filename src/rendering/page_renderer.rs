@@ -1151,19 +1151,14 @@ impl PageRenderer {
                                 &gs_clone,
                                 PipelinePaintKind::PathStroke,
                             );
-                            let render_gs: &GraphicsState =
-                                spliced.as_ref().unwrap_or(&gs_clone);
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(&gs_clone);
                             let transform = combine_transforms(base_transform, &gs_clone.ctm);
                             let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
-                            let overprint_snap =
-                                self.overprint_snapshot(pixmap, &gs_clone, false);
-                            self.path_rasterizer.stroke_path_clipped(
-                                pixmap, &path, transform, render_gs, clip,
-                            );
+                            let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, false);
+                            self.path_rasterizer
+                                .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                             if let Some(snap) = overprint_snap {
-                                self.apply_overprint_after_paint(
-                                    pixmap, &snap, &gs_clone, false,
-                                );
+                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, false);
                             }
                             if let Some(snap) = smask_snap {
                                 self.apply_smask_after_paint(
