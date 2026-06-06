@@ -1186,11 +1186,13 @@ impl PageRenderer {
                             let render_gs: &GraphicsState =
                                 spliced.as_ref().unwrap_or(&gs_clone);
                             let transform = combine_transforms(base_transform, &gs_clone.ctm);
-                            // §11.4.7: snapshot before the paint so the
-                            // post-paint modulator can blend between
-                            // backdrop (snapshot) and painted (pixmap)
-                            // weighted by the soft mask.
-                            let snapshot = self.smask_snapshot(pixmap, &gs_clone);
+                            // §11.4.7 + §11.7.4: snapshot before the
+                            // paint so the post-paint modulators can
+                            // blend the backdrop (snapshot) with the
+                            // painted result.
+                            let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                            let overprint_snap =
+                                self.overprint_snapshot(pixmap, &gs_clone, true);
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap,
                                 &path,
@@ -1199,7 +1201,12 @@ impl PageRenderer {
                                 tiny_skia::FillRule::Winding,
                                 clip,
                             );
-                            if let Some(snap) = snapshot {
+                            if let Some(snap) = overprint_snap {
+                                self.apply_overprint_after_paint(
+                                    pixmap, &snap, &gs_clone, true,
+                                );
+                            }
+                            if let Some(snap) = smask_snap {
                                 self.apply_smask_after_paint(
                                     pixmap, &snap, &gs_clone, doc, page_num, resources,
                                 )?;
@@ -2935,6 +2942,119 @@ impl PageRenderer {
             Some(pixmap.data().to_vec())
         } else {
             None
+        }
+    }
+
+    /// Take a snapshot of `pixmap` if the graphics state has fill
+    /// overprint active and a CMYK fill colour. Used by
+    /// [`Self::apply_overprint_after_paint`] to reconstruct the
+    /// pre-paint CMYK plate state in the painted region so the spec
+    /// per-plate composition can be applied.
+    fn overprint_snapshot(&self, pixmap: &Pixmap, gs: &GraphicsState, fill_side: bool) -> Option<Vec<u8>> {
+        let active = if fill_side {
+            gs.fill_overprint && gs.fill_color_cmyk.is_some()
+        } else {
+            gs.stroke_overprint && gs.stroke_color_cmyk.is_some()
+        };
+        if active {
+            Some(pixmap.data().to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// Apply §11.7.4 composite overprint correction to the painted
+    /// region. For each pixel where the paint contributed (snapshot
+    /// differs from the post-paint pixmap), read the *snapshot's* RGB,
+    /// invert to CMYK, and per-plate compose with the new paint's CMYK
+    /// quadruple under the active OPM rule:
+    ///
+    ///   - OPM=0 (standard): non-source plates are knocked out to 0
+    ///     except where overprint preserves them; for the composite
+    ///     preview the simplest implementation honours "non-zero
+    ///     source plate replaces dest" and "zero source plate is
+    ///     transparent for that plate, dest preserved".
+    ///   - OPM=1 (nonzero): zero source components are transparent for
+    ///     their plate (dest preserved); non-zero replace dest plate.
+    ///
+    /// The merged CMYK is converted back to RGB and written to the
+    /// destination pixel, replacing the naïve over-paint result.
+    fn apply_overprint_after_paint(
+        &self,
+        pixmap: &mut Pixmap,
+        snapshot: &[u8],
+        gs: &GraphicsState,
+        fill_side: bool,
+    ) {
+        let (sc, sm, sy, sk) = if fill_side {
+            match gs.fill_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        } else {
+            match gs.stroke_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        };
+        let opm = gs.overprint_mode;
+        let dest = pixmap.data_mut();
+        debug_assert_eq!(dest.len(), snapshot.len());
+
+        for px in 0..(dest.len() / 4) {
+            let off = px * 4;
+
+            // Detect "this pixel was painted": any RGBA byte differs
+            // between snapshot and current pixmap. Coverage-aware AA
+            // pixels are detected too.
+            let painted = dest[off] != snapshot[off]
+                || dest[off + 1] != snapshot[off + 1]
+                || dest[off + 2] != snapshot[off + 2]
+                || dest[off + 3] != snapshot[off + 3];
+            if !painted {
+                continue;
+            }
+
+            // Reconstruct the snapshot's CMYK from its RGB. We use the
+            // same simple additive-clamp inversion used by
+            // cmyk_to_rgb so the round-trip is consistent.
+            let dr = snapshot[off] as f32 / 255.0;
+            let dg = snapshot[off + 1] as f32 / 255.0;
+            let db = snapshot[off + 2] as f32 / 255.0;
+            let dc = (1.0 - dr).max(0.0);
+            let dm = (1.0 - dg).max(0.0);
+            let dy = (1.0 - db).max(0.0);
+            let dk_existing = 0.0_f32;
+
+            // Per-plate merge. OPM=1 nonzero overprint: zero source
+            // plate keeps dest plate; nonzero source plate replaces.
+            // OPM=0 standard overprint: paint = (source + dest) per
+            // plate (additive then clamp). Both differ from "replace
+            // every plate" which is the no-overprint behaviour.
+            let merge = |src: f32, dst: f32| -> f32 {
+                if opm == 1 {
+                    if src == 0.0 {
+                        dst
+                    } else {
+                        src
+                    }
+                } else {
+                    (src + dst).min(1.0)
+                }
+            };
+            let mc = merge(sc, dc);
+            let mm = merge(sm, dm);
+            let my = merge(sy, dy);
+            let mk = merge(sk, dk_existing);
+
+            let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
+            // Preserve the painted pixel's alpha (post-paint alpha
+            // already accounts for the paint's contribution); just
+            // overwrite RGB with the per-plate merged value.
+            dest[off] = (rr * 255.0).round().clamp(0.0, 255.0) as u8;
+            dest[off + 1] = (rg * 255.0).round().clamp(0.0, 255.0) as u8;
+            dest[off + 2] = (rb * 255.0).round().clamp(0.0, 255.0) as u8;
+            // Alpha unchanged.
         }
     }
 
