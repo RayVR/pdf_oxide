@@ -1031,22 +1031,13 @@ fn qa_round2_overprint_reconstruction_under_nonlinear_icc() {
     let (r_icc, g_icc, b_icc) = mean_rgb(&rgba_icc, 40, 60, 40, 60);
     let (r_ref, g_ref, b_ref) = mean_rgb(&rgba_ref, 40, 60, 40, 60);
 
-    let actual = (
-        r_icc.round() as i32,
-        g_icc.round() as i32,
-        b_icc.round() as i32,
-    );
-    let press = (
-        r_ref.round() as i32,
-        g_ref.round() as i32,
-        b_ref.round() as i32,
-    );
+    let actual = (r_icc.round() as i32, g_icc.round() as i32, b_icc.round() as i32);
+    let press = (r_ref.round() as i32, g_ref.round() as i32, b_ref.round() as i32);
 
     // Press-accurate: actual == reference. Any delta is reconstruction
     // loss. The Priority-4 plate-retention fix drives delta to zero.
     assert_eq!(
-        actual,
-        press,
+        actual, press,
         "composite overprint under non-linear ICC must hit the \
          press-accurate single-paint reference; got overlap={actual:?} \
          vs reference={press:?}. {}",
@@ -1109,20 +1100,11 @@ fn qa_round3_compose_first_under_icc_backdrop_press_accurate() {
     let (r_actual, g_actual, b_actual) = mean_rgb(&rgba_two, 35, 65, 35, 65);
     let (r_ref, g_ref, b_ref) = mean_rgb(&rgba_ref, 35, 65, 35, 65);
 
-    let actual = (
-        r_actual.round() as i32,
-        g_actual.round() as i32,
-        b_actual.round() as i32,
-    );
-    let press = (
-        r_ref.round() as i32,
-        g_ref.round() as i32,
-        b_ref.round() as i32,
-    );
+    let actual = (r_actual.round() as i32, g_actual.round() as i32, b_actual.round() as i32);
+    let press = (r_ref.round() as i32, g_ref.round() as i32, b_ref.round() as i32);
 
     assert_eq!(
-        actual,
-        press,
+        actual, press,
         "compose-first under ICC backdrop must hit the press-accurate \
          single-paint reference; got overlap={actual:?} vs \
          reference={press:?}. {}",

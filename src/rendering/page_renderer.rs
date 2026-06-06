@@ -1224,12 +1224,8 @@ impl PageRenderer {
                                 self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, false);
                             let cmyk_sidecar_snap =
                                 self.cmyk_sidecar_snapshot(pixmap, &gs_clone, false);
-                            let cmyk_coverage = self.rasterise_stroke_coverage(
-                                &path,
-                                transform,
-                                &gs_clone,
-                                clip,
-                            );
+                            let cmyk_coverage =
+                                self.rasterise_stroke_coverage(&path, transform, &gs_clone, clip);
                             self.path_rasterizer
                                 .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                             if let Some(snap) = cmyk_compose_snap {
@@ -1437,7 +1433,9 @@ impl PageRenderer {
                                 );
                             }
                             if let Some(snap) = fill_overprint_snap {
-                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, doc, true);
+                                self.apply_overprint_after_paint(
+                                    pixmap, &snap, &gs_clone, doc, true,
+                                );
                             }
                             if let Some(snap) = fill_smask_snap {
                                 self.apply_smask_after_paint(
@@ -1460,7 +1458,9 @@ impl PageRenderer {
                                 );
                             }
                             if let Some(snap) = stroke_overprint_snap {
-                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, doc, false);
+                                self.apply_overprint_after_paint(
+                                    pixmap, &snap, &gs_clone, doc, false,
+                                );
                             }
                             if let Some(snap) = stroke_smask_snap {
                                 self.apply_smask_after_paint(
@@ -1525,7 +1525,9 @@ impl PageRenderer {
                                 );
                             }
                             if let Some(snap) = fill_overprint_snap {
-                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, doc, true);
+                                self.apply_overprint_after_paint(
+                                    pixmap, &snap, &gs_clone, doc, true,
+                                );
                             }
                             if let Some(snap) = fill_smask_snap {
                                 self.apply_smask_after_paint(
@@ -3444,7 +3446,12 @@ impl PageRenderer {
     /// [`Self::mirror_cmyk_paint_into_sidecar`] consumes the snapshot
     /// + post-paint pixmap to identify the painted region and writes
     /// updated CMYK quadruples at those pixels.
-    fn cmyk_sidecar_snapshot(&self, pixmap: &Pixmap, gs: &GraphicsState, fill_side: bool) -> Option<Vec<u8>> {
+    fn cmyk_sidecar_snapshot(
+        &self,
+        pixmap: &Pixmap,
+        gs: &GraphicsState,
+        fill_side: bool,
+    ) -> Option<Vec<u8>> {
         if self.cmyk_plane.is_none() {
             return None;
         }
@@ -4045,9 +4052,7 @@ impl PageRenderer {
             None
         };
         let icc_intent = if icc_path {
-            Some(crate::color::RenderingIntent::from_pdf_name(
-                &gs.rendering_intent,
-            ))
+            Some(crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent))
         } else {
             None
         };
@@ -4082,24 +4087,23 @@ impl PageRenderer {
             let my = merge(sy, dy);
             let mk = merge(sk, dk_existing);
 
-            let (r_byte, g_byte, b_byte) = if let (Some(profile), Some(intent)) =
-                (icc_profile.as_ref(), icc_intent)
-            {
-                let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let transform = self.icc_transform_cache.get_or_build(profile, intent);
-                let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
-                (rgb[0], rgb[1], rgb[2])
-            } else {
-                let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
-                (
-                    (rr * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (rg * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (rb * 255.0).round().clamp(0.0, 255.0) as u8,
-                )
-            };
+            let (r_byte, g_byte, b_byte) =
+                if let (Some(profile), Some(intent)) = (icc_profile.as_ref(), icc_intent) {
+                    let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let transform = self.icc_transform_cache.get_or_build(profile, intent);
+                    let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
+                    (rgb[0], rgb[1], rgb[2])
+                } else {
+                    let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
+                    (
+                        (rr * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (rg * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (rb * 255.0).round().clamp(0.0, 255.0) as u8,
+                    )
+                };
 
             dest[off] = r_byte;
             dest[off + 1] = g_byte;
@@ -4217,9 +4221,7 @@ impl PageRenderer {
             None
         };
         let icc_intent = if icc_path {
-            Some(crate::color::RenderingIntent::from_pdf_name(
-                &gs.rendering_intent,
-            ))
+            Some(crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent))
         } else {
             None
         };
@@ -4255,12 +4257,7 @@ impl PageRenderer {
                 let dr = snapshot[off] as f32 / 255.0;
                 let dg = snapshot[off + 1] as f32 / 255.0;
                 let db = snapshot[off + 2] as f32 / 255.0;
-                (
-                    (1.0 - dr).max(0.0),
-                    (1.0 - dg).max(0.0),
-                    (1.0 - db).max(0.0),
-                    0.0_f32,
-                )
+                ((1.0 - dr).max(0.0), (1.0 - dg).max(0.0), (1.0 - db).max(0.0), 0.0_f32)
             };
 
             // Per-plate merge. OPM=1 nonzero overprint: zero source
@@ -4286,24 +4283,23 @@ impl PageRenderer {
 
             // CMYK → RGB conversion. ICC path for the press-accurate
             // case; additive-clamp `cmyk_to_rgb` for the fallback.
-            let (r_byte, g_byte, b_byte) = if let (Some(profile), Some(intent)) =
-                (icc_profile.as_ref(), icc_intent)
-            {
-                let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let transform = self.icc_transform_cache.get_or_build(profile, intent);
-                let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
-                (rgb[0], rgb[1], rgb[2])
-            } else {
-                let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
-                (
-                    (rr * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (rg * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (rb * 255.0).round().clamp(0.0, 255.0) as u8,
-                )
-            };
+            let (r_byte, g_byte, b_byte) =
+                if let (Some(profile), Some(intent)) = (icc_profile.as_ref(), icc_intent) {
+                    let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let transform = self.icc_transform_cache.get_or_build(profile, intent);
+                    let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
+                    (rgb[0], rgb[1], rgb[2])
+                } else {
+                    let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
+                    (
+                        (rr * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (rg * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (rb * 255.0).round().clamp(0.0, 255.0) as u8,
+                    )
+                };
 
             // Preserve the painted pixel's alpha (post-paint alpha
             // already accounts for the paint's contribution); just
@@ -4385,7 +4381,6 @@ impl PageRenderer {
         page_num: usize,
         resources: &Object,
     ) -> Result<()> {
-
         // Render the Form XObject into a fresh pixmap. The pixmap
         // starts fully transparent for /S /Alpha (the spec default
         // backdrop is the black point, which projects to alpha=0).
