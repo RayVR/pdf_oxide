@@ -284,3 +284,158 @@ fn pr634_smask_clips_text_paint() {
     );
 }
 
+// ===========================================================================
+// C.3 — Malformed SMask inputs must not panic (#634 17cee28)
+// ===========================================================================
+//
+// Each probe constructs a malformed /SMask shape and asserts the
+// renderer completes without panicking. No output assertion — the
+// defensive coverage is "the renderer is robust to broken input."
+//
+// The #634 commit's underlying impl fix:
+//   - Missing /S falls through (warn-and-skip)
+//   - /Group indirect refs resolved through doc.resolve_object
+//   - /K /I accept boolean OR non-zero integer
+//   - Recursion cap MAX_SMASK_DEPTH=32 against cyclic /G
+//
+// On THIS branch the round-2/3 work landed but the #634 hardening
+// fixes did NOT, so some probes may surface bugs (panic / hang /
+// undefined behaviour). Those are real bugs to flag for round-4.
+
+/// Malformed: /SMask missing /S subtype (#634 17cee28).
+///
+/// The spec marks /S as required. Renderer should warn-and-skip the
+/// mask install, paint normally without modulation. Must not panic.
+#[test]
+fn pr634_smask_missing_s_subtype_does_not_panic() {
+    let smask_form = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    // SMask dict has no /S key.
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   10 10 80 80 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /G 5 0 R >> >> >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[&obj_5]);
+    let result = render_rgba_no_panic(pdf);
+    assert!(
+        result.is_ok(),
+        "Renderer must not panic on /SMask with no /S subtype; got \
+         {result:?}. (#634 17cee28)"
+    );
+}
+
+/// Malformed: /SMask /S /UnknownSubtype (#634 17cee28).
+///
+/// Spec defines /Alpha and /Luminosity. Any other subtype should
+/// warn-and-skip (treat as no-mask). Must not panic.
+#[test]
+fn pr634_smask_unknown_s_subtype_does_not_panic() {
+    let smask_form = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   10 10 80 80 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Bogus /G 5 0 R >> >> >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[&obj_5]);
+    let result = render_rgba_no_panic(pdf);
+    assert!(
+        result.is_ok(),
+        "Renderer must not panic on /SMask /S /Bogus; got {result:?}. \
+         (#634 17cee28)"
+    );
+}
+
+/// Malformed: /SMask /BC out-of-range (#634 17cee28).
+///
+/// /BC backdrop colour values should be in [0, 1] for DeviceRGB.
+/// Out-of-range values must not crash the colour-conversion path.
+#[test]
+fn pr634_smask_bc_out_of_range_does_not_panic() {
+    let smask_form = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    // /BC carries values outside [0, 1] (incl. negative and >1).
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   10 10 80 80 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R \
+                     /BC [-0.5 2.0 1.5] >> >> >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[&obj_5]);
+    let result = render_rgba_no_panic(pdf);
+    assert!(
+        result.is_ok(),
+        "Renderer must not panic on /SMask /BC [-0.5 2.0 1.5]; got \
+         {result:?}. (#634 17cee28)"
+    );
+}
+
+/// Malformed: /SMask /TR with invalid /FunctionType (#634 17cee28).
+///
+/// /TR is a transfer function dict — types 0, 2, 3, 4 per ISO 32000.
+/// An unknown type should fall through to identity, not crash.
+#[test]
+fn pr634_smask_tr_invalid_function_type_does_not_panic() {
+    let smask_form = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   10 10 80 80 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R \
+                     /TR << /FunctionType 99 >> >> >> >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[&obj_5]);
+    let result = render_rgba_no_panic(pdf);
+    assert!(
+        result.is_ok(),
+        "Renderer must not panic on /SMask /TR /FunctionType 99; got \
+         {result:?}. (#634 17cee28)"
+    );
+}
+
+/// Malformed: missing /G referent (#634 17cee28).
+///
+/// /SMask /G points at an object that does not exist in the xref.
+/// Lookup must fall through, not crash on the dangling reference.
+#[test]
+fn pr634_smask_missing_g_referent_does_not_panic() {
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   10 10 80 80 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 99 0 R >> >> >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[]);
+    let result = render_rgba_no_panic(pdf);
+    assert!(
+        result.is_ok(),
+        "Renderer must not panic on /SMask /G referencing non-existent \
+         object; got {result:?}. (#634 17cee28)"
+    );
+}
+
