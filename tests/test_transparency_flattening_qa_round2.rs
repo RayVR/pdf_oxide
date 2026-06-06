@@ -822,6 +822,116 @@ fn fixture_overprint_under_no_icc() -> Vec<u8> {
     build_pdf_with_optional_output_intent(content, resources, &[], None)
 }
 
+// ===========================================================================
+// Round-3 probes — SMask coverage on PaintShading + Do paint arms
+// ===========================================================================
+//
+// Builds on the round-2 paint-arm coverage matrix. The round-2 QA
+// covered the path-painting arms (`B`, `B*`, `b`, `b*`, `f*`) and
+// pinned each gap with a probe. The round-3 wiring extends the
+// snapshot/apply cycle to PaintShading (`sh`) and Do (`Do`); these
+// probes verify the wiring fires.
+//
+// Text-showing arms (`Tj`, `TJ`, `'`, `"`) are wired in the same
+// round but fixture-side probing requires a font resource, which
+// the synthetic-PDF builder above does not yet emit. A follow-up
+// round can add font-bearing fixtures and pin the text-showing
+// SMask + overprint behaviour.
+
+/// Paint a 100×100 SMask form (50% grey ⇒ luminosity 0.5) and a
+/// separate Form XObject (red 100×100 fill) so the page's `Do`
+/// invocation paints opaque red modulated by the SMask.
+fn fixture_smask_for_do_form_xobject() -> Vec<u8> {
+    let smask_form = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    let do_form = "1 0 0 rg\n20 20 60 60 re\nf\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        do_form.len(),
+        do_form
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   /Fm1 Do\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> >> \
+                     /XObject << /Fm1 6 0 R >>";
+    build_pdf_with_optional_output_intent(content, resources, &[&obj_5, &obj_6], None)
+}
+
+/// SMask must modulate the painted Form XObject invoked through `Do`.
+/// At HEAD the `Operator::Do` arm bypasses the smask_snapshot /
+/// apply_smask_after_paint cycle, so the Form's opaque red paints
+/// through the soft mask unmodulated.
+#[test]
+fn qa_round3_smask_modulates_do_form_xobject() {
+    let rgba = render_rgba(fixture_smask_for_do_form_xobject());
+    // Painted region (PDF 20..80, 20..80) ⇒ image (20..80, 20..80).
+    // Sample centre.
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // SMask /S /Luminosity with 50%-grey form ⇒ modulation ≈ 0.5.
+    // Red painted on white at α≈0.5 ⇒ (255, 128, 128). Without
+    // wiring, Do paints fully opaque red ⇒ (255, 0, 0).
+    assert!(
+        r >= 240 && (g as i32 - 128).abs() <= 25 && (b as i32 - 128).abs() <= 25,
+        "Do (Form XObject) under SMask: expected ~(255, 128, 128); got \
+         ({r}, {g}, {b}). {}",
+        HONEST_GAP_SMASK_DO_NOT_WIRED
+    );
+}
+
+/// Axial shading from red (C0) to red (C1) — a uniform red fill, so
+/// the painted output is independent of the gradient interpolator.
+/// Combined with an SMask /S /Luminosity 50% grey form, the painted
+/// region must modulate to ~(255, 128, 128).
+fn fixture_smask_for_paint_shading() -> Vec<u8> {
+    let smask_form = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    // Axial shading from red (1,0,0) to red (1,0,0) covering the page.
+    // Uniform red — any interpolation produces red.
+    let obj_6 = "6 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB \
+                 /Coords [0 0 100 0] \
+                 /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [1 0 0] /N 1 >> >>\nendobj\n";
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   q\n20 20 60 60 re\nW n\n\
+                   /Sm gs\n\
+                   /Sh1 sh\n\
+                   Q\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> >> \
+                     /Shading << /Sh1 6 0 R >>";
+    build_pdf_with_optional_output_intent(content, resources, &[&obj_5, obj_6], None)
+}
+
+/// SMask must modulate the shading paint. The shading is uniform red;
+/// under a 50%-grey luminosity SMask the painted region must show
+/// ~(255, 128, 128). At HEAD the `Operator::PaintShading` arm
+/// bypasses the smask_snapshot / apply_smask_after_paint cycle, so
+/// the shading paints through unmodulated.
+#[test]
+fn qa_round3_smask_modulates_paint_shading() {
+    let rgba = render_rgba(fixture_smask_for_paint_shading());
+    // Painted region (PDF 20..80, 20..80) ⇒ image (20..80, 20..80).
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert!(
+        r >= 240 && (g as i32 - 128).abs() <= 25 && (b as i32 - 128).abs() <= 25,
+        "PaintShading (sh) under SMask: expected ~(255, 128, 128); got \
+         ({r}, {g}, {b}). {}",
+        HONEST_GAP_SMASK_PAINT_SHADING_NOT_WIRED
+    );
+}
+
 /// IGNORED — pins the magnitude of the composite-overprint
 /// reconstruction loss under a non-trivial ICC. Under additive-clamp
 /// (no ICC), the round-2 overprint correction is exact: the
