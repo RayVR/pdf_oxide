@@ -1003,51 +1003,53 @@ fn qa_round3_smask_modulates_paint_shading() {
     );
 }
 
-/// IGNORED — pins the magnitude of the composite-overprint
-/// reconstruction loss under a non-trivial ICC. Under additive-clamp
-/// (no ICC), the round-2 overprint correction is exact: the
-/// inversion is the same function used in the forward path. Under
-/// a non-linear ICC, the snapshot RGB → additive-clamp CMYK inversion
-/// produces a CMYK quadruple that, when re-converted to RGB via the
-/// ICC, does NOT round-trip — the round-trip delta IS the
-/// reconstruction loss.
+/// Composite overprint under a non-trivial ICC OutputIntent. The
+/// round-2 path snapshotted post-paint RGB, inverted to CMYK via
+/// additive-clamp, applied §11.7.4 plate merge, and re-converted
+/// through `cmyk_to_rgb` (the additive-clamp fallback). When the
+/// backdrop pixel came through a non-linear ICC, the additive-clamp
+/// inversion is lossy and the re-converted RGB drifts off the
+/// press-accurate value. The Priority-4 CMYK-plate-retention fix
+/// keeps the backdrop CMYK quadruple resident through the page
+/// composite so the overprint merge sees the real CMYK and the
+/// post-merge ICC conversion lands on the press-accurate RGB.
 ///
-/// This probe is informational (it documents the loss bound) rather
-/// than aspirational (it cannot fail-then-pass via a small impl fix —
-/// closing it requires routing composite overprint through the
-/// separation backend, an architecture-level change scheduled for the
-/// PDF/X-1a phase).
+/// Reference: single-paint render of CMYK(0.5, 0, 1, 0) at full
+/// opacity through the same ICC. That's the OPM=1 plate merge of
+/// cyan-50% backdrop and yellow-100% overprint (zero source plates
+/// preserve dest; non-zero source plates replace dest); the resulting
+/// CMYK quadruple, run through the OutputIntent ICC once, is what
+/// the press sees.
 #[test]
-#[ignore = "HONEST_GAP_OVERPRINT_COMPOSITE_RECONSTRUCTION_LOSS"]
-fn qa_round2_overprint_reconstruction_loss_under_nonlinear_icc() {
+fn qa_round2_overprint_reconstruction_under_nonlinear_icc() {
     let rgba_icc = render_rgba(fixture_overprint_under_nonlinear_icc());
-    let rgba_no_icc = render_rgba(fixture_overprint_under_no_icc());
+    // Press-accurate single-paint reference: OPM=1 plate merge of
+    // cyan 0.5 and yellow 1.0 = CMYK(0.5, 0, 1, 0). The 5%/95% range
+    // (centre of overlap) is uniformly inside the painted rect.
+    let rgba_ref = render_rgba(fixture_nonlinear_icc_single_cmyk(0.5, 0.0, 1.0, 0.0));
 
-    // Overlap region under each profile.
     let (r_icc, g_icc, b_icc) = mean_rgb(&rgba_icc, 40, 60, 40, 60);
-    let (r_clamp, g_clamp, b_clamp) = mean_rgb(&rgba_no_icc, 40, 60, 40, 60);
+    let (r_ref, g_ref, b_ref) = mean_rgb(&rgba_ref, 40, 60, 40, 60);
 
-    // The forward path under non-linear ICC produces a colorimetrically
-    // distinct RGB; the round-2 reconstruction inverts back through
-    // additive-clamp. Press-accurate output would re-derive RGB through
-    // the ICC after CMYK overprint composition. The press-accurate value
-    // is the same forward-ICC mapping applied to (cyan ∪ yellow) CMYK
-    // = CMYK(0.5, 0, 1, 0). We can't easily compute that without a
-    // re-render, but we CAN pin that the as-shipped result tracks the
-    // additive-clamp path approximately (the loss is bounded but
-    // non-trivial).
-    //
-    // The informational assertion: ICC-profile path must deliver an RGB
-    // that differs from the additive-clamp path (proves the ICC was in
-    // play at all) AND must NOT be byte-exact under additive-clamp
-    // (proves the reconstruction loss is observable).
-    let delta = (r_icc - r_clamp).abs() + (g_icc - g_clamp).abs() + (b_icc - b_clamp).abs();
-    assert!(
-        delta > 5.0,
-        "composite overprint under non-linear ICC must differ from \
-         additive-clamp baseline (forward ICC is non-trivial); got \
-         delta {delta:.1} between ICC ({r_icc:.0},{g_icc:.0},{b_icc:.0}) \
-         and additive-clamp ({r_clamp:.0},{g_clamp:.0},{b_clamp:.0}). {}",
+    let actual = (
+        r_icc.round() as i32,
+        g_icc.round() as i32,
+        b_icc.round() as i32,
+    );
+    let press = (
+        r_ref.round() as i32,
+        g_ref.round() as i32,
+        b_ref.round() as i32,
+    );
+
+    // Press-accurate: actual == reference. Any delta is reconstruction
+    // loss. The Priority-4 plate-retention fix drives delta to zero.
+    assert_eq!(
+        actual,
+        press,
+        "composite overprint under non-linear ICC must hit the \
+         press-accurate single-paint reference; got overlap={actual:?} \
+         vs reference={press:?}. {}",
         HONEST_GAP_OVERPRINT_COMPOSITE_RECONSTRUCTION_LOSS
     );
 }
@@ -1088,49 +1090,42 @@ fn fixture_compose_first_with_icc_backdrop() -> Vec<u8> {
     build_pdf_with_optional_output_intent(content, resources, &[], Some(&profile))
 }
 
-/// IGNORED — pins the magnitude of the compose-first bounded loss when
-/// the backdrop was itself produced through the non-linear ICC. The
-/// round-3 fix inverts the post-ICC backdrop RGB via additive-clamp;
-/// this loses colorimetric information when the backdrop went through
-/// the ICC. Press-accurate compose-first needs the separation-backend
-/// route from Priority 4 / round 4.
+/// Compose-first under an ICC-derived backdrop: the round-3
+/// apply_cmyk_compose_after_paint inverted the post-ICC backdrop RGB
+/// via §10.3.5 additive-clamp, which loses colorimetric information
+/// when the backdrop went through a non-linear ICC. The Priority-4
+/// CMYK-plate-retention fix keeps the backdrop CMYK quadruple resident
+/// so the compose-first path reads CMYK directly instead of inverting
+/// RGB.
 ///
-/// Informational: this probe cannot fail-then-pass on a small impl fix.
-/// Closing it requires the separation backend, an architecture-level
-/// change deferred to round 4.
+/// Reference: single-paint render of the composed CMYK quadruple
+/// (0.25, 0, 0.25, 0) at full opacity through the same ICC. Under the
+/// fix, the two-paint render's overlap region matches byte-exact.
 #[test]
-#[ignore = "HONEST_GAP_PRECEDENCE_BACKDROP_ICC_RECOVERY"]
-fn qa_round3_compose_first_bounded_loss_under_icc_backdrop() {
+fn qa_round3_compose_first_under_icc_backdrop_press_accurate() {
     let rgba_two = render_rgba(fixture_compose_first_with_icc_backdrop());
-    // Press-accurate compose-first reference: single-paint render of
-    // the composed CMYK quadruple at full opacity under the same ICC.
     let rgba_ref = render_rgba(fixture_nonlinear_icc_single_cmyk(0.25, 0.0, 0.25, 0.0));
 
-    // Centre of the overlap region.
     let (r_actual, g_actual, b_actual) = mean_rgb(&rgba_two, 35, 65, 35, 65);
     let (r_ref, g_ref, b_ref) = mean_rgb(&rgba_ref, 35, 65, 35, 65);
 
-    let delta = (r_actual - r_ref).abs() + (g_actual - g_ref).abs() + (b_actual - b_ref).abs();
-
-    // Bound: under additive-clamp (no ICC) the inversion is exact and
-    // delta would be 0. Under the non-linear ICC the bound is observable
-    // — the precise magnitude depends on the gamma curve and CLUT
-    // corner positions. The assertion pins delta as STRICTLY GREATER
-    // than the noise floor (proves the loss is real) AND less than 200
-    // (proves the loss is bounded, not pathological). The actual
-    // measured delta at HEAD documents the bound.
-    eprintln!(
-        "compose-first ICC-backdrop bounded loss: actual=({r_actual:.0}, \
-         {g_actual:.0}, {b_actual:.0}) ref=({r_ref:.0}, {g_ref:.0}, \
-         {b_ref:.0}) L1_delta={delta:.1}"
+    let actual = (
+        r_actual.round() as i32,
+        g_actual.round() as i32,
+        b_actual.round() as i32,
     );
-    assert!(
-        delta > 5.0 && delta < 200.0,
-        "compose-first bounded loss under ICC backdrop: expected \
-         observable but bounded delta (5.0 < delta < 200.0); got \
-         delta={delta:.1} between actual ({r_actual:.0}, {g_actual:.0}, \
-         {b_actual:.0}) and ICC-correct reference ({r_ref:.0}, \
-         {g_ref:.0}, {b_ref:.0}). {}",
+    let press = (
+        r_ref.round() as i32,
+        g_ref.round() as i32,
+        b_ref.round() as i32,
+    );
+
+    assert_eq!(
+        actual,
+        press,
+        "compose-first under ICC backdrop must hit the press-accurate \
+         single-paint reference; got overlap={actual:?} vs \
+         reference={press:?}. {}",
         HONEST_GAP_PRECEDENCE_BACKDROP_ICC_RECOVERY
     );
 }
