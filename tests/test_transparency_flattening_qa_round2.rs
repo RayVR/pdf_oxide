@@ -552,7 +552,6 @@ fn fixture_smask_for_op(op_ops: &str) -> Vec<u8> {
 /// IGNORED — SMask on `B` (fill+stroke). The Fill arm IS wired but
 /// `B` takes the FillStroke branch which is unwired.
 #[test]
-#[ignore = "HONEST_GAP_SMASK_FILLSTROKE_NOT_WIRED"]
 fn qa_round2_smask_modulates_fill_stroke_combo() {
     let pdf = fixture_smask_for_op("20 20 60 60 re\nB\n");
     let rgba = render_rgba(pdf);
@@ -658,7 +657,6 @@ fn fixture_no_overprint_for_op(op_ops: &str) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "HONEST_GAP_OVERPRINT_FILLSTROKE_NOT_WIRED"]
 fn qa_round2_overprint_modulates_fill_stroke_combo() {
     let with_op = render_rgba(fixture_overprint_for_op("30 30 50 50 re\nB\n"));
     let no_op = render_rgba(fixture_no_overprint_for_op("30 30 50 50 re\nB\n"));
