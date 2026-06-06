@@ -609,13 +609,19 @@ fn qa_round2_smask_modulates_fill_stroke_combo() {
     let pdf = fixture_smask_for_op("20 20 60 60 re\nB\n");
     let rgba = render_rgba(pdf);
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // SMask at /S /Luminosity with a 50%-grey form ⇒ modulation ≈ 0.5.
-    // Red over white at α≈0.5 ⇒ (255, 128, 128). As-shipped, B paints
-    // fully opaque red ⇒ (255, 0, 0).
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 15 && (b as i32 - 128).abs() <= 15,
-        "B (FillStroke) under SMask /Luminosity 50% grey form: expected \
-         ~(255, 128, 128); got ({r}, {g}, {b}). {}",
+    // SMask /S /Luminosity with 50% grey form. BT.601 luminance of
+    // (0.5, 0.5, 0.5) = 0.30·0.5 + 0.59·0.5 + 0.11·0.5 = 0.5.
+    // Modulated alpha m = 127/255 (after byte-round of 0.5·255).
+    // dest = m·painted + (1-m)·snapshot = (127/255)·(255,0,0) +
+    // (128/255)·(255,255,255) → channel-by-channel byte rounds to
+    // (255, 127, 127). The byte-exact reference is what the
+    // apply_smask_after_paint loop emits; any drift in the modulation
+    // path surfaces as a value change.
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "B (FillStroke) under SMask /Luminosity 50% grey form: \
+         expected byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_FILLSTROKE_NOT_WIRED
     );
 }
@@ -626,10 +632,11 @@ fn qa_round2_smask_modulates_fill_stroke_evenodd_combo() {
     let pdf = fixture_smask_for_op("20 20 60 60 re\nB*\n");
     let rgba = render_rgba(pdf);
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 15 && (b as i32 - 128).abs() <= 15,
-        "B* (FillStrokeEvenOdd) under SMask: expected ~(255, 128, 128); \
-         got ({r}, {g}, {b}). {}",
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "B* (FillStrokeEvenOdd) under SMask /Luminosity 50%: \
+         expected byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_FILLSTROKE_EVENODD_NOT_WIRED
     );
 }
@@ -641,10 +648,11 @@ fn qa_round2_smask_modulates_close_fill_stroke_combo() {
     let pdf = fixture_smask_for_op("20 20 m\n80 20 l\n80 80 l\n20 80 l\nb\n");
     let rgba = render_rgba(pdf);
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 15 && (b as i32 - 128).abs() <= 15,
-        "b (CloseFillStroke) under SMask: expected ~(255, 128, 128); got \
-         ({r}, {g}, {b}). {}",
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "b (CloseFillStroke) under SMask /Luminosity 50%: \
+         expected byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_CLOSE_FILLSTROKE_NOT_WIRED
     );
 }
@@ -655,10 +663,11 @@ fn qa_round2_smask_modulates_close_fill_stroke_evenodd_combo() {
     let pdf = fixture_smask_for_op("20 20 m\n80 20 l\n80 80 l\n20 80 l\nb*\n");
     let rgba = render_rgba(pdf);
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 15 && (b as i32 - 128).abs() <= 15,
-        "b* (CloseFillStrokeEvenOdd) under SMask: expected ~(255, 128, 128); \
-         got ({r}, {g}, {b}). {}",
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "b* (CloseFillStrokeEvenOdd) under SMask /Luminosity 50%: \
+         expected byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_CLOSE_FILLSTROKE_EVENODD_NOT_WIRED
     );
 }
@@ -669,10 +678,11 @@ fn qa_round2_smask_modulates_fill_evenodd() {
     let pdf = fixture_smask_for_op("20 20 60 60 re\nf*\n");
     let rgba = render_rgba(pdf);
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 15 && (b as i32 - 128).abs() <= 15,
-        "f* (FillEvenOdd) under SMask: expected ~(255, 128, 128); got \
-         ({r}, {g}, {b}). {}",
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "f* (FillEvenOdd) under SMask /Luminosity 50%: \
+         expected byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_FILL_EVENODD_NOT_WIRED
     );
 }
@@ -828,20 +838,26 @@ fn qa_round2_smask_does_not_leak_across_q_q() {
     // Outside-scope sample: image (75, 25) (PDF y=60..90 → image y=10..40).
     let (r_out, g_out, b_out, _) = pixel_at(&rgba, 75, 25);
 
-    // Inside the SMask scope, red should be faded by the 50%
-    // luminance modulation.
-    assert!(
-        r_in >= 240 && (g_in as i32 - 128).abs() <= 25 && (b_in as i32 - 128).abs() <= 25,
+    // Inside the SMask scope, red is faded by the 50% luminance
+    // modulation to byte-exact (255, 127, 127) — the same reference
+    // the paint-arm coverage probes hit.
+    assert_eq!(
+        (r_in, g_in, b_in),
+        (255, 127, 127),
         "inside SMask scope (q ... /Sm gs ... paint ... Q): expected \
-         faded red ~(255, 128, 128); got ({r_in}, {g_in}, {b_in})"
+         byte-exact faded red (255, 127, 127); got ({r_in}, {g_in}, \
+         {b_in})"
     );
-    // Outside the SMask scope (post-Q), red should be fully opaque
-    // (SMask state must have been popped along with the gstate).
-    assert!(
-        r_out >= 250 && g_out < 30 && b_out < 30,
-        "outside SMask scope (post-Q): expected fully opaque red \
-         ~(255, 0, 0); got ({r_out}, {g_out}, {b_out}). If this fails, \
-         SMask state leaks across q/Q boundaries — a real bug."
+    // Outside the SMask scope (post-Q), red is fully opaque. The
+    // paint-arm coverage path emits byte-exact (255, 0, 0) for an
+    // unmodulated red fill.
+    assert_eq!(
+        (r_out, g_out, b_out),
+        (255, 0, 0),
+        "outside SMask scope (post-Q): expected byte-exact fully \
+         opaque red (255, 0, 0); got ({r_out}, {g_out}, {b_out}). If \
+         this fails, SMask state leaks across q/Q boundaries — a real \
+         bug."
     );
 }
 
@@ -928,13 +944,14 @@ fn qa_round3_smask_modulates_do_form_xobject() {
     // Painted region (PDF 20..80, 20..80) ⇒ image (20..80, 20..80).
     // Sample centre.
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // SMask /S /Luminosity with 50%-grey form ⇒ modulation ≈ 0.5.
-    // Red painted on white at α≈0.5 ⇒ (255, 128, 128). Without
-    // wiring, Do paints fully opaque red ⇒ (255, 0, 0).
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 25 && (b as i32 - 128).abs() <= 25,
-        "Do (Form XObject) under SMask: expected ~(255, 128, 128); got \
-         ({r}, {g}, {b}). {}",
+    // SMask /S /Luminosity with 50% grey form. Red painted through
+    // 0.5 modulation onto white yields byte-exact (255, 127, 127).
+    // Without wiring, Do paints fully opaque red ⇒ (255, 0, 0).
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "Do (Form XObject) under SMask /Luminosity 50%: expected \
+         byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_DO_NOT_WIRED
     );
 }
@@ -977,10 +994,11 @@ fn qa_round3_smask_modulates_paint_shading() {
     let rgba = render_rgba(fixture_smask_for_paint_shading());
     // Painted region (PDF 20..80, 20..80) ⇒ image (20..80, 20..80).
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 25 && (b as i32 - 128).abs() <= 25,
-        "PaintShading (sh) under SMask: expected ~(255, 128, 128); got \
-         ({r}, {g}, {b}). {}",
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "PaintShading (sh) under SMask /Luminosity 50%: expected \
+         byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_PAINT_SHADING_NOT_WIRED
     );
 }
