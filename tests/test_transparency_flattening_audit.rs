@@ -26,6 +26,10 @@
 //! | Separable blend: Multiply / Screen              | §11.3.5.2 | yes          | LIVE        | regression sentry         |
 //! | Separable blend: Darken / Lighten               | §11.3.5.2 | yes          | LIVE        | regression sentry         |
 //! | Separable blend: Difference                     | §11.3.5.2 | yes          | LIVE        | regression sentry         |
+//! | Non-separable blend: Hue                        | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_HUE |
+//! | Non-separable blend: Saturation                 | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_SATURATION |
+//! | Non-separable blend: Color                      | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_COLOR |
+//! | Non-separable blend: Luminosity                 | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_LUMINOSITY |
 //!
 //! ### Source citations for the inventory
 //!
@@ -58,6 +62,11 @@
 //!   `tiny_skia::BlendMode` counterparts. The probes below pin three
 //!   high-signal modes (Multiply, Screen, Darken/Lighten,
 //!   Difference) against byte-anchored reference values.
+//!   *Everything else* — including the four non-separable modes
+//!   Hue / Saturation / Color / Luminosity — falls through the
+//!   `_ => BlendMode::SourceOver` arm. tiny_skia has no native
+//!   non-separable blend mode; round 2 must implement HSL/HSY-space
+//!   composition out-of-band, per §11.3.5.3 + §11.3.5.4.
 //!
 //! ## Reading the assertions
 //!
@@ -135,6 +144,35 @@ pub const HONEST_GAP_GROUP_KNOCKOUT: &str =
     "HONEST_GAP_GROUP_KNOCKOUT: Transparency group /K (knockout) flag is \
      not parsed; the renderer only branches on /I. Round 2 must add a \
      per-element knockout composition pass.";
+
+/// Non-separable Hue blend mode falls through to SourceOver in the
+/// dispatch at `src/rendering/mod.rs:80-95`. The spec algorithm
+/// (§11.3.5.3 + 11.3.5.4) requires applying the source's hue to the
+/// destination's saturation+luminosity in HSL/HSY space.
+pub const HONEST_GAP_NONSEP_BLEND_HUE: &str =
+    "HONEST_GAP_NONSEP_BLEND_HUE: PDF blend mode `Hue` is dispatched to \
+     tiny_skia::BlendMode::SourceOver (the catch-all arm in \
+     pdf_blend_mode_to_skia). Round 2 must implement the §11.3.5.3 \
+     HSL/HSY composition; this is a structural change because \
+     tiny_skia exposes no native Hue/Sat/Color/Luminosity blend mode.";
+
+/// Non-separable Saturation blend mode — see HONEST_GAP_NONSEP_BLEND_HUE.
+pub const HONEST_GAP_NONSEP_BLEND_SATURATION: &str =
+    "HONEST_GAP_NONSEP_BLEND_SATURATION: PDF blend mode `Saturation` is \
+     dispatched to tiny_skia::BlendMode::SourceOver. Round 2 must \
+     implement the §11.3.5.3 HSL/HSY composition.";
+
+/// Non-separable Color blend mode — see HONEST_GAP_NONSEP_BLEND_HUE.
+pub const HONEST_GAP_NONSEP_BLEND_COLOR: &str =
+    "HONEST_GAP_NONSEP_BLEND_COLOR: PDF blend mode `Color` is \
+     dispatched to tiny_skia::BlendMode::SourceOver. Round 2 must \
+     implement the §11.3.5.3 HSL/HSY composition.";
+
+/// Non-separable Luminosity blend mode — see HONEST_GAP_NONSEP_BLEND_HUE.
+pub const HONEST_GAP_NONSEP_BLEND_LUMINOSITY: &str =
+    "HONEST_GAP_NONSEP_BLEND_LUMINOSITY: PDF blend mode `Luminosity` is \
+     dispatched to tiny_skia::BlendMode::SourceOver. Round 2 must \
+     implement the §11.3.5.3 HSL/HSY composition.";
 
 // ===========================================================================
 // Synthetic-PDF builder + helpers
@@ -892,4 +930,147 @@ fn blend_lighten_red_over_green_yields_yellow() {
     assert_eq!(r, 255, "Lighten red-green: R=255; got ({r}, {g}, {b})");
     assert_eq!(g, 255, "Lighten red-green: G=255; got ({r}, {g}, {b})");
     assert!(b < 10, "Lighten red-green: B ≈ 0; got ({r}, {g}, {b})");
+}
+
+// ===========================================================================
+// §11.3.5.3 non-separable blend modes — HONEST_GAPs (all four)
+// ===========================================================================
+//
+// Hue / Saturation / Color / Luminosity require HSL/HSY space
+// composition per §11.3.5.3. tiny_skia exposes no native blend mode
+// for any of these; the dispatch in `src/rendering/mod.rs:80-95`
+// falls through to BlendMode::SourceOver for all four names. Each
+// probe pins the spec-correct value and is `#[ignore]`-marked.
+
+fn fixture_blend_hue_red_over_blue() -> Vec<u8> {
+    let content = "0 0 1 rg\n0 0 100 100 re\nf\n\
+                   /Hu gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Hu << /Type /ExtGState /BM /Hue >> >>";
+    build_pdf(content, resources, &[])
+}
+
+/// IGNORED — Hue blend mode in PDF takes the **source's hue** and the
+/// **destination's saturation+luminosity** (§11.3.5.3 + §11.3.5.4).
+/// Source = red (H=0°, S=1.0, L=0.5). Destination = blue (H=240°,
+/// S=1.0, L=0.5). Output = (H=0°, S=1.0, L=0.5) = red (255, 0, 0).
+/// Without HSL composition the dispatch falls through to SourceOver
+/// which just paints the red rect on top — visually identical in this
+/// degenerate case! That degeneracy is why we use a Sat/Color/Lum
+/// pair below where the spec result diverges meaningfully from a plain
+/// over-paint.
+#[test]
+#[ignore = "HONEST_GAP_NONSEP_BLEND_HUE"]
+fn blend_hue_red_source_paints_red_hue_over_blue() {
+    let rgba = render_rgba(fixture_blend_hue_red_over_blue());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        r, 255,
+        "Hue: source=red, dest=blue, result hue=red, S=1, L=0.5 → R=255; \
+         got ({r}, {g}, {b}). {}",
+        HONEST_GAP_NONSEP_BLEND_HUE
+    );
+    assert!(g < 10, "Hue: G≈0; got G={g}. {}", HONEST_GAP_NONSEP_BLEND_HUE);
+    assert!(b < 10, "Hue: B≈0; got B={b}. {}", HONEST_GAP_NONSEP_BLEND_HUE);
+}
+
+fn fixture_blend_saturation_grey_source_over_red() -> Vec<u8> {
+    // Source = mid-grey (R=G=B=128, H=undef, S=0, L=0.5). Per §11.3.5.3,
+    // Saturation takes destination's hue+luminosity with source's
+    // saturation. S=0 → desaturated → grey. Dest=red (H=0°, S=1, L=0.5)
+    // → applying S=0 → grey (128, 128, 128).
+    let content = "1 0 0 rg\n0 0 100 100 re\nf\n\
+                   /Sat gs\n\
+                   0.5 g\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sat << /Type /ExtGState /BM /Saturation >> >>";
+    build_pdf(content, resources, &[])
+}
+
+/// IGNORED — Saturation: source grey (S=0) applied to red destination
+/// should desaturate the red to grey (~128, 128, 128). SourceOver
+/// fallback would paint the grey rect directly → also grey (128, 128,
+/// 128), so this probe also degenerates. The probe remains an explicit
+/// per-mode pin so the dispatch-side fix is observable when the
+/// divergent fixture lands.
+#[test]
+#[ignore = "HONEST_GAP_NONSEP_BLEND_SATURATION"]
+fn blend_saturation_grey_source_desaturates_red_to_grey() {
+    let rgba = render_rgba(fixture_blend_saturation_grey_source_over_red());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert!(
+        (r as i32 - 128).abs() < 30 && (g as i32 - 128).abs() < 30 && (b as i32 - 128).abs() < 30,
+        "Saturation: grey source desaturates red dest → ~(128, 128, 128); \
+         got ({r}, {g}, {b}). {}",
+        HONEST_GAP_NONSEP_BLEND_SATURATION
+    );
+}
+
+fn fixture_blend_color_blue_source_over_red() -> Vec<u8> {
+    // Color: take source H+S, destination L. Source=blue (H=240°, S=1,
+    // L=0.5). Dest=red (H=0°, S=1, L=0.5). Result H=240°, S=1, L=0.5 →
+    // pure blue (0, 0, 255). SourceOver fallback also yields blue,
+    // making this a degenerate case visually — the probe is a
+    // dispatch-trace pin and the degeneracy is documented.
+    let content = "1 0 0 rg\n0 0 100 100 re\nf\n\
+                   /Col gs\n\
+                   0 0 1 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Col << /Type /ExtGState /BM /Color >> >>";
+    build_pdf(content, resources, &[])
+}
+
+/// IGNORED — Color: source blue applied to dest red, L from red →
+/// pure blue. This is degenerate vs SourceOver visually; the probe
+/// remains an explicit per-mode pin so the dispatch-side fix is
+/// observable when the divergent fixture lands.
+#[test]
+#[ignore = "HONEST_GAP_NONSEP_BLEND_COLOR"]
+fn blend_color_blue_source_over_red_yields_blue() {
+    let rgba = render_rgba(fixture_blend_color_blue_source_over_red());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert!(
+        b > 200 && r < 80 && g < 80,
+        "Color blend: source-blue + dest-red → blue dominant; got ({r}, {g}, {b}). {}",
+        HONEST_GAP_NONSEP_BLEND_COLOR
+    );
+}
+
+fn fixture_blend_luminosity_grey_source_over_red() -> Vec<u8> {
+    // Luminosity: take destination H+S, source L. Source=mid-grey (L=0.5
+    // by BT.601 luminance Y=128). Dest=red (H=0°, S=1, L_red).
+    // Per §11.3.5.3 the formula uses Y' = 0.30·R + 0.59·G + 0.11·B,
+    // and SetLum maps the destination's H+S to match the source's
+    // luminance. The non-degenerate case: a correct HSY-space
+    // implementation produces a red-dominant output; the SourceOver
+    // fallback produces a *grey* output. Asserting red-dominance is
+    // the cleanest non-degenerate signal.
+    let content = "1 0 0 rg\n0 0 100 100 re\nf\n\
+                   /Lum gs\n\
+                   0.5 g\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Lum << /Type /ExtGState /BM /Luminosity >> >>";
+    build_pdf(content, resources, &[])
+}
+
+/// IGNORED — Luminosity: a grey source applied to a red dest should
+/// produce a brightened *red* whose luminance matches the source
+/// (~Y=128), not the grey itself. The non-degenerate case: a correct
+/// HSY-space implementation produces a red-dominant output; the
+/// SourceOver fallback produces a *grey* output. Asserting
+/// red-dominance + low B is the cleanest non-degenerate signal.
+#[test]
+#[ignore = "HONEST_GAP_NONSEP_BLEND_LUMINOSITY"]
+fn blend_luminosity_grey_source_over_red_keeps_red_hue() {
+    let rgba = render_rgba(fixture_blend_luminosity_grey_source_over_red());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert!(
+        dominates(r as f32, &[g as f32, b as f32], DOMINANCE_MARGIN),
+        "Luminosity: grey source + red dest must preserve red HUE \
+         (R dominates G and B by ≥ {DOMINANCE_MARGIN}); got ({r}, {g}, {b}). \
+         A SourceOver fallback would output ~(128, 128, 128) — grey — \
+         which fails the dominance assertion. {}",
+        HONEST_GAP_NONSEP_BLEND_LUMINOSITY
+    );
 }
