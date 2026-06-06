@@ -407,13 +407,15 @@ fn ca_uppercase_stroke_alpha_half_paints_faded_red_ring() {
     // y=20 to 80; the stroke straddles the y=20/y=80 edges by ±4
     // image px.
     let (r, g, b, _a) = pixel_at(&rgba, 50, 17);
-    assert!(
-        r > 200 && (g as i32 - b as i32).abs() <= 5,
-        "/CA 0.5 stroke top edge: R must remain high (>200) and G≈B; got ({r}, {g}, {b})"
-    );
-    assert!(
-        (100..=200).contains(&g),
-        "/CA 0.5 stroke top edge: G must be midway (faded); got G={g}"
+    // /CA 0.5 source-over of red (255, 0, 0) onto white (255, 255,
+    // 255) = (255, 127.5, 127.5) → byte (255, 127, 127). The
+    // 8-pixel stroke covers (50, 16..20) so AA-free interior samples
+    // land byte-exact at this position.
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "/CA 0.5 stroke top edge: expected byte-exact (255, 127, 127); \
+         got ({r}, {g}, {b})"
     );
 }
 
@@ -553,10 +555,15 @@ fn smask_form_alpha_modulates_destination_alpha() {
     // destination alpha here is modulated by the form's 0 alpha
     // (outside its BBox), so the white backdrop should show through.
     let (r, g, b, _) = pixel_at(&rgba, 75, 25);
-    assert!(
-        r >= 230 && g >= 230 && b >= 230,
-        "outside Form-SMask BBox the destination must remain white \
-         (modulated alpha 0); got ({r}, {g}, {b}). {}",
+    // Outside the Form's BBox-implied region, the form's pixmap is
+    // fully transparent → SMask Alpha m=0 → dest = 0·painted +
+    // 1·snapshot = snapshot. The snapshot at (75, 25) is the white
+    // background paint, byte-exact (255, 255, 255).
+    assert_eq!(
+        (r, g, b),
+        (255, 255, 255),
+        "outside Form-SMask BBox the destination must remain byte-exact \
+         white (255, 255, 255); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_FORM_ALPHA
     );
 }
@@ -590,14 +597,15 @@ fn fixture_smask_form_luminosity() -> Vec<u8> {
 fn smask_form_luminosity_modulates_destination_via_bt601() {
     let rgba = render_rgba(fixture_smask_form_luminosity());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // 50%-grey Form → Y = 0.299*127 + 0.587*127 + 0.114*127 = 127.
-    // Modulated alpha 127/255 ≈ 0.498. Red over white at α=0.498:
-    //   r = 255 (red contributes 255*0.498 + 255*0.502 = 255)
-    //   g = 0*0.498 + 255*0.502 = 128
-    //   b = same as g
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 10 && (b as i32 - 128).abs() <= 10,
-        "luminosity Form-SMask must produce ~(255, 128, 128); got ({r}, {g}, {b}). {}",
+    // 50%-grey Form → BT.601 luma Y = 0.30·127 + 0.59·127 + 0.11·127
+    // = 127. m = 127/255. dest = m·painted + (1-m)·snapshot =
+    // (127/255)·(255,0,0) + (128/255)·(255,255,255) = (255, 127.5,
+    // 127.5) which the apply_smask loop rounds to (255, 127, 127).
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "luminosity Form-SMask must produce byte-exact (255, 127, 127); \
+         got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_FORM_LUMINOSITY
     );
 }
@@ -631,12 +639,15 @@ fn fixture_smask_with_bc_backdrop() -> Vec<u8> {
 fn smask_bc_backdrop_pre_fills_group() {
     let rgba = render_rgba(fixture_smask_with_bc_backdrop());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // /BC [0.5] backdrop + empty group → projected to luminance 127 →
-    // modulated alpha ≈ 127/255. Red over white at α ≈ 0.498 → roughly
-    // (255, 128, 128).
-    assert!(
-        r >= 240 && (g as i32 - 128).abs() <= 12 && (b as i32 - 128).abs() <= 12,
-        "/SMask /BC 0.5 backdrop must pre-fill the group; got ({r}, {g}, {b}). {}",
+    // /BC [0.5] backdrop + empty group → projected to BT.601 Y=127.
+    // Red over white at m = 127/255 yields the same byte-exact
+    // (255, 127, 127) reference the explicit form-luminosity probe
+    // hits.
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "/SMask /BC 0.5 backdrop must pre-fill the group; expected \
+         byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_BC
     );
 }
@@ -666,13 +677,15 @@ fn fixture_smask_with_tr_transfer() -> Vec<u8> {
 fn smask_tr_transfer_squares_modulation() {
     let rgba = render_rgba(fixture_smask_with_tr_transfer());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // Y=0.5 squared via /TR N=2 → 0.25. Red over white at α=0.25:
-    //   r = 255
-    //   g = 0*0.25 + 255*0.75 ≈ 191
-    //   b ≈ 191
-    assert!(
-        r >= 240 && (g as i32 - 191).abs() <= 12 && (b as i32 - 191).abs() <= 12,
-        "/SMask /TR Type 2 N=2 must square luminance; got ({r}, {g}, {b}). {}",
+    // Y=0.5 (form 50% grey) squared via /TR N=2 → m=0.25. dest =
+    // m·painted + (1-m)·snapshot ≈ (64/255)·(255,0,0) +
+    // (191/255)·(255,255,255) = (255, 191.something, 191.something)
+    // which rounds to byte-exact (255, 191, 191).
+    assert_eq!(
+        (r, g, b),
+        (255, 191, 191),
+        "/SMask /TR Type 2 N=2 must square luminance; expected \
+         byte-exact (255, 191, 191); got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_TR
     );
 }
