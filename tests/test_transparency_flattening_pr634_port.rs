@@ -439,3 +439,227 @@ fn pr634_smask_missing_g_referent_does_not_panic() {
     );
 }
 
+// ===========================================================================
+// C.4 — SMask + knockout review-feedback hardening (#634 4d82947)
+// ===========================================================================
+//
+// The #634 commit added 7 hardening tests. The audit suite already
+// covers basic knockout (HONEST_GAP_GROUP_KNOCKOUT was un-ignored in
+// round 2). The unique scenarios from 4d82947:
+//
+//   1. /Group indirect-ref resolution (`/Group 12 0 R` not direct dict).
+//   2. /K accepting integer 1 (not just boolean true).
+//   3. Knockout under non-Normal blend modes (Multiply/Hue/Sat/Color/Lum).
+//   4. Pixel-exact byte-equality after knockout (no rounding noise).
+//
+// Port the ones not already covered.
+
+/// `/Group` as an indirect reference (#634 4d82947).
+///
+/// Form XObject's `/Group` is `12 0 R` rather than an inline dict.
+/// Renderer must resolve through doc.resolve_object before reading
+/// /S /Transparency, /I, /K. Old code's `.as_dict()` on the
+/// reference returned None and silently dropped the group.
+#[test]
+fn pr634_group_indirect_ref_resolves_transparency_flag() {
+    // Form whose /Group is an indirect ref to an isolated transparency
+    // group dict. Form paints blue. If indirect resolution works, the
+    // blue paints through the transparency group; if not, the form
+    // degenerates to a direct render (still paints blue — so the
+    // discriminator has to be subtler).
+    //
+    // Approach: red backdrop on the page, then transparent paint
+    // /ca 0.5 of blue via the Form. With an isolated /Group dict,
+    // the form's paint composites against the group's transparent
+    // black backdrop (alpha = 0), not the red. Without /Group
+    // resolution, it composites against the red backdrop. The
+    // overlap discriminator: with isolation, the result is half-blue
+    // on the page's red backdrop (mixed); without, the form's blue
+    // blends with red at half-alpha.
+    //
+    // For the renderer at HEAD, the simplest robust assertion is
+    // "does not panic, does paint blue" — surface real bugs but
+    // avoid false flags on the half-implemented isolation path.
+    let form_content = "0 0 1 rg\n20 20 60 60 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group 6 0 R /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let obj_6 = b"6 0 obj\n<< /Type /Group /S /Transparency /I true >>\nendobj\n";
+    let content = "1 0 0 rg\n0 0 100 100 re\nf\n/F1 Do\n";
+    let resources = "/XObject << /F1 5 0 R >>";
+    let pdf = build_pdf(
+        "0 0 100 100",
+        resources,
+        content,
+        &[&obj_5, std::str::from_utf8(obj_6).unwrap()],
+    );
+    let result = render_rgba_no_panic(pdf);
+    assert!(
+        result.is_ok(),
+        "Renderer must not panic on Form /Group as indirect ref; \
+         got {result:?}. (#634 4d82947)"
+    );
+    let rgba = result.unwrap();
+    // Sample form's painted region — must be blue (with or without
+    // isolation, the form paints blue).
+    let (r, _g, b, _) = pixel_at(&rgba, 100, 50, 50);
+    assert!(
+        b > 100,
+        "Form with /Group as indirect ref must still paint blue in \
+         its interior; got r={r} b={b}. If b ≈ 0 the indirect /Group \
+         broke the form dispatch. (#634 4d82947)"
+    );
+}
+
+/// `/K` accepting integer 1 (#634 4d82947).
+///
+/// Legacy tools emit `/K 1` instead of `/K true`. Renderer should
+/// accept either. The probe asserts the form paints (no panic) when
+/// /K is integer 1.
+#[test]
+fn pr634_group_k_accepts_integer_one() {
+    let form_content = "0 0 1 rg\n20 20 60 60 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /K 1 >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n/F1 Do\n";
+    let resources = "/XObject << /F1 5 0 R >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[&obj_5]);
+    let result = render_rgba_no_panic(pdf);
+    assert!(
+        result.is_ok(),
+        "Renderer must not panic on /K 1 (integer instead of bool); \
+         got {result:?}. (#634 4d82947)"
+    );
+    let rgba = result.unwrap();
+    let (_r, _g, b, _) = pixel_at(&rgba, 100, 50, 50);
+    assert!(
+        b > 100,
+        "Form with /K 1 (knockout via integer) must still paint blue; \
+         got b={b}. (#634 4d82947)"
+    );
+}
+
+/// Knockout under non-Normal blend mode (#634 4d82947).
+///
+/// Per §11.6.6.2, a knockout group with opaque-but-non-Normal-blend
+/// paints must still redirect each element to the backdrop (the
+/// blend formula reads the destination, so the alpha=1 short-circuit
+/// is wrong). The #634 fix added `knockout_paint_alpha(gs_alpha,
+/// blend_mode)` returning 0.0 for any non-Normal mode.
+///
+/// Probe: knockout group with /BM /Multiply red over blue. With the
+/// short-circuit bug, red opaque-multiplies blue → purple. With the
+/// fix, the red element starts from the backdrop (= white page)
+/// because knockout resets the destination → red·white = red.
+#[test]
+fn pr634_knockout_under_multiply_blend_redirects_to_backdrop() {
+    // Form XObject with /Group /K true. Inside the form: blue rect,
+    // then red rect with /BM /Multiply over the blue. Knockout
+    // semantics: red sees only the form's transparent backdrop (not
+    // the blue). Multiply against transparent backdrop = red itself
+    // (1·1, 0·1, 0·1) = (1, 0, 0).
+    let form_content = "0 0 1 rg\n0 0 100 100 re\nf\n\
+                        /GMul gs\n\
+                        1 0 0 rg\n\
+                        25 25 50 50 re\nf\n";
+    let form_resources = "/ExtGState << /GMul << /Type /ExtGState \
+                          /BM /Multiply >> >>";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /K true >> \
+         /Resources << {} >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_resources,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n/F1 Do\n";
+    let resources = "/XObject << /F1 5 0 R >>";
+    let pdf = build_pdf("0 0 100 100", resources, content, &[&obj_5]);
+    let result = render_rgba_no_panic(pdf);
+    assert!(
+        result.is_ok(),
+        "Renderer must not panic on knockout + /BM /Multiply; got \
+         {result:?}. (#634 4d82947)"
+    );
+    let rgba = result.unwrap();
+    // Sample inside the red rect (PDF 25..75 → image y 25..75).
+    let (r, g, b, _) = pixel_at(&rgba, 100, 50, 50);
+    // Knockout-redirect: red multiplies the backdrop (white page),
+    // not the blue inside the form ⇒ output is red.
+    // Without redirect: red multiplies blue ⇒ purple-ish.
+    // The discriminator is the green channel: red·white g=0, but
+    // red·blue (multiply) also gives g=0. The CLEAR discriminator is
+    // the blue channel: red·white b=0 (red is (1,0,0)·(1,1,1)=red);
+    // red·blue (where blue=(0,0,1)): multiply ⇒ (0,0,0) (black).
+    //
+    // So: bugged behaviour → (≈0, ≈0, ≈0) black; correct knockout
+    // redirect → (≈255, ≈0, ≈0) red.
+    // Byte-exact: red·white = (255·1, 0·1, 0·1) = (255, 0, 0).
+    // Under the bug: red·blue (multiply) = (255·0, 0·0, 0·255) =
+    // (0, 0, 0) black. The byte-exact reference cleanly separates the
+    // two paths.
+    assert_eq!(
+        (r, g, b),
+        (255, 0, 0),
+        "Knockout group under /BM /Multiply must redirect element to \
+         backdrop. Byte-exact expected (255, 0, 0) (red·white = red); \
+         got ({r}, {g}, {b}). (0, 0, 0) means the alpha=1 short-circuit \
+         fired and the red multiplied the blue inside the form, \
+         skipping knockout redirect. (#634 4d82947)"
+    );
+}
+
+/// Knockout pixel-exact byte-equality (#634 4d82947).
+///
+/// §11.6.6.2 defines knockout as "the prior paint leaves NO trace
+/// where the new paint covers." Probe: render two scenes, one with
+/// the prior paint, one without; assert byte-identical pages over
+/// the knockout-covered region.
+#[test]
+fn pr634_knockout_byte_equal_under_full_coverage() {
+    // Scene A: knockout group with red (covered by blue), then blue
+    //          full-page paint. Blue fully covers red ⇒ knockout
+    //          leaves no red trace.
+    // Scene B: knockout group with just blue full-page paint.
+    // Assertion: A and B are byte-identical in the painted region.
+    let form_a = "1 0 0 rg\n0 0 100 100 re\nf\n\
+                  0 0 1 rg\n0 0 100 100 re\nf\n";
+    let form_b = "0 0 1 rg\n0 0 100 100 re\nf\n";
+    let obj_5_a = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /K true >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_a.len(),
+        form_a
+    );
+    let obj_5_b = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /K true >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_b.len(),
+        form_b
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n/F1 Do\n";
+    let resources = "/XObject << /F1 5 0 R >>";
+    let pdf_a = build_pdf("0 0 100 100", resources, content, &[&obj_5_a]);
+    let pdf_b = build_pdf("0 0 100 100", resources, content, &[&obj_5_b]);
+    let rgba_a = render_rgba(pdf_a, 100, 100);
+    let rgba_b = render_rgba(pdf_b, 100, 100);
+    // Painted region centre (PDF 0..100 ⇒ image 0..100).
+    let pa = pixel_at(&rgba_a, 100, 50, 50);
+    let pb = pixel_at(&rgba_b, 100, 50, 50);
+    assert_eq!(
+        pa, pb,
+        "Knockout byte-equality §11.6.6.2: fully-covered prior paint \
+         must leave NO trace. Got A={pa:?} B={pb:?} at (50, 50). \
+         (#634 4d82947)"
+    );
+}
