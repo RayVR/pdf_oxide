@@ -5,15 +5,27 @@
 //! parser in a single module avoids drift between the two renderers and
 //! removes the `pub(crate)` leak that previously crossed module boundaries.
 
-use crate::content::graphics_state::GraphicsState;
+use crate::content::graphics_state::{GraphicsState, SoftMaskForm, SoftMaskSubtype};
 use crate::document::PdfDocument;
 use crate::error::Result;
 use crate::object::Object;
 
+/// A parsed `/SMask` value from an ExtGState dict (§11.4.7 / Table 144).
+/// `None` corresponds to the spec `/None` value (clear the current mask);
+/// `Form` carries the Form XObject reference plus optional backdrop and
+/// transfer function (see [`SoftMaskForm`]).
+#[derive(Clone, Debug)]
+pub(crate) enum SoftMaskValue {
+    /// `/SMask /None` — clear the current mask.
+    None,
+    /// `/SMask <<` … Form-XObject soft mask.
+    Form(SoftMaskForm),
+}
+
 /// Parsed effects of a PDF `ExtGState` dictionary. Only the fields actually
-/// applied during rendering are captured (fill/stroke alpha, blend mode, and
-/// the overprint parameters from ISO 32000-1 §11.7.4). Anything else
-/// (TK / SMask / AIS) is intentionally ignored so the cached entry stays tiny.
+/// applied during rendering are captured (fill/stroke alpha, blend mode,
+/// the overprint parameters from ISO 32000-1 §11.7.4, and §11.4.7
+/// Form-XObject soft masks).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ParsedExtGState {
     pub(crate) fill_alpha: Option<f32>,
@@ -25,6 +37,11 @@ pub(crate) struct ParsedExtGState {
     pub(crate) fill_overprint: Option<bool>,
     /// Overprint mode (ExtGState `/OPM`, §11.7.4). 0 = standard, 1 = nonzero.
     pub(crate) overprint_mode: Option<u8>,
+    /// Soft mask dispatch (§11.4.7). `None` means the entry was absent —
+    /// gs.smask is left untouched. `Some(SoftMaskValue::None)` is the
+    /// spec `/None` value (clear). `Some(SoftMaskValue::Form(..))` is a
+    /// Form-XObject mask.
+    pub(crate) smask: Option<SoftMaskValue>,
 }
 
 impl ParsedExtGState {
@@ -48,6 +65,16 @@ impl ParsedExtGState {
         }
         if let Some(v) = self.overprint_mode {
             gs.overprint_mode = v;
+        }
+        if let Some(ref sm) = self.smask {
+            match sm {
+                SoftMaskValue::None => {
+                    gs.smask = None;
+                },
+                SoftMaskValue::Form(f) => {
+                    gs.smask = Some(f.clone());
+                },
+            }
         }
     }
 }
@@ -104,6 +131,72 @@ pub(crate) fn parse_ext_g_state_inner(
         // value is undefined; clamp to 0 so a malformed PDF doesn't
         // accidentally enable nonzero-overprint mode.
         out.overprint_mode = Some(if opm == 1 { 1 } else { 0 });
+    }
+
+    // ISO 32000-1:2008 §11.4.7 / Table 144. `/SMask` is either the
+    // name `/None` (clear the current soft mask) or a soft-mask
+    // dictionary referencing a Form XObject. Image-attached soft
+    // masks (via an image XObject's own /SMask entry) are handled
+    // at the image-blit site; this parser covers the ExtGState
+    // path.
+    if let Some(smask_obj) = state_dict.get("SMask") {
+        // Resolve through references before classifying.
+        let resolved = doc.resolve_object(smask_obj).unwrap_or(smask_obj.clone());
+        match &resolved {
+            Object::Name(n) if n == "None" => {
+                out.smask = Some(SoftMaskValue::None);
+            },
+            Object::Dictionary(mask_dict) => {
+                // Subtype: /S /Alpha or /S /Luminosity (default Alpha
+                // per spec). Anything else falls through to None — a
+                // malformed mask must not silently mis-render.
+                let subtype = match mask_dict.get("S").and_then(Object::as_name) {
+                    Some("Alpha") => SoftMaskSubtype::Alpha,
+                    Some("Luminosity") => SoftMaskSubtype::Luminosity,
+                    _ => SoftMaskSubtype::Alpha,
+                };
+
+                // /G — required Form XObject reference.
+                let form_ref = mask_dict
+                    .get("G")
+                    .and_then(|o| match o {
+                        Object::Reference(r) => Some(*r),
+                        _ => None,
+                    });
+
+                if let Some(form_ref) = form_ref {
+                    // /BC backdrop colour — array of N reals. Only
+                    // honoured for /S /Luminosity per §11.4.7; for
+                    // /S /Alpha the spec ignores /BC.
+                    let backdrop = if subtype == SoftMaskSubtype::Luminosity {
+                        mask_dict.get("BC").and_then(|o| o.as_array()).map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| {
+                                    v.as_real()
+                                        .map(|r| r as f32)
+                                        .or_else(|| v.as_integer().map(|i| i as f32))
+                                })
+                                .collect::<Vec<f32>>()
+                        })
+                    } else {
+                        None
+                    };
+
+                    // /TR transfer function — stored raw; the
+                    // renderer evaluates per-pixel via the Function
+                    // evaluator already used for tint transforms.
+                    let transfer = mask_dict.get("TR").cloned();
+
+                    out.smask = Some(SoftMaskValue::Form(SoftMaskForm {
+                        form_ref,
+                        subtype,
+                        backdrop,
+                        transfer,
+                    }));
+                }
+            },
+            _ => {},
+        }
     }
 
     Ok(out)

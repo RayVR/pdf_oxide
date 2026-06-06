@@ -587,7 +587,6 @@ fn fixture_smask_form_luminosity() -> Vec<u8> {
 /// Y = 127, and the red fill should be ~50% blended with the white
 /// backdrop. As-shipped, the red paints fully opaque.
 #[test]
-#[ignore = "HONEST_GAP_SMASK_FORM_LUMINOSITY"]
 fn smask_form_luminosity_modulates_destination_via_bt601() {
     let rgba = render_rgba(fixture_smask_form_luminosity());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
@@ -629,7 +628,6 @@ fn fixture_smask_with_bc_backdrop() -> Vec<u8> {
 
 /// IGNORED — `/SMask /BC` backdrop is not honoured.
 #[test]
-#[ignore = "HONEST_GAP_SMASK_BC"]
 fn smask_bc_backdrop_pre_fills_group() {
     let rgba = render_rgba(fixture_smask_with_bc_backdrop());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
@@ -665,7 +663,6 @@ fn fixture_smask_with_tr_transfer() -> Vec<u8> {
 
 /// IGNORED — `/SMask /TR` is not honoured.
 #[test]
-#[ignore = "HONEST_GAP_SMASK_TR"]
 fn smask_tr_transfer_squares_modulation() {
     let rgba = render_rgba(fixture_smask_with_tr_transfer());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);

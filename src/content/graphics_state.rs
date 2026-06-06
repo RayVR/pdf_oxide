@@ -279,6 +279,40 @@ pub struct GraphicsState {
     /// Overprint mode (ExtGState `/OPM`): 0 = standard, 1 = nonzero
     /// ("Adobe nonzero overprint"). PDF default `0`.
     pub overprint_mode: u8,
+
+    /// Active Form-XObject soft mask (§11.4.7). When `Some`, each paint
+    /// operator within the graphics-state scope has its destination
+    /// alpha modulated by the rasterised Form XObject's projected
+    /// values (alpha channel for /S /Alpha, BT.601 luminance for
+    /// /S /Luminosity). PDF default `None` (no soft mask).
+    pub smask: Option<SoftMaskForm>,
+}
+
+/// Subtype of a soft-mask (§11.4.7 / Table 144 `S` field). Alpha uses
+/// the rasterised Form XObject's alpha channel as the modulation
+/// source; Luminosity uses the BT.601 luma of its RGB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoftMaskSubtype {
+    /// `/S /Alpha` — modulation source is the form's alpha channel.
+    Alpha,
+    /// `/S /Luminosity` — modulation source is the form's BT.601 luma.
+    Luminosity,
+}
+
+/// Form-XObject soft-mask payload (§11.4.7).
+#[derive(Clone, Debug)]
+pub struct SoftMaskForm {
+    /// Reference to the Form XObject that supplies the mask geometry.
+    pub form_ref: crate::object::ObjectRef,
+    /// Alpha vs Luminosity projection.
+    pub subtype: SoftMaskSubtype,
+    /// Optional `/BC` backdrop colour. Length matches the Group
+    /// colour-space component count (1 for /DeviceGray, 3 for
+    /// /DeviceRGB, 4 for /DeviceCMYK). Per §11.4.7 honoured only for
+    /// /S /Luminosity.
+    pub backdrop: Option<Vec<f32>>,
+    /// Optional `/TR` transfer function (PDF Function object).
+    pub transfer: Option<crate::object::Object>,
 }
 
 impl GraphicsState {
@@ -327,6 +361,7 @@ impl GraphicsState {
             fill_overprint: false,           // §11.7.4 default
             stroke_overprint: false,         // §11.7.4 default
             overprint_mode: 0,               // §11.7.4 default (standard mode)
+            smask: None,                     // §11.4.7 default (no soft mask)
         }
     }
 

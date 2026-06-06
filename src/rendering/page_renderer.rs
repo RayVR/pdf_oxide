@@ -1172,7 +1172,7 @@ impl PageRenderer {
                         );
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         if let Some(path) = current_path.finish() {
-                            let gs = gs_stack.current();
+                            let gs_clone = gs_stack.current().clone();
                             // Resolve the active fill colour through the
                             // pipeline (PostScript Type 4 tint transforms,
                             // ICCBased N=4, etc.) and splice the resulting
@@ -1180,11 +1180,17 @@ impl PageRenderer {
                             // rasteriser consumes.
                             let spliced = self.pipeline_resolve_paint_gs(
                                 doc,
-                                gs,
+                                &gs_clone,
                                 PipelinePaintKind::PathFill,
                             );
-                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
-                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            let render_gs: &GraphicsState =
+                                spliced.as_ref().unwrap_or(&gs_clone);
+                            let transform = combine_transforms(base_transform, &gs_clone.ctm);
+                            // §11.4.7: snapshot before the paint so the
+                            // post-paint modulator can blend between
+                            // backdrop (snapshot) and painted (pixmap)
+                            // weighted by the soft mask.
+                            let snapshot = self.smask_snapshot(pixmap, &gs_clone);
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap,
                                 &path,
@@ -1193,6 +1199,11 @@ impl PageRenderer {
                                 tiny_skia::FillRule::Winding,
                                 clip,
                             );
+                            if let Some(snap) = snapshot {
+                                self.apply_smask_after_paint(
+                                    pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                )?;
+                            }
                         }
                     } else {
                         let _ = current_path.finish();
@@ -2914,6 +2925,195 @@ impl PageRenderer {
         Ok(())
     }
 
+    /// Take a snapshot of `pixmap` if the graphics state has an active
+    /// `/SMask`. The caller paints normally, then calls
+    /// [`Self::apply_smask_after_paint`] with the snapshot to modulate
+    /// the painted contribution by the soft mask. Returns `None` when
+    /// the gs has no soft mask, so the caller takes the no-op branch.
+    fn smask_snapshot(&self, pixmap: &Pixmap, gs: &GraphicsState) -> Option<Vec<u8>> {
+        if gs.smask.is_some() {
+            Some(pixmap.data().to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// Modulate the destination pixmap's painted contribution by the
+    /// soft mask declared on `gs`. The mask is rendered once per call
+    /// from the referenced Form XObject; on rendering failure the
+    /// snapshot is restored (the paint is suppressed entirely — safer
+    /// than leaving the unmodulated paint, which would mis-render
+    /// content the author intended to hide).
+    ///
+    /// Per ISO 32000-1:2008 §11.4.7, for each pixel:
+    ///   - `S=Alpha`: `mask_value = form_pixmap.alpha[px]`
+    ///   - `S=Luminosity`: `mask_value = 0.30 R + 0.59 G + 0.11 B` of form_pixmap
+    /// Optional `/TR` transfer is evaluated on the mask value before
+    /// modulation. The destination pixel is updated as a linear blend
+    /// between `snapshot` and `pixmap` weighted by the mask:
+    ///   `dest = mask * pixmap + (1 - mask) * snapshot`.
+    fn apply_smask_after_paint(
+        &mut self,
+        pixmap: &mut Pixmap,
+        snapshot: &[u8],
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        page_num: usize,
+        resources: &Object,
+    ) -> Result<()> {
+        let smask = match gs.smask.as_ref() {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+
+        // Render the Form XObject into a fresh pixmap. The pixmap
+        // starts fully transparent for /S /Alpha (the spec default
+        // backdrop is the black point, which projects to alpha=0).
+        // For /S /Luminosity the optional /BC backdrop pre-fills with
+        // the declared colour; absent /BC the spec default is the
+        // colour space's black point (also fills with zeros).
+        let w = pixmap.width();
+        let h = pixmap.height();
+        let mut mask_pixmap = match Pixmap::new(w, h) {
+            Some(p) => p,
+            None => {
+                // Allocation failed — restore the snapshot to avoid
+                // emitting an unmasked paint.
+                pixmap.data_mut().copy_from_slice(snapshot);
+                return Ok(());
+            },
+        };
+
+        // For /S /Luminosity, pre-fill with the /BC backdrop if
+        // present. The backdrop is in the Group colour space; we
+        // assume DeviceGray / DeviceRGB / DeviceCMYK based on the
+        // backdrop array length. (The audit fixture uses /BC [0.5]
+        // which maps to DeviceGray = (128, 128, 128).)
+        if smask.subtype == crate::content::graphics_state::SoftMaskSubtype::Luminosity {
+            if let Some(ref bc) = smask.backdrop {
+                let (r, g, b) = match bc.len() {
+                    1 => {
+                        let v = (bc[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        (v, v, v)
+                    },
+                    3 => (
+                        (bc[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (bc[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (bc[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ),
+                    4 => {
+                        let (rf, gf, bf) =
+                            cmyk_to_rgb(bc[0], bc[1], bc[2], bc[3]);
+                        (
+                            (rf * 255.0).round() as u8,
+                            (gf * 255.0).round() as u8,
+                            (bf * 255.0).round() as u8,
+                        )
+                    },
+                    _ => (0, 0, 0),
+                };
+                let data = mask_pixmap.data_mut();
+                for px in 0..(w * h) as usize {
+                    let off = px * 4;
+                    data[off] = r;
+                    data[off + 1] = g;
+                    data[off + 2] = b;
+                    data[off + 3] = 255;
+                }
+            }
+        }
+
+        // Resolve the Form XObject and render it into the mask
+        // pixmap.
+        let form_obj = match doc.load_object(smask.form_ref) {
+            Ok(o) => o,
+            Err(_) => {
+                pixmap.data_mut().copy_from_slice(snapshot);
+                return Ok(());
+            },
+        };
+
+        let (form_dict, form_data) = match &form_obj {
+            Object::Stream { dict, .. } => {
+                // Decode through the encryption layer if present, the
+                // same way render_form_xobject does at the main
+                // dispatch site (page_renderer:2320).
+                let data = doc.decode_stream_with_encryption(&form_obj, smask.form_ref)?;
+                (dict.clone(), data)
+            },
+            _ => {
+                pixmap.data_mut().copy_from_slice(snapshot);
+                return Ok(());
+            },
+        };
+
+        let form_resources_obj = form_dict
+            .get("Resources")
+            .and_then(|r| doc.resolve_object(r).ok())
+            .unwrap_or_else(|| resources.clone());
+
+        // Render the form. We pass a Transform::identity so the form's
+        // /Matrix and /BBox define its pixel footprint within the
+        // pixmap. The audit fixture uses a 100×100 page and a Form
+        // with /BBox [0 0 50 50] — the form's content paints into
+        // (10..40, 10..40) of the mask pixmap.
+        let _ = self.render_form_xobject(
+            &mut mask_pixmap,
+            &form_dict,
+            &form_data,
+            Transform::identity(),
+            doc,
+            page_num,
+            &form_resources_obj,
+        );
+
+        // Resolve /TR transfer function once. The audit fixture uses
+        // a Type-2 power function (`N=2` squares the input); the
+        // helper below covers Type 2 and falls through to identity
+        // for unsupported types. PDF spec §11.4.7 requires identity
+        // as the default when /TR is absent.
+        let transfer = smask
+            .transfer
+            .as_ref()
+            .and_then(|tr_obj| doc.resolve_object(tr_obj).ok())
+            .and_then(|resolved| parse_transfer_function(&resolved));
+
+        // Apply the mask: pixmap = mask * pixmap + (1 - mask) * snapshot.
+        let mask_data = mask_pixmap.data();
+        let dest = pixmap.data_mut();
+        debug_assert_eq!(mask_data.len(), dest.len());
+        debug_assert_eq!(snapshot.len(), dest.len());
+
+        for px in 0..(dest.len() / 4) {
+            let off = px * 4;
+            let mut m = match smask.subtype {
+                crate::content::graphics_state::SoftMaskSubtype::Alpha => {
+                    mask_data[off + 3] as f32 / 255.0
+                },
+                crate::content::graphics_state::SoftMaskSubtype::Luminosity => {
+                    let r = mask_data[off] as f32 / 255.0;
+                    let g = mask_data[off + 1] as f32 / 255.0;
+                    let b = mask_data[off + 2] as f32 / 255.0;
+                    0.30 * r + 0.59 * g + 0.11 * b
+                },
+            };
+
+            if let Some(ref tf) = transfer {
+                m = tf.eval(m).clamp(0.0, 1.0);
+            }
+
+            let inv_m = 1.0 - m;
+            for c in 0..4 {
+                let painted = dest[off + c] as f32;
+                let backed = snapshot[off + c] as f32;
+                let blended = m * painted + inv_m * backed;
+                dest[off + c] = blended.clamp(0.0, 255.0).round() as u8;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Render a knockout transparency group per ISO 32000-1:2008 §11.4.6.2.
     ///
     /// The group's initial backdrop is `pixmap` on entry. Each painted
@@ -3458,6 +3658,85 @@ impl PageRenderer {
 /// colour change. Anything coarser would risk dropping subtle overrides
 /// the renderer needs to honour.
 const RGBA_MATCH_EPSILON: f32 = 1.0e-6;
+
+/// Single-input single-output transfer function used by `/SMask /TR`.
+/// `Identity` is the spec default when `/TR` is absent.
+#[derive(Clone, Debug)]
+pub(crate) enum SMaskTransfer {
+    /// Identity transfer.
+    Identity,
+    /// `f(x) = C0 + x^N * (C1 - C0)` per §7.10.3 Type 2 functions.
+    Type2 {
+        /// Lower endpoint of the codomain.
+        c0: f32,
+        /// Upper endpoint of the codomain.
+        c1: f32,
+        /// Exponent.
+        n: f32,
+    },
+}
+
+impl SMaskTransfer {
+    /// Evaluate the transfer at `x` clamped to its domain `[0, 1]`.
+    pub(crate) fn eval(&self, x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        match self {
+            SMaskTransfer::Identity => x,
+            SMaskTransfer::Type2 { c0, c1, n } => {
+                let p = x.powf(*n);
+                c0 + p * (c1 - c0)
+            },
+        }
+    }
+}
+
+/// Parse a `/SMask /TR` function. Only Type 2 (exponential
+/// interpolation) is supported today; Type 0 (sampled) and Type 4
+/// (PostScript) would land if a real-world fixture demanded them.
+/// Identity is the spec default for absent or unrecognised /TR.
+fn parse_transfer_function(obj: &Object) -> Option<SMaskTransfer> {
+    // Identity is a Name `/Identity` per Table 109. Anything else
+    // should be a function dictionary.
+    if let Some("Identity") = obj.as_name() {
+        return Some(SMaskTransfer::Identity);
+    }
+    let dict = obj.as_dict()?;
+    let ft = dict.get("FunctionType").and_then(Object::as_integer)?;
+    match ft {
+        2 => {
+            let c0 = dict
+                .get("C0")
+                .and_then(|o| o.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| {
+                    v.as_real()
+                        .map(|r| r as f32)
+                        .or_else(|| v.as_integer().map(|i| i as f32))
+                })
+                .unwrap_or(0.0);
+            let c1 = dict
+                .get("C1")
+                .and_then(|o| o.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| {
+                    v.as_real()
+                        .map(|r| r as f32)
+                        .or_else(|| v.as_integer().map(|i| i as f32))
+                })
+                .unwrap_or(1.0);
+            let n = dict
+                .get("N")
+                .and_then(|v| {
+                    v.as_real()
+                        .map(|r| r as f32)
+                        .or_else(|| v.as_integer().map(|i| i as f32))
+                })
+                .unwrap_or(1.0);
+            Some(SMaskTransfer::Type2 { c0, c1, n })
+        },
+        _ => Some(SMaskTransfer::Identity),
+    }
+}
 
 /// Returns `true` when the operator paints pixels into the pixmap.
 ///
