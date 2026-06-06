@@ -992,35 +992,37 @@ fn fixture_blend_hue_red_over_blue() -> Vec<u8> {
     build_pdf(content, resources, &[])
 }
 
-/// IGNORED — Hue blend mode in PDF takes the **source's hue** and the
-/// **destination's saturation+luminosity** (§11.3.5.3 + §11.3.5.4).
-/// Source = red (H=0°, S=1.0, L=0.5). Destination = blue (H=240°,
-/// S=1.0, L=0.5). Output = (H=0°, S=1.0, L=0.5) = red (255, 0, 0).
-/// Without HSL composition the dispatch falls through to SourceOver
-/// which just paints the red rect on top — visually identical in this
-/// degenerate case! That degeneracy is why we use a Sat/Color/Lum
-/// pair below where the spec result diverges meaningfully from a plain
-/// over-paint.
+/// Hue blend mode in PDF takes the **source's hue** and the
+/// **destination's saturation + luminance** (§11.3.5.3 + §11.3.5.4).
+/// Source = red, Destination = blue. Per the spec luminance projection
+/// `Y = 0.30 R + 0.59 G + 0.11 B` we have Lum(Cb=blue) = 0.11 and
+/// Sat(Cb=blue) = 1. SetSat(Cs=red, 1) = red; SetLum(red, 0.11) shifts
+/// red by d=0.11-0.30=-0.19 then ClipColor scales toward the
+/// luminance, producing roughly (94, 0, 0): a dim red whose
+/// luminance matches the original blue. This is the spec-correct
+/// result; the earlier (255, 0, 0) expectation conflated HSL
+/// lightness with BT.601 luminance.
 #[test]
-#[ignore = "HONEST_GAP_NONSEP_BLEND_HUE"]
 fn blend_hue_red_source_paints_red_hue_over_blue() {
     let rgba = render_rgba(fixture_blend_hue_red_over_blue());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert_eq!(
-        r, 255,
-        "Hue: source=red, dest=blue, result hue=red, S=1, L=0.5 → R=255; \
+    // Spec result ≈ (94, 0, 0). Allow ±20 for AA edges.
+    assert!(
+        (r as i32 - 94).abs() <= 20,
+        "Hue: source-red over dest-blue under BT.601 luma should yield R≈94; \
          got ({r}, {g}, {b}). {}",
         HONEST_GAP_NONSEP_BLEND_HUE
     );
-    assert!(g < 10, "Hue: G≈0; got G={g}. {}", HONEST_GAP_NONSEP_BLEND_HUE);
-    assert!(b < 10, "Hue: B≈0; got B={b}. {}", HONEST_GAP_NONSEP_BLEND_HUE);
+    assert!(g < 20, "Hue: G≈0; got G={g}. {}", HONEST_GAP_NONSEP_BLEND_HUE);
+    assert!(b < 20, "Hue: B≈0; got B={b}. {}", HONEST_GAP_NONSEP_BLEND_HUE);
 }
 
 fn fixture_blend_saturation_grey_source_over_red() -> Vec<u8> {
-    // Source = mid-grey (R=G=B=128, H=undef, S=0, L=0.5). Per §11.3.5.3,
-    // Saturation takes destination's hue+luminosity with source's
-    // saturation. S=0 → desaturated → grey. Dest=red (H=0°, S=1, L=0.5)
-    // → applying S=0 → grey (128, 128, 128).
+    // Source = mid-grey (R=G=B=128, Sat=0). Per §11.3.5.3 Saturation
+    // takes destination's hue + luminance with source's saturation.
+    // Sat=0 desaturates the destination to its luminance level.
+    // Dest = red has Lum = 0.30; the result is a grey at intensity
+    // 0.30 → ~(77, 77, 77).
     let content = "1 0 0 rg\n0 0 100 100 re\nf\n\
                    /Sat gs\n\
                    0.5 g\n\
@@ -1029,20 +1031,29 @@ fn fixture_blend_saturation_grey_source_over_red() -> Vec<u8> {
     build_pdf(content, resources, &[])
 }
 
-/// IGNORED — Saturation: source grey (S=0) applied to red destination
-/// should desaturate the red to grey (~128, 128, 128). SourceOver
-/// fallback would paint the grey rect directly → also grey (128, 128,
-/// 128), so this probe also degenerates. The probe remains an explicit
-/// per-mode pin so the dispatch-side fix is observable when the
-/// divergent fixture lands.
+/// Saturation: source grey (Sat=0) applied to red destination should
+/// desaturate the red to a grey at the destination's BT.601 luminance.
+/// Lum(red) = 0.30 → result ≈ (77, 77, 77). The earlier (128, 128, 128)
+/// expectation conflated HSL midtone with BT.601 luma.
 #[test]
-#[ignore = "HONEST_GAP_NONSEP_BLEND_SATURATION"]
 fn blend_saturation_grey_source_desaturates_red_to_grey() {
     let rgba = render_rgba(fixture_blend_saturation_grey_source_over_red());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // Spec result ≈ (77, 77, 77). Channels should be near-equal
+    // (desaturated) and centered on ~77.
+    let max_diff = (r as i32 - g as i32)
+        .abs()
+        .max((r as i32 - b as i32).abs())
+        .max((g as i32 - b as i32).abs());
     assert!(
-        (r as i32 - 128).abs() < 30 && (g as i32 - 128).abs() < 30 && (b as i32 - 128).abs() < 30,
-        "Saturation: grey source desaturates red dest → ~(128, 128, 128); \
+        max_diff < 15,
+        "Saturation: grey source must desaturate red dest (channels near-equal); \
+         got ({r}, {g}, {b}). {}",
+        HONEST_GAP_NONSEP_BLEND_SATURATION
+    );
+    assert!(
+        (r as i32 - 77).abs() <= 15,
+        "Saturation: result intensity should track Lum(red)=0.30 → ~77; \
          got ({r}, {g}, {b}). {}",
         HONEST_GAP_NONSEP_BLEND_SATURATION
     );
@@ -1067,7 +1078,6 @@ fn fixture_blend_color_blue_source_over_red() -> Vec<u8> {
 /// remains an explicit per-mode pin so the dispatch-side fix is
 /// observable when the divergent fixture lands.
 #[test]
-#[ignore = "HONEST_GAP_NONSEP_BLEND_COLOR"]
 fn blend_color_blue_source_over_red_yields_blue() {
     let rgba = render_rgba(fixture_blend_color_blue_source_over_red());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
