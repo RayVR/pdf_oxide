@@ -16,6 +16,10 @@
 //! |-------------------------------------------------|-----------|--------------|-------------|---------------------------|
 //! | `/CA`, `/ca` ExtGState alpha                    | §11.3.4   | yes          | LIVE        | regression sentry         |
 //! | `/SMask` image-attached alpha                   | §11.4.7   | yes (image)  | LIVE        | regression sentry         |
+//! | `/SMask /S /Alpha` (Form XObject soft mask)     | §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_FORM_ALPHA |
+//! | `/SMask /S /Luminosity` (Form XObject soft mask)| §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_FORM_LUMINOSITY |
+//! | `/SMask /BC` backdrop colour                    | §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_BC       |
+//! | `/SMask /TR` transfer function                  | §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_TR       |
 //!
 //! ### Source citations for the inventory
 //!
@@ -27,6 +31,13 @@
 //!   `/SMask` stream is decoded as 8-bit greyscale and multiplied
 //!   into the image's destination alpha; this is the only SMask
 //!   path the composite renderer honours today.
+//! - `src/rendering/ext_gstate.rs:16` — explicit comment "TK / SMask
+//!   / AIS is intentionally ignored". The ExtGState parser does not
+//!   touch `/SMask`, so the Form-XObject SMask path defined in
+//!   §11.4.7 (set via `gs.SMask` on an ExtGState dict, with /S /Alpha
+//!   or /S /Luminosity, optional /BC, optional /TR) is unreachable
+//!   from the composite renderer end-to-end. The `#[ignore]`-marked
+//!   probes below pin the spec values for round 2 to lift.
 //!
 //! ## Reading the assertions
 //!
@@ -44,6 +55,57 @@
 
 use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
+
+// ===========================================================================
+// HONEST_GAP tracking constants
+// ===========================================================================
+//
+// Every `#[ignore]`-marked probe below references one of these constants
+// so a future engineer running `cargo test -- --ignored` or `grep -RI
+// 'HONEST_GAP_' tests/` sees the open feature gap by name. The next
+// round of work removes the `#[ignore]`, lands the implementation, and
+// the probe goes green.
+
+/// Form-XObject SMask with `/S /Alpha` is not parsed today; ExtGState
+/// dispatch in `src/rendering/ext_gstate.rs` explicitly drops the
+/// `/SMask` key. The composite render of a page that depends on a
+/// soft-mask Form XObject silently produces the wrong alpha.
+pub const HONEST_GAP_SMASK_FORM_ALPHA: &str =
+    "HONEST_GAP_SMASK_FORM_ALPHA: ExtGState /SMask /S /Alpha Form-XObject \
+     soft mask is not implemented; the composite path renders without the \
+     soft mask. Round 2 must implement parsing + Form-XObject rasterisation \
+     to an alpha mask, then a destination-alpha modulation.";
+
+/// Form-XObject SMask with `/S /Luminosity` (BT.601 grey of the
+/// rasterised group pixels) is not parsed today. §11.4.7 requires
+/// `Y = 0.2989·R + 0.5870·G + 0.1140·B` as the modulation source.
+pub const HONEST_GAP_SMASK_FORM_LUMINOSITY: &str =
+    "HONEST_GAP_SMASK_FORM_LUMINOSITY: ExtGState /SMask /S /Luminosity \
+     Form-XObject soft mask is not implemented; the composite path \
+     renders without the soft mask. Round 2 must implement \
+     BT.601 luminance projection of the rasterised group pixels into \
+     an alpha mask.";
+
+/// `/SMask /BC` declares the backdrop colour the soft-mask group is
+/// composited against before luminance projection. Without `/BC` the
+/// default is the colour space's black point. The current code reads
+/// neither.
+pub const HONEST_GAP_SMASK_BC: &str =
+    "HONEST_GAP_SMASK_BC: /SMask /BC backdrop colour is ignored. \
+     Round 2 must read /BC and pre-fill the soft-mask group's \
+     backdrop pixmap with the declared colour before rasterising the \
+     group content.";
+
+/// `/SMask /TR` is a transfer function (Type 0/2/3/4) applied to the
+/// modulation values before they reach the destination alpha. Without
+/// /TR the identity is used (correct default per §11.4.7). The current
+/// code does not parse /TR at all so a non-identity transfer is silently
+/// dropped.
+pub const HONEST_GAP_SMASK_TR: &str =
+    "HONEST_GAP_SMASK_TR: /SMask /TR transfer function is not parsed. \
+     Round 2 must wire the Function evaluator (already shipped for \
+     tint-transform paths) to evaluate /TR over the projected \
+     modulation values before they apply to destination alpha.";
 
 // ===========================================================================
 // Synthetic-PDF builder + helpers
@@ -334,5 +396,178 @@ fn image_smask_alpha_paints_diagonal_red_over_white() {
         "SMask diagonal: expected one of two diagonals to be red and the other white. \
          TL=({r_tl},{g_tl},{b_tl}) TR=({r_tr},{g_tr},{b_tr}) \
          BL=({r_bl},{g_bl},{b_bl}) BR=({r_br},{g_br},{b_br})"
+    );
+}
+
+// ===========================================================================
+// §11.4.7 Form-XObject SMask /S /Alpha — HONEST_GAP
+// ===========================================================================
+//
+// When `/SMask` on an ExtGState references a Form XObject (not an
+// image), the Form is rasterised independently, projected to a single
+// alpha plane per `/S` (= /Alpha or /Luminosity), and the resulting
+// alpha modulates destination alpha for subsequent paints. This entire
+// path is unimplemented today. The probe documents the gap; round 2
+// must lift the #[ignore].
+
+fn fixture_smask_form_alpha() -> Vec<u8> {
+    // ExtGState /Sm declares a /SMask Form XObject 5 0 R with /S /Alpha.
+    // The Form rasterises a smaller alpha-50% red square. Without
+    // Form-SMask support, the smask is ignored and the subsequent
+    // 60×60 black fill paints fully opaque black.
+    let form_content = "0.5 g\n10 10 30 30 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 50 50] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   0 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Alpha /G 5 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5])
+}
+
+/// IGNORED — `/SMask /S /Alpha` Form XObject is not parsed. With the
+/// gap closed, only the Form's painted rect should modulate alpha;
+/// outside the Form's BBox the destination must remain unaffected by
+/// the subsequent black fill. As-shipped, the black fill paints
+/// straight through.
+#[test]
+#[ignore = "HONEST_GAP_SMASK_FORM_ALPHA"]
+fn smask_form_alpha_modulates_destination_alpha() {
+    let rgba = render_rgba(fixture_smask_form_alpha());
+    // Sample outside the Form's BBox-implied region but inside the
+    // 60×60 black fill rect. With Form-SMask honoured, the
+    // destination alpha here is modulated by the form's 0 alpha
+    // (outside its BBox), so the white backdrop should show through.
+    let (r, g, b, _) = pixel_at(&rgba, 75, 25);
+    assert!(
+        r >= 230 && g >= 230 && b >= 230,
+        "outside Form-SMask BBox the destination must remain white \
+         (modulated alpha 0); got ({r}, {g}, {b}). {}",
+        HONEST_GAP_SMASK_FORM_ALPHA
+    );
+}
+
+// ===========================================================================
+// §11.4.7 Form-XObject SMask /S /Luminosity — HONEST_GAP
+// ===========================================================================
+
+fn fixture_smask_form_luminosity() -> Vec<u8> {
+    let form_content = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5])
+}
+
+/// IGNORED — `/SMask /S /Luminosity` Form XObject is not parsed. With
+/// the gap closed, the 50% grey form should project to BT.601 luminance
+/// Y = 127, and the red fill should be ~50% blended with the white
+/// backdrop. As-shipped, the red paints fully opaque.
+#[test]
+#[ignore = "HONEST_GAP_SMASK_FORM_LUMINOSITY"]
+fn smask_form_luminosity_modulates_destination_via_bt601() {
+    let rgba = render_rgba(fixture_smask_form_luminosity());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // 50%-grey Form → Y = 0.299*127 + 0.587*127 + 0.114*127 = 127.
+    // Modulated alpha 127/255 ≈ 0.498. Red over white at α=0.498:
+    //   r = 255 (red contributes 255*0.498 + 255*0.502 = 255)
+    //   g = 0*0.498 + 255*0.502 = 128
+    //   b = same as g
+    assert!(
+        r >= 240 && (g as i32 - 128).abs() <= 10 && (b as i32 - 128).abs() <= 10,
+        "luminosity Form-SMask must produce ~(255, 128, 128); got ({r}, {g}, {b}). {}",
+        HONEST_GAP_SMASK_FORM_LUMINOSITY
+    );
+}
+
+// ===========================================================================
+// §11.4.7 SMask /BC + /TR — HONEST_GAP probes
+// ===========================================================================
+
+fn fixture_smask_with_bc_backdrop() -> Vec<u8> {
+    // Form is fully transparent (no paint). With /BC declaring a 50%
+    // grey backdrop, the soft-mask group's pre-fill is 50% grey →
+    // luminance Y ≈ 127 → modulated alpha 127/255.
+    let form_content = "% empty form\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R /BC [0.5] >> >> >>";
+    build_pdf(content, resources, &[&obj_5])
+}
+
+/// IGNORED — `/SMask /BC` backdrop is not honoured.
+#[test]
+#[ignore = "HONEST_GAP_SMASK_BC"]
+fn smask_bc_backdrop_pre_fills_group() {
+    let rgba = render_rgba(fixture_smask_with_bc_backdrop());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // /BC [0.5] backdrop + empty group → projected to luminance 127 →
+    // modulated alpha ≈ 127/255. Red over white at α ≈ 0.498 → roughly
+    // (255, 128, 128).
+    assert!(
+        r >= 240 && (g as i32 - 128).abs() <= 12 && (b as i32 - 128).abs() <= 12,
+        "/SMask /BC 0.5 backdrop must pre-fill the group; got ({r}, {g}, {b}). {}",
+        HONEST_GAP_SMASK_BC
+    );
+}
+
+fn fixture_smask_with_tr_transfer() -> Vec<u8> {
+    // /TR Type 2 with N=2 squares the luminance: 50% grey (Y=0.5) →
+    // modulation 0.25 → red over white at α=0.25 yields (255, 191, 191).
+    let form_content = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let obj_6 = "6 0 obj\n<< /FunctionType 2 /Domain [0 1] /Range [0 1] /N 2 >>\nendobj\n";
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R /TR 6 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5, obj_6])
+}
+
+/// IGNORED — `/SMask /TR` is not honoured.
+#[test]
+#[ignore = "HONEST_GAP_SMASK_TR"]
+fn smask_tr_transfer_squares_modulation() {
+    let rgba = render_rgba(fixture_smask_with_tr_transfer());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // Y=0.5 squared via /TR N=2 → 0.25. Red over white at α=0.25:
+    //   r = 255
+    //   g = 0*0.25 + 255*0.75 ≈ 191
+    //   b ≈ 191
+    assert!(
+        r >= 240 && (g as i32 - 191).abs() <= 12 && (b as i32 - 191).abs() <= 12,
+        "/SMask /TR Type 2 N=2 must square luminance; got ({r}, {g}, {b}). {}",
+        HONEST_GAP_SMASK_TR
     );
 }
