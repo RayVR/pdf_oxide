@@ -569,7 +569,6 @@ fn qa_round2_smask_modulates_fill_stroke_combo() {
 
 /// IGNORED — SMask on `B*` (fill+stroke EvenOdd).
 #[test]
-#[ignore = "HONEST_GAP_SMASK_FILLSTROKE_EVENODD_NOT_WIRED"]
 fn qa_round2_smask_modulates_fill_stroke_evenodd_combo() {
     let pdf = fixture_smask_for_op("20 20 60 60 re\nB*\n");
     let rgba = render_rgba(pdf);
@@ -613,7 +612,6 @@ fn qa_round2_smask_modulates_close_fill_stroke_evenodd_combo() {
 
 /// IGNORED — SMask on `f*` (fill EvenOdd).
 #[test]
-#[ignore = "HONEST_GAP_SMASK_FILL_EVENODD_NOT_WIRED"]
 fn qa_round2_smask_modulates_fill_evenodd() {
     let pdf = fixture_smask_for_op("20 20 60 60 re\nf*\n");
     let rgba = render_rgba(pdf);
@@ -671,7 +669,6 @@ fn qa_round2_overprint_modulates_fill_stroke_combo() {
 }
 
 #[test]
-#[ignore = "HONEST_GAP_OVERPRINT_FILLSTROKE_EVENODD_NOT_WIRED"]
 fn qa_round2_overprint_modulates_fill_stroke_evenodd_combo() {
     let with_op = render_rgba(fixture_overprint_for_op("30 30 50 50 re\nB*\n"));
     let no_op = render_rgba(fixture_no_overprint_for_op("30 30 50 50 re\nB*\n"));
@@ -715,7 +712,6 @@ fn qa_round2_overprint_modulates_close_fill_stroke_evenodd_combo() {
 }
 
 #[test]
-#[ignore = "HONEST_GAP_OVERPRINT_FILL_EVENODD_NOT_WIRED"]
 fn qa_round2_overprint_modulates_fill_evenodd() {
     let with_op = render_rgba(fixture_overprint_for_op("30 30 50 50 re\nf*\n"));
     let no_op = render_rgba(fixture_no_overprint_for_op("30 30 50 50 re\nf*\n"));
