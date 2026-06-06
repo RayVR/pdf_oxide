@@ -31,6 +31,7 @@
 //! | Non-separable blend: Color                      | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_COLOR |
 //! | Non-separable blend: Luminosity                 | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_LUMINOSITY |
 //! | Overprint `/OP`, `/op` (composite path)         | §11.7.4   | NO (separation-only) | IGNORED | HONEST_GAP_OVERPRINT_COMPOSITE |
+//! | Compose-in-source-space then OutputIntent       | §11.4 + Annex G | NO (convert-first composite-after) | IGNORED | HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE |
 //!
 //! ### Source citations for the inventory
 //!
@@ -74,6 +75,14 @@
 //!   `gs.fill_overprint` / `gs.stroke_overprint`; an `/OP true` paint
 //!   composites identically to an `/OP false` paint when rendered to
 //!   the composite RGBA pixmap.
+//! - `src/rendering/resolution/color.rs:625-737` —
+//!   `cmyk_to_rgb_via_intent` runs at *paint resolution time*, i.e.
+//!   each `f`/`B` operator's CMYK fill is converted to RGB through the
+//!   OutputIntent profile, then handed to the rasteriser as an
+//!   already-RGB colour. Subsequent alpha compositing happens against
+//!   the destination *RGB* pixmap. Press accuracy requires the
+//!   composition to happen in CMYK (source space) before the
+//!   single CMYK→RGB conversion at display — see §11.4.3 and Annex G.
 //!
 //! ## Reading the assertions
 //!
@@ -192,6 +201,20 @@ pub const HONEST_GAP_OVERPRINT_COMPOSITE: &str =
      gs.stroke_overprint / gs.overprint_mode. Round 3 (per the plan) \
      wires composite overprint preview by routing through the \
      separation backend and re-compositing via the OutputIntent ICC.";
+
+/// Per §11.4 / Annex G the correct architecture composes in source
+/// colour space first, then converts via the OutputIntent profile at
+/// the rasterised-pixel level. Today the resolver converts each paint's
+/// CMYK to RGB through the OutputIntent profile *before* the paint
+/// reaches the pixmap, and then alpha compositing happens in
+/// destination RGB. This is observable when the CMYK→RGB transform is
+/// nonlinear: `convert(α·A + (1-α)·B) ≠ α·convert(A) + (1-α)·convert(B)`.
+pub const HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE: &str =
+    "HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE: the composite path \
+     converts each CMYK paint via OutputIntent ICC at paint-resolution \
+     time, then composites the resulting RGB. Press accuracy needs the \
+     reverse order. Round 2 must defer CMYK→RGB until after alpha \
+     compositing in source space.";
 
 // ===========================================================================
 // Synthetic-PDF builder + helpers
@@ -1148,5 +1171,94 @@ fn overprint_composite_overlap_differs_from_no_overprint() {
          got delta {delta:.1} between ({r_op:.0},{g_op:.0},{b_op:.0}) and \
          ({r_no:.0},{g_no:.0},{b_no:.0}). {}",
         HONEST_GAP_OVERPRINT_COMPOSITE
+    );
+}
+
+// ===========================================================================
+// §11.4 + Annex G precedence — compose THEN convert via OutputIntent
+// ===========================================================================
+//
+// The structural HONEST_GAP probe documents the convert-first
+// composite-after order in `cmyk_to_rgb_via_intent`
+// (src/rendering/resolution/color.rs:625-737). Each CMYK paint is
+// resolved to RGB at paint-resolution time, then composited in RGB.
+// Press-correct order is the reverse: compose CMYK in source space
+// first, then run a single CMYK→RGB conversion via the OutputIntent
+// profile per final-display pixel.
+//
+// The constant-CLUT OutputIntent profile from
+// `test_render_output_intent.rs` happens to make convert-first and
+// composite-first colorimetrically identical (every CMYK input maps
+// to the same grey). To surface the divergence we need a non-linear
+// OutputIntent — which round 2 builds. For round 1 we pin the
+// *additive-clamp* fallback (no OutputIntent declared) and observe
+// the convert-first marker: each CMYK paint resolves to its own
+// additive-clamp RGB before alpha compositing reaches the pixmap.
+// Round 2's composite-first rewrite changes the per-paint resolution
+// model and surfaces here as a different overlap byte triple.
+
+fn fixture_outputintent_then_transparency() -> Vec<u8> {
+    // CMYK(0.5, 0, 0, 0) opaque background rect + CMYK(0, 0, 0.5, 0)
+    // at /ca 0.5 overlapping rect. The two paints overlap in the
+    // PDF (30..70, 30..70) region.
+    let content = "0.5 0 0 0 k\n10 10 60 60 re\nf\n\
+                   /Half gs\n\
+                   0 0 0.5 0 k\n\
+                   30 30 60 60 re\nf\n";
+    let resources = "/ExtGState << /Half << /Type /ExtGState /ca 0.5 >> >>";
+    build_pdf(content, resources, &[])
+}
+
+/// IGNORED — pins the convert-then-composite order. As-shipped, each
+/// CMYK paint resolves to per-paint additive-clamp RGB BEFORE alpha
+/// compositing reaches the pixmap. In the overlap region the
+/// composite is therefore `over` of two already-converted RGB colours,
+/// not the (correct) `over` of two CMYK quadruples followed by a single
+/// CMYK→RGB conversion. The non-overlap region of the lower paint
+/// (CMYK 0.5, 0, 0, 0 → additive-clamp RGB (128, 255, 255)) lets us
+/// observe the per-paint conversion happened. Round 2 must defer
+/// CMYK→RGB until after compositing.
+#[test]
+#[ignore = "HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE"]
+fn outputintent_then_transparency_composite_before_convert() {
+    let rgba = render_rgba(fixture_outputintent_then_transparency());
+    // Sample inside lower paint only (no upper-paint overlap).
+    // CMYK(0.5, 0, 0, 0) additive-clamp → RGB(128, 255, 255) — cyan.
+    // PDF rect (10, 10, 60, 60); upper rect starts at PDF y=30, x=30.
+    // PDF (15, 15) is firmly inside the lower-only region.
+    // PDF y=15 → image y=85.
+    let (r, g, b, _) = pixel_at(&rgba, 15, 85);
+    // As-shipped: convert-first means we see the additive-clamp
+    // (128, 255, 255) here regardless of any overlap.
+    assert!(
+        (r as i32 - 128).abs() <= 12 && g >= 240 && b >= 240,
+        "lower-paint-only region must show per-paint additive-clamp \
+         (128, 255, 255); got ({r}, {g}, {b}). When round 2 lands \
+         composite-first this region's exact value is unchanged \
+         (no overlap), so this probe is *not* what surfaces the round-2 \
+         architectural change. The probe pins the *current* order and \
+         is the round-2 fix target via a non-overlap-changing fixture \
+         pair. {}",
+        HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE
+    );
+
+    // Sample inside the overlap. The current order:
+    //   lower paint → RGB(128, 255, 255), opaque
+    //   upper paint → RGB(255, 255, 128) per additive-clamp
+    //   over-blend at α=0.5 → ((128+255)/2, 255, (255+128)/2) =
+    //     (191, 255, 191)
+    // The composite-first order would:
+    //   composite CMYK first: (0.25, 0, 0.25, 0)
+    //   then additive-clamp → (191, 255, 191) too (because the
+    //   additive-clamp is *also* linear in CMYK). Need a non-linear
+    //   OutputIntent ICC to surface the divergence. Round 2 lands the
+    //   ICC fixture; the probe currently pins only the per-paint
+    //   value.
+    let (r2, g2, b2, _) = pixel_at(&rgba, 50, 50);
+    assert!(
+        (r2 as i32 - 191).abs() <= 12 && g2 >= 240 && (b2 as i32 - 191).abs() <= 12,
+        "overlap must show the linearly-composited per-paint value \
+         (191, 255, 191) under the current convert-first order; \
+         got ({r2}, {g2}, {b2})"
     );
 }
