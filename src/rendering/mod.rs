@@ -40,9 +40,9 @@ pub(crate) mod separation_renderer;
 /// hold the §11.4 transparency-composite state during a page render.
 ///
 /// Public so integration tests can drive the §11.7.4.2 dispatch
-/// classifier ([`sidecar::BlendModeClass`]) directly without
-/// going through a rendered pixmap. Internal types
-/// ([`sidecar::CmykSidecar`]) remain `pub(crate)`.
+/// classifier ([`crate::rendering::sidecar::BlendModeClass`]) directly
+/// without going through a rendered pixmap. Internal storage types
+/// (`CmykSidecar`) remain `pub(crate)`.
 pub mod sidecar;
 mod text_rasterizer;
 

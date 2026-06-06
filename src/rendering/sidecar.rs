@@ -63,7 +63,8 @@
 //! `/Luminosity`, §11.3.5.3) AND the two separable-but-non-white-
 //! preserving modes (`/Difference`, `/Exclusion`, §11.3.5.2 Note 2)
 //! all trigger `/Normal` substitution on spot lanes. This is encoded
-//! by [`BlendModeClass`] below.
+//! by [`BlendModeClass`](crate::rendering::sidecar::BlendModeClass)
+//! below.
 //!
 //! Process lanes always honour the requested blend mode; for non-sep
 //! modes the §11.3.5.3 CMYK projection (complement `CMY → RGB`,
@@ -74,7 +75,8 @@
 //!
 //! # Storage layout
 //!
-//! [`CmykSidecar`] owns two separate buffers:
+//! The `CmykSidecar` storage type (crate-private; see the type
+//! definition below) owns two separate buffers:
 //!
 //! - `cmyk`: a packed `4·w·h` byte plane with the four `DeviceCMYK`
 //!   channels in `(C, M, Y, K)` order, row-major, top-left origin.
@@ -164,8 +166,8 @@ impl BlendModeClass {
     ///
     /// Per ISO 32000-1 §11.6.3, an unknown blend mode name shall fall
     /// back to `/Normal`. We honour that by classifying unknown names
-    /// as [`SeparableWhitePreserving`] — the same class `/Normal`
-    /// itself belongs to. This matches the existing
+    /// as [`BlendModeClass::SeparableWhitePreserving`] — the same
+    /// class `/Normal` itself belongs to. This matches the existing
     /// `pdf_blend_mode_to_skia` fallback in `src/rendering/mod.rs`.
     pub fn from_name(name: &str) -> Self {
         match name {
@@ -181,9 +183,10 @@ impl BlendModeClass {
         }
     }
 
-    /// Process-lane dispatch decision. Always [`UseRequested`] per
-    /// §11.7.4.2: "the current blend mode parameter … shall always
-    /// apply to process colorants".
+    /// Process-lane dispatch decision. Always
+    /// [`ProcessBlendDispatch::UseRequested`] per §11.7.4.2: "the
+    /// current blend mode parameter … shall always apply to process
+    /// colorants".
     pub fn process_dispatch(&self) -> ProcessBlendDispatch {
         ProcessBlendDispatch::UseRequested
     }
