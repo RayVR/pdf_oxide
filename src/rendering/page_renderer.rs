@@ -1510,7 +1510,15 @@ impl PageRenderer {
                             // that clone — no operator-arm-side clone
                             // needed.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
-                            self.text_rasterizer.render_text(
+                            // §11.4.7 + §11.7.4 + §11.4 cycle: text-
+                            // showing is a fill-side paint (modulated by
+                            // Tr render mode for stroke). One snapshot
+                            // per Tj call brackets the whole string.
+                            let smask_snap = self.smask_snapshot(pixmap, gs);
+                            let overprint_snap = self.overprint_snapshot(pixmap, gs, true);
+                            let cmyk_compose_snap =
+                                self.cmyk_compose_snapshot(pixmap, gs, doc, true);
+                            let adv = self.text_rasterizer.render_text(
                                 pixmap,
                                 text,
                                 transform,
@@ -1520,7 +1528,36 @@ impl PageRenderer {
                                 doc,
                                 clip,
                                 &self.fonts,
-                            )?
+                            )?;
+                            let gs_for_apply = gs_stack.current().clone();
+                            if let Some(snap) = cmyk_compose_snap {
+                                self.apply_cmyk_compose_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    doc,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = overprint_snap {
+                                self.apply_overprint_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = smask_snap {
+                                self.apply_smask_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                )?;
+                            }
+                            adv
                         } else {
                             self.text_rasterizer.measure_text(text, gs, &self.fonts)
                         };
@@ -1557,7 +1594,11 @@ impl PageRenderer {
                             // on the prior colour-setting ops, so the resolve
                             // happens here, not inside `T*`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
-                            self.text_rasterizer.render_text(
+                            let smask_snap = self.smask_snapshot(pixmap, gs);
+                            let overprint_snap = self.overprint_snapshot(pixmap, gs, true);
+                            let cmyk_compose_snap =
+                                self.cmyk_compose_snapshot(pixmap, gs, doc, true);
+                            let adv = self.text_rasterizer.render_text(
                                 pixmap,
                                 text,
                                 transform,
@@ -1567,7 +1608,36 @@ impl PageRenderer {
                                 doc,
                                 clip,
                                 &self.fonts,
-                            )?
+                            )?;
+                            let gs_for_apply = gs_stack.current().clone();
+                            if let Some(snap) = cmyk_compose_snap {
+                                self.apply_cmyk_compose_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    doc,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = overprint_snap {
+                                self.apply_overprint_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = smask_snap {
+                                self.apply_smask_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                )?;
+                            }
+                            adv
                         } else {
                             self.text_rasterizer.measure_text(text, gs, &self.fonts)
                         };
@@ -1600,7 +1670,11 @@ impl PageRenderer {
                             // calls so the colour propagates without an
                             // operator-arm-side clone of `gs`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
-                            self.text_rasterizer.render_tj_array(
+                            let smask_snap = self.smask_snapshot(pixmap, gs);
+                            let overprint_snap = self.overprint_snapshot(pixmap, gs, true);
+                            let cmyk_compose_snap =
+                                self.cmyk_compose_snapshot(pixmap, gs, doc, true);
+                            let adv = self.text_rasterizer.render_tj_array(
                                 pixmap,
                                 array,
                                 transform,
@@ -1610,7 +1684,36 @@ impl PageRenderer {
                                 doc,
                                 clip,
                                 &self.fonts,
-                            )?
+                            )?;
+                            let gs_for_apply = gs_stack.current().clone();
+                            if let Some(snap) = cmyk_compose_snap {
+                                self.apply_cmyk_compose_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    doc,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = overprint_snap {
+                                self.apply_overprint_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = smask_snap {
+                                self.apply_smask_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                )?;
+                            }
+                            adv
                         } else {
                             self.text_rasterizer
                                 .measure_tj_array(array, gs, &self.fonts)
@@ -1656,7 +1759,11 @@ impl PageRenderer {
                             // happens immediately before painting just like
                             // in `Tj` / `'`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
-                            self.text_rasterizer.render_text(
+                            let smask_snap = self.smask_snapshot(pixmap, gs);
+                            let overprint_snap = self.overprint_snapshot(pixmap, gs, true);
+                            let cmyk_compose_snap =
+                                self.cmyk_compose_snapshot(pixmap, gs, doc, true);
+                            let adv = self.text_rasterizer.render_text(
                                 pixmap,
                                 text,
                                 transform,
@@ -1666,7 +1773,36 @@ impl PageRenderer {
                                 doc,
                                 clip,
                                 &self.fonts,
-                            )?
+                            )?;
+                            let gs_for_apply = gs_stack.current().clone();
+                            if let Some(snap) = cmyk_compose_snap {
+                                self.apply_cmyk_compose_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    doc,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = overprint_snap {
+                                self.apply_overprint_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = smask_snap {
+                                self.apply_smask_after_paint(
+                                    pixmap,
+                                    &snap,
+                                    &gs_for_apply,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                )?;
+                            }
+                            adv
                         } else {
                             self.text_rasterizer.measure_text(text, gs, &self.fonts)
                         };
@@ -1680,13 +1816,40 @@ impl PageRenderer {
                 // XObject (images) — suppressed when inside an excluded OCG layer
                 Operator::Do { name } => {
                     if excluded_layer_depth == 0 {
-                        let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
+                        let gs_clone = gs_stack.current().clone();
+                        let transform = combine_transforms(base_transform, &gs_clone.ctm);
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         log::debug!("Do: rendering XObject '{}'", name);
+                        // §11.4.7 + §11.7.4 + §11.4 cycle: the entire
+                        // XObject paint (Form or Image) sits inside the
+                        // snapshot bracket so a /SMask attached via
+                        // ExtGState modulates the cumulative
+                        // contribution. Image XObjects always behave as
+                        // fill-side paints; Form XObjects honour their
+                        // own internal ExtGState changes (the snapshot
+                        // captures the page-level state, the Form runs
+                        // recursively, and the apply blends the Form's
+                        // contribution against the captured backdrop).
+                        let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                        let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
+                        let cmyk_compose_snap =
+                            self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
                         self.render_xobject(
-                            pixmap, name, transform, gs, resources, doc, page_num, clip,
+                            pixmap, name, transform, &gs_clone, resources, doc, page_num, clip,
                         )?;
+                        if let Some(snap) = cmyk_compose_snap {
+                            self.apply_cmyk_compose_after_paint(
+                                pixmap, &snap, &gs_clone, doc, true,
+                            );
+                        }
+                        if let Some(snap) = overprint_snap {
+                            self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
+                        }
+                        if let Some(snap) = smask_snap {
+                            self.apply_smask_after_paint(
+                                pixmap, &snap, &gs_clone, doc, page_num, resources,
+                            )?;
+                        }
                     }
                 },
 
@@ -1793,10 +1956,39 @@ impl PageRenderer {
                 // Shading (gradient) operator — suppressed when inside excluded layer
                 Operator::PaintShading { name } => {
                     if excluded_layer_depth == 0 {
-                        let gs = gs_stack.current();
-                        let transform = combine_transforms(base_transform, &gs.ctm);
+                        let gs_clone = gs_stack.current().clone();
+                        let transform = combine_transforms(base_transform, &gs_clone.ctm);
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        self.render_shading(pixmap, name, transform, gs, resources, doc, clip)?;
+                        // §11.4.7 + §11.7.4 + §11.4 cycle: shading is
+                        // a fill-side paint, so the snapshot/apply
+                        // cadence mirrors the path-Fill arm. The
+                        // overprint and compose-first paths short-
+                        // circuit when the active fill colour is not
+                        // CMYK (the shading paint's per-pixel colour
+                        // comes from the gradient interpolator, not
+                        // `gs.fill_color_cmyk`), so they only fire when
+                        // the page set a CMYK fill before invoking
+                        // `sh`.
+                        let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                        let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
+                        let cmyk_compose_snap =
+                            self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
+                        self.render_shading(
+                            pixmap, name, transform, &gs_clone, resources, doc, clip,
+                        )?;
+                        if let Some(snap) = cmyk_compose_snap {
+                            self.apply_cmyk_compose_after_paint(
+                                pixmap, &snap, &gs_clone, doc, true,
+                            );
+                        }
+                        if let Some(snap) = overprint_snap {
+                            self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
+                        }
+                        if let Some(snap) = smask_snap {
+                            self.apply_smask_after_paint(
+                                pixmap, &snap, &gs_clone, doc, page_num, resources,
+                            )?;
+                        }
                     }
                 },
 
