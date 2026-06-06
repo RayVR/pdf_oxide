@@ -307,6 +307,29 @@ impl CmykSidecar {
         }
         Some(&self.spots[start..end])
     }
+
+    /// Mutable slice over the tint plane for spot ink `index`.
+    /// Returns `None` when `index >= spot_count()`. The per-paint spot
+    /// mirror writes through this accessor to compose new tints
+    /// against the backdrop.
+    pub(crate) fn spot_plane_mut(&mut self, index: usize) -> Option<&mut [u8]> {
+        let (w, h) = self.dims;
+        let plane_size = (w as usize) * (h as usize);
+        let start = index.checked_mul(plane_size)?;
+        let end = start.checked_add(plane_size)?;
+        if end > self.spots.len() {
+            return None;
+        }
+        Some(&mut self.spots[start..end])
+    }
+
+    /// Find the spot plane index for an ink name, or `None` when the
+    /// name was not discovered on the page (the device has no plate
+    /// for it per §8.6.6.3 — the composite path's alternate colour
+    /// space then provides the approximation on the visible pixmap).
+    pub(crate) fn spot_index(&self, ink: &str) -> Option<usize> {
+        self.spot_names.iter().position(|n| n == ink)
+    }
 }
 
 /// Discover the set of `/Separation` and `/DeviceN` spot colorants
@@ -495,7 +518,7 @@ fn bm_is_non_normal(bm: &Object) -> bool {
 /// §11.3.5 enumerates (separable §11.3.5.2 or non-separable §11.3.5.3).
 /// `/Normal` counts as recognised. Unknown names are NOT recognised and
 /// trigger the §11.6.3 fallback at the call site.
-fn is_recognised_mode(name: &str) -> bool {
+pub(crate) fn is_recognised_mode(name: &str) -> bool {
     matches!(
         name,
         "Normal"
@@ -521,6 +544,200 @@ fn is_recognised_mode(name: &str) -> bool {
 /// transparency trigger fires only on this set.
 fn is_non_normal_mode(name: &str) -> bool {
     is_recognised_mode(name) && name != "Normal"
+}
+
+/// Evaluate the §11.3.5.2 separable blend function `B(c_b, c_s)` for
+/// one component. The PDF spec defines colour components as additive
+/// values in `[0, 1]`. For SUBTRACTIVE-tint sidecar lanes (CMYK, spot),
+/// the call site converts subtractive tint `t` to additive `1 - t`
+/// before evaluating, then converts back. This helper does not do that
+/// conversion — it operates on whatever component representation the
+/// caller passes in, per ISO 32000-1 §11.3.5.2 Table 136.
+///
+/// Returns `c_s` unchanged when `mode` is not recognised (the §11.6.3
+/// "unknown name → Normal" fallback), and returns `c_s` for `/Normal`.
+///
+/// Non-separable modes (`/Hue`, `/Saturation`, `/Color`, `/Luminosity`)
+/// return `c_s` here because they cannot be evaluated component-wise —
+/// the caller must dispatch on the BlendModeClass and route non-sep
+/// modes through the §11.3.5.3 RGB projection helper. Spot lanes never
+/// reach the non-sep formulas under §11.7.4.2 (the BM is substituted
+/// to /Normal before this function is called) so the spot mirror's
+/// non-sep return is unreachable in practice.
+pub(crate) fn separable_blend(mode: &str, c_b: f32, c_s: f32) -> f32 {
+    // ISO 32000-1 §11.3.5.2 Table 136.
+    let c_b = c_b.clamp(0.0, 1.0);
+    let c_s = c_s.clamp(0.0, 1.0);
+    match mode {
+        "Normal" => c_s,
+        "Multiply" => c_b * c_s,
+        "Screen" => c_b + c_s - c_b * c_s,
+        "Overlay" => {
+            // HardLight(c_s, c_b) — symmetric swap per Table 136.
+            hard_light_component(c_s, c_b)
+        },
+        "Darken" => c_b.min(c_s),
+        "Lighten" => c_b.max(c_s),
+        "ColorDodge" => {
+            if c_s >= 1.0 {
+                1.0
+            } else {
+                (c_b / (1.0 - c_s)).min(1.0)
+            }
+        },
+        "ColorBurn" => {
+            if c_s <= 0.0 {
+                0.0
+            } else {
+                1.0 - ((1.0 - c_b) / c_s).min(1.0)
+            }
+        },
+        "HardLight" => hard_light_component(c_b, c_s),
+        "SoftLight" => soft_light_component(c_b, c_s),
+        "Difference" => (c_b - c_s).abs(),
+        "Exclusion" => c_b + c_s - 2.0 * c_b * c_s,
+        // §11.6.3 fallback: unknown / non-separable names render as
+        // /Normal at the call site after dispatch routing. Returning
+        // c_s here matches that policy if a caller reaches us with an
+        // unexpected name.
+        _ => c_s,
+    }
+}
+
+fn hard_light_component(c_b: f32, c_s: f32) -> f32 {
+    if c_s <= 0.5 {
+        // Multiply(c_b, 2*c_s)
+        c_b * 2.0 * c_s
+    } else {
+        // Screen(c_b, 2*c_s - 1)
+        let twin = 2.0 * c_s - 1.0;
+        c_b + twin - c_b * twin
+    }
+}
+
+fn soft_light_component(c_b: f32, c_s: f32) -> f32 {
+    // §11.3.5.2 Table 136 SoftLight: piecewise on c_s.
+    if c_s <= 0.5 {
+        c_b - (1.0 - 2.0 * c_s) * c_b * (1.0 - c_b)
+    } else {
+        let d = if c_b <= 0.25 {
+            ((16.0 * c_b - 12.0) * c_b + 4.0) * c_b
+        } else {
+            c_b.sqrt()
+        };
+        c_b + (2.0 * c_s - 1.0) * (d - c_b)
+    }
+}
+
+/// Extract the active spot ink names + tint values from a resolved
+/// `Separation` / `DeviceN` colour-space array paired with the
+/// operator's component values.
+///
+/// Per ISO 32000-1 §8.6.6.4 / §8.6.6.5:
+/// - `Separation` arrays carry one colorant name and one tint. The
+///   reserved names `/All` and `/None` are surfaced verbatim so the
+///   §8.6.6.3 dispatch at the call site can branch on them.
+/// - `DeviceN` arrays carry an N-name colorants array. If a `/Process`
+///   attributes dict declares any of those names as process channels,
+///   those names are filtered out here per §8.6.6.5 — they ride the
+///   CMYK plane, not a spot lane.
+///
+/// Returns an empty vec when:
+/// - the array is malformed (no type tag, no name array),
+/// - the type tag is not `Separation` or `DeviceN`,
+/// - the components count does not match the colorant count.
+///
+/// The returned ordering matches the source declaration order so the
+/// caller can pair component-index N with colorant-index N.
+pub(crate) fn extract_paint_spot_inks(
+    space: &Object,
+    components: &[f32],
+    doc: &PdfDocument,
+) -> Vec<(String, f32)> {
+    let arr = match space.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let type_name = match arr.first().and_then(Object::as_name) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let deref =
+        |obj: &Object| -> Object { doc.resolve_object(obj).unwrap_or_else(|_| obj.clone()) };
+
+    match type_name {
+        "Separation" => {
+            if components.is_empty() {
+                return Vec::new();
+            }
+            let name_obj = match arr.get(1) {
+                Some(o) => deref(o),
+                None => return Vec::new(),
+            };
+            let Some(ink) = name_obj.as_name() else {
+                return Vec::new();
+            };
+            // /All and /None are surfaced verbatim; the call site
+            // branches on them per §8.6.6.3 (paint every plate at the
+            // tint, or skip every plate).
+            vec![(ink.to_string(), components[0])]
+        },
+        "DeviceN" => {
+            let names_obj = match arr.get(1) {
+                Some(o) => deref(o),
+                None => return Vec::new(),
+            };
+            let Some(names) = names_obj.as_array() else {
+                return Vec::new();
+            };
+            // ISO 32000-1 §8.6.6.5 / Table 73: the optional 5th element
+            // is the attributes dictionary. When its `/Process`
+            // sub-dictionary declares a `/Components` array, those
+            // names are PROCESS colorants. Filter them out so the spot
+            // lane mirror does not write spot lanes for /Cyan,
+            // /Magenta, /Yellow, /Black on a /DeviceN /Process source.
+            let process_names: std::collections::HashSet<String> = arr
+                .get(4)
+                .map(deref)
+                .as_ref()
+                .and_then(Object::as_dict)
+                .and_then(|attrs| attrs.get("Process"))
+                .map(deref)
+                .as_ref()
+                .and_then(Object::as_dict)
+                .and_then(|proc_dict| proc_dict.get("Components"))
+                .map(deref)
+                .as_ref()
+                .and_then(Object::as_array)
+                .map(|comps| {
+                    comps
+                        .iter()
+                        .filter_map(|o| o.as_name().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut out = Vec::with_capacity(names.len());
+            for (i, ink_obj) in names.iter().enumerate() {
+                let Some(ink) = ink_obj.as_name() else {
+                    continue;
+                };
+                if ink == "All" || ink == "None" {
+                    continue;
+                }
+                if process_names.contains(ink) {
+                    continue;
+                }
+                // Pair the colorant with its index-matched component.
+                // If components vector is short the source is malformed
+                // — pin tint 0 (no ink) for the missing position.
+                let tint = components.get(i).copied().unwrap_or(0.0);
+                out.push((ink.to_string(), tint));
+            }
+            out
+        },
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]

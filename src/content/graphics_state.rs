@@ -286,6 +286,27 @@ pub struct GraphicsState {
     /// values (alpha channel for /S /Alpha, BT.601 luminance for
     /// /S /Luminosity). PDF default `None` (no soft mask).
     pub smask: Option<SoftMaskForm>,
+
+    /// Active spot ink names paired with their tint values for the most
+    /// recent fill paint. Populated by the SetFillColor / SetFillColorN
+    /// dispatchers when the active fill colour space is `/Separation`
+    /// (ISO 32000-1 §8.6.6.4) or `/DeviceN` (§8.6.6.5). Each tuple is
+    /// `(ink_name, subtractive_tint)` matching the source colorant
+    /// declaration order; `/All` and `/None` are surfaced verbatim so
+    /// the §8.6.6.3 reserved-name branch in the renderer can dispatch
+    /// on them. Empty Vec means "no explicit spot ink active" — i.e.
+    /// the fill came from Device-family / CIE-based / Indexed source.
+    ///
+    /// The sidecar's per-paint spot-lane mirror reads this field at
+    /// paint time to decide which lanes to write under the §11.7.3
+    /// "every object paints every component" + §11.7.4.2 BM split
+    /// rules. Process colorants named by a DeviceN /Process attrs dict
+    /// (§8.6.6.5) are NOT surfaced here — they ride the CMYK plane
+    /// alongside the spot lanes.
+    pub fill_spot_inks: Vec<(String, f32)>,
+    /// Same as [`Self::fill_spot_inks`], for the stroke side
+    /// (`SetStrokeColorN`, §8.6.5.1).
+    pub stroke_spot_inks: Vec<(String, f32)>,
 }
 
 /// Subtype of a soft-mask (§11.4.7 / Table 144 `S` field). Alpha uses
@@ -362,6 +383,8 @@ impl GraphicsState {
             stroke_overprint: false,         // §11.7.4 default
             overprint_mode: 0,               // §11.7.4 default (standard mode)
             smask: None,                     // §11.4.7 default (no soft mask)
+            fill_spot_inks: Vec::new(),      // no spot source yet
+            stroke_spot_inks: Vec::new(),    // no spot source yet
         }
     }
 

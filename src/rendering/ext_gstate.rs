@@ -106,11 +106,19 @@ pub(crate) fn parse_ext_g_state_inner(
             .or_else(|| ca_upper.as_integer().map(|v| v as f32));
     }
     if let Some(bm) = state_dict.get("BM") {
+        // ISO 32000-1 §11.3.5 + §11.6.3: `/BM` may be a name OR an array of
+        // names. For an array, "the first name that names a blend mode
+        // supported by the conforming reader shall be used". Unrecognised
+        // names fall back to `/Normal` per §11.6.3. The classifier in
+        // `crate::rendering::sidecar::is_recognised_mode` enumerates every
+        // standard mode from §11.3.5.2 + §11.3.5.3; we share that list so
+        // detection and dispatch stay in lockstep.
         let mode = match bm {
             Object::Name(n) => n.clone(),
             Object::Array(arr) => arr
-                .first()
-                .and_then(|o| o.as_name())
+                .iter()
+                .filter_map(Object::as_name)
+                .find(|name| crate::rendering::sidecar::is_recognised_mode(name))
                 .unwrap_or("Normal")
                 .to_string(),
             _ => "Normal".to_string(),
