@@ -3443,18 +3443,16 @@ impl PageRenderer {
     /// the paint side carries a CMYK colour. The plane mirror runs at
     /// every CMYK paint (opaque or transparent) so the sidecar stays
     /// in sync with the page's plate state. The mirror helper
-    /// [`Self::mirror_cmyk_paint_into_sidecar`] consumes the snapshot
-    /// + post-paint pixmap to identify the painted region and writes
-    /// updated CMYK quadruples at those pixels.
+    /// `mirror_cmyk_paint_into_sidecar` consumes the snapshot + post-
+    /// paint pixmap to identify the painted region and writes updated
+    /// CMYK quadruples at those pixels.
     fn cmyk_sidecar_snapshot(
         &self,
         pixmap: &Pixmap,
         gs: &GraphicsState,
         fill_side: bool,
     ) -> Option<Vec<u8>> {
-        if self.cmyk_plane.is_none() {
-            return None;
-        }
+        self.cmyk_plane.as_ref()?;
         let has_cmyk = if fill_side {
             gs.fill_color_cmyk.is_some()
         } else {
@@ -3644,9 +3642,7 @@ impl PageRenderer {
         fill_rule: tiny_skia::FillRule,
         clip: Option<&tiny_skia::Mask>,
     ) -> Option<Vec<u8>> {
-        if self.cmyk_plane.is_none() {
-            return None;
-        }
+        self.cmyk_plane.as_ref()?;
         let (w, h) = self.cmyk_plane_dims;
         let mut mask = tiny_skia::Mask::new(w, h)?;
         mask.fill_path(path, fill_rule, true, transform);
@@ -3675,9 +3671,7 @@ impl PageRenderer {
         gs: &GraphicsState,
         clip: Option<&tiny_skia::Mask>,
     ) -> Option<Vec<u8>> {
-        if self.cmyk_plane.is_none() {
-            return None;
-        }
+        self.cmyk_plane.as_ref()?;
         let (w, h) = self.cmyk_plane_dims;
         let mut scratch = Pixmap::new(w, h)?;
         let dash = if !gs.dash_pattern.0.is_empty() {
