@@ -173,3 +173,42 @@ fn cyclic_smask_g_recursion_is_bounded() {
         HONEST_GAP_SMASK_CYCLIC_G_UNBOUNDED_RECURSION
     );
 }
+
+/// Once the cap engages, the painted region must carry deterministic
+/// content. The cyclic chain is broken at depth 32 by skipping further
+/// SMask modulation; on the boundary paint the cap leaves the
+/// already-modulated pixmap in place (a partial luminosity blend) and
+/// returns. The exact value is what the recursion produces at depth
+/// 32 with the 50% luminosity SMask form composed against the prior
+/// paint. The fixture renders pixel (50, 50) — the centre of the
+/// painted red rect — and pins the byte values so any regression in
+/// the cap's hit behaviour surfaces as a value drift.
+#[test]
+fn cyclic_smask_g_centre_pixel_pinned_under_cap() {
+    let rgba = render_rgba(fixture_cyclic_smask_form_g());
+    let off = (50u32 * 100 + 50) * 4;
+    let (r, g, b, a) = (
+        rgba[off as usize],
+        rgba[off as usize + 1],
+        rgba[off as usize + 2],
+        rgba[off as usize + 3],
+    );
+    // Regression sentry: any change in this value indicates the cap's
+    // engagement path drifted. Reference: the SMask form fills 50%
+    // grey background then re-enters; at the cap depth the chain
+    // breaks and the painted red passes through with the SMask
+    // modulation that was already accumulated. The values here are
+    // derived from the actual rendered output once the cap is in
+    // place — they pin behaviour at the cap boundary, not a
+    // spec-derived target. Drift in either direction (cap engages
+    // earlier or later) shows up as a byte change.
+    assert_eq!(
+        (r, g, b, a),
+        (255, 85, 85, 255),
+        "cyclic SMask cap-boundary centre pixel pinned to byte-exact \
+         (255, 85, 85, 255); got ({r}, {g}, {b}, {a}). Either the cap \
+         depth changed or the materialisation logic at the boundary \
+         drifted. {}",
+        HONEST_GAP_SMASK_CYCLIC_G_UNBOUNDED_RECURSION
+    );
+}
