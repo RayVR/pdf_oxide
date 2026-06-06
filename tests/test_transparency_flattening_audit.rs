@@ -1102,7 +1102,6 @@ fn fixture_blend_luminosity_grey_source_over_red() -> Vec<u8> {
 /// SourceOver fallback produces a *grey* output. Asserting
 /// red-dominance + low B is the cleanest non-degenerate signal.
 #[test]
-#[ignore = "HONEST_GAP_NONSEP_BLEND_LUMINOSITY"]
 fn blend_luminosity_grey_source_over_red_keeps_red_hue() {
     let rgba = render_rgba(fixture_blend_luminosity_grey_source_over_red());
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
