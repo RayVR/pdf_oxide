@@ -780,11 +780,43 @@ impl PageRenderer {
 
                 // Color space operators
                 Operator::SetFillColorSpace { name } => {
-                    gs_stack.current_mut().fill_color_space = name.clone();
+                    // ISO 32000-1 §8.6.8: the `cs` operator shall also
+                    // set the current colour to its initial value, which
+                    // depends on the colour space. For Separation /
+                    // DeviceN the initial tint is 1.0 per colorant
+                    // (§8.6.6.4 / §8.6.6.5); for DeviceCMYK the initial
+                    // colour is (0, 0, 0, 1); device-family RGB / Gray
+                    // start at all-zeros. Failing to reset the colour
+                    // here means a paint after `cs /CS_B` without an
+                    // intervening `scn` would carry the prior space's
+                    // identity and tint, including its spot ink list —
+                    // round 2 QA pinned that the spot mirror would then
+                    // write the prior /CS_A's spot lane.
+                    let resolved = self.color_spaces.get(name).cloned();
+                    let initial =
+                        sidecar_mod::initial_colour_for_space(name, resolved.as_ref(), doc);
+                    let gs = gs_stack.current_mut();
+                    gs.fill_color_space = name.clone();
+                    gs.fill_color_rgb = initial.rgb;
+                    gs.fill_color_cmyk = initial.cmyk;
+                    gs.fill_color_components.clear();
+                    gs.fill_color_components
+                        .extend_from_slice(&initial.components);
+                    gs.fill_spot_inks = initial.spot_inks;
                     log::debug!("SetFillColorSpace: {}", name);
                 },
                 Operator::SetStrokeColorSpace { name } => {
-                    gs_stack.current_mut().stroke_color_space = name.clone();
+                    let resolved = self.color_spaces.get(name).cloned();
+                    let initial =
+                        sidecar_mod::initial_colour_for_space(name, resolved.as_ref(), doc);
+                    let gs = gs_stack.current_mut();
+                    gs.stroke_color_space = name.clone();
+                    gs.stroke_color_rgb = initial.rgb;
+                    gs.stroke_color_cmyk = initial.cmyk;
+                    gs.stroke_color_components.clear();
+                    gs.stroke_color_components
+                        .extend_from_slice(&initial.components);
+                    gs.stroke_spot_inks = initial.spot_inks;
                 },
                 Operator::SetFillColor { components } => {
                     let gs = gs_stack.current_mut();
@@ -1306,6 +1338,7 @@ impl PageRenderer {
                             let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(&gs_clone);
                             let transform = combine_transforms(base_transform, &gs_clone.ctm);
                             let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                            let smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
                             let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, false);
                             let cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, false);
@@ -1354,7 +1387,13 @@ impl PageRenderer {
                             );
                             if let Some(snap) = smask_snap {
                                 self.apply_smask_after_paint(
-                                    pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                    pixmap,
+                                    &snap,
+                                    smask_spot_snap.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    page_num,
+                                    resources,
                                 )?;
                             }
                         }
@@ -1392,6 +1431,7 @@ impl PageRenderer {
                             // blend the backdrop (snapshot) with the
                             // painted result.
                             let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                            let smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
                             let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
                             let cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
@@ -1450,7 +1490,13 @@ impl PageRenderer {
                             );
                             if let Some(snap) = smask_snap {
                                 self.apply_smask_after_paint(
-                                    pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                    pixmap,
+                                    &snap,
+                                    smask_spot_snap.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    page_num,
+                                    resources,
                                 )?;
                             }
                         }
@@ -1521,11 +1567,22 @@ impl PageRenderer {
                             // pass also lays paint on top, so each side
                             // gets its own snapshot/apply cycle.
                             let fill_smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                            let fill_smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
                             let fill_overprint_snap =
                                 self.overprint_snapshot(pixmap, &gs_clone, true);
                             let fill_cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
                             let fill_spot_snap = self.spot_paint_snapshot(pixmap, &gs_clone, true);
+                            // §11.7.3 + §11.3.3 require per-pixel
+                            // coverage on every lane. The path-Fill
+                            // helper uses `rasterise_fill_coverage`;
+                            // the combo arm uses the same call so AA
+                            // edges receive fractional coverage and an
+                            // alternate-CS RGB collision with backdrop
+                            // does not mask the paint from the spot
+                            // mirror's diff branch.
+                            let fill_cmyk_coverage =
+                                self.rasterise_fill_coverage(&path, transform, fill_rule, clip);
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap, &path, transform, render_gs, fill_rule, clip,
                             );
@@ -1541,24 +1598,37 @@ impl PageRenderer {
                             }
                             if let Some(snap) = fill_spot_snap {
                                 self.mirror_spot_paint_into_sidecar_with_coverage(
-                                    pixmap, &snap, None, &gs_clone, true,
+                                    pixmap,
+                                    &snap,
+                                    fill_cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    true,
                                 );
                             }
                             if let Some(snap) = fill_smask_snap {
                                 self.apply_smask_after_paint(
-                                    pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                    pixmap,
+                                    &snap,
+                                    fill_smask_spot_snap.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    page_num,
+                                    resources,
                                 )?;
                             }
 
                             // Stroke side: same snapshot/apply pattern
                             // against the stroke-side fields.
                             let stroke_smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                            let stroke_smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
                             let stroke_overprint_snap =
                                 self.overprint_snapshot(pixmap, &gs_clone, false);
                             let stroke_cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, false);
                             let stroke_spot_snap =
                                 self.spot_paint_snapshot(pixmap, &gs_clone, false);
+                            let stroke_cmyk_coverage =
+                                self.rasterise_stroke_coverage(&path, transform, &gs_clone, clip);
                             self.path_rasterizer
                                 .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                             if let Some(snap) = stroke_cmyk_compose_snap {
@@ -1573,12 +1643,22 @@ impl PageRenderer {
                             }
                             if let Some(snap) = stroke_spot_snap {
                                 self.mirror_spot_paint_into_sidecar_with_coverage(
-                                    pixmap, &snap, None, &gs_clone, false,
+                                    pixmap,
+                                    &snap,
+                                    stroke_cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    false,
                                 );
                             }
                             if let Some(snap) = stroke_smask_snap {
                                 self.apply_smask_after_paint(
-                                    pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                    pixmap,
+                                    &snap,
+                                    stroke_smask_spot_snap.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    page_num,
+                                    resources,
                                 )?;
                             }
                         }
@@ -1621,11 +1701,21 @@ impl PageRenderer {
                             // rule, which only changes coverage, not
                             // the colour-composition rule.
                             let fill_smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                            let fill_smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
                             let fill_overprint_snap =
                                 self.overprint_snapshot(pixmap, &gs_clone, true);
                             let fill_cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
                             let fill_spot_snap = self.spot_paint_snapshot(pixmap, &gs_clone, true);
+                            // §11.7.3 + §11.3.3 spot mirror needs a
+                            // real per-pixel coverage mask — see the
+                            // FillStroke arm above for the rationale.
+                            let fill_cmyk_coverage = self.rasterise_fill_coverage(
+                                &path,
+                                transform,
+                                tiny_skia::FillRule::EvenOdd,
+                                clip,
+                            );
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap,
                                 &path,
@@ -1646,12 +1736,22 @@ impl PageRenderer {
                             }
                             if let Some(snap) = fill_spot_snap {
                                 self.mirror_spot_paint_into_sidecar_with_coverage(
-                                    pixmap, &snap, None, &gs_clone, true,
+                                    pixmap,
+                                    &snap,
+                                    fill_cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    true,
                                 );
                             }
                             if let Some(snap) = fill_smask_snap {
                                 self.apply_smask_after_paint(
-                                    pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                    pixmap,
+                                    &snap,
+                                    fill_smask_spot_snap.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    page_num,
+                                    resources,
                                 )?;
                             }
 
@@ -1659,12 +1759,15 @@ impl PageRenderer {
                                 // Stroke side: same snapshot/paint/apply
                                 // cycle against the stroke fields.
                                 let stroke_smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                                let stroke_smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
                                 let stroke_overprint_snap =
                                     self.overprint_snapshot(pixmap, &gs_clone, false);
                                 let stroke_cmyk_compose_snap =
                                     self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, false);
                                 let stroke_spot_snap =
                                     self.spot_paint_snapshot(pixmap, &gs_clone, false);
+                                let stroke_cmyk_coverage = self
+                                    .rasterise_stroke_coverage(&path, transform, &gs_clone, clip);
                                 self.path_rasterizer
                                     .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                                 if let Some(snap) = stroke_cmyk_compose_snap {
@@ -1679,12 +1782,22 @@ impl PageRenderer {
                                 }
                                 if let Some(snap) = stroke_spot_snap {
                                     self.mirror_spot_paint_into_sidecar_with_coverage(
-                                        pixmap, &snap, None, &gs_clone, false,
+                                        pixmap,
+                                        &snap,
+                                        stroke_cmyk_coverage.as_deref(),
+                                        &gs_clone,
+                                        false,
                                     );
                                 }
                                 if let Some(snap) = stroke_smask_snap {
                                     self.apply_smask_after_paint(
-                                        pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                        pixmap,
+                                        &snap,
+                                        stroke_smask_spot_snap.as_deref(),
+                                        &gs_clone,
+                                        doc,
+                                        page_num,
+                                        resources,
                                     )?;
                                 }
                             }
@@ -1769,6 +1882,7 @@ impl PageRenderer {
                             // Tr render mode for stroke). One snapshot
                             // per Tj call brackets the whole string.
                             let smask_snap = self.smask_snapshot(pixmap, gs);
+                            let smask_spot_snap = self.smask_spot_snapshot(gs);
                             let overprint_snap = self.overprint_snapshot(pixmap, gs, true);
                             let cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, gs, doc, true);
@@ -1816,6 +1930,7 @@ impl PageRenderer {
                                 self.apply_smask_after_paint(
                                     pixmap,
                                     &snap,
+                                    smask_spot_snap.as_deref(),
                                     &gs_for_apply,
                                     doc,
                                     page_num,
@@ -1860,6 +1975,7 @@ impl PageRenderer {
                             // happens here, not inside `T*`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
                             let smask_snap = self.smask_snapshot(pixmap, gs);
+                            let smask_spot_snap = self.smask_spot_snapshot(gs);
                             let overprint_snap = self.overprint_snapshot(pixmap, gs, true);
                             let cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, gs, doc, true);
@@ -1907,6 +2023,7 @@ impl PageRenderer {
                                 self.apply_smask_after_paint(
                                     pixmap,
                                     &snap,
+                                    smask_spot_snap.as_deref(),
                                     &gs_for_apply,
                                     doc,
                                     page_num,
@@ -1947,6 +2064,7 @@ impl PageRenderer {
                             // operator-arm-side clone of `gs`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
                             let smask_snap = self.smask_snapshot(pixmap, gs);
+                            let smask_spot_snap = self.smask_spot_snapshot(gs);
                             let overprint_snap = self.overprint_snapshot(pixmap, gs, true);
                             let cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, gs, doc, true);
@@ -1994,6 +2112,7 @@ impl PageRenderer {
                                 self.apply_smask_after_paint(
                                     pixmap,
                                     &snap,
+                                    smask_spot_snap.as_deref(),
                                     &gs_for_apply,
                                     doc,
                                     page_num,
@@ -2047,6 +2166,7 @@ impl PageRenderer {
                             // in `Tj` / `'`.
                             let colors = self.pipeline_resolve_text_colors(doc, gs);
                             let smask_snap = self.smask_snapshot(pixmap, gs);
+                            let smask_spot_snap = self.smask_spot_snapshot(gs);
                             let overprint_snap = self.overprint_snapshot(pixmap, gs, true);
                             let cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, gs, doc, true);
@@ -2094,6 +2214,7 @@ impl PageRenderer {
                                 self.apply_smask_after_paint(
                                     pixmap,
                                     &snap,
+                                    smask_spot_snap.as_deref(),
                                     &gs_for_apply,
                                     doc,
                                     page_num,
@@ -2129,6 +2250,7 @@ impl PageRenderer {
                         // recursively, and the apply blends the Form's
                         // contribution against the captured backdrop).
                         let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                        let smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
                         let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
                         let cmyk_compose_snap =
                             self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
@@ -2151,7 +2273,13 @@ impl PageRenderer {
                         }
                         if let Some(snap) = smask_snap {
                             self.apply_smask_after_paint(
-                                pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                pixmap,
+                                &snap,
+                                smask_spot_snap.as_deref(),
+                                &gs_clone,
+                                doc,
+                                page_num,
+                                resources,
                             )?;
                         }
                     }
@@ -2274,6 +2402,7 @@ impl PageRenderer {
                         // the page set a CMYK fill before invoking
                         // `sh`.
                         let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                        let smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
                         let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
                         let cmyk_compose_snap =
                             self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
@@ -2296,7 +2425,13 @@ impl PageRenderer {
                         }
                         if let Some(snap) = smask_snap {
                             self.apply_smask_after_paint(
-                                pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                pixmap,
+                                &snap,
+                                smask_spot_snap.as_deref(),
+                                &gs_clone,
+                                doc,
+                                page_num,
+                                resources,
                             )?;
                         }
                     }
@@ -3559,6 +3694,25 @@ impl PageRenderer {
         }
     }
 
+    /// Companion to [`Self::smask_snapshot`] for the spot-lane sidecar.
+    /// When the graphics state has an active `/SMask` AND the sidecar
+    /// is allocated, return a flat snapshot of every spot plane so the
+    /// SMask attenuation path can blend `m·post_mirror + (1-m)·pre`
+    /// per pixel per lane.
+    ///
+    /// ISO 32000-1 §11.3.3 + §11.7.3: "Only a single shape value and
+    /// opacity value shall be maintained at each point in the computed
+    /// group results; they shall apply to both process and spot colour
+    /// components." The pixmap's RGB lanes receive the SMask alpha
+    /// attenuation via [`Self::apply_smask_after_paint`]; the spot
+    /// lanes need the same attenuation against their pre-paint state so
+    /// the lane composes at the spec-correct effective alpha.
+    fn smask_spot_snapshot(&self, gs: &GraphicsState) -> Option<Vec<u8>> {
+        gs.smask.as_ref()?;
+        let sidecar = self.cmyk_sidecar.as_ref()?;
+        Some(sidecar.spots_all().to_vec())
+    }
+
     /// Predicate: should the CMYK compose-before-convert path fire for
     /// the current paint operator? Per ISO 32000-1:2008 §11.4 + Annex G,
     /// transparency compositing happens in the source colour space and
@@ -4721,6 +4875,7 @@ impl PageRenderer {
         &mut self,
         pixmap: &mut Pixmap,
         snapshot: &[u8],
+        spot_snapshot: Option<&[u8]>,
         gs: &GraphicsState,
         doc: &PdfDocument,
         page_num: usize,
@@ -4747,8 +4902,15 @@ impl PageRenderer {
             return Ok(());
         }
         self.smask_depth += 1;
-        let result =
-            self.apply_smask_after_paint_inner(pixmap, snapshot, &smask, doc, page_num, resources);
+        let result = self.apply_smask_after_paint_inner(
+            pixmap,
+            snapshot,
+            spot_snapshot,
+            &smask,
+            doc,
+            page_num,
+            resources,
+        );
         self.smask_depth -= 1;
         result
     }
@@ -4757,6 +4919,7 @@ impl PageRenderer {
         &mut self,
         pixmap: &mut Pixmap,
         snapshot: &[u8],
+        spot_snapshot: Option<&[u8]>,
         smask: &crate::content::graphics_state::SoftMaskForm,
         doc: &PdfDocument,
         page_num: usize,
@@ -4879,7 +5042,15 @@ impl PageRenderer {
         debug_assert_eq!(mask_data.len(), dest.len());
         debug_assert_eq!(snapshot.len(), dest.len());
 
-        for px in 0..(dest.len() / 4) {
+        // §11.3.3 + §11.7.3: the SMask alpha is a single shape/opacity
+        // value per pixel that applies to BOTH process and spot colour
+        // components. Compute the per-pixel mask alpha once, then
+        // attenuate the visible pixmap (RGB+α) AND, when the sidecar
+        // is allocated, every spot lane against its pre-mirror
+        // snapshot.
+        let pixel_count = dest.len() / 4;
+        let mut mask_alpha: Vec<f32> = Vec::with_capacity(pixel_count);
+        for px in 0..pixel_count {
             let off = px * 4;
             let mut m = match smask.subtype {
                 crate::content::graphics_state::SoftMaskSubtype::Alpha => {
@@ -4896,6 +5067,7 @@ impl PageRenderer {
             if let Some(ref tf) = transfer {
                 m = tf.eval(m).clamp(0.0, 1.0);
             }
+            mask_alpha.push(m);
 
             let inv_m = 1.0 - m;
             for c in 0..4 {
@@ -4903,6 +5075,38 @@ impl PageRenderer {
                 let backed = snapshot[off + c] as f32;
                 let blended = m * painted + inv_m * backed;
                 dest[off + c] = blended.clamp(0.0, 255.0).round() as u8;
+            }
+        }
+
+        // Spot lanes: apply the same SMask alpha attenuation to every
+        // spot plane against its pre-mirror snapshot. Per §11.7.3, the
+        // soft mask's alpha modulates the spot lane the same way it
+        // modulates process channels — a single (shape, opacity) per
+        // pixel applies to every lane class. Skipping this step (or
+        // applying the SMask only to the pixmap) leaves the spot lanes
+        // composed at α=1 while the visible pixmap is attenuated, so
+        // the press plate output would over-deposit ink relative to
+        // the visible composite by exactly the SMask attenuation
+        // factor.
+        if let (Some(pre_spots), Some(sidecar)) = (spot_snapshot, self.cmyk_sidecar.as_mut()) {
+            let spots = sidecar.spots_all_mut();
+            // The snapshot length tracks the page's spot plane count.
+            // If the sidecar's plane count changed mid-paint (it
+            // doesn't — fixed at page setup) the comparison would be
+            // unsafe; debug-assert it stays in sync.
+            debug_assert_eq!(spots.len(), pre_spots.len());
+            let plane_size = pixel_count;
+            let plane_count = spots.len() / plane_size;
+            for plane_idx in 0..plane_count {
+                let base = plane_idx * plane_size;
+                for px in 0..plane_size {
+                    let m = mask_alpha[px];
+                    let inv_m = 1.0 - m;
+                    let post = spots[base + px] as f32;
+                    let pre = pre_spots[base + px] as f32;
+                    let blended = m * post + inv_m * pre;
+                    spots[base + px] = blended.clamp(0.0, 255.0).round() as u8;
+                }
             }
         }
 

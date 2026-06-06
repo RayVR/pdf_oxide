@@ -78,13 +78,92 @@ pub const HONEST_GAP_SPOT_LANE_UNSOURCED_PRESERVE_BACKDROP: &str =
      — which for /Normal under opaque paint would erase the backdrop. \
      The §11.7.4.3 CompatibleOverprint rule (implicit when overprint \
      is enabled) preserves the backdrop on unsourced channels. Round 2 \
-     adopts the CompatibleOverprint semantics unconditionally for \
-     unsourced spot lanes — the spot mirror never writes to spot lanes \
-     not named by the active source, regardless of /OP state. This is \
-     the behaviour real-world spot-aware workflows expect and matches \
-     how the §11.7.4.3 example pins the spot-source case ('the value \
-     is c_s for that spot component and c_b for all process components \
-     and all other spot components').";
+     adopts the CompatibleOverprint semantics for spot lanes NOT named \
+     by the active source's colorant list, regardless of /OP state. \
+     The asymmetry this creates between two superficially similar \
+     paint shapes is real and worth spelling out: \
+     \n\n\
+     (1) EXPLICIT zero tint via `/CS_InkA cs 0 scn` on a /Separation \
+     /InkA space — the source DOES name /InkA at tint 0, so the spot \
+     mirror walks the source ink list, finds /InkA, composes via the \
+     §11.3.3 formula with t_s = 0 under /Normal at α = 1:  \n\
+       t_r = (1 − 1) · t_b + 1 · 0 = 0   (ERASES the backdrop).  \n\
+     This branch is exercised by the QA probe \
+     `qa1_explicit_zero_tint_separation_erases_inka_backdrop_under_\
+     normal`. \
+     \n\n\
+     (2) IMPLICIT not-named — the source's colour space does not name \
+     /InkA at all (e.g. a /DeviceCMYK `k` paint following an earlier \
+     /InkA paint). The spot mirror's source ink list is empty for the \
+     /InkA dimension; under the round-2 preserve-backdrop policy the \
+     lane is not touched at all (PRESERVES the backdrop). This branch \
+     is exercised by `qa1_unsourced_inka_lane_preserves_backdrop_under_\
+     normal_at_full_alpha`. \
+     \n\n\
+     Both readings have spec support — §11.7.3's strict reading \
+     supports (1) on a literal application of the basic compositing \
+     formula with 'source 0.0 subtractive' for unsourced channels; \
+     §11.7.4.3's CompatibleOverprint example supports (2) on its \
+     definition that 'the value is c_s for that spot component and \
+     c_b for all process components and all other spot components'. \
+     Round 2 picks (2) for the implicit case because real-world \
+     spot-aware artwork almost always intends 'paint only what I said \
+     to paint'; (1) is preserved for explicit zero-tint because \
+     erasing what the source literally requested is the only reading \
+     that does not silently drop the operator's intent.";
+
+/// Combo (`B`/`b`/`B*`/`b*`), text-show (`Tj`/`TJ`/`'`/`\"`),
+/// image+Form (`Do`) and shading (`sh`) paint sites that lack a
+/// pre-rasterised coverage mask: the round-2 spot mirror's diff
+/// branch treats every changed pixel as full coverage = 255. The
+/// combo arms were upgraded to use the same rasterised coverage path
+/// the path-Fill / path-Stroke helpers use (so combos now hit the
+/// spec-correct fractional coverage at AA edges); text / Do / sh
+/// remain on the diff path until a future round wires:
+///  - glyph rasterisation through the font cache for text-show,
+///  - the XObject footprint mask for `Do`,
+///  - the shading-engine geometry for `sh`.
+///
+/// At AA-edge pixels of these remaining paint sites the spot lane
+/// receives full ink while the visible pixmap composes at fractional
+/// alpha — a (1 − pix_alpha) per-edge over-deposit relative to the
+/// visible composite. Interior pixels are byte-exact. Real prepress
+/// artwork typically only sees AA edges at glyph boundaries, image
+/// edges, and shading boundaries; the absolute over-deposit is
+/// bounded by the AA pixel count, which is geometry-dependent.
+pub const HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE: &str =
+    "HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE: ISO 32000-1 §11.7.3 + \
+     §11.3.3 require a per-pixel coverage on every lane. The round-2 \
+     spot mirror's diff branch (snapshot-vs-post-paint byte compare) \
+     treats every changed pixel as coverage = 255, which over-deposits \
+     ink on the spot lane at AA-edge pixels by (1 − pix_alpha). The \
+     diff branch still fires at text / Do / sh paint sites; the combo \
+     arms (`B`/`b`/`B*`/`b*`) were promoted to the rasterised \
+     coverage path. Fix: rasterise an explicit coverage mask for the \
+     remaining paint sites — glyph rasterisation for text-show, the \
+     XObject footprint for `Do`, the gradient geometry for `sh`. \
+     Interior pixels are byte-exact under the current behaviour.";
+
+/// Identical-RGB collision: when a /Separation paint's alternate-CS
+/// RGB happens to equal the backdrop RGB at every pixel, the diff
+/// branch records coverage = 0 and the spot lane is NOT written.
+/// The combo arms now use rasterised coverage and so do not hit this
+/// corner; text / Do / sh paint sites still diff and would lose the
+/// paint in this collision. Real prepress artwork rarely hits this
+/// because spot inks are usually visually distinct from the
+/// alternate-CS approximation (the alternate is a fallback for
+/// devices that don't carry the spot plate; using a fallback colour
+/// identical to the backdrop defeats the spot's purpose). But a
+/// designer painting a white-on-white spot varnish would hit it.
+pub const HONEST_GAP_SPOT_MIRROR_IDENTICAL_RGB_COLLISION: &str =
+    "HONEST_GAP_SPOT_MIRROR_IDENTICAL_RGB_COLLISION: a /Separation \
+     paint whose alternate-CS RGB equals the backdrop RGB at every \
+     painted pixel hits a byte-equality miss in the diff branch — \
+     the spot lane is not written even though the paint conceptually \
+     covered the path. Combo paints (`B`/`b`/`B*`/`b*`) were promoted \
+     to use rasterised coverage and so do not hit this corner; text / \
+     Do / sh paint sites still do. Fix: same rasterise-real-coverage \
+     work as HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE.";
 
 // ===========================================================================
 // Synthetic PDF builder — re-uses the round-1 shape for corpus
@@ -773,54 +852,104 @@ fn round2_p9_stroke_fill_share_one_bm_per_paint_arm() {
 }
 
 // ===========================================================================
-// PROBE 10: soft mask interaction (/SMask + /BM /Hue + Separation).
+// PROBE 10: soft mask interaction — /SMask attenuates the spot lane the
+// same way it attenuates the pixmap (single shape/opacity per pixel
+// per §11.3.3 + §11.7.3), simultaneously with the §11.7.4.2 /Normal
+// substitution for non-separable BMs.
 // ===========================================================================
 
-/// `/SMask` is applied AFTER the spot mirror runs. The spot mirror
-/// fires on the paint, and the SMask materialisation modulates the
-/// pixmap's alpha — but the sidecar's spot lanes are NOT touched by
-/// the SMask layer. Round 4 wired the CMYK SMask path; the spot lanes
-/// stay at their pre-SMask composed tints.
+/// `/SMask /S /Alpha` over a /Separation /InkA paint with /BM /Hue:
+/// two §11 mechanisms compose on the SAME paint operator:
+///  1. §11.7.4.2 — /Hue is non-separable → spot lane substitutes
+///     /Normal (the requested BM is honoured on the process lanes
+///     only).
+///  2. §11.4.7 + §11.3.3 + §11.7.3 — the soft mask produces an
+///     alpha that applies to BOTH the visible pixmap AND every spot
+///     lane via the SHARED (shape, opacity) per-pixel rule. The spot
+///     lane composes against its pre-mirror snapshot with the SMask
+///     alpha attenuating the source contribution exactly the way
+///     the pixmap RGB attenuates against `snapshot`.
 ///
-/// Probe pin: a /Separation /InkA paint at tint 0.6 with /BM /Hue
-/// (non-separable, spot lane substitutes /Normal) writes 0.6 → u8 =
-/// 153 to the spot lane regardless of whether an /SMask is present.
-/// The /Hue substitution is the round-2 contribution; the /SMask
-/// non-interaction is the round-4 wiring boundary this probe pins.
+/// Construction:
+///  - SMask form renders a uniform 0.5 grey over the page bbox; in
+///    /S /Alpha mode the mask alpha is then the form's alpha
+///    channel — uniformly 1.0 across the form's footprint (the
+///    `0.5 g 0 0 100 100 re f` paints opaque mid-grey). So /Alpha
+///    yields a mask of 1.0, which would NOT attenuate. We instead
+///    use /S /Luminosity (BC absent → default backdrop is colour
+///    space's black point, which is luminosity 0). The /Luminosity
+///    extraction of the form's grey 0.5 fill yields a mask of 0.5
+///    over the form footprint.
+///
+/// Byte-exact reference computation:
+///  - Source: /CS_PMS /Separation /InkA at scn 0.6, /BM /Hue.
+///  - /Hue is non-separable → spot dispatch substitutes /Normal.
+///  - gs.fill_alpha = 1.0 (no /ca explicitly set on the SMask gs);
+///    coverage = 1.0 at the centre pixel.
+///  - Mirror writes lane[centre] via Normal(0, 0.6) at α=1: t_r =
+///    (1-1)·0 + 1·0.6 = 0.6 → u8 = round(0.6·255) = 153.
+///  - SMask materialises mask m = 0.5 at the centre pixel.
+///  - SMask attenuation: out = m·post + (1-m)·pre =
+///    0.5·153 + 0.5·0 = 76.5 → round to u8 = 77.
 #[test]
-fn round2_p10_smask_does_not_perturb_spot_lane_writes() {
+fn round2_p10_smask_attenuates_spot_lane_under_normal_substitution() {
     let icc = build_constant_cmyk_icc(135);
     let psfunc = "<< /FunctionType 2 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] \
                   /C0 [0.0 0.0 0.0 0.0] /C1 [0.0 1.0 0.0 0.0] /N 1 >>";
-    // The /Hue gs sets /BM /Hue. Sidecar allocates because /BM is
-    // non-Normal (transparency trigger). The probe pins the spot
-    // lane value AS WRITTEN BY THE SPOT MIRROR — not the
-    // post-SMask pixmap.
+    // SMask form: paints uniform grey 0.5 over the 100×100 bbox.
+    // Under /S /Luminosity the mask alpha at every covered pixel is
+    // Lum((0.5, 0.5, 0.5)) = 0.5. The /Hue BM is on the page-level
+    // gs (HueG), not on the SMask form's internal content.
+    let smask_form = "6 0 obj\n\
+        << /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 100 100] \
+           /Resources << >> \
+           /Group << /Type /Group /S /Transparency /CS /DeviceGray >> \
+           /Length 28 >>\n\
+        stream\n0.5 g\n0 0 100 100 re\nf\nendstream\nendobj\n";
+    // HueG declares /BM /Hue AND /SMask pointing to the form. The
+    // single ExtGState sets both so the spot mirror's effective BM
+    // is /Hue AND apply_smask_after_paint fires.
     let content = "/HueG gs\n\
                    /CS_PMS cs\n0.6 scn\n0 0 100 100 re\nf\n";
     let resources = format!(
-        "/ExtGState << /HueG << /Type /ExtGState /BM /Hue >> >> \
+        "/ExtGState << /HueG << /Type /ExtGState /BM /Hue \
+            /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >> \
          /ColorSpace << /CS_PMS [/Separation /InkA /DeviceCMYK {} ] >>",
         psfunc
     );
-    let pdf = build_pdf_with_output_intent(content, &resources, &icc, &[]);
+    let pdf = build_pdf_with_output_intent(content, &resources, &icc, &[smask_form]);
     let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF parses");
     let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72).as_raw());
     let _img = renderer.render_page(&doc, 0).expect("render succeeds");
 
-    // §11.7.4.2: /Hue is non-separable → spot lane substitutes /Normal.
-    //   t_r = (1-1)·0 + 1·0.6 = 0.6 → u8 = (0.6·255).round() = 153.
-    let expected = tint_to_u8(compose_normal(0.0, 0.6, 1.0));
-    assert_eq!(expected, 153);
+    // §11.7.4.2: /Hue is non-separable → spot lane substitutes
+    // /Normal. Mirror writes post = (1-1)·0 + 1·0.6 = 0.6 → u8 153.
+    // §11.4.7 + §11.3.3 + §11.7.3: SMask m = 0.5; pre = 0.
+    //   out = m·post + (1-m)·pre = 0.5·153 + 0.5·0 = 76.5 → u8 77.
+    //
+    // Compute byte-exact in the same quantise-after-mirror cascade
+    // the impl uses: mirror writes the u8 first (153), then SMask
+    // attenuates the u8.
+    let post_u8 = tint_to_u8(compose_normal(0.0, 0.6, 1.0));
+    assert_eq!(post_u8, 153);
+    let m = 0.5_f32;
+    let expected = (m * post_u8 as f32 + (1.0 - m) * 0.0)
+        .clamp(0.0, 255.0)
+        .round() as u8;
+    assert_eq!(expected, 77);
+
     let plane = renderer.cmyk_sidecar_spot_plane(0).expect("InkA plane");
     let dims = renderer.cmyk_sidecar_dims().unwrap();
     let centre = ((dims.1 / 2) * dims.0 + dims.0 / 2) as usize;
     assert_eq!(
         plane[centre], expected,
-        "ISO 32000-1 §11.7.4.2: a non-separable /BM /Hue substitutes \
-         /Normal on the spot lane. Normal(0, 0.6) at α=1 = 0.6 → u8 = \
-         {}. Got {}.",
-        expected, plane[centre]
+        "ISO 32000-1 §11.7.4.2 + §11.4.7 + §11.3.3 + §11.7.3: two \
+         rules compose on this paint. (1) /Hue is non-separable → \
+         spot lane substitutes /Normal: mirror writes u8 {}. (2) \
+         SMask /S /Luminosity at uniform 0.5 attenuates the lane \
+         against the pre-mirror snapshot (zero): out = 0.5·{} + \
+         0.5·0 = u8 {}. Got {} at centre.",
+        post_u8, post_u8, expected, plane[centre]
     );
 }
 
