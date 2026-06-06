@@ -1359,8 +1359,8 @@ impl PageRenderer {
                         );
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         if let Some(path) = current_path.finish() {
-                            let gs = gs_stack.current();
-                            let transform = combine_transforms(base_transform, &gs.ctm);
+                            let gs_clone = gs_stack.current().clone();
+                            let transform = combine_transforms(base_transform, &gs_clone.ctm);
                             // One unified resolve covers both fill and the
                             // optional stroke pass — for plain `f*` the
                             // helper produces a fill-only splice; for
@@ -1372,8 +1372,20 @@ impl PageRenderer {
                             } else {
                                 PipelinePaintKind::PathFill
                             };
-                            let spliced = self.pipeline_resolve_paint_gs(doc, gs, kind);
-                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(gs);
+                            let spliced = self.pipeline_resolve_paint_gs(doc, &gs_clone, kind);
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(&gs_clone);
+
+                            // Fill side: snapshot + paint + correctors.
+                            // §11.4.7 + §11.7.4 + §11.4 compose-first
+                            // each apply to `f*` just as they do to `f`
+                            // — the only difference is the EvenOdd fill
+                            // rule, which only changes coverage, not
+                            // the colour-composition rule.
+                            let fill_smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                            let fill_overprint_snap =
+                                self.overprint_snapshot(pixmap, &gs_clone, true);
+                            let fill_cmyk_compose_snap =
+                                self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap,
                                 &path,
@@ -1382,13 +1394,45 @@ impl PageRenderer {
                                 tiny_skia::FillRule::EvenOdd,
                                 clip,
                             );
+                            if let Some(snap) = fill_cmyk_compose_snap {
+                                self.apply_cmyk_compose_after_paint(
+                                    pixmap, &snap, &gs_clone, doc, true,
+                                );
+                            }
+                            if let Some(snap) = fill_overprint_snap {
+                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
+                            }
+                            if let Some(snap) = fill_smask_snap {
+                                self.apply_smask_after_paint(
+                                    pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                )?;
+                            }
+
                             if matches!(op, Operator::FillStrokeEvenOdd) {
-                                // Stroke side: Type 4 Separation on the
-                                // stroke colour is honoured — the spliced
-                                // `render_gs` carries the resolved stroke
-                                // fields.
+                                // Stroke side: same snapshot/paint/apply
+                                // cycle against the stroke fields.
+                                let stroke_smask_snap = self.smask_snapshot(pixmap, &gs_clone);
+                                let stroke_overprint_snap =
+                                    self.overprint_snapshot(pixmap, &gs_clone, false);
+                                let stroke_cmyk_compose_snap =
+                                    self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, false);
                                 self.path_rasterizer
                                     .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
+                                if let Some(snap) = stroke_cmyk_compose_snap {
+                                    self.apply_cmyk_compose_after_paint(
+                                        pixmap, &snap, &gs_clone, doc, false,
+                                    );
+                                }
+                                if let Some(snap) = stroke_overprint_snap {
+                                    self.apply_overprint_after_paint(
+                                        pixmap, &snap, &gs_clone, false,
+                                    );
+                                }
+                                if let Some(snap) = stroke_smask_snap {
+                                    self.apply_smask_after_paint(
+                                        pixmap, &snap, &gs_clone, doc, page_num, resources,
+                                    )?;
+                                }
                             }
                         }
                     } else {
