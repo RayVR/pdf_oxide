@@ -36,47 +36,17 @@ use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_separations, PageRenderer, RenderOptions};
 
 // ===========================================================================
-// QA bug markers — pin exact misbehaviours with spec citation.
-// ===========================================================================
-
-/// The composite-path's `apply_overprint_after_paint` uses
-/// `(src + dst).min(1.0)` per-plate for OPM=0. ISO 32000-1 §11.7.4.3
-/// (PDF 1.3 overprint mode) says: "If the source colour space ... is
-/// DeviceCMYK ... it shall be regarded as specifying all four process
-/// colorant values. The nonzero (or nonzero-overridden) source values
-/// replace the corresponding plate values; zero source values either
-/// also replace (OPM=0) or preserve (OPM=1)."
-///
-/// For a DeviceCMYK source with /OP true and OPM=0, the spec-correct
-/// per-plate output is "replace per plate" (all four components
-/// specified → all four plates replaced). The composite path's
-/// `(src + dst).min(1.0)` additive merge is a composite-preview
-/// approximation, NOT the spec per-plate rule. Round 3 routed pages
-/// with /ca<1 + /OP true through the composite path; the per-plate
-/// output for OPM=0 is therefore additively merged (wrong), not
-/// replaced (right).
-///
-/// Round 3's dispatch criterion `page_declares_transparency` excludes
-/// /OP from the trigger explicitly so pure-OP pages stay on the
-/// per-plate walker. But pages that mix transparency AND overprint
-/// (e.g. /ca<1 with /OP true on a DeviceCMYK paint) still trigger the
-/// composite path via /ca<1. The result is per-plate output that
-/// reflects an additive composite preview rather than per-plate
-/// replace semantics.
-pub const QA_BUG_OPM0_COMPOSITE_PATH_ADDITIVELY_MERGES_PLATES: &str =
-    "QA_BUG_OPM0_COMPOSITE_PATH_ADDITIVELY_MERGES_PLATES: ISO 32000-1 \
-     §11.7.4.3 (OPM=0, DeviceCMYK source, /OP true) prescribes \
-     replace-per-plate. The composite path uses (src + dst).min(1.0) \
-     additive merge. Round-3 dispatch routes /ca<1 + /OP pages to the \
-     composite path, producing additively-merged per-plate output \
-     instead of replaced. Round-3 self-doc names this as the reason \
-     /OP alone keeps the per-plate walker; the gap is that /OP + /ca \
-     also requires the per-plate walker's rule, but round 3 routes it \
-     to composite.";
-
-// ===========================================================================
 // HONEST_GAP markers — documented spec gaps round 3 declared (or
 // should have).
+//
+// The round-3 QA_BUG_OPM0_COMPOSITE_PATH_ADDITIVELY_MERGES_PLATES
+// marker was REMOVED in round 4. The composite-path
+// apply_overprint_after_paint now implements the ISO 32000-1 §11.7.4.3
+// CompatibleOverprint blend function (Table 149) per-channel, replacing
+// the (src + dst).min(1.0) additive-merge approximation. QA-A1/A2/A3
+// below are now byte-exact references against the spec rule; see
+// `tests/test_46_round4_overprint_spec.rs` for the full
+// source-CS-class × OPM matrix.
 // ===========================================================================
 
 /// The /K knockout group's per-byte merge skips byte-equality with the
@@ -296,32 +266,19 @@ fn centre(plate: &pdf_oxide::rendering::SeparationPlate) -> u8 {
 
 /// QA-A1: transparency + OPM=0 with DeviceCMYK source, /OP true.
 ///
-/// Page: backdrop = full /ca=1 DeviceCMYK paint (0.4, 0, 0, 0) =
-/// Cyan-40%. Foreground = /ca=0.5 DeviceCMYK paint (0, 0.5, 0, 0) with
-/// /OP true (OPM=0 default).
+/// Backdrop = full /ca=1 DeviceCMYK paint (0.4, 0, 0, 0) = Cyan-40%.
+/// Foreground = /ca=0.5 DeviceCMYK paint (0, 0.5, 0, 0) with /OP true
+/// (OPM=0 default).
 ///
-/// Spec reading (§11.7.4.3 OPM=0, DeviceCMYK fully-specified): Magenta
-/// plate = source replace at the overprinting paint pixel; for the
-/// per-plate output, the Magenta value after the second paint is the
-/// blended source. Cyan plate should be similarly replaced (DeviceCMYK
-/// = all four specified). So both plates show the second paint's
-/// composed contribution.
+/// ISO 32000-1 §11.7.4.3 Table 149 row 1 (DeviceCMYK direct, OP=true,
+/// OPM=0): `B(c_b, c_s) = c_s` for every C/M/Y/K channel. §11.3.3
+/// composition: `c_r = α · c_s + (1 - α) · c_b`.
 ///
-/// Round-3 dispatch routes ca<1 + /OP to the composite path. The
-/// composite path's overprint handler does additive merge for OPM=0
-/// per channel. So the Cyan plate retains the 0.4 backdrop additively
-/// merged with 0 source = 0.4 (clamped) which matches the per-plate
-/// REPLACE rule only by coincidence (since source Cyan is 0). The
-/// Magenta plate gets (0 + composed_source_M).min(1) = composed
-/// source.
-///
-/// This probe pins the OBSERVED byte-exact behaviour. The agent's
-/// self-flagged area (a) admits this is a wrong path, but the
-/// architectural decision is to accept it. Probe documents the gap.
+///   C: 0.5·0   + 0.5·0.4 = 0.20 → u8 51.
+///   M: 0.5·0.5 + 0.5·0   = 0.25 → u8 64.
 #[test]
 fn qa_a1_transparency_opm0_devicecmyk_overprint_observed_byte_exact() {
     let icc = build_constant_cmyk_icc(135);
-    // Default OPM is 0 (PDF 1.3 mode). /OP true + /ca 0.5.
     let content = "0.4 0 0 0 k\n0 0 100 100 re\nf\n\
                    /Ov gs\n0 0.5 0 0 k\n0 0 100 100 re\nf\n";
     let resources = "/ExtGState << /Ov << /Type /ExtGState /OP true /ca 0.5 >> >>";
@@ -331,73 +288,35 @@ fn qa_a1_transparency_opm0_devicecmyk_overprint_observed_byte_exact() {
     let c = plate(&plates, "Cyan");
     let m = plate(&plates, "Magenta");
 
-    // Just pin observed values. The point of the probe is to make any
-    // change in behaviour OR architecture surface in CI. Empirical
-    // pinning records the round-3 dispatch's chosen byte at centre.
-    // If a future round widens the dispatch to push /OP+/ca pages to
-    // a per-plate walker or rewrites the overprint handler, these
-    // values change and the probe must be updated with the new
-    // reference + spec rationale.
-    let observed_c = centre(c);
-    let observed_m = centre(m);
-    // Cyan: backdrop 0.4 → u8 102 after first paint. Second paint's
-    // OPM=0 additive merge keeps Cyan at composed value. The composite
-    // path's compose-after-paint runs ICC + then overprint additive
-    // merge.
-    //
-    // We assert the observed value is non-zero (the round-3 composite
-    // path did mirror the Cyan plane), which is the floor signal: any
-    // regression that DROPS the Cyan plate entirely (returns 0)
-    // would fail this assertion.
-    assert!(
-        observed_c > 0,
-        "{} — Cyan plate centre = {}; expected non-zero (backdrop \
-         retention under OPM=0 composite path). A zero here means the \
-         composite path lost the first paint's plate contribution.",
-        QA_BUG_OPM0_COMPOSITE_PATH_ADDITIVELY_MERGES_PLATES,
-        observed_c
+    assert_eq!(
+        centre(c),
+        51,
+        "ISO 32000-1 §11.7.4.3 Table 149 row 1 (DeviceCMYK direct, \
+         OP=true, OPM=0): C lane c_r = 0.5·0 + 0.5·0.4 = 0.2 → u8 51. \
+         Got u8 {}.",
+        centre(c)
     );
-    assert!(
-        observed_m > 0,
-        "{} — Magenta plate centre = {}; expected non-zero (second \
-         paint's M contribution should appear in plate output).",
-        QA_BUG_OPM0_COMPOSITE_PATH_ADDITIVELY_MERGES_PLATES,
-        observed_m
+    assert_eq!(
+        centre(m),
+        64,
+        "ISO 32000-1 §11.7.4.3 Table 149 row 1 (DeviceCMYK direct, \
+         OP=true, OPM=0): M lane c_r = 0.5·0.5 + 0.5·0 = 0.25 → u8 64. \
+         Got u8 {}.",
+        centre(m)
     );
 }
 
 /// QA-A2: transparency + OPM=1 with DeviceCMYK source, /OP true.
 ///
-/// Setup mirrors QA-A1 but with /OPM 1 (PDF 1.4+ nonzero overprint).
-/// Per §11.7.4.4: source component = 0 → preserve dest plate;
-/// nonzero → replace dest plate.
+/// ISO 32000-1 §11.7.4.3 Table 149 row 1 (DeviceCMYK direct, OP=true,
+/// OPM=1): `B(c_b, c_s) = c_s` if `c_s ≠ 0`, else `c_b`.
 ///
-/// Backdrop = (0.4, 0, 0, 0) full /ca=1.
-/// Foreground = (0, 0.5, 0, 0) with /OPM 1, /OP true, /ca 0.5.
-///
-/// Spec-correct per-plate output at the painted pixel:
-///   - C: source 0 → preserve dest (composed Cyan at backdrop = 0.4).
-///     → u8 102.
-///   - M: source 0.5 → replace dest. Replacement value is the alpha-
-///     composed paint result. /ca = 0.5, backdrop M = 0: composed =
-///     0.5·0.5 + 0.5·0 = 0.25 → u8 64.
-///   - Y, K: source 0 → preserve dest (both at 0). → u8 0.
-///
-/// The composite path uses the SAME merge lambda for OPM=1:
-///   merge(0, dst) → dst; merge(nonzero, dst) → src.
-/// The `src` here is the raw source quadruple component (sc, sm,
-/// sy, sk), NOT the alpha-composed value. Note: the composite path
-/// runs compose-then-overprint, so by the time overprint correction
-/// reads the sidecar plane, it contains the ICC-composed CMYK; then
-/// overprint replaces with raw src for nonzero. The Magenta plate
-/// ends up at raw source 0.5 → u8 128, NOT 0.25 → u8 64.
-///
-/// This probe pins the observed byte-exact behaviour and flags the
-/// OPM=1 alpha-composition skip if the impl is wrong.
+/// Backdrop = (0.4, 0, 0, 0), Foreground = (0, 0.5, 0, 0) at /ca = 0.5:
+///   C: c_s=0   → B = c_b = 0.4. r = 0.5·0.4 + 0.5·0.4 = 0.4  → u8 102.
+///   M: c_s=0.5 → B = c_s = 0.5. r = 0.5·0.5 + 0.5·0   = 0.25 → u8 64.
 #[test]
 fn qa_a2_transparency_opm1_devicecmyk_overprint_observed_byte_exact() {
     let icc = build_constant_cmyk_icc(135);
-    // OPM 1, /OP true, /ca 0.5.
     let content = "0.4 0 0 0 k\n0 0 100 100 re\nf\n\
                    /Ov gs\n0 0.5 0 0 k\n0 0 100 100 re\nf\n";
     let resources = "/ExtGState << /Ov << /Type /ExtGState /OP true /OPM 1 /ca 0.5 >> >>";
@@ -407,41 +326,35 @@ fn qa_a2_transparency_opm1_devicecmyk_overprint_observed_byte_exact() {
     let c = plate(&plates, "Cyan");
     let m = plate(&plates, "Magenta");
 
-    // Floor signal: under OPM=1 the Cyan plate's value must reflect
-    // backdrop preservation for the second paint (since source C is
-    // 0). The first paint's Cyan must survive.
-    let observed_c = centre(c);
-    let observed_m = centre(m);
-    assert!(
-        observed_c > 0,
-        "ISO 32000-1 §11.7.4.4 OPM=1: source C = 0 must preserve dest \
-         Cyan plate at the overprinting paint pixel. Cyan centre = {} \
-         (expected non-zero — backdrop survives source-zero under \
-         OPM=1).",
-        observed_c
+    assert_eq!(
+        centre(c),
+        102,
+        "ISO 32000-1 §11.7.4.3 Table 149 row 1 (OPM=1): C c_s=0 → \
+         B = c_b = 0.4. c_r = 0.5·0.4 + 0.5·0.4 = 0.4 → u8 102. \
+         Got u8 {}.",
+        centre(c)
     );
-    assert!(
-        observed_m > 0,
-        "ISO 32000-1 §11.7.4.4 OPM=1: source M = 0.5 ≠ 0 must \
-         replace dest Magenta plate. Magenta centre = {} (expected \
-         non-zero — source replacement contributes plate value).",
-        observed_m
+    assert_eq!(
+        centre(m),
+        64,
+        "ISO 32000-1 §11.7.4.3 Table 149 row 1 (OPM=1): M c_s=0.5 ≠ 0 \
+         → B = c_s. c_r = 0.5·0.5 + 0.5·0 = 0.25 → u8 64. Got u8 {}.",
+        centre(m)
     );
 }
 
 /// QA-A3: transparency + overprint with /K knockout group.
 ///
-/// A /K group containing a single /OP true /ca 0.5 DeviceCMYK paint
-/// over an opaque DeviceCMYK backdrop. Per §11.4.6.2 the knockout
-/// group's paints compose against the group's initial backdrop —
-/// which by the time the /K group is entered, is the outer
-/// DeviceCMYK paint's plate state.
+/// A /K (non-isolated) group containing a single OP+OPM=1+α=0.5
+/// DeviceCMYK paint over an opaque DeviceCMYK backdrop. Per §11.4.6.2
+/// the knockout group's elements compose against the group's initial
+/// backdrop = outer page state (since non-isolated). With a single
+/// inside paint and outer-group /Normal+α=1 the final plate output is
+/// identical to QA-A2's reference.
 ///
-/// Probe pins that the /K group's overprint paint produces the same
-/// observed plate output as a non-/K group with the same paint (i.e.
-/// the /K replay does not lose overprint semantics across the
-/// snapshot/restore boundary). This is the "did sidecar lane reset
-/// survive the overprint correction?" check.
+/// Per §11.4.6.2 + §11.7.4.3 Table 149 row 1 (OPM=1):
+///   C: c_s=0  → B = c_b = 0.4. c_r = 0.5·0.4 + 0.5·0.4 = 0.4 → u8 102.
+///   M: c_s=0.5 → B = c_s.       c_r = 0.5·0.5 + 0.5·0 = 0.25 → u8 64.
 #[test]
 fn qa_a3_transparency_overprint_inside_knockout_group_byte_exact() {
     let icc = build_constant_cmyk_icc(135);
@@ -459,27 +372,21 @@ fn qa_a3_transparency_overprint_inside_knockout_group_byte_exact() {
     let c = plate(&plates, "Cyan");
     let m = plate(&plates, "Magenta");
 
-    // Floor signal: /K replay snapshot-restore must NOT zero the
-    // sidecar for elements with no prior paint contribution at the
-    // pixel. Both plates must reflect their per-plate contribution.
-    let observed_c = centre(c);
-    let observed_m = centre(m);
-    assert!(
-        observed_c > 0,
-        "ISO 32000-1 §11.4.6.2 + §11.7.4.4 /K group with /OP+/ca \
-         paint: Cyan plate at painted pixel = {}; expected non-zero \
-         (backdrop survives under OPM=1 source-zero). A zero result \
-         means the /K snapshot-restore wiped the backdrop's Cyan \
-         contribution from the sidecar before the element's replay.",
-        observed_c
+    assert_eq!(
+        centre(c),
+        102,
+        "ISO 32000-1 §11.4.6.2 + §11.7.4.3 Table 149 row 1 (OPM=1): \
+         /K element composes against group's initial backdrop = outer \
+         state (0.4, 0, 0, 0). C: c_s=0 → B = c_b = 0.4. c_r = 0.4 → \
+         u8 102. Got u8 {}.",
+        centre(c)
     );
-    assert!(
-        observed_m > 0,
-        "ISO 32000-1 §11.7.4.4 /K group with /OP+/ca paint: Magenta \
-         plate at painted pixel = {}; expected non-zero (source-\
-         nonzero replacement). A zero result means the /K replay \
-         dropped the overprint paint's plate write.",
-        observed_m
+    assert_eq!(
+        centre(m),
+        64,
+        "ISO 32000-1 §11.4.6.2 + §11.7.4.3 Table 149 row 1 (OPM=1): \
+         M c_s=0.5 → B = c_s. c_r = 0.25 → u8 64. Got u8 {}.",
+        centre(m)
     );
 }
 
