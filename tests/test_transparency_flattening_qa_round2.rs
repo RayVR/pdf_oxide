@@ -484,25 +484,55 @@ fn qa_round2_compose_before_convert_under_nonlinear_icc() {
     // Under a non-linear ICC, these MUST differ — otherwise the
     // round-2 agent's deferral claim ("compose-first vs convert-first
     // are byte-identical") would be correct.
-    let convert_first_delta =
-        (or_mean_r - 128.0).abs() + (or_mean_g - 128.0).abs() + (or_mean_b - 128.0).abs();
-    let compose_first_delta = (or_mean_r - cs_mean_r).abs()
-        + (or_mean_g - cs_mean_g).abs()
-        + (or_mean_b - cs_mean_b).abs();
+    // BYTE-EXACT reference. The round-2 QA agent originally pinned this
+    // with a triple-channel L1 sum < 15.0 tolerance; round-3 QA
+    // hand-derived the byte-exact value by reading the agent's failure
+    // output at parent SHA 5585ce4 — at convert-first HEAD, the overlap
+    // measured (129, 129, 129) and the single-paint reference (66, 66,
+    // 66), a 189-byte L1 delta. The "≈ 66" value is what the non-linear
+    // ICC produces for CMYK(0.5, 0.5, 0.5, 0.5): gamma-2.2 input curves
+    // raise each 0.5 byte to ≈ 0.728 (the qcms 256-entry table sample),
+    // multilinear interp over the 2⁴ CLUT corners L = 255 − 63·(c+m+y+k)
+    // gives ≈ 255 − 252·x; the qcms tetrahedral path lands every pixel
+    // in the 30×30 sample on byte 66 exactly. The 30×30 mean is exactly
+    // 66.0 on every channel — no AA noise inside the overlap region.
+    //
+    // The previous `compose_first_delta < 15.0` tolerance is replaced
+    // by an exact-equality assertion on the integer mean. The
+    // convert-first reference at (128, 128, 128) is preserved as a
+    // discrimination check — should the implementation regress, we want
+    // to know whether it landed on convert-first or some third value.
+    let or_int_r = or_mean_r.round() as i32;
+    let or_int_g = or_mean_g.round() as i32;
+    let or_int_b = or_mean_b.round() as i32;
+    let cs_int_r = cs_mean_r.round() as i32;
+    let cs_int_g = cs_mean_g.round() as i32;
+    let cs_int_b = cs_mean_b.round() as i32;
 
-    // Assertion: the overlap region MUST match the compose-first
-    // expected value (single-paint at composited CMYK), NOT the
-    // convert-first RGB-blend value. As shipped, the implementation
-    // is convert-first, so this assertion fails.
-    assert!(
-        compose_first_delta < 15.0,
-        "compose-first expected: overlap region under non-linear ICC must \
-         equal the single-paint render of CMYK(0.5, 0.5, 0.5, 0.5). \
-         Got overlap RGB ({or_mean_r:.0}, {or_mean_g:.0}, {or_mean_b:.0}); \
-         single-paint reference RGB ({cs_mean_r:.0}, {cs_mean_g:.0}, \
-         {cs_mean_b:.0}); convert-first reference RGB (128, 128, 128). \
-         compose_first_delta={compose_first_delta:.1}, \
-         convert_first_delta={convert_first_delta:.1}. {}",
+    // Single-paint reference is byte-exact 66/66/66 because the
+    // non-linear ICC fixture is deterministic and the 30×30 sample is
+    // entirely inside the painted rect.
+    assert_eq!(
+        (cs_int_r, cs_int_g, cs_int_b),
+        (66, 66, 66),
+        "single-paint reference under non-linear ICC must be byte-exact \
+         RGB(66, 66, 66); got ({cs_int_r}, {cs_int_g}, {cs_int_b}). \
+         Fixture drift — re-derive the reference from the curve+CLUT \
+         tables."
+    );
+
+    // Compose-first impl must hit the same byte-exact reference. The
+    // CMYK source-space alpha blend of (0,0,0,0) and (1,1,1,1) at α=0.5
+    // is exactly CMYK(0.5, 0.5, 0.5, 0.5), and the ICC conversion is
+    // deterministic — so byte-exact equality holds.
+    assert_eq!(
+        (or_int_r, or_int_g, or_int_b),
+        (66, 66, 66),
+        "compose-first overlap under non-linear ICC: expected byte-exact \
+         RGB(66, 66, 66) (single-paint reference). Got ({or_int_r}, \
+         {or_int_g}, {or_int_b}); single-paint reference ({cs_int_r}, \
+         {cs_int_g}, {cs_int_b}); convert-first reference (128, 128, \
+         128). {}",
         HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE_NONLINEAR_ICC
     );
 }
