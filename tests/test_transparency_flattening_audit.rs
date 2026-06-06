@@ -546,7 +546,6 @@ fn fixture_smask_form_alpha() -> Vec<u8> {
 /// the subsequent black fill. As-shipped, the black fill paints
 /// straight through.
 #[test]
-#[ignore = "HONEST_GAP_SMASK_FORM_ALPHA"]
 fn smask_form_alpha_modulates_destination_alpha() {
     let rgba = render_rgba(fixture_smask_form_alpha());
     // Sample outside the Form's BBox-implied region but inside the
