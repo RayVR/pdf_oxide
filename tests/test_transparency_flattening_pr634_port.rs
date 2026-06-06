@@ -222,3 +222,65 @@ fn pr634_smask_applies_to_paint_inside_nested_do() {
     );
 }
 
+// ===========================================================================
+// C.2 — SMask clipping across image and text paints (#634 87457d4)
+// ===========================================================================
+//
+// The original tests used a 1×1 DeviceRGB image and Helvetica text.
+// Port both. Both check that an active SMask clips non-path paint
+// operators correctly.
+
+/// Active SMask clips text paint (#634 87457d4).
+///
+/// Pattern: SMask /S /Luminosity 50% grey, then Helvetica text. The
+/// painted glyph pixels must be modulated by the soft mask.
+///
+/// This is the same shape as `qa_round3_smask_modulates_tj_text` in
+/// the text-arm probe file but routed through a different fixture
+/// builder for independent provenance.
+#[test]
+fn pr634_smask_clips_text_paint() {
+    let smask_form = "0.5 g\n0 0 200 200 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    let obj_6 = b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont \
+                  /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n";
+    let content = "1 1 1 rg\n0 0 200 200 re\nf\n\
+                   /Sm gs\n\
+                   0 0 0 rg\n\
+                   BT /F1 48 Tf 30 80 Td (HELLO) Tj ET\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> >> \
+                     /Font << /F1 6 0 R >>";
+    let pdf = build_pdf(
+        "0 0 200 200",
+        resources,
+        content,
+        &[&obj_5, std::str::from_utf8(obj_6).unwrap()],
+    );
+    let rgba = render_rgba(pdf, 200, 200);
+    // Scan the text band for a representative painted pixel.
+    let mut painted_min_r = 255u8;
+    for y in 80..130 {
+        for x in 30..180 {
+            let (r, _, _, _) = pixel_at(&rgba, 200, x, y);
+            if r < painted_min_r {
+                painted_min_r = r;
+            }
+        }
+    }
+    // Without SMask wiring: opaque black ⇒ painted_min_r < 30.
+    // With 50%-luminance SMask: painted pixels lift toward mid-grey
+    // ⇒ painted_min_r > 50.
+    assert!(
+        painted_min_r > 50,
+        "Active SMask must modulate text paint; expected darkest \
+         painted pixel r > 50 (lifted by 50% luminance); got {painted_min_r}. \
+         (#634 87457d4)"
+    );
+}
+
