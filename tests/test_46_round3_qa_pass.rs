@@ -1058,6 +1058,122 @@ fn qa_6_diag2_outer_k_with_plain_inner_form_propagates_inner_sidecar_write() {
     );
 }
 
+/// QA-6-MECH: pins the underlying mechanism the QA-6 family bug was
+/// rooted in — the `Do` operator's post-Do spot-lane mirror.
+///
+/// Setup: no transparency groups anywhere. Page content stream is
+///   /CS_PMS cs 0.6 scn /Form Do
+/// Form XObject content stream is
+///   /Half gs /CS_PMS cs 0.3 scn 0 0 100 100 re f
+/// where /Half is /ca 0.5. The Form has NO /Group dict.
+///
+/// What the Form does internally:
+///  - sets fill alpha = 0.5
+///  - sets fill colour space + tint InkA 0.3
+///  - paints a 100×100 rect → the path's fill operator's per-paint
+///    spot mirror writes lane = compose_normal(0, 0.3, 0.5) = 0.15
+///    → u8 38 at the painted pixels.
+///
+/// What the OUTER content stream does:
+///  - sets fill colour space + tint InkA 0.6 at α=1 (no /Half on the
+///    outer side)
+///  - calls /Form Do
+///
+/// The `Do` dispatcher captures `gs_clone` = OUTER gs at Do time:
+/// `fill_spot_inks = [("InkA", 0.6)]`, `fill_alpha = 1.0`. The Form
+/// XObject's `render_form_xobject` path executes the form's internal
+/// operators, which DO their own per-paint spot mirror (writing 38).
+///
+/// The pre-fix bug: the `Do` dispatcher unconditionally ran a post-Do
+/// `mirror_spot_paint_into_sidecar_with_coverage(pixmap, &snap, None,
+/// &gs_clone, true)` block whenever `gs_clone` had a spot ink active.
+/// That post-Do mirror used the OUTER gs's tint (0.6) and α (1.0) and,
+/// because `coverage = None`, fell back to the snapshot-vs-post diff
+/// (any pixel where RGB changed counts as "fully painted at 255"). So
+/// every pixel the form had touched got re-written: lane =
+/// (1−1)·38 + 1·0.6 = 0.6 → u8 153. The form's correct 38 was
+/// overwritten by the outer-gs-flavoured 153.
+///
+/// Spec basis for the fix (ISO 32000-1 §11.4.7 + §8.10):
+///  - Form XObjects execute their own content stream with their own
+///    graphics state; the per-paint sidecar mirror runs at each Form-
+///    internal paint operator and is already complete by the time the
+///    Form returns.
+///  - Image / ImageMask XObjects do not execute paint operators of
+///    their own; their pixel data is painted using the OUTER gs's
+///    fill colour (ImageMask) or carries its own colours (Image), so
+///    the outer gs's CMYK / overprint / spot-lane modulators must
+///    run post-Do.
+///
+/// The fix dispatches the post-Do CMYK compose / overprint / spot
+/// mirror by the XObject's `/Subtype`: skipped for Form, applied for
+/// Image / ImageMask. SMask attenuation always applies regardless of
+/// subtype (it modulates whatever pixels the Do produced against the
+/// captured backdrop, per §11.4.7).
+///
+/// This probe is byte-exact: lane = 38.
+/// Failure mode 153 = post-Do mirror re-fired with outer tint 0.6
+/// (the regression this fix closes).
+#[test]
+fn qa_6_mech_do_dispatcher_does_not_remirror_outer_spot_over_form_internal_writes() {
+    let icc = build_constant_cmyk_icc(135);
+    let psfunc = "<< /FunctionType 2 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] \
+                  /C0 [0.0 0.0 0.0 0.0] /C1 [0.0 1.0 0.0 0.0] /N 1 >>";
+    // Plain (non-/K, non-/Group) Form: just a fill at tint 0.3 α=0.5.
+    let form_stream = "/Half gs\n/CS_PMS cs\n0.3 scn\n0 0 100 100 re\nf\n";
+    let form = format!(
+        "6 0 obj\n\
+        << /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 100 100] \
+           /Resources << /ExtGState << /Half << /Type /ExtGState /ca 0.5 >> >> \
+                         /ColorSpace << /CS_PMS [/Separation /InkA /DeviceCMYK \
+                           << /FunctionType 2 /Domain [0 1] \
+                              /Range [0 1 0 1 0 1 0 1] /C0 [0.0 0.0 0.0 0.0] \
+                              /C1 [0.0 1.0 0.0 0.0] /N 1 >> ] >> >> \
+           /Length {} >>\n\
+        stream\n{}endstream\nendobj\n",
+        form_stream.len(),
+        form_stream
+    );
+    // Page content: set outer spot ink to InkA tint 0.6 α=1, then Form Do.
+    // The outer's `cs/scn` populates `gs.fill_spot_inks = [("InkA", 0.6)]`
+    // which would trip the pre-fix Do dispatcher's spot mirror.
+    //
+    // The page's `/ExtGState` carries an unused `/Trigger` /ca<1 entry
+    // so `page_declares_transparency` returns true and the dispatcher
+    // routes through the composite-then-decompose path that owns the
+    // sidecar machinery. Without this trigger the per-plate walker
+    // path (sidecar-blind by design) would handle the page and the
+    // probe wouldn't exercise the Do dispatcher we're pinning.
+    let content = "/CS_PMS cs\n0.6 scn\n/Form Do\n";
+    let resources = format!(
+        "/XObject << /Form 6 0 R >> \
+         /ExtGState << /Trigger << /Type /ExtGState /ca 0.99 >> >> \
+         /ColorSpace << /CS_PMS [/Separation /InkA /DeviceCMYK {} ] >>",
+        psfunc
+    );
+    let pdf = build_pdf_with_output_intent(content, &resources, &icc, &[&form]);
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let inka = plate(&plates, "InkA");
+
+    let observed = centre(inka);
+    assert_eq!(
+        observed, 38,
+        "ISO 32000-1 §11.4.7 / §8.10: a Form XObject executes its own \
+         content stream with its own graphics state; its per-paint \
+         sidecar mirror is the authoritative lane write for the Form's \
+         pixels. The Do dispatcher MUST NOT re-mirror the outer gs's \
+         spot tint over the Form's contribution, or the outer's stale \
+         colour overwrites the Form's correct lane state. Got {} \
+         (expected 38). If 153: the Do dispatcher's post-Do spot-lane \
+         mirror is firing on Form Do — that's the mechanism behind the \
+         QA-6 / QA-6-DIAG-2 regression, where outer /K iteration 2's \
+         Inner Do lost the inner Form's spot writes because this \
+         double-mirror smashed them.",
+        observed
+    );
+}
+
 // ===========================================================================
 // Adversarial probe 7: /K + SMask + spot paint.
 // ===========================================================================
