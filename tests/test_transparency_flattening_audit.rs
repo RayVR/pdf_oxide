@@ -1222,7 +1222,6 @@ fn fixture_outputintent_then_transparency() -> Vec<u8> {
 /// observe the per-paint conversion happened. Round 2 must defer
 /// CMYK→RGB until after compositing.
 #[test]
-#[ignore = "HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE"]
 fn outputintent_then_transparency_composite_before_convert() {
     let rgba = render_rgba(fixture_outputintent_then_transparency());
     // Sample inside lower paint only (no upper-paint overlap).

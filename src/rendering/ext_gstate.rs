@@ -157,12 +157,10 @@ pub(crate) fn parse_ext_g_state_inner(
                 };
 
                 // /G — required Form XObject reference.
-                let form_ref = mask_dict
-                    .get("G")
-                    .and_then(|o| match o {
-                        Object::Reference(r) => Some(*r),
-                        _ => None,
-                    });
+                let form_ref = mask_dict.get("G").and_then(|o| match o {
+                    Object::Reference(r) => Some(*r),
+                    _ => None,
+                });
 
                 if let Some(form_ref) = form_ref {
                     // /BC backdrop colour — array of N reals. Only

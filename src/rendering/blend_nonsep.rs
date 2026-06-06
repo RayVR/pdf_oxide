@@ -52,11 +52,7 @@ impl NonSeparableBlend {
 /// considerations). The current composite path renders into RGBA
 /// pixmaps with dest alpha already at 255 (page background was filled),
 /// so the simplified composition is correct for the audit fixtures.
-pub(crate) fn compose_in_place(
-    dest: &mut [u8],
-    source: &[u8],
-    mode: NonSeparableBlend,
-) {
+pub(crate) fn compose_in_place(dest: &mut [u8], source: &[u8], mode: NonSeparableBlend) {
     debug_assert_eq!(dest.len(), source.len());
     debug_assert_eq!(dest.len() % 4, 0);
 
@@ -277,10 +273,6 @@ mod tests {
             .abs()
             .max((dest[0] as i32 - dest[2] as i32).abs())
             .max((dest[1] as i32 - dest[2] as i32).abs());
-        assert!(
-            max_diff < 30,
-            "Saturation grey-over-red should desaturate; got {:?}",
-            dest
-        );
+        assert!(max_diff < 30, "Saturation grey-over-red should desaturate; got {:?}", dest);
     }
 }

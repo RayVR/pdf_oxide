@@ -1183,16 +1183,14 @@ impl PageRenderer {
                                 &gs_clone,
                                 PipelinePaintKind::PathFill,
                             );
-                            let render_gs: &GraphicsState =
-                                spliced.as_ref().unwrap_or(&gs_clone);
+                            let render_gs: &GraphicsState = spliced.as_ref().unwrap_or(&gs_clone);
                             let transform = combine_transforms(base_transform, &gs_clone.ctm);
                             // §11.4.7 + §11.7.4: snapshot before the
                             // paint so the post-paint modulators can
                             // blend the backdrop (snapshot) with the
                             // painted result.
                             let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
-                            let overprint_snap =
-                                self.overprint_snapshot(pixmap, &gs_clone, true);
+                            let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap,
                                 &path,
@@ -1202,9 +1200,7 @@ impl PageRenderer {
                                 clip,
                             );
                             if let Some(snap) = overprint_snap {
-                                self.apply_overprint_after_paint(
-                                    pixmap, &snap, &gs_clone, true,
-                                );
+                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
                             }
                             if let Some(snap) = smask_snap {
                                 self.apply_smask_after_paint(
@@ -2950,7 +2946,12 @@ impl PageRenderer {
     /// [`Self::apply_overprint_after_paint`] to reconstruct the
     /// pre-paint CMYK plate state in the painted region so the spec
     /// per-plate composition can be applied.
-    fn overprint_snapshot(&self, pixmap: &Pixmap, gs: &GraphicsState, fill_side: bool) -> Option<Vec<u8>> {
+    fn overprint_snapshot(
+        &self,
+        pixmap: &Pixmap,
+        gs: &GraphicsState,
+        fill_side: bool,
+    ) -> Option<Vec<u8>> {
         let active = if fill_side {
             gs.fill_overprint && gs.fill_color_cmyk.is_some()
         } else {
@@ -3066,12 +3067,14 @@ impl PageRenderer {
     /// content the author intended to hide).
     ///
     /// Per ISO 32000-1:2008 §11.4.7, for each pixel:
-    ///   - `S=Alpha`: `mask_value = form_pixmap.alpha[px]`
-    ///   - `S=Luminosity`: `mask_value = 0.30 R + 0.59 G + 0.11 B` of form_pixmap
+    ///
+    /// - `S=Alpha`: `mask_value = form_pixmap.alpha[px]`
+    /// - `S=Luminosity`: `mask_value = 0.30 R + 0.59 G + 0.11 B` of form_pixmap
+    ///
     /// Optional `/TR` transfer is evaluated on the mask value before
     /// modulation. The destination pixel is updated as a linear blend
     /// between `snapshot` and `pixmap` weighted by the mask:
-    ///   `dest = mask * pixmap + (1 - mask) * snapshot`.
+    /// `dest = mask * pixmap + (1 - mask) * snapshot`.
     fn apply_smask_after_paint(
         &mut self,
         pixmap: &mut Pixmap,
@@ -3122,8 +3125,7 @@ impl PageRenderer {
                         (bc[2].clamp(0.0, 1.0) * 255.0).round() as u8,
                     ),
                     4 => {
-                        let (rf, gf, bf) =
-                            cmyk_to_rgb(bc[0], bc[1], bc[2], bc[3]);
+                        let (rf, gf, bf) = cmyk_to_rgb(bc[0], bc[1], bc[2], bc[3]);
                         (
                             (rf * 255.0).round() as u8,
                             (gf * 255.0).round() as u8,
