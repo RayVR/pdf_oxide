@@ -437,13 +437,69 @@ fn ext_g_states_signal_transparency(
                 return true;
             }
         }
-        if let Some(Object::Name(bm)) = state_dict.get("BM") {
-            if bm != "Normal" {
+        // ISO 32000-1 §11.3.5 + §11.6.3: `/BM` may be a name OR an
+        // array of names. For an array, "the first name that names a
+        // blend mode supported by the conforming reader shall be used".
+        // An unrecognised name maps to /Normal per §11.6.3. Walk both
+        // shapes; fire the detection trigger only when the resolved
+        // mode is non-/Normal.
+        if let Some(bm) = state_dict.get("BM") {
+            if bm_is_non_normal(bm) {
                 return true;
             }
         }
     }
     false
+}
+
+/// Resolve a `/BM` entry to "is this a recognised non-Normal blend
+/// mode?". Handles both the name and array forms per §11.3.5 +
+/// §11.6.3: the array form picks the FIRST recognised name; the name
+/// form is classified directly. Unrecognised names fall through to
+/// /Normal per the §11.6.3 fallback.
+fn bm_is_non_normal(bm: &Object) -> bool {
+    match bm {
+        Object::Name(name) => is_non_normal_mode(name),
+        Object::Array(arr) => arr
+            .iter()
+            .filter_map(Object::as_name)
+            .find(|name| is_recognised_mode(name))
+            .map(is_non_normal_mode)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// True when `name` is one of the standard blend-mode names ISO 32000-1
+/// §11.3.5 enumerates (separable §11.3.5.2 or non-separable §11.3.5.3).
+/// `/Normal` counts as recognised. Unknown names are NOT recognised and
+/// trigger the §11.6.3 fallback at the call site.
+fn is_recognised_mode(name: &str) -> bool {
+    matches!(
+        name,
+        "Normal"
+            | "Multiply"
+            | "Screen"
+            | "Overlay"
+            | "Darken"
+            | "Lighten"
+            | "ColorDodge"
+            | "ColorBurn"
+            | "HardLight"
+            | "SoftLight"
+            | "Difference"
+            | "Exclusion"
+            | "Hue"
+            | "Saturation"
+            | "Color"
+            | "Luminosity"
+    )
+}
+
+/// True when `name` is a recognised non-/Normal blend mode. The
+/// transparency trigger fires only on this set.
+fn is_non_normal_mode(name: &str) -> bool {
+    is_recognised_mode(name) && name != "Normal"
 }
 
 #[cfg(test)]

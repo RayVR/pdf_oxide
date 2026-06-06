@@ -312,7 +312,6 @@ fn qa1_2_devicen_with_nchannel_subtype_excludes_process_channels() {
 /// `Object::Name(bm)` and skips the array — trigger does NOT fire,
 /// sidecar stays None.
 #[test]
-#[ignore = "round-1 fix: detection helper must unwrap /BM array"]
 fn qa2_1_detection_fires_for_bm_array_with_non_normal_mode() {
     let icc = build_constant_cmyk_icc(135);
     let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
