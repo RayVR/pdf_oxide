@@ -220,7 +220,24 @@ pub struct PageRenderer {
     /// page in `render_page_with_options`; lives across paint
     /// operators within the page.
     pub(crate) icc_transform_cache: IccTransformCache,
+    /// Depth counter for the SMask materialisation path. Incremented
+    /// on entry to [`Self::apply_smask_after_paint`] and decremented
+    /// on exit. When the counter reaches [`MAX_SMASK_DEPTH`] further
+    /// SMask materialisation is skipped (the paint is left
+    /// unmodulated) so adversarial cyclic `/G` references do not
+    /// drive unbounded recursion. ISO 32000-1:2008 does not mandate a
+    /// numeric cap; 32 levels is well above any realistic nesting and
+    /// keeps the stack usage bounded.
+    smask_depth: u32,
 }
+
+/// Maximum SMask materialisation recursion depth. A cyclic
+/// `/SMask /G` chain (form XObject whose own ExtGState declares the
+/// same `/SMask`) would otherwise drive unbounded recursion. The cap
+/// is chosen above any realistic nesting depth so legitimate PDFs are
+/// unaffected; adversarial inputs fall through to the no-soft-mask
+/// branch once the cap engages.
+pub(crate) const MAX_SMASK_DEPTH: u32 = 32;
 
 impl PageRenderer {
     /// Create a new page renderer with the specified options.
@@ -233,6 +250,7 @@ impl PageRenderer {
             color_spaces: HashMap::new(),
             excluded_layers_snapshot: None,
             icc_transform_cache: IccTransformCache::new(),
+            smask_depth: 0,
         }
     }
 
@@ -3619,6 +3637,38 @@ impl PageRenderer {
             Some(s) => s.clone(),
             None => return Ok(()),
         };
+
+        // Defend against adversarial cyclic /SMask /G chains: the form
+        // referenced by /G can itself declare /SMask on its own
+        // content, re-entering this materialisation path. Without a
+        // cap recursion is unbounded. At the cap the paint is left
+        // unmodulated (the pre-paint snapshot is NOT restored — the
+        // caller's paint stays visible) and the recursion unwinds.
+        if self.smask_depth >= MAX_SMASK_DEPTH {
+            log::warn!(
+                "SMask materialisation reached MAX_SMASK_DEPTH={}; \
+                 likely cyclic /SMask /G chain. Skipping further \
+                 modulation on this paint.",
+                MAX_SMASK_DEPTH
+            );
+            return Ok(());
+        }
+        self.smask_depth += 1;
+        let result =
+            self.apply_smask_after_paint_inner(pixmap, snapshot, &smask, doc, page_num, resources);
+        self.smask_depth -= 1;
+        result
+    }
+
+    fn apply_smask_after_paint_inner(
+        &mut self,
+        pixmap: &mut Pixmap,
+        snapshot: &[u8],
+        smask: &crate::content::graphics_state::SoftMaskForm,
+        doc: &PdfDocument,
+        page_num: usize,
+        resources: &Object,
+    ) -> Result<()> {
 
         // Render the Form XObject into a fresh pixmap. The pixmap
         // starts fully transparent for /S /Alpha (the spec default
