@@ -468,7 +468,6 @@ fn fixture_nonlinear_icc_two_overlapping_cmyk_paints() -> Vec<u8> {
 /// single-paint render produces a value distinct from the overlap-blend
 /// value.
 #[test]
-#[ignore = "HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE_NONLINEAR_ICC"]
 fn qa_round2_compose_before_convert_under_nonlinear_icc() {
     let rgba_two = render_rgba(fixture_nonlinear_icc_two_overlapping_cmyk_paints());
     let rgba_composited = render_rgba(fixture_nonlinear_icc_single_cmyk(0.5, 0.5, 0.5, 0.5));
