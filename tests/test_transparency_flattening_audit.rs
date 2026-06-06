@@ -15,6 +15,7 @@
 //! | Feature                                         | Spec      | Implemented? | Test status | Tracking                  |
 //! |-------------------------------------------------|-----------|--------------|-------------|---------------------------|
 //! | `/CA`, `/ca` ExtGState alpha                    | §11.3.4   | yes          | LIVE        | regression sentry         |
+//! | `/SMask` image-attached alpha                   | §11.4.7   | yes (image)  | LIVE        | regression sentry         |
 //!
 //! ### Source citations for the inventory
 //!
@@ -22,6 +23,10 @@
 //!   routes `/CA` to `gs.stroke_alpha` and `/ca` to `gs.fill_alpha`;
 //!   the rasteriser folds those alphas into the painted pixels via
 //!   tiny_skia's `Color::from_rgba(_, _, _, alpha)`.
+//! - `src/rendering/page_renderer.rs:2520-2555` — image-attached
+//!   `/SMask` stream is decoded as 8-bit greyscale and multiplied
+//!   into the image's destination alpha; this is the only SMask
+//!   path the composite renderer honours today.
 //!
 //! ## Reading the assertions
 //!
@@ -238,5 +243,96 @@ fn ca_uppercase_stroke_alpha_half_paints_faded_red_ring() {
     assert!(
         (100..=200).contains(&g),
         "/CA 0.5 stroke top edge: G must be midway (faded); got G={g}"
+    );
+}
+
+// ===========================================================================
+// §11.4.7 image-attached SMask alpha
+// ===========================================================================
+//
+// pdf_oxide treats an image's `/SMask` stream as a luminance alpha mask
+// (page_renderer.rs:2520-2555). This is the only SMask path that
+// actually runs today. We pin its end-to-end behaviour with a tiny 2×2
+// image whose attached 2×2 SMask is `[255, 0; 0, 255]` — diagonal
+// opaque pixels.
+
+/// Build a fixture: a 2×2 red image upscaled to 60×60 with an SMask
+/// that makes the top-left and bottom-right pixels opaque, the others
+/// transparent. The image is painted over white.
+fn fixture_image_smask_diagonal() -> Vec<u8> {
+    // 2×2 RGB image, all red.
+    let img_data: [u8; 12] = [255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0];
+    // 2×2 8-bit greyscale SMask: [255 0; 0 255] — diagonal opaque.
+    let smask_data: [u8; 4] = [255, 0, 0, 255];
+
+    let img_obj = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 2 \
+         /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length {} >>\n\
+         stream\n",
+        img_data.len()
+    );
+    let mut obj_5 = img_obj.into_bytes();
+    obj_5.extend_from_slice(&img_data);
+    obj_5.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let smask_obj = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 2 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\n\
+         stream\n",
+        smask_data.len()
+    );
+    let mut obj_6 = smask_obj.into_bytes();
+    obj_6.extend_from_slice(&smask_data);
+    obj_6.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   q 60 0 0 60 20 20 cm /Im1 Do Q\n";
+    let resources = "/XObject << /Im1 5 0 R >>";
+
+    // build_pdf takes &[&str]; the binary samples (some 0x00 / 0xFF)
+    // are not valid UTF-8 individually but the surrounding stream
+    // dict + endstream framing IS valid, and `from_utf8_unchecked` on
+    // arbitrary bytes is sound when the consumer only reads the bytes
+    // back out (which `build_pdf` does via `as_bytes`).
+    let obj_5_str = unsafe { std::str::from_utf8_unchecked(&obj_5) };
+    let obj_6_str = unsafe { std::str::from_utf8_unchecked(&obj_6) };
+    build_pdf(content, resources, &[obj_5_str, obj_6_str])
+}
+
+/// Pin: a 2×2 red image with diagonal SMask paints diagonal red over
+/// white. The opaque-diagonal pixels at upper-left and lower-right
+/// quadrants must be red-dominant; the off-diagonal pixels must remain
+/// white (the SMask zeroed their alpha so the white backdrop shows
+/// through).
+#[test]
+fn image_smask_alpha_paints_diagonal_red_over_white() {
+    let rgba = render_rgba(fixture_image_smask_diagonal());
+    // The image is upscaled 2×2 → 60×60. Each source pixel covers a
+    // 30×30 image-space patch. The patches are:
+    //   src (0, 0) → image (20, 20)..(50, 50)    SMask=255 → opaque red
+    //   src (1, 0) → image (50, 20)..(80, 50)    SMask=  0 → transparent
+    //   src (0, 1) → image (20, 50)..(80, 80)    SMask=  0 → transparent
+    //   src (1, 1) → image (50, 50)..(80, 80)    SMask=255 → opaque red
+    // Note the PDF Y flip: src row 0 is the BOTTOM of the image in PDF
+    // user space, which becomes the BOTTOM of the rendered raster too
+    // (the y flip happens at the image-blit level, swapping rows).
+    let (r_tl, g_tl, b_tl, _) = pixel_at(&rgba, 30, 35);
+    let (r_br, g_br, b_br, _) = pixel_at(&rgba, 70, 65);
+    let (r_tr, g_tr, b_tr, _) = pixel_at(&rgba, 70, 35);
+    let (r_bl, g_bl, b_bl, _) = pixel_at(&rgba, 30, 65);
+    // Opaque red patches (one of the two diagonals): the rendered Y
+    // flip is implementation-defined for image XObjects; assert that
+    // EXACTLY one diagonal is red and the other transparent (white).
+    let red_at = |r: u8, g: u8, b: u8| r >= 200 && (g as i32) < 60 && (b as i32) < 60;
+    let white_at = |r: u8, g: u8, b: u8| r >= 230 && g >= 230 && b >= 230;
+    let diag_a_red = red_at(r_tl, g_tl, b_tl) && red_at(r_br, g_br, b_br);
+    let diag_b_red = red_at(r_tr, g_tr, b_tr) && red_at(r_bl, g_bl, b_bl);
+    let diag_a_white = white_at(r_tr, g_tr, b_tr) && white_at(r_bl, g_bl, b_bl);
+    let diag_b_white = white_at(r_tl, g_tl, b_tl) && white_at(r_br, g_br, b_br);
+    assert!(
+        (diag_a_red && diag_a_white) || (diag_b_red && diag_b_white),
+        "SMask diagonal: expected one of two diagonals to be red and the other white. \
+         TL=({r_tl},{g_tl},{b_tl}) TR=({r_tr},{g_tr},{b_tr}) \
+         BL=({r_bl},{g_bl},{b_bl}) BR=({r_br},{g_br},{b_br})"
     );
 }
