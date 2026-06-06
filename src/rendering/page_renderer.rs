@@ -3375,8 +3375,7 @@ impl PageRenderer {
             let m_u8 = (sm.clamp(0.0, 1.0) * 255.0).round() as u8;
             let y_u8 = (sy.clamp(0.0, 1.0) * 255.0).round() as u8;
             let k_u8 = (sk.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let transform =
-                self.icc_transform_cache.get_or_build(&profile, intent);
+            let transform = self.icc_transform_cache.get_or_build(&profile, intent);
             let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
             [
                 rgb[0] as f32 / 255.0,
@@ -3420,10 +3419,10 @@ impl PageRenderer {
                 (snap_g - src_rgb_ic[1]).abs(),
                 (snap_b - src_rgb_ic[2]).abs(),
             ];
-            let (max_idx, max_diff) =
-                diffs.iter().enumerate().fold((0usize, 0.0_f32), |acc, (i, &v)| {
-                    if v > acc.1 { (i, v) } else { acc }
-                });
+            let (max_idx, max_diff) = diffs
+                .iter()
+                .enumerate()
+                .fold((0usize, 0.0_f32), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc });
 
             let c_alpha = if max_diff > 1.0 / 255.0 {
                 let (snap_ch, post_ch, src_ch) = match max_idx {
@@ -3461,8 +3460,7 @@ impl PageRenderer {
             let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
             let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
             let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let transform =
-                self.icc_transform_cache.get_or_build(&profile, intent);
+            let transform = self.icc_transform_cache.get_or_build(&profile, intent);
             let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
 
             dest[off] = rgb[0];
