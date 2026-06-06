@@ -1161,7 +1161,6 @@ fn fixture_overprint_composite_two_cmyk_paints_no_op() -> Vec<u8> {
 /// overprint preserves it). As-shipped, the two renders produce
 /// identical bytes.
 #[test]
-#[ignore = "HONEST_GAP_OVERPRINT_COMPOSITE"]
 fn overprint_composite_overlap_differs_from_no_overprint() {
     let rgba_op = render_rgba(fixture_overprint_composite_two_cmyk_paints());
     let rgba_no = render_rgba(fixture_overprint_composite_two_cmyk_paints_no_op());
