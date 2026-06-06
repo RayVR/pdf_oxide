@@ -1155,8 +1155,15 @@ impl PageRenderer {
                             let transform = combine_transforms(base_transform, &gs_clone.ctm);
                             let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
                             let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, false);
+                            let cmyk_compose_snap =
+                                self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, false);
                             self.path_rasterizer
                                 .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
+                            if let Some(snap) = cmyk_compose_snap {
+                                self.apply_cmyk_compose_after_paint(
+                                    pixmap, &snap, &gs_clone, doc, false,
+                                );
+                            }
                             if let Some(snap) = overprint_snap {
                                 self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, false);
                             }
@@ -1201,6 +1208,8 @@ impl PageRenderer {
                             // painted result.
                             let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
                             let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
+                            let cmyk_compose_snap =
+                                self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap,
                                 &path,
@@ -1209,6 +1218,11 @@ impl PageRenderer {
                                 tiny_skia::FillRule::Winding,
                                 clip,
                             );
+                            if let Some(snap) = cmyk_compose_snap {
+                                self.apply_cmyk_compose_after_paint(
+                                    pixmap, &snap, &gs_clone, doc, true,
+                                );
+                            }
                             if let Some(snap) = overprint_snap {
                                 self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
                             }
@@ -2948,6 +2962,231 @@ impl PageRenderer {
             Some(pixmap.data().to_vec())
         } else {
             None
+        }
+    }
+
+    /// Predicate: should the CMYK compose-before-convert path fire for
+    /// the current paint operator? Per ISO 32000-1:2008 §11.4 + Annex G,
+    /// transparency compositing happens in the source colour space and
+    /// the OutputIntent ICC conversion happens at display. When all of
+    /// the following hold, the spec-correct rendering requires composing
+    /// in CMYK before converting through the ICC profile:
+    ///
+    /// * The active colour on the relevant side is genuine CMYK
+    ///   (`gs.fill_color_cmyk` / `gs.stroke_color_cmyk` populated).
+    /// * The graphics state declares non-trivial transparency: alpha
+    ///   below 1.0, a non-Normal blend mode, or an active soft mask.
+    /// * A CMYK OutputIntent ICC profile is available (otherwise the
+    ///   additive-clamp fallback is linear, so convert-first and
+    ///   compose-first are byte-identical and we save the work).
+    ///
+    /// Returns `true` only when every condition is met so the no-op
+    /// branch is the cheapest possible test: a single ICC-profile
+    /// lookup + a few `gs` field reads.
+    fn cmyk_compose_active(&self, gs: &GraphicsState, doc: &PdfDocument, fill_side: bool) -> bool {
+        let has_cmyk = if fill_side {
+            gs.fill_color_cmyk.is_some()
+        } else {
+            gs.stroke_color_cmyk.is_some()
+        };
+        if !has_cmyk {
+            return false;
+        }
+        let alpha = if fill_side {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
+        let non_trivial = alpha < 1.0 || gs.blend_mode != "Normal" || gs.smask.is_some();
+        if !non_trivial {
+            return false;
+        }
+        doc.output_intent_cmyk_profile().is_some()
+    }
+
+    /// Snapshot the pixmap when [`Self::cmyk_compose_active`] returns
+    /// true. The caller paints normally with the tiny_skia rasteriser
+    /// (which renders CMYK→RGB-via-ICC then alpha-blends in RGB — the
+    /// convert-first path), then hands the snapshot to
+    /// [`Self::apply_cmyk_compose_after_paint`] to overwrite the
+    /// painted region with the compose-first result.
+    fn cmyk_compose_snapshot(
+        &self,
+        pixmap: &Pixmap,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        fill_side: bool,
+    ) -> Option<Vec<u8>> {
+        if self.cmyk_compose_active(gs, doc, fill_side) {
+            Some(pixmap.data().to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// Recompute every painted pixel through the §11.4 compose-first
+    /// rule. The naive paint path converted CMYK→RGB through the
+    /// OutputIntent ICC before alpha-blending; under a non-linear ICC
+    /// (input curves != identity), `ICC(α·A + (1-α)·B) ≠ α·ICC(A) +
+    /// (1-α)·ICC(B)`, so the convert-first result diverges from the
+    /// spec-correct compose-first value. This helper recovers the
+    /// effective coverage from the post-paint RGB (using the convert-
+    /// first source RGB the rasteriser actually wrote) and replaces the
+    /// pixel with `ICC(α·source_cmyk + (1-α)·snapshot_cmyk)`, where
+    /// `snapshot_cmyk` comes from inverting the snapshot RGB through
+    /// the additive-clamp formula. The inversion is exact when the
+    /// snapshot was produced by an additive-clamp paint (the
+    /// no-transparency baseline) and is the same lossy approximation
+    /// the composite overprint path admits when the backdrop went
+    /// through a non-trivial ICC.
+    ///
+    /// Alpha channel is preserved from the post-paint pixmap because
+    /// the alpha composition rule is the same in either ordering
+    /// (`α_out = c·α_src + (1-c·α_src)·α_dst`).
+    fn apply_cmyk_compose_after_paint(
+        &self,
+        pixmap: &mut Pixmap,
+        snapshot: &[u8],
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        fill_side: bool,
+    ) {
+        let (sc, sm, sy, sk) = if fill_side {
+            match gs.fill_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        } else {
+            match gs.stroke_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        };
+        let alpha_g = if fill_side {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
+        let profile = match doc.output_intent_cmyk_profile() {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Build a single ICC transform for this call. The renderer's
+        // per-page IccTransformCache holds the compiled qcms transform
+        // across the many paint operators on the page; we look it up
+        // through the same cache so we never rebuild the 17⁴ CLUT for
+        // the same `(profile, intent)` tuple twice.
+        let intent = crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent);
+
+        // Compute the convert-first source RGB the rasteriser actually
+        // wrote into the pixmap. We need this to recover the effective
+        // coverage `c·α` from the post-paint pixel:
+        //   post = (c·α)·src_rgb_ic + (1 - c·α)·snap_rgb
+        // The recovery picks the channel with maximum |snap - src| for
+        // numerical stability and skips channels where the difference
+        // is below a threshold.
+        let src_rgb_ic = {
+            let c_u8 = (sc.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let m_u8 = (sm.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let y_u8 = (sy.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let k_u8 = (sk.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let transform =
+                self.icc_transform_cache.get_or_build(&profile, intent);
+            let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
+            [
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            ]
+        };
+
+        let dest = pixmap.data_mut();
+        debug_assert_eq!(dest.len(), snapshot.len());
+
+        for px in 0..(dest.len() / 4) {
+            let off = px * 4;
+
+            // Detect "this pixel was painted": any RGBA byte differs
+            // between snapshot and current pixmap.
+            let painted = dest[off] != snapshot[off]
+                || dest[off + 1] != snapshot[off + 1]
+                || dest[off + 2] != snapshot[off + 2]
+                || dest[off + 3] != snapshot[off + 3];
+            if !painted {
+                continue;
+            }
+
+            let snap_r = snapshot[off] as f32 / 255.0;
+            let snap_g = snapshot[off + 1] as f32 / 255.0;
+            let snap_b = snapshot[off + 2] as f32 / 255.0;
+            let post_r = dest[off] as f32 / 255.0;
+            let post_g = dest[off + 1] as f32 / 255.0;
+            let post_b = dest[off + 2] as f32 / 255.0;
+
+            // Recover effective coverage c·α by inverting the source-
+            // over alpha-blend on the channel with maximum |snap -
+            // src_rgb_ic| (most numerically stable). Default to the
+            // graphics-state alpha when the source RGB matches the
+            // snapshot exactly on every channel — in that case the
+            // pixel's RGB contribution is zero so any coverage value
+            // produces the same result.
+            let diffs = [
+                (snap_r - src_rgb_ic[0]).abs(),
+                (snap_g - src_rgb_ic[1]).abs(),
+                (snap_b - src_rgb_ic[2]).abs(),
+            ];
+            let (max_idx, max_diff) =
+                diffs.iter().enumerate().fold((0usize, 0.0_f32), |acc, (i, &v)| {
+                    if v > acc.1 { (i, v) } else { acc }
+                });
+
+            let c_alpha = if max_diff > 1.0 / 255.0 {
+                let (snap_ch, post_ch, src_ch) = match max_idx {
+                    0 => (snap_r, post_r, src_rgb_ic[0]),
+                    1 => (snap_g, post_g, src_rgb_ic[1]),
+                    _ => (snap_b, post_b, src_rgb_ic[2]),
+                };
+                ((snap_ch - post_ch) / (snap_ch - src_ch)).clamp(0.0, 1.0)
+            } else {
+                // Source RGB ≈ snapshot RGB — coverage is moot, but use
+                // the graphics-state alpha as a sensible fallback so a
+                // non-Normal blend mode still gets the right magnitude.
+                alpha_g
+            };
+
+            // Invert snapshot RGB → CMYK via §10.3.5 additive clamp.
+            // For backdrops produced by previous CMYK-via-ICC paints
+            // this inversion is lossy; the bound is captured by the
+            // composite-overprint reconstruction-loss probe. For the
+            // baseline-white backdrop the inversion is exact: white
+            // (255,255,255) maps to CMYK(0,0,0,0).
+            let dc = (1.0 - snap_r).max(0.0);
+            let dm = (1.0 - snap_g).max(0.0);
+            let dy = (1.0 - snap_b).max(0.0);
+            let dk = 0.0_f32;
+
+            // Compose in CMYK source space at effective coverage·alpha.
+            let mc = c_alpha * sc + (1.0 - c_alpha) * dc;
+            let mm = c_alpha * sm + (1.0 - c_alpha) * dm;
+            let my = c_alpha * sy + (1.0 - c_alpha) * dy;
+            let mk = c_alpha * sk + (1.0 - c_alpha) * dk;
+
+            // Convert the composed CMYK through the OutputIntent ICC.
+            let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let transform =
+                self.icc_transform_cache.get_or_build(&profile, intent);
+            let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
+
+            dest[off] = rgb[0];
+            dest[off + 1] = rgb[1];
+            dest[off + 2] = rgb[2];
+            // Alpha unchanged — the source-over alpha rule is identical
+            // in convert-first vs compose-first, so the tiny_skia
+            // rasteriser's alpha output is correct as-is.
         }
     }
 
