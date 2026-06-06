@@ -691,6 +691,20 @@ fn extract_inks_from_color_space_dict(
     doc: Option<&PdfDocument>,
     out: &mut Vec<String>,
 ) {
+    for cs_def in cs_dict.values() {
+        collect_inks_from_color_space(cs_def, doc, out);
+    }
+}
+
+/// Inner walker — surfaces inks from a single colour-space definition.
+/// Factored out of [`extract_inks_from_color_space_dict`] so the
+/// Pattern arm can recurse into its underlying colour space without
+/// requiring a synthetic single-entry dict.
+fn collect_inks_from_color_space(
+    cs_def: &Object,
+    doc: Option<&PdfDocument>,
+    out: &mut Vec<String>,
+) {
     let deref = |obj: &Object| -> Object {
         match (obj.as_reference(), doc) {
             (Some(r), Some(d)) => d.load_object(r).unwrap_or_else(|_| obj.clone()),
@@ -698,82 +712,87 @@ fn extract_inks_from_color_space_dict(
         }
     };
 
-    for cs_def in cs_dict.values() {
-        let arr = match cs_def.as_array() {
-            Some(a) => a,
-            None => continue,
-        };
-        if arr.len() < 2 {
-            continue;
-        }
-        let cs_type = match arr.first().and_then(Object::as_name) {
-            Some(n) => n,
-            None => continue,
-        };
-        match cs_type {
-            "Separation" => {
-                // §8.6.6.2: [/Separation /InkName /AlternateCS /TintTransform].
-                // The name slot is usually inline but resolve indirects for safety.
-                let name_obj = match arr.get(1) {
-                    Some(o) => deref(o),
-                    None => continue,
-                };
-                if let Some(ink) = name_obj.as_name() {
-                    if ink != "All" && ink != "None" {
-                        out.push(ink.to_string());
-                    }
+    let arr = match cs_def.as_array() {
+        Some(a) => a,
+        None => return,
+    };
+    if arr.len() < 2 {
+        return;
+    }
+    let cs_type = match arr.first().and_then(Object::as_name) {
+        Some(n) => n,
+        None => return,
+    };
+    match cs_type {
+        "Pattern" => {
+            // ISO 32000-1 §8.7.3.1: a Pattern colour space's
+            // optional second array element is the underlying
+            // colour space (uncoloured Tiling carries the
+            // underlying space's tints). Recurse so a Pattern
+            // with /Separation or /DeviceN underlying surfaces
+            // the spot colorants for plate allocation.
+            let underlying = deref(&arr[1]);
+            collect_inks_from_color_space(&underlying, doc, out);
+        },
+        "Separation" => {
+            // §8.6.6.2: [/Separation /InkName /AlternateCS /TintTransform].
+            // The name slot is usually inline but resolve indirects for safety.
+            let name_obj = deref(&arr[1]);
+            if let Some(ink) = name_obj.as_name() {
+                if ink != "All" && ink != "None" {
+                    out.push(ink.to_string());
                 }
-            },
-            "DeviceN" => {
-                // §8.6.6.5: [/DeviceN <names-array> /AlternateCS /TintTransform <attrs>].
-                // The names array is commonly emitted as an indirect reference
-                // when the same colorant set is shared across multiple DeviceN
-                // spaces; resolve before unpacking the names.
-                let names_obj = match arr.get(1) {
-                    Some(o) => deref(o),
-                    None => continue,
-                };
-                // ISO 32000-1 §8.6.6.5 / Table 73: the optional 5th array
-                // element is the attributes dictionary. When its `/Process`
-                // sub-dictionary declares a `/Components` array, those names
-                // are PROCESS colorants (riding the page's process plates),
-                // not spot inks. The same rule applies whether the attrs
-                // dict's `/Subtype` is `/DeviceN` (the default, PDF 1.6) or
-                // `/NChannel` (PDF 1.7 stricter subtype) — §8.6.6.5 names the
-                // /Process key on both subtypes. Build the process-name set
-                // here so the colorants loop can filter against it.
-                let process_names: std::collections::HashSet<String> = arr
-                    .get(4)
-                    .map(&deref)
-                    .as_ref()
-                    .and_then(Object::as_dict)
-                    .and_then(|attrs| attrs.get("Process"))
-                    .map(&deref)
-                    .as_ref()
-                    .and_then(Object::as_dict)
-                    .and_then(|proc_dict| proc_dict.get("Components"))
-                    .map(&deref)
-                    .as_ref()
-                    .and_then(Object::as_array)
-                    .map(|comps| {
-                        comps
-                            .iter()
-                            .filter_map(|o| o.as_name().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if let Some(inks) = names_obj.as_array() {
-                    for ink_obj in inks {
-                        if let Some(ink) = ink_obj.as_name() {
-                            if ink != "All" && ink != "None" && !process_names.contains(ink) {
-                                out.push(ink.to_string());
-                            }
+            }
+        },
+        "DeviceN" => {
+            // §8.6.6.5: [/DeviceN <names-array> /AlternateCS /TintTransform <attrs>].
+            // The names array is commonly emitted as an indirect reference
+            // when the same colorant set is shared across multiple DeviceN
+            // spaces; resolve before unpacking the names.
+            let names_obj = match arr.get(1) {
+                Some(o) => deref(o),
+                None => return,
+            };
+            // ISO 32000-1 §8.6.6.5 / Table 73: the optional 5th array
+            // element is the attributes dictionary. When its `/Process`
+            // sub-dictionary declares a `/Components` array, those names
+            // are PROCESS colorants (riding the page's process plates),
+            // not spot inks. The same rule applies whether the attrs
+            // dict's `/Subtype` is `/DeviceN` (the default, PDF 1.6) or
+            // `/NChannel` (PDF 1.7 stricter subtype) — §8.6.6.5 names the
+            // /Process key on both subtypes. Build the process-name set
+            // here so the colorants loop can filter against it.
+            let process_names: std::collections::HashSet<String> = arr
+                .get(4)
+                .map(&deref)
+                .as_ref()
+                .and_then(Object::as_dict)
+                .and_then(|attrs| attrs.get("Process"))
+                .map(&deref)
+                .as_ref()
+                .and_then(Object::as_dict)
+                .and_then(|proc_dict| proc_dict.get("Components"))
+                .map(&deref)
+                .as_ref()
+                .and_then(Object::as_array)
+                .map(|comps| {
+                    comps
+                        .iter()
+                        .filter_map(|o| o.as_name().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(inks) = names_obj.as_array() {
+                for ink_obj in inks {
+                    if let Some(ink) = ink_obj.as_name() {
+                        if ink != "All" && ink != "None" && !process_names.contains(ink) {
+                            out.push(ink.to_string());
                         }
                     }
                 }
-            },
-            _ => {},
-        }
+            }
+        },
+        _ => {},
     }
 }
 

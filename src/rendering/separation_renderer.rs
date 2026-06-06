@@ -781,6 +781,19 @@ fn classify_resolved(
         "DeviceCMYK" | "CMYK" => ResolvedSpace::Cmyk,
         "DeviceRGB" | "RGB" => ResolvedSpace::Rgb,
         "DeviceGray" | "G" => ResolvedSpace::Gray,
+        "Pattern" => {
+            // ISO 32000-1 §8.7.3.1: Pattern colour space's optional
+            // index-1 element is the underlying colour space
+            // (uncoloured Tiling carries the underlying space's
+            // tints). For separation-ink scanning, recurse so a
+            // Pattern[/Separation /Foo] marks /Foo as referenced.
+            // Round 5 brings this into parity with the round-5
+            // sidecar extractor's Pattern arm.
+            match arr.get(1) {
+                Some(underlying) => classify_resolved(underlying, color_spaces, resources, doc),
+                None => ResolvedSpace::Unknown,
+            }
+        },
         "Separation" => {
             let ink = arr
                 .get(1)
