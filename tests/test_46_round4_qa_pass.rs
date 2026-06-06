@@ -225,34 +225,31 @@ fn tint_to_u8(t: f32) -> u8 {
 /// tints `(0.5, 0.2, 0.7, 0.1)`, /OP true, OPM=0, /ca = 0.5 over a
 /// backdrop `(0.4, 0, 0, 0)`.
 ///
-/// Probe FINDING (P1): the agent's broad-read `OtherProcess`
-/// classification is correct in DISPATCH, but the SOURCE CMYK it feeds
-/// into `compose_overprint_channel` is wrong. The `SetFillColorN` arm
-/// for "DeviceN" / "Separation" leaves `gs.fill_color_rgb` UNCHANGED at
-/// its post-`cs` initial value (0, 0, 0). `source_for_overprint`'s `_=>`
-/// arm reads `gs.fill_color_rgb` and computes CMYK via additive-clamp
-/// inverse, yielding (1, 1, 1, 0) — the all-ink source — REGARDLESS of
-/// the actual tints painted via `scn`.
+/// Pins the §11.7.4.3 broad-read result on tint-correct source CMYK.
+/// The `SetFillColorN` "Separation"|"DeviceN" arm evaluates /Process
+/// attribution (§8.6.6.5 + Table 72): for /Process /ColorSpace
+/// /DeviceCMYK + /Components [/Cyan /Magenta /Yellow /Black], the
+/// source tints `(0.5, 0.2, 0.7, 0.1)` ARE the source CMYK directly
+/// (per §8.6.6.5: "values associated with the process components shall
+/// be stored in their natural form"). `source_for_overprint` reads the
+/// reconstructed CMYK off `gs.fill_color_cmyk` and routes it via
+/// `OtherProcess` (the broad read — see
+/// HONEST_GAP_DEVICEN_PROCESS_OVERPRINT_CLASS).
 ///
-/// So this probe pins the observed byte-exact output AND surfaces the
-/// gap: the DeviceN /Process broad-read currently produces a constant
-/// (1,1,1,0)-source paint, not the tint-transformed source.
-///
-/// Observed (with fill_color_rgb = (0,0,0), source CMYK = (1,1,1,0),
-/// α = 0.5):
-///   C: 0.5·1 + 0.5·0.4 = 0.7 → u8 round(178.5) = 179.
-///   M: 0.5·1 + 0.5·0 = 0.5 → u8 128.
-///   Y: 0.5·1 + 0.5·0 = 0.5 → u8 128.
-///   K: 0.5·0 + 0.5·0 = 0.0 → u8 0.
-///
-/// The probe asserts these byte-exact values so a future fix that
-/// properly evaluates the tint transform into `gs.fill_color_rgb` for
-/// /DeviceN paints will cause this probe to FAIL — at which point the
-/// expected values should be recomputed from the correct source CMYK.
+/// Expected (Table 149 row 4/5 OtherProcess: B = c_s for every
+/// process channel under OPM=0; §11.3.3 composite c_r = α·B + (1−α)·c_b):
+///   Source CMYK = (0.5, 0.2, 0.7, 0.1)
+///   Backdrop CMYK = (0.4, 0, 0, 0)
+///   α = 0.5
+///   C: 0.5·0.5 + 0.5·0.4 = 0.45 → u8 round(114.75) = 115.
+///   M: 0.5·0.2 + 0.5·0   = 0.10 → u8 round( 25.5 ) =  26.
+///   Y: 0.5·0.7 + 0.5·0   = 0.35 → u8 round( 89.25) =  89.
+///   K: 0.5·0.1 + 0.5·0   = 0.05 → u8 round( 12.75) =  13.
 ///
 /// The narrow-read alternative (`SeparationOrDeviceN` class → process
 /// channels preserve backdrop) would yield C=u8 102, M=Y=K=0. This probe
-/// FAILS the narrow read because the agent's broad-read is what landed.
+/// FAILS the narrow read because the broad-read is what landed; see
+/// HONEST_GAP_DEVICEN_PROCESS_OVERPRINT_CLASS.
 #[test]
 fn devicen_process_subtype_routes_to_process_class() {
     let icc = build_constant_cmyk_icc(135);
@@ -279,39 +276,47 @@ fn devicen_process_subtype_routes_to_process_class() {
     let y = centre(plate(&plates, "Yellow"));
     let k = centre(plate(&plates, "Black"));
 
-    // Falsify narrow-read: M, Y must be non-zero.
+    // Falsify narrow-read: M, Y, K must be non-zero (because the
+    // source tints feed all four process channels via /Process /CMYK).
     assert!(
-        m > 0 && y > 0,
-        "Broad-read DeviceN /Process must produce non-zero M, Y. Got \
-         M=u8 {}, Y=u8 {}. If both zero, narrow-read (preserve backdrop) \
-         is being applied. See HONEST_GAP_DEVICEN_PROCESS_OVERPRINT_CLASS.",
+        m > 0 && y > 0 && k > 0,
+        "Broad-read DeviceN /Process must produce non-zero M, Y, K. \
+         Got M=u8 {}, Y=u8 {}, K=u8 {}. If any zero, narrow-read \
+         (preserve backdrop) is being applied. See \
+         HONEST_GAP_DEVICEN_PROCESS_OVERPRINT_CLASS.",
         m,
-        y
+        y,
+        k
     );
 
-    // P1: source CMYK is (1, 1, 1, 0) because fill_color_rgb stays at
-    // the post-`cs` initial (0,0,0). The scn DeviceN arm doesn't update
-    // fill_color_rgb. Pin these observed byte values so a future tint-
-    // transform-driven fix will be caught by this probe.
+    // Source CMYK reconstructed from /Process /CMYK source tints
+    // (0.5, 0.2, 0.7, 0.1); §11.3.3 composite over backdrop
+    // (0.4, 0, 0, 0) at α=0.5.
     assert_eq!(
-        c, 179,
-        "Broad-read DeviceN /Process current behaviour: source CMYK = \
-         (1,1,1,0) from fill_color_rgb (0,0,0). C: 0.5·1 + 0.5·0.4 = \
-         0.7 → u8 179. Got u8 {}. P1: scn for /DeviceN doesn't update \
-         fill_color_rgb so the overprint source CMYK is tint-blind.",
+        c, 115,
+        "Broad-read DeviceN /Process: source C=0.5 reconstructed from \
+         /Process /CMYK tint. C: 0.5·0.5 + 0.5·0.4 = 0.45 → u8 \
+         round(114.75) = 115. Got u8 {}.",
         c
     );
     assert_eq!(
-        m, 128,
-        "Broad-read DeviceN /Process: M lane source c_s = 1, c_b = 0, \
-         α = 0.5 → 0.5 → u8 128. Got u8 {}.",
+        m, 26,
+        "Broad-read DeviceN /Process: source M=0.2. M: 0.5·0.2 + 0.5·0 \
+         = 0.10 → u8 round(25.5) = 26. Got u8 {}.",
         m
     );
-    assert_eq!(y, 128, "Broad-read DeviceN /Process: Y lane same as M. Got u8 {}.", y);
     assert_eq!(
-        k, 0,
-        "Broad-read DeviceN /Process: K = 0 because §10.3.5 additive \
-         inverse sets K = 0 (only C, M, Y derive from R, G, B). Got u8 {}.",
+        y, 89,
+        "Broad-read DeviceN /Process: source Y=0.7. Y: 0.5·0.7 + 0.5·0 \
+         = 0.35 → u8 round(89.25) = 89. Got u8 {}.",
+        y
+    );
+    assert_eq!(
+        k, 13,
+        "Broad-read DeviceN /Process: source K=0.1 (preserved by \
+         /Process /CMYK direct reconstruction, NOT the §10.3.5 RGB \
+         inverse which would zero K). K: 0.5·0.1 + 0.5·0 = 0.05 → u8 \
+         round(12.75) = 13. Got u8 {}.",
         k
     );
 }
@@ -322,7 +327,8 @@ fn devicen_process_subtype_routes_to_process_class() {
 /// The `extract_paint_spot_inks` filter should treat it identically.
 ///
 /// This probe asserts the byte-exact equivalence between /DeviceN
-/// /Process and /NChannel /Process.
+/// /Process and /NChannel /Process by pinning the same C/M/Y/K
+/// plate bytes as the /DeviceN case above.
 #[test]
 fn nchannel_process_subtype_routes_to_process_class() {
     let icc = build_constant_cmyk_icc(135);
@@ -345,17 +351,17 @@ fn nchannel_process_subtype_routes_to_process_class() {
     let doc = PdfDocument::from_bytes(pdf).expect("parse");
     let plates = render_separations(&doc, 0, 72).expect("render");
 
-    // Same broad-read arithmetic as the /DeviceN case.
+    // Byte-exact equivalence with `devicen_process_subtype_routes_to_process_class`.
+    // §8.6.6.5: /NChannel is a /DeviceN with stricter attribute
+    // requirements; the /Process /CMYK reconstruction path is the same.
+    let c = centre(plate(&plates, "Cyan"));
     let m = centre(plate(&plates, "Magenta"));
     let y = centre(plate(&plates, "Yellow"));
-    assert!(
-        m > 0 && y > 0,
-        "/NChannel /Process broad-read must produce non-zero M and Y \
-         lanes (consistent with /DeviceN /Process). Got M={}, Y={}. \
-         See HONEST_GAP_DEVICEN_PROCESS_OVERPRINT_CLASS.",
-        m,
-        y
-    );
+    let k = centre(plate(&plates, "Black"));
+    assert_eq!(c, 115, "/NChannel /Process: C lane mismatch with /DeviceN. Got u8 {}.", c);
+    assert_eq!(m, 26, "/NChannel /Process: M lane mismatch with /DeviceN. Got u8 {}.", m);
+    assert_eq!(y, 89, "/NChannel /Process: Y lane mismatch with /DeviceN. Got u8 {}.", y);
+    assert_eq!(k, 13, "/NChannel /Process: K lane mismatch with /DeviceN. Got u8 {}.", k);
 }
 
 // ===========================================================================

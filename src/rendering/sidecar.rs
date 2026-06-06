@@ -939,6 +939,138 @@ pub(crate) fn extract_paint_spot_inks(
     }
 }
 
+/// Process-colour reconstruction for a DeviceN paint that declares
+/// `/Process` attribution (ISO 32000-1:2008 §8.6.6.5 / Table 71 + Table 72).
+///
+/// A DeviceN colour space may carry an `/Attributes` sub-dictionary
+/// whose `/Process` entry routes a prefix of the source colorants
+/// through a declared process colour space (`/DeviceCMYK`,
+/// `/DeviceRGB`, `/DeviceGray`, or `/ICCBased`). For overprint /
+/// transparency compositing, those process-attributed tints establish
+/// the §11.7.4.3 source CMYK directly — the paint's tint transform
+/// (which targets the DeviceN alternate space) is irrelevant for the
+/// process attribution path because §8.6.6.5 explicitly states that
+/// process components are "interpreted directly as process values by
+/// consumers making use of the process dictionary".
+///
+/// Returns `Some((c, m, y, k))` when `space` is a `DeviceN` array with
+/// a `/Process` attribute and the process colour space evaluates
+/// successfully. Returns `None` for:
+///  - non-`DeviceN` colour spaces (callers should handle Separation /
+///    Device-family / ICC / CalGray / CalRGB explicitly),
+///  - DeviceN without `/Process` attribution (the paint is a pure spot
+///    paint; the process-side overprint rule is "preserve backdrop" per
+///    Table 149 row 3, handled by the `SeparationOrDeviceN` class),
+///  - DeviceN with `/Process /ColorSpace /ICCBased <ref>` — see
+///    `HONEST_GAP_DEVICEN_PROCESS_ICC_OVERPRINT`. The fallback at the
+///    call site computes the source CMYK from the existing
+///    fill-RGB / §10.3.5 inverse path.
+///
+/// The component pairing follows §8.6.6.5: `/Process /Components`
+/// entries map name-by-position to the channels of the process
+/// colour space; each name's index in the parent `/Names` array picks
+/// the source tint. This handles both the "all-process" case (every
+/// colorant in /Names is in /Components, in canonical order) and the
+/// "mixed" case (process prefix + spot tail, where the process
+/// position in /Names need not be index 0 for a /DeviceN — only
+/// /NChannel constrains the names to appear "sequentially").
+pub(crate) fn extract_process_paint_cmyk(
+    space: &Object,
+    components: &[f32],
+    doc: &PdfDocument,
+) -> Option<(f32, f32, f32, f32)> {
+    let arr = space.as_array()?;
+    if arr.first().and_then(Object::as_name)? != "DeviceN" {
+        return None;
+    }
+    let deref =
+        |obj: &Object| -> Object { doc.resolve_object(obj).unwrap_or_else(|_| obj.clone()) };
+
+    // Parent /Names array — every colorant name appears here in source
+    // declaration order. The source tints (`components`) index into
+    // this array.
+    let names_obj = deref(arr.get(1)?);
+    let names = names_obj.as_array()?;
+    let name_index = |target: &str| -> Option<usize> {
+        names
+            .iter()
+            .enumerate()
+            .find_map(|(i, o)| match o.as_name() {
+                Some(n) if n == target => Some(i),
+                _ => None,
+            })
+    };
+
+    // /Attributes /Process sub-dictionary.
+    let attrs_obj = deref(arr.get(4)?);
+    let attrs = attrs_obj.as_dict()?;
+    let process_obj = deref(attrs.get("Process")?);
+    let process = process_obj.as_dict()?;
+    let cs_obj = deref(process.get("ColorSpace")?);
+    let proc_components_obj = deref(process.get("Components")?);
+    let proc_components = proc_components_obj.as_array()?;
+
+    // Pull the source tint corresponding to each /Process /Components
+    // entry by looking the name up in the parent /Names array.
+    let mut proc_tints: Vec<f32> = Vec::with_capacity(proc_components.len());
+    for c in proc_components {
+        let name = c.as_name()?;
+        let idx = name_index(name)?;
+        // Malformed sources with short component vectors pin missing
+        // positions to 0 (no ink) — same conservative rule the spot
+        // extractor uses.
+        proc_tints.push(components.get(idx).copied().unwrap_or(0.0));
+    }
+
+    // Resolve the process /ColorSpace into a CMYK quadruple per
+    // §10.3.5 / §8.6.4. Names may be a direct name or an array form
+    // (e.g. /ICCBased indirect-ref); handle the four documented cases
+    // and route the rest to the caller's fallback.
+    match cs_obj.as_name() {
+        Some("DeviceCMYK") | Some("CMYK") => {
+            // §8.6.4.4: subtractive (c, m, y, k) — the source tints ARE
+            // the source CMYK in their natural form per §8.6.6.5
+            // ("values associated with the process components shall be
+            // stored in their natural form").
+            if proc_tints.len() < 4 {
+                return None;
+            }
+            Some((proc_tints[0], proc_tints[1], proc_tints[2], proc_tints[3]))
+        },
+        Some("DeviceRGB") | Some("RGB") => {
+            // §10.3.5 additive-clamp inverse: C = 1-R, M = 1-G,
+            // Y = 1-B, K = 0. Per §8.6.6.5 the process tints are stored
+            // in their natural (additive) form for RGB, matching
+            // §10.3.5's input convention.
+            if proc_tints.len() < 3 {
+                return None;
+            }
+            let c = (1.0 - proc_tints[0]).clamp(0.0, 1.0);
+            let m = (1.0 - proc_tints[1]).clamp(0.0, 1.0);
+            let y = (1.0 - proc_tints[2]).clamp(0.0, 1.0);
+            Some((c, m, y, 0.0))
+        },
+        Some("DeviceGray") | Some("G") => {
+            // Gray → CMYK convention used by every device-space arm in
+            // the renderer: K = 1 − g, C = M = Y = 0.
+            if proc_tints.is_empty() {
+                return None;
+            }
+            let k = (1.0 - proc_tints[0]).clamp(0.0, 1.0);
+            Some((0.0, 0.0, 0.0, k))
+        },
+        _ => {
+            // ICCBased / CalRGB / CalGray / other array-form. Routing
+            // these through the proper ICC transform is out of the
+            // round-4 scope (the renderer's overprint dispatcher
+            // doesn't carry an ICC evaluator). The call site falls back
+            // to the §10.3.5 inverse from the rasterised RGB —
+            // HONEST_GAP_DEVICEN_PROCESS_ICC_OVERPRINT documents this.
+            None
+        },
+    }
+}
+
 /// Initial colour values for a colour space per ISO 32000-1 §8.6.8
 /// ("The `CS`/`cs` operator shall also set the current colour to its
 /// initial value, which depends on the colour space").

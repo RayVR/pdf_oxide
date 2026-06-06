@@ -1158,6 +1158,32 @@ impl PageRenderer {
                                                 // see the matching comment in the SetFillColor
                                                 // arm above. The dispatcher just records the
                                                 // components for the pipeline to read.
+                                                //
+                                                // BUT: §11.7.4.3 CompatibleOverprint reads
+                                                // `gs.fill_color_cmyk` (when populated) /
+                                                // `gs.fill_color_rgb` to recover the source
+                                                // CMYK for the `B(c_b, c_s)` blend function.
+                                                // A DeviceN paint that declares /Process
+                                                // attribution (§8.6.6.5) carries process
+                                                // colorants directly in its source tints; we
+                                                // must populate the graphics-state CMYK
+                                                // identity here, otherwise the overprint
+                                                // dispatcher reads the stale post-`cs`
+                                                // initial `(0,0,0)` RGB and produces a
+                                                // constant `(1,1,1,0)` source CMYK
+                                                // regardless of actual scn tints.
+                                                if type_name == "DeviceN" {
+                                                    if let Some(cmyk) =
+                                                        crate::rendering::sidecar::extract_process_paint_cmyk(
+                                                            rs, components, doc,
+                                                        )
+                                                    {
+                                                        gs.fill_color_cmyk = Some(cmyk);
+                                                        gs.fill_color_rgb = cmyk_to_rgb(
+                                                            cmyk.0, cmyk.1, cmyk.2, cmyk.3,
+                                                        );
+                                                    }
+                                                }
                                                 handled = true;
                                             },
                                             "Indexed" => {
@@ -1263,7 +1289,23 @@ impl PageRenderer {
                                             "Separation" | "DeviceN" => {
                                                 // Pipeline owns the colour at paint time —
                                                 // see the matching comment in the SetFillColor
-                                                // arm.
+                                                // arm. The §11.7.4.3 CompatibleOverprint
+                                                // source-CMYK reconstruction for /Process-
+                                                // attributed DeviceN runs the same way as the
+                                                // fill side; see the comment in
+                                                // `SetFillColorN` above.
+                                                if type_name == "DeviceN" {
+                                                    if let Some(cmyk) =
+                                                        crate::rendering::sidecar::extract_process_paint_cmyk(
+                                                            rs, components, doc,
+                                                        )
+                                                    {
+                                                        gs.stroke_color_cmyk = Some(cmyk);
+                                                        gs.stroke_color_rgb = cmyk_to_rgb(
+                                                            cmyk.0, cmyk.1, cmyk.2, cmyk.3,
+                                                        );
+                                                    }
+                                                }
                                                 handled = true;
                                             },
                                             "Indexed" => {
@@ -6464,13 +6506,27 @@ fn source_for_overprint(gs: &GraphicsState, fill_side: bool) -> Option<Overprint
                     class: SourceCsClass::SeparationOrDeviceN,
                     cmyk: (0.0, 0.0, 0.0, 0.0),
                 })
+            } else if let Some(cmyk) = color_cmyk {
+                // DeviceN /Process attribution (§8.6.6.5): `SetFillColorN`
+                // resolved the process tints through the /Process
+                // /ColorSpace and pinned the result on the GS CMYK
+                // identity. Use that directly under Table 149 row 4/5
+                // "any other process colour space" — preserves the K
+                // channel and any non-RGB precision a §10.3.5 inverse
+                // would discard.
+                Some(OverprintSource {
+                    class: SourceCsClass::OtherProcess,
+                    cmyk,
+                })
             } else {
-                // ICCBased / Pattern / Indexed / DeviceN /Process — falls
-                // under Table 149 row 2 "any other process colour space".
-                // Recover CMYK from the convert-from-RGB additive-clamp
-                // inverse so the per-process-channel B = c_s rule has a
-                // defensible source value. This is the same conversion
-                // the no-OutputIntent fallback uses.
+                // ICCBased / Pattern / Indexed / DeviceN /Process with a
+                // /Process /ColorSpace the dispatcher could not resolve
+                // (ICCBased — HONEST_GAP_DEVICEN_PROCESS_ICC_OVERPRINT)
+                // — falls under Table 149 row 2 "any other process
+                // colour space". Recover CMYK from the convert-from-RGB
+                // additive-clamp inverse so the per-process-channel
+                // `B = c_s` rule has a defensible source value. This is
+                // the same conversion the no-OutputIntent fallback uses.
                 let (r, g, b) = color_rgb;
                 let c = (1.0 - r).clamp(0.0, 1.0);
                 let m = (1.0 - g).clamp(0.0, 1.0);
