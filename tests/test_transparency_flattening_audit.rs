@@ -20,6 +20,9 @@
 //! | `/SMask /S /Luminosity` (Form XObject soft mask)| §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_FORM_LUMINOSITY |
 //! | `/SMask /BC` backdrop colour                    | §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_BC       |
 //! | `/SMask /TR` transfer function                  | §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_TR       |
+//! | Transparency group `/I` (isolated flag)         | §11.4.5   | yes          | LIVE        | regression sentry         |
+//! | Transparency group `/K` (knockout flag)         | §11.4.5/6 | NO           | IGNORED     | HONEST_GAP_GROUP_KNOCKOUT |
+//! | Form XObject `/Group` dict                      | §11.4.5   | yes          | LIVE        | regression sentry         |
 //!
 //! ### Source citations for the inventory
 //!
@@ -38,6 +41,13 @@
 //!   or /S /Luminosity, optional /BC, optional /TR) is unreachable
 //!   from the composite renderer end-to-end. The `#[ignore]`-marked
 //!   probes below pin the spec values for round 2 to lift.
+//! - `src/rendering/page_renderer.rs:2793-2866` — Form-XObject group
+//!   dispatch reads only `/Group /S` (=`/Transparency`) and `/Group /I`
+//!   (isolated). `/Group /K` (knockout) is NOT read; `/BBox` is not
+//!   honoured for clipping; the composition rule between an isolated
+//!   group and its parent is `PixmapPaint::default()` (i.e. SourceOver),
+//!   which is the right separable-blend default but loses the
+//!   `/Group /S /Transparency /CS /...` colour-space override.
 //!
 //! ## Reading the assertions
 //!
@@ -106,6 +116,15 @@ pub const HONEST_GAP_SMASK_TR: &str =
      Round 2 must wire the Function evaluator (already shipped for \
      tint-transform paths) to evaluate /TR over the projected \
      modulation values before they apply to destination alpha.";
+
+/// Group `/K` (knockout) is not read on the composite path. Per §11.4.5
+/// a knockout group ignores accumulated transparency under each new
+/// shape — the destination is reset to the group backdrop for each
+/// element. The current code only branches on `/I`.
+pub const HONEST_GAP_GROUP_KNOCKOUT: &str =
+    "HONEST_GAP_GROUP_KNOCKOUT: Transparency group /K (knockout) flag is \
+     not parsed; the renderer only branches on /I. Round 2 must add a \
+     per-element knockout composition pass.";
 
 // ===========================================================================
 // Synthetic-PDF builder + helpers
@@ -569,5 +588,157 @@ fn smask_tr_transfer_squares_modulation() {
         r >= 240 && (g as i32 - 191).abs() <= 12 && (b as i32 - 191).abs() <= 12,
         "/SMask /TR Type 2 N=2 must square luminance; got ({r}, {g}, {b}). {}",
         HONEST_GAP_SMASK_TR
+    );
+}
+
+// ===========================================================================
+// §11.4.5 transparency groups — `/I` isolated flag
+// ===========================================================================
+//
+// Isolated transparency groups: `/Group /S /Transparency /I true` —
+// the group's initial backdrop is fully transparent; group content
+// composites against itself, then the composited group is over-blended
+// onto the parent. pdf_oxide implements this correctly per
+// page_renderer.rs:2837-2862. The probe pins the boundary case where
+// /I affects observable output: a red rect at α=0.5 inside an isolated
+// group, with the group's own background empty, composited over a
+// blue parent. Non-isolated would composite the red onto the blue
+// inside the group; isolated lets the group's transparent backdrop
+// reach the parent.
+
+fn fixture_isolated_group_alpha_red_over_blue() -> Vec<u8> {
+    // Blue background full canvas + Form XObject with /Group /I true
+    // containing a red fill at /ca 0.5.
+    let form_content = "/Half gs\n\
+                        1 0 0 rg\n\
+                        20 20 60 60 re\nf\n";
+    let form_resources = "/ExtGState << /Half << /Type /ExtGState /ca 0.5 >> >>";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /I true >> \
+         /Resources << {} >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_resources,
+        form_content.len(),
+        form_content
+    );
+    let content = "0 0 1 rg\n0 0 100 100 re\nf\n\
+                   /Fm1 Do\n";
+    let resources = "/XObject << /Fm1 5 0 R >>";
+    build_pdf(content, resources, &[&obj_5])
+}
+
+/// Pin: isolated transparency group composites internally then
+/// over-blends onto the parent. The centre pixel reflects red-over-
+/// blue at the group's effective alpha.
+#[test]
+fn isolated_transparency_group_composites_red_over_blue() {
+    let rgba = render_rgba(fixture_isolated_group_alpha_red_over_blue());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // Inside the rect, the isolated group composites red at α=0.5 onto
+    // its transparent backdrop, then the group (α effectively 0.5) is
+    // over-blended onto the blue parent.
+    //   group rgba post-composition ≈ (127, 0, 0, 127)
+    //   over blue (0, 0, 255, 255):
+    //     r ≈ 127 + (1 - 0.5) * 0 ≈ 127
+    //     g ≈ 0
+    //     b ≈ 0 + (1 - 0.5) * 255 ≈ 127
+    assert!(
+        r > b.saturating_add(20) || b > r.saturating_add(20) || (r as i32 - b as i32).abs() < 30,
+        "isolated group: expected R and B near-equal (red+blue mix); got ({r}, {g}, {b})"
+    );
+    assert!(g < 50, "isolated group: G must stay low (no green source); got G={g}");
+    assert!(
+        r > 60 && b > 60,
+        "isolated group must contain both red and blue contributions; got ({r}, {g}, {b})"
+    );
+}
+
+// ===========================================================================
+// §11.4.5 transparency groups — `/K` knockout flag (HONEST_GAP)
+// ===========================================================================
+
+fn fixture_knockout_group_two_overlapping_rects() -> Vec<u8> {
+    // Knockout group containing two overlapping rectangles, the
+    // second painted with /ca 0.5. Per §11.4.5 knockout semantics, the
+    // second rect knocks the first rect's accumulated transparency
+    // out and composites against the group backdrop directly. Without
+    // knockout (the current behaviour), the second rect composites
+    // against the accumulated first rect's contribution. The two
+    // results differ in the overlap region.
+    let form_content = "1 0 0 rg\n\
+                        10 10 50 50 re\nf\n\
+                        /Half gs\n\
+                        0 0 1 rg\n\
+                        40 40 50 50 re\nf\n";
+    let form_resources = "/ExtGState << /Half << /Type /ExtGState /ca 0.5 >> >>";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /K true >> \
+         /Resources << {} >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_resources,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Fm1 Do\n";
+    let resources = "/XObject << /Fm1 5 0 R >>";
+    build_pdf(content, resources, &[&obj_5])
+}
+
+/// IGNORED — knockout `/K true` is not honoured. With the gap closed,
+/// inside the overlap region the blue rect at α=0.5 should composite
+/// against the group's white backdrop (not against the red rect that
+/// painted there first). Expected centre pixel ≈ (127, 0, 127) after
+/// blue-over-white-at-half then over-the-parent (which is also white).
+#[test]
+#[ignore = "HONEST_GAP_GROUP_KNOCKOUT"]
+fn knockout_group_resets_destination_per_element() {
+    let rgba = render_rgba(fixture_knockout_group_two_overlapping_rects());
+    let (_r, g, _b, _) = pixel_at(&rgba, 50, 50);
+    // Knockout: blue α=0.5 over white backdrop in the overlap region:
+    //   r ≈ 127, g ≈ 127, b ≈ 255
+    // Without knockout: blue α=0.5 over red (the accumulated paint):
+    //   r ≈ 127, g ≈ 0, b ≈ 127
+    // The g-channel is the discriminator.
+    assert!(
+        g > 100,
+        "knockout: overlap region must reset to white backdrop before \
+         compositing blue; expected G > 100, got G={g}. {}",
+        HONEST_GAP_GROUP_KNOCKOUT
+    );
+}
+
+// ===========================================================================
+// §11.4.5 Form XObject /Group dict — regression sentry
+// ===========================================================================
+//
+// A Form XObject whose /Group dict declares /S /Transparency triggers
+// the transparency-group code path even without /I or /K. The probe
+// confirms the Form-with-/Group dispatch wires the group composition
+// helpers rather than degenerating to a direct render.
+
+fn fixture_form_with_group_dict_blue_over_white() -> Vec<u8> {
+    let form_content = "0 0 1 rg\n\
+                        20 20 60 60 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Fm1 Do\n";
+    let resources = "/XObject << /Fm1 5 0 R >>";
+    build_pdf(content, resources, &[&obj_5])
+}
+
+#[test]
+fn form_xobject_group_dict_with_transparency_paints_blue() {
+    let rgba = render_rgba(fixture_form_with_group_dict_blue_over_white());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert!(
+        b > 200 && r < 80 && g < 80,
+        "Form-XObject /Group /S /Transparency must paint blue; got ({r}, {g}, {b})"
     );
 }
