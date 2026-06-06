@@ -256,6 +256,15 @@ pub struct PageRenderer {
     /// fall back to additive-clamp inversion when the sidecar is
     /// `None`.
     cmyk_sidecar: Option<CmykSidecar>,
+    /// When `true`, allocate the CMYK + spot sidecar on every
+    /// transparency-detected page regardless of whether the document
+    /// declares a CMYK `OutputIntent`. The separation-renderer's
+    /// composite-then-decompose entry point flips this so the spot
+    /// lanes and the process plane survive the render even for press
+    /// jobs whose `OutputIntent` is missing or non-CMYK. The detection
+    /// gate ([`page_declares_transparency_or_overprint`]) is still
+    /// honoured; detection-OFF pages never allocate a sidecar.
+    pub(crate) force_cmyk_sidecar: bool,
 }
 
 /// Maximum SMask materialisation recursion depth. A cyclic
@@ -279,7 +288,22 @@ impl PageRenderer {
             icc_transform_cache: IccTransformCache::new(),
             smask_depth: 0,
             cmyk_sidecar: None,
+            force_cmyk_sidecar: false,
         }
+    }
+
+    /// Take ownership of the per-page CMYK + spot-ink sidecar produced
+    /// by the most recent [`Self::render_page_with_options`] call.
+    /// Leaves the renderer's slot empty so a subsequent render starts
+    /// fresh.
+    ///
+    /// Used by the separation entry point
+    /// ([`super::separation_renderer::render_separations`]) to harvest
+    /// the populated process + spot lanes after a composite render and
+    /// decompose them into per-plate output (ISO 32000-1 §10.5 plates,
+    /// §11.7.3 spot lanes, §11.7.4.2 BM split).
+    pub(crate) fn take_cmyk_sidecar(&mut self) -> Option<CmykSidecar> {
+        self.cmyk_sidecar.take()
     }
 
     /// Number of qcms transform constructions the per-page cache has
@@ -459,7 +483,18 @@ impl PageRenderer {
         // operators can blind-index by ink without re-walking the
         // resource tree.
         self.cmyk_sidecar = None;
-        let needs_cmyk_sidecar = doc.output_intent_cmyk_profile().is_some()
+        // ISO 32000-1 §11.7.3 + §11.7.4.2 + §10.5: the sidecar carries
+        // the composite-then-separate workflow's process + spot lanes.
+        // The default page-renderer path gates on the OutputIntent CMYK
+        // profile because the compose-first / overprint-correction
+        // helpers only fire when there is a non-trivial CMYK→RGB
+        // transform to compose under. The separation entry point flips
+        // `force_cmyk_sidecar` so the sidecar lives on every
+        // detection-ON page regardless of OutputIntent — the per-plate
+        // output is meaningful even without a press ICC profile (it is
+        // the raw subtractive tint at every pixel).
+        let needs_cmyk_sidecar = (self.force_cmyk_sidecar
+            || doc.output_intent_cmyk_profile().is_some())
             && page_declares_transparency_or_overprint(doc, &resources);
         if needs_cmyk_sidecar {
             let spot_names = sidecar_mod::discover_page_spot_inks(doc, page_num);
@@ -5148,6 +5183,22 @@ impl PageRenderer {
         let height = pixmap.height();
         let backdrop_data: Vec<u8> = pixmap.data().to_vec();
 
+        // Sidecar backdrop snapshot. ISO 32000-1 §11.3.3 + §11.4.6.2:
+        // a knockout group composes each element against the group's
+        // INITIAL backdrop, and the single (shape, opacity) the spec
+        // maintains per pixel applies to BOTH process and spot lanes.
+        // So the CMYK plane and every spot plane must be reset to the
+        // group's backdrop before each element's cumulative replay,
+        // exactly like the RGB pixmap is. Without this reset the
+        // round-2 spot mirror's per-paint writes would compose against
+        // the previous element's lane state — that is non-isolated
+        // group semantics, NOT knockout. The brief calls this out as
+        // the round-2 gap the secondary scope of round 3 closes.
+        let sidecar_backdrop_cmyk: Option<Vec<u8>> =
+            self.cmyk_sidecar.as_ref().map(|s| s.cmyk().to_vec());
+        let sidecar_backdrop_spots: Option<Vec<u8>> =
+            self.cmyk_sidecar.as_ref().map(|s| s.spots_all().to_vec());
+
         // Identify paint-operator indices. These define element
         // boundaries.
         let paint_indices: Vec<usize> = operators
@@ -5171,6 +5222,11 @@ impl PageRenderer {
         // Accumulator starts as the backdrop. Each element's painted
         // pixels overwrite the accumulator.
         let mut accumulator: Vec<u8> = backdrop_data.clone();
+        // Sidecar accumulators parallel `accumulator` for the process
+        // and spot lanes. They start at the group's initial backdrop
+        // and absorb per-element scratch-vs-backdrop diffs.
+        let mut sidecar_accum_cmyk: Option<Vec<u8>> = sidecar_backdrop_cmyk.clone();
+        let mut sidecar_accum_spots: Option<Vec<u8>> = sidecar_backdrop_spots.clone();
 
         for &end_idx in &paint_indices {
             // Cumulative replay: graphics-state operators 0..end_idx
@@ -5185,6 +5241,25 @@ impl PageRenderer {
                 crate::error::Error::InvalidPdf("knockout scratch pixmap alloc failed".into())
             })?;
             scratch.data_mut().copy_from_slice(&backdrop_data);
+
+            // Reset sidecar lanes to the group's backdrop before this
+            // element's replay so the per-paint mirror writes compose
+            // against the BACKDROP (knockout rule), not against earlier
+            // elements' lane state. The §11.4.6.2 spec is explicit: the
+            // group's "constituent objects ... shall be composited with
+            // the group's initial backdrop rather than with each
+            // other". This restoration extends that rule to the
+            // process / spot lanes the round-1/2 sidecar carries.
+            if let (Some(sidecar), Some(cmyk_b)) =
+                (self.cmyk_sidecar.as_mut(), sidecar_backdrop_cmyk.as_ref())
+            {
+                sidecar.restore_cmyk(cmyk_b);
+            }
+            if let (Some(sidecar), Some(spots_b)) =
+                (self.cmyk_sidecar.as_mut(), sidecar_backdrop_spots.as_ref())
+            {
+                sidecar.restore_spots(spots_b);
+            }
 
             let element_ops: Vec<Operator> = operators[..=end_idx]
                 .iter()
@@ -5231,6 +5306,42 @@ impl PageRenderer {
                     accumulator[off + 3] = scratch_data[off + 3];
                 }
             }
+
+            // Merge sidecar lanes: any byte that differs from the
+            // backdrop snapshot was written by this element's paint
+            // mirror. Pull the post-element value into the accumulator
+            // so later replay iterations see only the backdrop on
+            // restore, but the merged group result preserves every
+            // element's contribution (last-paint wins on per-byte
+            // collision, mirroring the pixmap merge).
+            if let (Some(sidecar), Some(accum), Some(backdrop)) = (
+                self.cmyk_sidecar.as_ref(),
+                sidecar_accum_cmyk.as_mut(),
+                sidecar_backdrop_cmyk.as_ref(),
+            ) {
+                let post = sidecar.cmyk();
+                debug_assert_eq!(post.len(), backdrop.len());
+                debug_assert_eq!(accum.len(), backdrop.len());
+                for i in 0..post.len() {
+                    if post[i] != backdrop[i] {
+                        accum[i] = post[i];
+                    }
+                }
+            }
+            if let (Some(sidecar), Some(accum), Some(backdrop)) = (
+                self.cmyk_sidecar.as_ref(),
+                sidecar_accum_spots.as_mut(),
+                sidecar_backdrop_spots.as_ref(),
+            ) {
+                let post = sidecar.spots_all();
+                debug_assert_eq!(post.len(), backdrop.len());
+                debug_assert_eq!(accum.len(), backdrop.len());
+                for i in 0..post.len() {
+                    if post[i] != backdrop[i] {
+                        accum[i] = post[i];
+                    }
+                }
+            }
         }
 
         // Replay any trailing non-paint operators (state side effects
@@ -5238,6 +5349,21 @@ impl PageRenderer {
         // visible output IS the accumulator, so we install it before
         // returning.
         pixmap.data_mut().copy_from_slice(&accumulator);
+
+        // Install the merged sidecar accumulators back into the
+        // sidecar. The group's spot and process lanes are now the
+        // accumulated knockout result — later operators (outside the
+        // group) compose against this state.
+        if let (Some(sidecar), Some(cmyk_a)) =
+            (self.cmyk_sidecar.as_mut(), sidecar_accum_cmyk.as_ref())
+        {
+            sidecar.restore_cmyk(cmyk_a);
+        }
+        if let (Some(sidecar), Some(spots_a)) =
+            (self.cmyk_sidecar.as_mut(), sidecar_accum_spots.as_ref())
+        {
+            sidecar.restore_spots(spots_a);
+        }
         Ok(())
     }
 
