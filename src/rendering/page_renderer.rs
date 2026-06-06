@@ -25,6 +25,9 @@ use crate::rendering::resolution::{
     DeviceColor, IccTransformCache, LogicalColor, PaintIntent, PaintKind, PaintSide,
     ResolutionContext, ResolutionPipeline, ResolvedColor,
 };
+use crate::rendering::sidecar::{
+    self as sidecar_mod, page_declares_transparency_or_overprint, CmykSidecar,
+};
 use crate::rendering::text_rasterizer::TextRasterizer;
 
 use crate::fonts::FontInfo;
@@ -229,25 +232,30 @@ pub struct PageRenderer {
     /// numeric cap; 32 levels is well above any realistic nesting and
     /// keeps the stack usage bounded.
     smask_depth: u32,
-    /// CMYK sidecar plane for press-accurate transparency + overprint
-    /// composition. When present, every opaque CMYK paint mirrors its
-    /// plate values into this buffer so the compose-first and
-    /// overprint-correction paths can read the backdrop CMYK
-    /// quadruple directly instead of inverting the post-ICC RGB
-    /// (which is lossy under non-linear OutputIntent profiles).
-    /// Layout matches the RGBA pixmap: 4 bytes per pixel (C, M, Y,
-    /// K), row-major, width × height.
+    /// Per-page CMYK + spot-ink compositing sidecar. When present,
+    /// every opaque CMYK paint mirrors its plate values into the
+    /// CMYK lanes so the compose-first and overprint-correction
+    /// paths read the backdrop CMYK quadruple directly instead of
+    /// inverting the post-ICC RGB (lossy under non-linear OutputIntent
+    /// profiles). The CMYK lane layout matches the RGBA pixmap:
+    /// 4 bytes per pixel (C, M, Y, K), row-major, width × height —
+    /// preserved byte-for-byte from the round-4 shape.
     ///
-    /// Lazy allocation: stays `None` for pages without OutputIntent
-    /// or pages whose only paints land on the no-transparency convert-
-    /// first path. The detection-OFF path is byte-identical to the
-    /// pre-Priority-4 behaviour because the compose / overprint
-    /// helpers fall back to additive-clamp inversion when the sidecar
-    /// is `None`.
-    cmyk_plane: Option<Vec<u8>>,
-    /// Cached page pixmap dimensions for sidecar allocation. Filled
-    /// at the top of `render_page_with_options`.
-    cmyk_plane_dims: (u32, u32),
+    /// The sidecar additionally carries one tint plane per discovered
+    /// spot ink, sized at page setup from the page's resource tree
+    /// (ISO 32000-1:2008 §8.6.6.4 / §8.6.6.5 declarations on
+    /// `/Resources/ColorSpace` and nested Form XObjects). The spot
+    /// lanes sit ALONGSIDE the CMYK blend space per §11.7.3 — they
+    /// are NOT a blend space themselves, since §11.3.4 and §11.6.6
+    /// (Table 147) forbid `Separation` and `DeviceN` as blend spaces.
+    ///
+    /// Lazy allocation: stays `None` for pages without an OutputIntent
+    /// CMYK profile and pages whose resources declare no transparency
+    /// or overprint trigger. The detection-OFF path is byte-identical
+    /// to the pre-sidecar behaviour because the consuming helpers
+    /// fall back to additive-clamp inversion when the sidecar is
+    /// `None`.
+    cmyk_sidecar: Option<CmykSidecar>,
 }
 
 /// Maximum SMask materialisation recursion depth. A cyclic
@@ -270,8 +278,7 @@ impl PageRenderer {
             excluded_layers_snapshot: None,
             icc_transform_cache: IccTransformCache::new(),
             smask_depth: 0,
-            cmyk_plane: None,
-            cmyk_plane_dims: (0, 0),
+            cmyk_sidecar: None,
         }
     }
 
@@ -284,6 +291,41 @@ impl PageRenderer {
     #[cfg(feature = "test-support")]
     pub fn icc_transform_cache_build_count(&self) -> usize {
         self.icc_transform_cache.build_count()
+    }
+
+    /// Pixmap dimensions of the per-page compositing sidecar, or
+    /// `None` when the sidecar was not allocated for the most recent
+    /// `render_page_with_options` call (detection-OFF).
+    ///
+    /// Test-support only — gates round-1 spot-ink discovery probes
+    /// and round-4 CMYK plane shape probes.
+    #[cfg(feature = "test-support")]
+    pub fn cmyk_sidecar_dims(&self) -> Option<(u32, u32)> {
+        self.cmyk_sidecar.as_ref().map(CmykSidecar::dims)
+    }
+
+    /// Read-only view over the sidecar's packed `(C, M, Y, K)` plane.
+    /// `None` when the sidecar is not allocated.
+    #[cfg(feature = "test-support")]
+    pub fn cmyk_sidecar_cmyk_bytes(&self) -> Option<&[u8]> {
+        self.cmyk_sidecar.as_ref().map(CmykSidecar::cmyk)
+    }
+
+    /// Ordered list of spot ink names the discovery pre-pass surfaced
+    /// for the most recent render (sorted ASCII, deduped, `/All` and
+    /// `/None` filtered out per ISO 32000-1 §8.6.6.4). `None` when
+    /// the sidecar is not allocated.
+    #[cfg(feature = "test-support")]
+    pub fn cmyk_sidecar_spot_names(&self) -> Option<&[String]> {
+        self.cmyk_sidecar.as_ref().map(CmykSidecar::spot_names)
+    }
+
+    /// Read-only view over the tint plane for spot ink `index`,
+    /// or `None` when the sidecar is not allocated or `index` is
+    /// beyond the discovered spot set.
+    #[cfg(feature = "test-support")]
+    pub fn cmyk_sidecar_spot_plane(&self, index: usize) -> Option<&[u8]> {
+        self.cmyk_sidecar.as_ref().and_then(|s| s.spot_plane(index))
     }
 
     /// Render a page to a raster image.
@@ -391,30 +433,37 @@ impl PageRenderer {
         // Pre-load resources (v0.3.18 synchronization)
         self.load_resources(doc, &resources)?;
 
-        // Decide whether to allocate the CMYK sidecar plane. The plane
-        // costs `4·width·height` bytes per page and mirrors every
-        // opaque CMYK paint so the compose-first and overprint
+        // Decide whether to allocate the CMYK + spot-ink sidecar. The
+        // CMYK plane costs `4·width·height` bytes per page and mirrors
+        // every opaque CMYK paint so the compose-first and overprint
         // correction helpers can read the backdrop CMYK quadruple
-        // directly instead of inverting the post-ICC RGB. Allocation
-        // is gated on (a) the OutputIntent declares a CMYK profile —
-        // without one, neither helper would fire at all — and (b) the
-        // page resources declare ExtGState entries that could drive
-        // transparency or overprint, or the page's Form XObjects
-        // declare /Group dicts (which trigger transparency-group
+        // directly instead of inverting the post-ICC RGB. Each spot
+        // ink adds one extra plane of `width·height` bytes.
+        //
+        // Allocation is gated on (a) the OutputIntent declares a
+        // CMYK profile — without one, the process-side helpers would
+        // not fire at all — and (b) the page resources declare
+        // ExtGState entries that could drive transparency or
+        // overprint, or the page's Form XObjects declare /Group dicts
+        // or /SMask entries (which trigger transparency-group
         // compositing). When either condition is false the sidecar
         // stays `None` and the per-paint mirror is a no-op; the
-        // detection-OFF path is byte-identical to the pre-Priority-4
+        // detection-OFF path is byte-identical to the pre-sidecar
         // behaviour.
-        self.cmyk_plane = None;
-        self.cmyk_plane_dims = (width, height);
-        let needs_cmyk_plane = doc.output_intent_cmyk_profile().is_some()
+        //
+        // The spot ink set is discovered with the same walker the
+        // separation renderer's per-plate path uses (§8.6.6.4 /
+        // §8.6.6.5: `/Separation` and non-process `/DeviceN`
+        // colorants, with `/All` and `/None` filtered out). Sizing
+        // the sidecar's spot lanes up front means subsequent paint
+        // operators can blind-index by ink without re-walking the
+        // resource tree.
+        self.cmyk_sidecar = None;
+        let needs_cmyk_sidecar = doc.output_intent_cmyk_profile().is_some()
             && page_declares_transparency_or_overprint(doc, &resources);
-        if needs_cmyk_plane {
-            // Sidecar initialised to (0, 0, 0, 0) = no ink = paper
-            // white. Pixels never touched by a CMYK paint stay at
-            // paper-white in the sidecar, which matches the implicit
-            // page backdrop.
-            self.cmyk_plane = Some(vec![0u8; (width as usize) * (height as usize) * 4]);
+        if needs_cmyk_sidecar {
+            let spot_names = sidecar_mod::discover_page_spot_inks(doc, page_num);
+            self.cmyk_sidecar = Some(CmykSidecar::new(width, height, spot_names));
         }
 
         // Get page content stream
@@ -3452,7 +3501,7 @@ impl PageRenderer {
         gs: &GraphicsState,
         fill_side: bool,
     ) -> Option<Vec<u8>> {
-        self.cmyk_plane.as_ref()?;
+        self.cmyk_sidecar.as_ref()?;
         let has_cmyk = if fill_side {
             gs.fill_color_cmyk.is_some()
         } else {
@@ -3546,8 +3595,8 @@ impl PageRenderer {
         };
 
         let post = pixmap.data();
-        let plane = match self.cmyk_plane.as_mut() {
-            Some(p) => p,
+        let plane = match self.cmyk_sidecar.as_mut() {
+            Some(s) => s.cmyk_mut(),
             None => return,
         };
         debug_assert_eq!(post.len(), snapshot.len());
@@ -3642,8 +3691,8 @@ impl PageRenderer {
         fill_rule: tiny_skia::FillRule,
         clip: Option<&tiny_skia::Mask>,
     ) -> Option<Vec<u8>> {
-        self.cmyk_plane.as_ref()?;
-        let (w, h) = self.cmyk_plane_dims;
+        let sidecar = self.cmyk_sidecar.as_ref()?;
+        let (w, h) = sidecar.dims();
         let mut mask = tiny_skia::Mask::new(w, h)?;
         mask.fill_path(path, fill_rule, true, transform);
         let mut buf = mask.data().to_vec();
@@ -3671,8 +3720,8 @@ impl PageRenderer {
         gs: &GraphicsState,
         clip: Option<&tiny_skia::Mask>,
     ) -> Option<Vec<u8>> {
-        self.cmyk_plane.as_ref()?;
-        let (w, h) = self.cmyk_plane_dims;
+        let sidecar = self.cmyk_sidecar.as_ref()?;
+        let (w, h) = sidecar.dims();
         let mut scratch = Pixmap::new(w, h)?;
         let dash = if !gs.dash_pattern.0.is_empty() {
             tiny_skia::StrokeDash::new(gs.dash_pattern.0.clone(), gs.dash_pattern.1)
@@ -3719,7 +3768,7 @@ impl PageRenderer {
         doc: &PdfDocument,
         fill_side: bool,
     ) {
-        if self.cmyk_plane.is_none() || coverage.is_none() {
+        if self.cmyk_sidecar.is_none() || coverage.is_none() {
             // Fall back to the diff-driven path. Detection-OFF
             // byte-identical behaviour.
             self.apply_cmyk_compose_after_paint(pixmap, snapshot, gs, doc, fill_side);
@@ -3760,7 +3809,7 @@ impl PageRenderer {
             let c_alpha = (coverage_frac * alpha_g).clamp(0.0, 1.0);
 
             // Backdrop CMYK from sidecar.
-            let plane = self.cmyk_plane.as_ref().expect("checked above");
+            let plane = self.cmyk_sidecar.as_ref().expect("checked above").cmyk();
             let dc = plane[off] as f32 / 255.0;
             let dm = plane[off + 1] as f32 / 255.0;
             let dy = plane[off + 2] as f32 / 255.0;
@@ -3784,7 +3833,7 @@ impl PageRenderer {
             dest[off + 2] = rgb[2];
 
             // Mirror composed CMYK back to sidecar.
-            let plane = self.cmyk_plane.as_mut().expect("re-borrow");
+            let plane = self.cmyk_sidecar.as_mut().expect("re-borrow").cmyk_mut();
             plane[off] = mc_u8;
             plane[off + 1] = mm_u8;
             plane[off + 2] = my_u8;
@@ -3916,21 +3965,22 @@ impl PageRenderer {
             //      fallback OutputIntent path; bounded-loss when the
             //      backdrop went through a non-linear ICC. Documented
             //      gap, kept for the detection-OFF path.
-            let (dc, dm, dy, dk) = if let Some(plane) = self.cmyk_plane.as_ref() {
-                (
-                    plane[off] as f32 / 255.0,
-                    plane[off + 1] as f32 / 255.0,
-                    plane[off + 2] as f32 / 255.0,
-                    plane[off + 3] as f32 / 255.0,
-                )
-            } else {
-                (
-                    (1.0 - snap_r).max(0.0),
-                    (1.0 - snap_g).max(0.0),
-                    (1.0 - snap_b).max(0.0),
-                    0.0_f32,
-                )
-            };
+            let (dc, dm, dy, dk) =
+                if let Some(plane) = self.cmyk_sidecar.as_ref().map(CmykSidecar::cmyk) {
+                    (
+                        plane[off] as f32 / 255.0,
+                        plane[off + 1] as f32 / 255.0,
+                        plane[off + 2] as f32 / 255.0,
+                        plane[off + 3] as f32 / 255.0,
+                    )
+                } else {
+                    (
+                        (1.0 - snap_r).max(0.0),
+                        (1.0 - snap_g).max(0.0),
+                        (1.0 - snap_b).max(0.0),
+                        0.0_f32,
+                    )
+                };
 
             // Compose in CMYK source space at effective coverage·alpha.
             let mc = c_alpha * sc + (1.0 - c_alpha) * dc;
@@ -3957,7 +4007,7 @@ impl PageRenderer {
             // paints see the press-accurate backdrop. The mirror is
             // bypassed when the sidecar is None (detection-OFF
             // byte-identical path).
-            if let Some(plane) = self.cmyk_plane.as_mut() {
+            if let Some(plane) = self.cmyk_sidecar.as_mut().map(CmykSidecar::cmyk_mut) {
                 plane[off] = mc_u8;
                 plane[off + 1] = mm_u8;
                 plane[off + 2] = my_u8;
@@ -4020,7 +4070,7 @@ impl PageRenderer {
         doc: &PdfDocument,
         fill_side: bool,
     ) {
-        if self.cmyk_plane.is_none() || coverage.is_none() {
+        if self.cmyk_sidecar.is_none() || coverage.is_none() {
             self.apply_overprint_after_paint(pixmap, snapshot, gs, doc, fill_side);
             return;
         }
@@ -4059,7 +4109,7 @@ impl PageRenderer {
             }
 
             // Backdrop CMYK from sidecar.
-            let plane = self.cmyk_plane.as_ref().expect("checked above");
+            let plane = self.cmyk_sidecar.as_ref().expect("checked above").cmyk();
             let dc = plane[off] as f32 / 255.0;
             let dm = plane[off + 1] as f32 / 255.0;
             let dy = plane[off + 2] as f32 / 255.0;
@@ -4104,7 +4154,7 @@ impl PageRenderer {
             dest[off + 2] = b_byte;
 
             // Mirror merged CMYK into sidecar.
-            let plane = self.cmyk_plane.as_mut().expect("re-borrow");
+            let plane = self.cmyk_sidecar.as_mut().expect("re-borrow").cmyk_mut();
             plane[off] = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
             plane[off + 1] = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
             plane[off + 2] = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -4125,7 +4175,7 @@ impl PageRenderer {
         doc: &PdfDocument,
         fill_side: bool,
     ) {
-        if self.cmyk_plane.is_none() || coverage.is_none() {
+        if self.cmyk_sidecar.is_none() || coverage.is_none() {
             self.mirror_cmyk_paint_into_sidecar(pixmap, snapshot, gs, doc, fill_side);
             return;
         }
@@ -4159,7 +4209,11 @@ impl PageRenderer {
         }
 
         let coverage = coverage.expect("checked above");
-        let plane = self.cmyk_plane.as_mut().expect("checked above");
+        let plane = self
+            .cmyk_sidecar
+            .as_mut()
+            .expect("checked above")
+            .cmyk_mut();
         for px in 0..(plane.len() / 4) {
             let cov = coverage[px];
             if cov == 0 {
@@ -4208,7 +4262,7 @@ impl PageRenderer {
         // present AND an OutputIntent CMYK profile is available. The
         // merged CMYK then runs through the ICC; otherwise the
         // additive-clamp `cmyk_to_rgb` round-trip stays in place.
-        let icc_path = self.cmyk_plane.is_some() && doc.output_intent_cmyk_profile().is_some();
+        let icc_path = self.cmyk_sidecar.is_some() && doc.output_intent_cmyk_profile().is_some();
         let icc_profile = if icc_path {
             doc.output_intent_cmyk_profile()
         } else {
@@ -4240,19 +4294,20 @@ impl PageRenderer {
             // Backdrop CMYK source. Same dual path as
             // apply_cmyk_compose_after_paint: sidecar when available,
             // additive-clamp inversion otherwise.
-            let (dc, dm, dy, dk_existing) = if let Some(plane) = self.cmyk_plane.as_ref() {
-                (
-                    plane[off] as f32 / 255.0,
-                    plane[off + 1] as f32 / 255.0,
-                    plane[off + 2] as f32 / 255.0,
-                    plane[off + 3] as f32 / 255.0,
-                )
-            } else {
-                let dr = snapshot[off] as f32 / 255.0;
-                let dg = snapshot[off + 1] as f32 / 255.0;
-                let db = snapshot[off + 2] as f32 / 255.0;
-                ((1.0 - dr).max(0.0), (1.0 - dg).max(0.0), (1.0 - db).max(0.0), 0.0_f32)
-            };
+            let (dc, dm, dy, dk_existing) =
+                if let Some(plane) = self.cmyk_sidecar.as_ref().map(CmykSidecar::cmyk) {
+                    (
+                        plane[off] as f32 / 255.0,
+                        plane[off + 1] as f32 / 255.0,
+                        plane[off + 2] as f32 / 255.0,
+                        plane[off + 3] as f32 / 255.0,
+                    )
+                } else {
+                    let dr = snapshot[off] as f32 / 255.0;
+                    let dg = snapshot[off + 1] as f32 / 255.0;
+                    let db = snapshot[off + 2] as f32 / 255.0;
+                    ((1.0 - dr).max(0.0), (1.0 - dg).max(0.0), (1.0 - db).max(0.0), 0.0_f32)
+                };
 
             // Per-plate merge. OPM=1 nonzero overprint: zero source
             // plate keeps dest plate; nonzero source plate replaces.
@@ -4305,7 +4360,7 @@ impl PageRenderer {
 
             // Mirror merged CMYK into the sidecar so subsequent paints
             // see the post-overprint backdrop.
-            if let Some(plane) = self.cmyk_plane.as_mut() {
+            if let Some(plane) = self.cmyk_sidecar.as_mut().map(CmykSidecar::cmyk_mut) {
                 plane[off] = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
                 plane[off + 1] = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
                 plane[off + 2] = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -5250,106 +5305,6 @@ fn build_logical_color<'a>(
 /// the hot path in `execute_operators` uses `parse_ext_g_state_inner` against
 /// a pre-resolved resource dict (the per-form ExtGState dict has 10 000+
 /// entries on heavy vector figures and deep-cloning it on every `gs` op was
-/// Page-walk detection: does this page declare any resource that
-/// could drive transparency or overprint? A `true` return triggers
-/// CMYK-sidecar allocation in [`PageRenderer::render_page_with_options`]
-/// so the compose-first and overprint helpers can read the backdrop
-/// CMYK quadruple directly. Detection criteria:
-///
-///   * Any ExtGState in `/Resources /ExtGState` declares one of:
-///     - `/OP true` or `/op true` (overprint)
-///     - `/CA < 1.0` or `/ca < 1.0` (transparent paint)
-///     - `/SMask` non-null (soft mask)
-///     - `/BM` non-Normal (non-trivial blend mode)
-///   * Any Form XObject in `/Resources /XObject` declares a `/Group`
-///     dict (transparency group).
-///
-/// A conservative TRUE return drives sidecar allocation; a FALSE
-/// return keeps the page on the zero-cost path. The detection-OFF
-/// path is byte-identical to the pre-Priority-4 behaviour because
-/// the sidecar-consuming helpers fall back to the additive-clamp
-/// inversion when the sidecar is `None`.
-fn page_declares_transparency_or_overprint(doc: &PdfDocument, resources: &Object) -> bool {
-    let res_dict = match resources {
-        Object::Dictionary(d) => d,
-        _ => return false,
-    };
-
-    if let Some(ext_gs_obj) = res_dict.get("ExtGState") {
-        if let Ok(ext_gs_resolved) = doc.resolve_object(ext_gs_obj) {
-            if let Some(ext_g_states) = ext_gs_resolved.as_dict() {
-                for state in ext_g_states.values() {
-                    if let Ok(state_resolved) = doc.resolve_object(state) {
-                        if let Some(state_dict) = state_resolved.as_dict() {
-                            if state_dict
-                                .get("OP")
-                                .map(|o| matches!(o, Object::Boolean(true)))
-                                .unwrap_or(false)
-                                || state_dict
-                                    .get("op")
-                                    .map(|o| matches!(o, Object::Boolean(true)))
-                                    .unwrap_or(false)
-                            {
-                                return true;
-                            }
-                            for key in ["CA", "ca"] {
-                                if let Some(v) = state_dict.get(key) {
-                                    let alpha = match v {
-                                        Object::Real(r) => *r as f32,
-                                        Object::Integer(i) => *i as f32,
-                                        _ => 1.0,
-                                    };
-                                    if alpha < 1.0 {
-                                        return true;
-                                    }
-                                }
-                            }
-                            if let Some(smask) = state_dict.get("SMask") {
-                                // /SMask /None is the spec sentinel for
-                                // "no soft mask". Any other value
-                                // (dictionary, indirect reference) is a
-                                // soft mask declaration.
-                                if !matches!(smask, Object::Name(n) if n == "None") {
-                                    return true;
-                                }
-                            }
-                            if let Some(Object::Name(bm)) = state_dict.get("BM") {
-                                if bm != "Normal" {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(xobj_obj) = res_dict.get("XObject") {
-        if let Ok(xobj_resolved) = doc.resolve_object(xobj_obj) {
-            if let Some(xobj_dict) = xobj_resolved.as_dict() {
-                for obj in xobj_dict.values() {
-                    if let Ok(resolved) = doc.resolve_object(obj) {
-                        // Form XObject /Group dict, or image /SMask:
-                        // either triggers transparency compositing.
-                        let dict = match &resolved {
-                            Object::Stream { dict, .. } => Some(dict),
-                            _ => None,
-                        };
-                        if let Some(dict) = dict {
-                            if dict.contains_key("Group") || dict.contains_key("SMask") {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    false
-}
-
 /// the previous bottleneck).
 fn parse_ext_g_state(
     dict_name: &str,

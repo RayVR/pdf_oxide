@@ -36,6 +36,14 @@ pub(crate) mod page_renderer;
 mod path_rasterizer;
 pub(crate) mod resolution;
 pub(crate) mod separation_renderer;
+/// CMYK + spot-ink compositing sidecar used by the page renderer to
+/// hold the §11.4 transparency-composite state during a page render.
+///
+/// Public so integration tests can drive the §11.7.4.2 dispatch
+/// classifier ([`sidecar::BlendModeClass`]) directly without
+/// going through a rendered pixmap. Internal types
+/// ([`sidecar::CmykSidecar`]) remain `pub(crate)`.
+pub mod sidecar;
 mod text_rasterizer;
 
 pub use page_renderer::{ImageFormat, PageRenderer, RenderOptions, RenderedImage};
