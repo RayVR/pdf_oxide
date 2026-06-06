@@ -781,7 +781,6 @@ fn fixture_knockout_group_two_overlapping_rects() -> Vec<u8> {
 /// painted there first). Expected centre pixel ≈ (127, 0, 127) after
 /// blue-over-white-at-half then over-the-parent (which is also white).
 #[test]
-#[ignore = "HONEST_GAP_GROUP_KNOCKOUT"]
 fn knockout_group_resets_destination_per_element() {
     let rgba = render_rgba(fixture_knockout_group_two_overlapping_rects());
     let (_r, g, _b, _) = pixel_at(&rgba, 50, 50);
