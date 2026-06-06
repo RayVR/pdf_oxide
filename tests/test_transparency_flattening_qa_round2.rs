@@ -584,7 +584,6 @@ fn qa_round2_smask_modulates_fill_stroke_evenodd_combo() {
 
 /// IGNORED — SMask on `b` (close+fill+stroke).
 #[test]
-#[ignore = "HONEST_GAP_SMASK_CLOSE_FILLSTROKE_NOT_WIRED"]
 fn qa_round2_smask_modulates_close_fill_stroke_combo() {
     // Use a path that needs closing — moveto + lineto + lineto + b.
     let pdf = fixture_smask_for_op("20 20 m\n80 20 l\n80 80 l\n20 80 l\nb\n");
@@ -600,7 +599,6 @@ fn qa_round2_smask_modulates_close_fill_stroke_combo() {
 
 /// IGNORED — SMask on `b*` (close+fill+stroke EvenOdd).
 #[test]
-#[ignore = "HONEST_GAP_SMASK_CLOSE_FILLSTROKE_EVENODD_NOT_WIRED"]
 fn qa_round2_smask_modulates_close_fill_stroke_evenodd_combo() {
     let pdf = fixture_smask_for_op("20 20 m\n80 20 l\n80 80 l\n20 80 l\nb*\n");
     let rgba = render_rgba(pdf);
@@ -688,7 +686,6 @@ fn qa_round2_overprint_modulates_fill_stroke_evenodd_combo() {
 }
 
 #[test]
-#[ignore = "HONEST_GAP_OVERPRINT_CLOSE_FILLSTROKE_NOT_WIRED"]
 fn qa_round2_overprint_modulates_close_fill_stroke_combo() {
     let with_op = render_rgba(fixture_overprint_for_op("30 30 m\n80 30 l\n80 80 l\n30 80 l\nb\n"));
     let no_op = render_rgba(fixture_no_overprint_for_op("30 30 m\n80 30 l\n80 80 l\n30 80 l\nb\n"));
@@ -703,7 +700,6 @@ fn qa_round2_overprint_modulates_close_fill_stroke_combo() {
 }
 
 #[test]
-#[ignore = "HONEST_GAP_OVERPRINT_CLOSE_FILLSTROKE_EVENODD_NOT_WIRED"]
 fn qa_round2_overprint_modulates_close_fill_stroke_evenodd_combo() {
     let with_op = render_rgba(fixture_overprint_for_op("30 30 m\n80 30 l\n80 80 l\n30 80 l\nb*\n"));
     let no_op =
