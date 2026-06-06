@@ -30,6 +30,7 @@
 //! | Non-separable blend: Saturation                 | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_SATURATION |
 //! | Non-separable blend: Color                      | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_COLOR |
 //! | Non-separable blend: Luminosity                 | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_LUMINOSITY |
+//! | Overprint `/OP`, `/op` (composite path)         | §11.7.4   | NO (separation-only) | IGNORED | HONEST_GAP_OVERPRINT_COMPOSITE |
 //!
 //! ### Source citations for the inventory
 //!
@@ -67,6 +68,12 @@
 //!   `_ => BlendMode::SourceOver` arm. tiny_skia has no native
 //!   non-separable blend mode; round 2 must implement HSL/HSY-space
 //!   composition out-of-band, per §11.3.5.3 + §11.3.5.4.
+//! - `src/rendering/separation_renderer.rs:820-870` — `/OP` / `/op` /
+//!   `/OPM` ARE honoured on the *separation-plate* path. The composite
+//!   pixmap path in `page_renderer.rs` never reads
+//!   `gs.fill_overprint` / `gs.stroke_overprint`; an `/OP true` paint
+//!   composites identically to an `/OP false` paint when rendered to
+//!   the composite RGBA pixmap.
 //!
 //! ## Reading the assertions
 //!
@@ -173,6 +180,18 @@ pub const HONEST_GAP_NONSEP_BLEND_LUMINOSITY: &str =
     "HONEST_GAP_NONSEP_BLEND_LUMINOSITY: PDF blend mode `Luminosity` is \
      dispatched to tiny_skia::BlendMode::SourceOver. Round 2 must \
      implement the §11.3.5.3 HSL/HSY composition.";
+
+/// `/OP` / `/op` are honoured on the *separation-plate* render path
+/// only. The composite RGBA path never branches on `gs.fill_overprint`
+/// or `gs.stroke_overprint`. A document depending on the composite
+/// overprint preview to demonstrate spot-ink behaviour gets no signal.
+pub const HONEST_GAP_OVERPRINT_COMPOSITE: &str =
+    "HONEST_GAP_OVERPRINT_COMPOSITE: §11.7.4 overprint is implemented \
+     only on the separation-plate path (render_separation*). The \
+     composite render path does not consult gs.fill_overprint / \
+     gs.stroke_overprint / gs.overprint_mode. Round 3 (per the plan) \
+     wires composite overprint preview by routing through the \
+     separation backend and re-compositing via the OutputIntent ICC.";
 
 // ===========================================================================
 // Synthetic-PDF builder + helpers
@@ -1072,5 +1091,62 @@ fn blend_luminosity_grey_source_over_red_keeps_red_hue() {
          A SourceOver fallback would output ~(128, 128, 128) — grey — \
          which fails the dominance assertion. {}",
         HONEST_GAP_NONSEP_BLEND_LUMINOSITY
+    );
+}
+
+// ===========================================================================
+// §11.7.4 overprint on composite path — HONEST_GAP
+// ===========================================================================
+//
+// `/OP` / `/op` / `/OPM` work on the separation-plate path (see the
+// tests/test_separation_overprint.rs suite, which exhaustively covers
+// the per-plate semantics) but NOT on the composite RGBA path. The
+// probe below renders the same two-CMYK-paint fixture twice — once
+// with `/op true /OP true /OPM 1` on the upper paint, once without —
+// and expects the overlap region to differ. As-shipped, the two
+// renders produce identical bytes because the composite path never
+// branches on the overprint flags.
+
+fn fixture_overprint_composite_two_cmyk_paints() -> Vec<u8> {
+    // First paint: CMYK(0.5, 0, 0, 0) — 50% cyan. Second paint
+    // overlapping: CMYK(0, 0, 1, 0) (yellow) with /op true.
+    // Without overprint, the yellow paint replaces the cyan in the
+    // overlap. With overprint enabled, the yellow paint only fills the
+    // Y plate; cyan plate retains its 50% value.
+    let content_with_op = "0.5 0 0 0 k\n10 10 60 60 re\nf\n\
+                           /OpOn gs\n\
+                           0 0 1 0 k\n\
+                           30 30 60 60 re\nf\n";
+    let resources = "/ExtGState << /OpOn << /Type /ExtGState /op true /OP true /OPM 1 >> >>";
+    build_pdf(content_with_op, resources, &[])
+}
+
+fn fixture_overprint_composite_two_cmyk_paints_no_op() -> Vec<u8> {
+    let content_without_op = "0.5 0 0 0 k\n10 10 60 60 re\nf\n\
+                              0 0 1 0 k\n\
+                              30 30 60 60 re\nf\n";
+    build_pdf(content_without_op, "", &[])
+}
+
+/// IGNORED — composite path does not honour `/op`. The probe expects
+/// the *with-overprint* render to differ from the *without-overprint*
+/// render in the overlap region (the cyan must show through where
+/// overprint preserves it). As-shipped, the two renders produce
+/// identical bytes.
+#[test]
+#[ignore = "HONEST_GAP_OVERPRINT_COMPOSITE"]
+fn overprint_composite_overlap_differs_from_no_overprint() {
+    let rgba_op = render_rgba(fixture_overprint_composite_two_cmyk_paints());
+    let rgba_no = render_rgba(fixture_overprint_composite_two_cmyk_paints_no_op());
+    // Overlap region: PDF (30..70, 30..70) → image (30..70, 30..70).
+    let (r_op, g_op, b_op) = mean_rgb(&rgba_op, 35, 65, 35, 65);
+    let (r_no, g_no, b_no) = mean_rgb(&rgba_no, 35, 65, 35, 65);
+    let delta = (r_op - r_no).abs() + (g_op - g_no).abs() + (b_op - b_no).abs();
+    assert!(
+        delta > 30.0,
+        "composite overprint must change the overlap region vs no-overprint; \
+         got delta {delta:.1} between ({r_op:.0},{g_op:.0},{b_op:.0}) and \
+         ({r_no:.0},{g_no:.0},{b_no:.0}). {}",
+        HONEST_GAP_OVERPRINT_COMPOSITE
     );
 }
