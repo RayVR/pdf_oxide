@@ -345,6 +345,95 @@ impl CmykSidecar {
     pub(crate) fn spots_all_mut(&mut self) -> &mut [u8] {
         &mut self.spots
     }
+
+    /// Decompose one of the four `DeviceCMYK` process plates from the
+    /// packed interleaved sidecar plane.
+    ///
+    /// ISO 32000-1 §10.5 (separated plate output) prescribes one
+    /// grayscale plate per ink whose pixel value equals the subtractive
+    /// tint of that ink at that pixel (0 = no ink, 255 = full tint).
+    /// The composite-then-separate workflow §11.7.3 + §11.7.4.2 mandate
+    /// arrives at the §10.5 plate by running the §11.4 compositing in
+    /// the process blend space first, then extracting per-ink lanes
+    /// from the composited buffer.
+    ///
+    /// `ink` is matched case-sensitively against the four process
+    /// colorant names "Cyan" / "Magenta" / "Yellow" / "Black". Any
+    /// other name returns `None`; spot inks go through
+    /// [`Self::spot_plate`].
+    ///
+    /// Returns a fresh `Vec<u8>` (length `w · h`) because the storage
+    /// layout interleaves the four process channels — the requested
+    /// channel's pixels are not contiguous in memory and a slice cannot
+    /// describe them. Callers wrap the buffer in their own per-plate
+    /// surface type and the allocation cost is one pass over `4 · w · h`
+    /// bytes regardless.
+    pub(crate) fn process_plate(&self, ink: &str) -> Option<Vec<u8>> {
+        let channel: usize = match ink {
+            "Cyan" => 0,
+            "Magenta" => 1,
+            "Yellow" => 2,
+            "Black" => 3,
+            _ => return None,
+        };
+        let (w, h) = self.dims;
+        let pixels = (w as usize) * (h as usize);
+        let mut out = Vec::with_capacity(pixels);
+        for px in 0..pixels {
+            out.push(self.cmyk[px * 4 + channel]);
+        }
+        Some(out)
+    }
+
+    /// Borrow the spot tint plane for a named spot ink, or `None` when
+    /// the ink was not in the active spot set surfaced by
+    /// [`discover_page_spot_inks`].
+    ///
+    /// ISO 32000-1 §8.6.6.3: a `Separation` / `DeviceN` colorant for
+    /// which the device has no plate falls back to the alternate
+    /// colour-space approximation on the visible composite; the
+    /// per-plate output (§10.5) drops the colorant. Returning `None`
+    /// here lets the separation entry point allocate an all-zero plate
+    /// per the spec's "no plate" semantic.
+    ///
+    /// Returns a borrowed slice (no allocation) because each spot
+    /// plane is stored as a contiguous `w · h` byte block — see the
+    /// layout note on [`Self`].
+    pub(crate) fn spot_plate(&self, ink: &str) -> Option<&[u8]> {
+        let idx = self.spot_index(ink)?;
+        self.spot_plane(idx)
+    }
+
+    /// Overwrite the packed `(C, M, Y, K)` plane with `data`. Used by
+    /// the knockout-group cumulative replay path to restore the
+    /// group's initial backdrop state before composing each element so
+    /// later paints compose against the backdrop rather than the
+    /// accumulated paint from earlier elements
+    /// (ISO 32000-1 §11.4.6.2).
+    ///
+    /// Panics if `data.len() != self.cmyk.len()`. The caller is the
+    /// knockout-group replay which snapshots the exact buffer before
+    /// the loop.
+    pub(crate) fn restore_cmyk(&mut self, data: &[u8]) {
+        debug_assert_eq!(data.len(), self.cmyk.len());
+        self.cmyk.copy_from_slice(data);
+    }
+
+    /// Overwrite the spot plane stack with `data`. Companion to
+    /// [`Self::restore_cmyk`] for the spot lanes inside a knockout
+    /// group's cumulative replay. ISO 32000-1 §11.3.3 + §11.4.6.2:
+    /// "a single shape value and opacity value shall be maintained at
+    /// each point in the computed group results; they shall apply to
+    /// both process and spot colour components" — so the knockout's
+    /// "compose against backdrop" rule covers the spot lanes too,
+    /// which means each replay iteration must start from the group's
+    /// backdrop spot state, not the previously-composed state.
+    ///
+    /// Panics if `data.len() != self.spots.len()`.
+    pub(crate) fn restore_spots(&mut self, data: &[u8]) {
+        debug_assert_eq!(data.len(), self.spots.len());
+        self.spots.copy_from_slice(data);
+    }
 }
 
 /// Discover the set of `/Separation` and `/DeviceN` spot colorants
@@ -395,6 +484,101 @@ pub(crate) fn discover_page_spot_inks(doc: &PdfDocument, page_index: usize) -> V
             Vec::new()
         },
     }
+}
+
+/// Narrower variant of [`page_declares_transparency_or_overprint`]
+/// that fires ONLY on transparency triggers (`/CA`, `/ca`, `/SMask`,
+/// non-Normal `/BM`, `/Group`, XObject `/SMask`). Overprint flags
+/// (`/OP`, `/op`) are intentionally NOT counted.
+///
+/// Used by the separation entry point to decide whether to route
+/// through the composite-then-decompose path. The §11.4 transparency
+/// model requires composite-first for correctness; the §11.7.4
+/// overprint model is per-plate by definition (the per-plate walker
+/// already implements OPM=0 / OPM=1 correctly), so routing pure-OP
+/// pages through the composite path would either produce wrong plate
+/// values (the page renderer's overprint handler is RGB-composite-
+/// oriented, not per-plate) or require duplicating overprint logic
+/// in the sidecar mirror. Drawing the line at "transparency only"
+/// keeps the seam clean: detection-OFF and OP-only pages stay on the
+/// per-plate walker; pages that mix transparency with overprint go
+/// through composite-then-decompose where the §11.4 model evaluates
+/// against the composite buffer.
+pub(crate) fn page_declares_transparency(doc: &PdfDocument, resources: &Object) -> bool {
+    let res_dict = match resources {
+        Object::Dictionary(d) => d,
+        _ => return false,
+    };
+
+    if let Some(ext_gs_obj) = res_dict.get("ExtGState") {
+        if let Ok(ext_gs_resolved) = doc.resolve_object(ext_gs_obj) {
+            if let Some(ext_g_states) = ext_gs_resolved.as_dict() {
+                if ext_g_states_signal_transparency_only(doc, ext_g_states) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if let Some(xobj_obj) = res_dict.get("XObject") {
+        if let Ok(xobj_resolved) = doc.resolve_object(xobj_obj) {
+            if let Some(xobj_dict) = xobj_resolved.as_dict() {
+                for obj in xobj_dict.values() {
+                    if let Ok(resolved) = doc.resolve_object(obj) {
+                        let dict = match &resolved {
+                            Object::Stream { dict, .. } => Some(dict),
+                            _ => None,
+                        };
+                        if let Some(dict) = dict {
+                            if dict.contains_key("Group") || dict.contains_key("SMask") {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn ext_g_states_signal_transparency_only(
+    doc: &PdfDocument,
+    ext_g_states: &HashMap<String, Object>,
+) -> bool {
+    for state in ext_g_states.values() {
+        let state_resolved = match doc.resolve_object(state) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let Some(state_dict) = state_resolved.as_dict() else {
+            continue;
+        };
+        for key in ["CA", "ca"] {
+            if let Some(v) = state_dict.get(key) {
+                let alpha = match v {
+                    Object::Real(r) => *r as f32,
+                    Object::Integer(i) => *i as f32,
+                    _ => 1.0,
+                };
+                if alpha < 1.0 {
+                    return true;
+                }
+            }
+        }
+        if let Some(smask) = state_dict.get("SMask") {
+            if !matches!(smask, Object::Name(n) if n == "None") {
+                return true;
+            }
+        }
+        if let Some(bm) = state_dict.get("BM") {
+            if bm_is_non_normal(bm) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Conservative detection: does this page declare any resource that
@@ -1075,6 +1259,71 @@ mod tests {
         assert_eq!(s.cmyk().len(), 4 * 7 * 3);
         assert!(s.spot_names().is_empty());
         assert!(s.spot_plane(0).is_none());
+    }
+
+    /// `process_plate` decomposes the four `DeviceCMYK` channels from
+    /// the interleaved `(C, M, Y, K)` plane. ISO 32000-1 §10.5: the
+    /// plate's pixel value equals the subtractive tint of that ink at
+    /// the pixel. Probe pins per-channel extraction with a synthetic
+    /// interleaved fill.
+    #[test]
+    fn sidecar_process_plate_extracts_named_channel() {
+        let mut s = CmykSidecar::new(2, 2, vec![]);
+        // Pixel 0: C=10, M=20, Y=30, K=40
+        // Pixel 1: C=50, M=60, Y=70, K=80
+        // Pixel 2: C=90, M=100, Y=110, K=120
+        // Pixel 3: C=130, M=140, Y=150, K=160
+        let plane = s.cmyk_mut();
+        for (i, v) in plane.iter_mut().enumerate() {
+            *v = (i + 10) as u8;
+        }
+        assert_eq!(
+            s.process_plate("Cyan").unwrap(),
+            vec![10, 14, 18, 22],
+            "Cyan = byte 0 of every interleaved quad starting at 10, +4 per pixel"
+        );
+        assert_eq!(s.process_plate("Magenta").unwrap(), vec![11, 15, 19, 23]);
+        assert_eq!(s.process_plate("Yellow").unwrap(), vec![12, 16, 20, 24]);
+        assert_eq!(s.process_plate("Black").unwrap(), vec![13, 17, 21, 25]);
+        // Unknown / spot name returns None — spot inks go through
+        // spot_plate.
+        assert!(s.process_plate("PANTONE 185 C").is_none());
+        assert!(s.process_plate("cyan").is_none(), "case-sensitive");
+    }
+
+    /// `spot_plate` borrows the requested spot lane by name. Returns
+    /// `None` when the ink was not in the discovered spot set.
+    #[test]
+    fn sidecar_spot_plate_returns_named_lane() {
+        let mut s = CmykSidecar::new(3, 1, vec!["InkA".into(), "InkB".into()]);
+        let plane_a = s.spot_plane_mut(0).unwrap();
+        plane_a.copy_from_slice(&[10, 20, 30]);
+        let plane_b = s.spot_plane_mut(1).unwrap();
+        plane_b.copy_from_slice(&[40, 50, 60]);
+        assert_eq!(s.spot_plate("InkA").unwrap(), &[10, 20, 30]);
+        assert_eq!(s.spot_plate("InkB").unwrap(), &[40, 50, 60]);
+        // Not-discovered → None (the §8.6.6.3 "no plate" semantic at
+        // the caller).
+        assert!(s.spot_plate("InkC").is_none());
+    }
+
+    /// `restore_cmyk` and `restore_spots` overwrite the sidecar's
+    /// process and spot buffers. Used by the knockout-group cumulative
+    /// replay to reset lane state to the group's backdrop between
+    /// element compositions (ISO 32000-1 §11.4.6.2).
+    #[test]
+    fn sidecar_restore_cmyk_and_spots_overwrites_buffers() {
+        let mut s = CmykSidecar::new(2, 1, vec!["InkA".into()]);
+        // Dirty both lanes.
+        s.cmyk_mut().copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        s.spot_plane_mut(0).unwrap().copy_from_slice(&[9, 10]);
+        // Snapshots.
+        let backdrop_cmyk = vec![100u8; 8];
+        let backdrop_spots = vec![50u8; 2];
+        s.restore_cmyk(&backdrop_cmyk);
+        s.restore_spots(&backdrop_spots);
+        assert_eq!(s.cmyk(), backdrop_cmyk.as_slice());
+        assert_eq!(s.spots_all(), backdrop_spots.as_slice());
     }
 
     /// A test-only `log::Log` that captures every record into a
