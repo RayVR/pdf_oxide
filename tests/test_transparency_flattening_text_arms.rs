@@ -275,3 +275,108 @@ fn qa_round3_smask_modulates_quote_text() {
     ));
     assert_smask_modulates(&rgba, "\"");
 }
+
+// ===========================================================================
+// Text-arm overprint probes — CMYK text under /op true
+// ===========================================================================
+//
+// Lay a cyan 50% backdrop, then paint yellow text over it with
+// /op true /OPM 1 (overprint). With the round-3 wiring, the
+// painted glyph pixels should retain the cyan plate where the yellow
+// glyph overlaps — overprint adds plates rather than knocking them
+// out. Without wiring, the yellow knocks the cyan out completely.
+//
+// The probe compares the painted-pixel RGB to a no-overprint render
+// of the same fixture. With overprint, painted pixels include the
+// retained cyan ⇒ the green channel stays high but the blue drops
+// LESS than without overprint (cyan = (0, 1, 1) RGB).
+
+fn fixture_overprint_text(text_op: &str) -> Vec<u8> {
+    let content = format!(
+        "0.5 0 0 0 k\n0 0 200 200 re\nf\n\
+         /OpOn gs\n\
+         0 0 1 0 k\n\
+         0 0 1 0 K\n\
+         {}\n",
+        text_op
+    );
+    let resources = "/ExtGState << /OpOn << /Type /ExtGState /op true /OP true /OPM 1 >> >>";
+    build_text_pdf(&content, resources, &[])
+}
+
+fn fixture_no_overprint_text(text_op: &str) -> Vec<u8> {
+    let content = format!(
+        "0.5 0 0 0 k\n0 0 200 200 re\nf\n\
+         0 0 1 0 k\n\
+         0 0 1 0 K\n\
+         {}\n",
+        text_op
+    );
+    build_text_pdf(&content, "", &[])
+}
+
+fn assert_overprint_modulates(rgba_op: &[u8], rgba_no_op: &[u8], op_name: &str) {
+    // Painted-pixel mean inside the text band on each render.
+    let (r_op, g_op, b_op, n_op) = mean_painted_rgb(rgba_op, 30, 180, 80, 130);
+    let (r_no, g_no, b_no, n_no) = mean_painted_rgb(rgba_no_op, 30, 180, 80, 130);
+    assert!(
+        n_op >= 50 && n_no >= 50,
+        "{op_name} overprint probe: expected ≥ 50 painted pixels in \
+         each render; got n_op={n_op}, n_no_op={n_no}. Text fixture \
+         didn't render glyphs — can't discriminate overprint wiring."
+    );
+    let delta = (r_op - r_no).abs() + (g_op - g_no).abs() + (b_op - b_no).abs();
+    assert!(
+        delta > 20.0,
+        "{op_name} text overprint vs no-overprint painted-pixel mean \
+         delta: expected > 20.0 (overprint retains cyan plate where \
+         yellow glyph overlaps the backdrop); got delta={delta:.1} \
+         between op=({r_op:.0}, {g_op:.0}, {b_op:.0}) and \
+         no_op=({r_no:.0}, {g_no:.0}, {b_no:.0}). If delta ≈ 0 the \
+         overprint wiring on {op_name} is broken."
+    );
+}
+
+#[test]
+fn qa_round3_overprint_modulates_tj_text() {
+    let rgba_op = render_rgba_200(fixture_overprint_text(
+        "BT /F1 48 Tf 30 80 Td (HELLO) Tj ET",
+    ));
+    let rgba_no = render_rgba_200(fixture_no_overprint_text(
+        "BT /F1 48 Tf 30 80 Td (HELLO) Tj ET",
+    ));
+    assert_overprint_modulates(&rgba_op, &rgba_no, "Tj");
+}
+
+#[test]
+fn qa_round3_overprint_modulates_tj_array_text() {
+    let rgba_op = render_rgba_200(fixture_overprint_text(
+        "BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET",
+    ));
+    let rgba_no = render_rgba_200(fixture_no_overprint_text(
+        "BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET",
+    ));
+    assert_overprint_modulates(&rgba_op, &rgba_no, "TJ");
+}
+
+#[test]
+fn qa_round3_overprint_modulates_apostrophe_text() {
+    let rgba_op = render_rgba_200(fixture_overprint_text(
+        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj (BTM) ' ET",
+    ));
+    let rgba_no = render_rgba_200(fixture_no_overprint_text(
+        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj (BTM) ' ET",
+    ));
+    assert_overprint_modulates(&rgba_op, &rgba_no, "'");
+}
+
+#[test]
+fn qa_round3_overprint_modulates_quote_text() {
+    let rgba_op = render_rgba_200(fixture_overprint_text(
+        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj 0 0 (BTM) \" ET",
+    ));
+    let rgba_no = render_rgba_200(fixture_no_overprint_text(
+        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj 0 0 (BTM) \" ET",
+    ));
+    assert_overprint_modulates(&rgba_op, &rgba_no, "\"");
+}
