@@ -2284,12 +2284,51 @@ impl PageRenderer {
                         // captures the page-level state, the Form runs
                         // recursively, and the apply blends the Form's
                         // contribution against the captured backdrop).
+                        //
+                        // Per-subtype dispatch for the post-Do colour-
+                        // lane modulators: Image / ImageMask XObjects do
+                        // NOT execute their own paint operators — their
+                        // pixel data is painted using the outer
+                        // graphics state, so the post-Do CMYK compose,
+                        // overprint and spot-lane mirrors are how those
+                        // lanes learn about the contribution. Form
+                        // XObjects DO execute their own paint operators
+                        // (Fill / Stroke / FillStroke / Do / ShowText /
+                        // shading), each of which runs its own per-
+                        // paint sidecar mirror with the FORM's gs at
+                        // the time of the paint. Re-applying the outer
+                        // gs's CMYK / overprint / spot mirror after a
+                        // Form Do would composite the form's region
+                        // again with whatever colour the OUTER gs had,
+                        // double-counting (and, when the outer colour
+                        // differs from the form's, overwriting the
+                        // form's mirror writes — the QA-6 / QA-6-DIAG-2
+                        // failure mode where outer /K's iteration 2
+                        // /Inner Do lost the inner Form's spot
+                        // contribution). SMask attenuation always
+                        // applies — an outer /SMask gs in effect at the
+                        // Do attaches to the Do's entire region
+                        // regardless of how the inner produced its
+                        // pixels.
+                        let xobj_subtype = self.xobject_subtype(name, resources, doc);
+                        let is_form = matches!(xobj_subtype.as_deref(), Some("Form"));
                         let smask_snap = self.smask_snapshot(pixmap, &gs_clone);
                         let smask_spot_snap = self.smask_spot_snapshot(&gs_clone);
-                        let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
-                        let cmyk_compose_snap =
-                            self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
-                        let spot_snap = self.spot_paint_snapshot(pixmap, &gs_clone, true);
+                        let overprint_snap = if is_form {
+                            None
+                        } else {
+                            self.overprint_snapshot(pixmap, &gs_clone, true)
+                        };
+                        let cmyk_compose_snap = if is_form {
+                            None
+                        } else {
+                            self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true)
+                        };
+                        let spot_snap = if is_form {
+                            None
+                        } else {
+                            self.spot_paint_snapshot(pixmap, &gs_clone, true)
+                        };
                         self.render_xobject(
                             pixmap, name, transform, &gs_clone, resources, doc, page_num, clip,
                         )?;
@@ -3029,6 +3068,29 @@ impl PageRenderer {
     }
 
     /// Render an XObject (image or form).
+    /// Resolve the `/Subtype` name of the named XObject in the active
+    /// resources without rendering it. Returns `Some("Form")`,
+    /// `Some("Image")`, etc., or `None` when the lookup fails or the
+    /// XObject lacks a `/Subtype`. Used by the `Do` operator dispatcher
+    /// to pick the correct post-Do colour-lane modulators per ISO
+    /// 32000-1 §11.4.7 (Image XObjects paint with outer gs; Form
+    /// XObjects run their own operators with their own gs).
+    fn xobject_subtype(&self, name: &str, resources: &Object, doc: &PdfDocument) -> Option<String> {
+        let res_dict = resources.as_dict()?;
+        let xobj_entry = res_dict.get("XObject")?;
+        let xobjects_obj = doc.resolve_object(xobj_entry).ok()?;
+        let xobjects = xobjects_obj.as_dict()?;
+        let xobj_ref_obj = xobjects.get(name)?;
+        let xobj = doc.resolve_object(xobj_ref_obj).ok()?;
+        if let Object::Stream { ref dict, .. } = xobj {
+            return dict
+                .get("Subtype")
+                .and_then(|o| o.as_name())
+                .map(String::from);
+        }
+        None
+    }
+
     fn render_xobject(
         &mut self,
         pixmap: &mut Pixmap,
