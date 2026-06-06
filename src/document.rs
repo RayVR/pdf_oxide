@@ -725,7 +725,7 @@ fn extract_inks_from_color_space_dict(
                 }
             },
             "DeviceN" => {
-                // §8.6.6.3: [/DeviceN <names-array> /AlternateCS /TintTransform <attrs>].
+                // §8.6.6.5: [/DeviceN <names-array> /AlternateCS /TintTransform <attrs>].
                 // The names array is commonly emitted as an indirect reference
                 // when the same colorant set is shared across multiple DeviceN
                 // spaces; resolve before unpacking the names.
@@ -733,10 +733,39 @@ fn extract_inks_from_color_space_dict(
                     Some(o) => deref(o),
                     None => continue,
                 };
+                // ISO 32000-1 §8.6.6.5 / Table 73: the optional 5th array
+                // element is the attributes dictionary. When its `/Process`
+                // sub-dictionary declares a `/Components` array, those names
+                // are PROCESS colorants (riding the page's process plates),
+                // not spot inks. The same rule applies whether the attrs
+                // dict's `/Subtype` is `/DeviceN` (the default, PDF 1.6) or
+                // `/NChannel` (PDF 1.7 stricter subtype) — §8.6.6.5 names the
+                // /Process key on both subtypes. Build the process-name set
+                // here so the colorants loop can filter against it.
+                let process_names: std::collections::HashSet<String> = arr
+                    .get(4)
+                    .map(&deref)
+                    .as_ref()
+                    .and_then(Object::as_dict)
+                    .and_then(|attrs| attrs.get("Process"))
+                    .map(&deref)
+                    .as_ref()
+                    .and_then(Object::as_dict)
+                    .and_then(|proc_dict| proc_dict.get("Components"))
+                    .map(&deref)
+                    .as_ref()
+                    .and_then(Object::as_array)
+                    .map(|comps| {
+                        comps
+                            .iter()
+                            .filter_map(|o| o.as_name().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 if let Some(inks) = names_obj.as_array() {
                     for ink_obj in inks {
                         if let Some(ink) = ink_obj.as_name() {
-                            if ink != "All" && ink != "None" {
+                            if ink != "All" && ink != "None" && !process_names.contains(ink) {
                                 out.push(ink.to_string());
                             }
                         }

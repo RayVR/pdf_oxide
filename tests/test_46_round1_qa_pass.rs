@@ -227,7 +227,6 @@ fn build_constant_cmyk_icc(l_byte: u8) -> Vec<u8> {
 /// CURRENT IMPL BEHAVIOUR (BUG): pushes all five names; the sidecar
 /// allocates five spot lanes including four named after process inks.
 #[test]
-#[ignore = "round-1 fix: filter /Process colorants out of the DeviceN spot set"]
 fn qa1_1_devicen_with_process_subtype_excludes_process_channels() {
     let icc = build_constant_cmyk_icc(135);
     let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
@@ -269,7 +268,6 @@ fn qa1_1_devicen_with_process_subtype_excludes_process_channels() {
 /// subtype that requires the alternate CS to be a process colour
 /// space; the spot-vs-process rule is identical.
 #[test]
-#[ignore = "round-1 fix: NChannel subtype must also filter /Process channels"]
 fn qa1_2_devicen_with_nchannel_subtype_excludes_process_channels() {
     let icc = build_constant_cmyk_icc(135);
     let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
