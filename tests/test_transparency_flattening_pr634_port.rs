@@ -28,12 +28,7 @@ use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 /// every indirect object as a pre-formatted string starting at object
 /// 4 (catalog=1, pages=2, page=3 are fixed). The page declares
 /// `/Resources << resources_inner >>` and `/Contents 4 0 R`.
-fn build_pdf(
-    media: &str,
-    resources_inner: &str,
-    content: &str,
-    extra_objs: &[&str],
-) -> Vec<u8> {
+fn build_pdf(media: &str, resources_inner: &str, content: &str, extra_objs: &[&str]) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"%PDF-1.4\n");
 

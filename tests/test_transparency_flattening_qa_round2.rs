@@ -1092,8 +1092,7 @@ fn qa_round3_compose_first_bounded_loss_under_icc_backdrop() {
     let (r_actual, g_actual, b_actual) = mean_rgb(&rgba_two, 35, 65, 35, 65);
     let (r_ref, g_ref, b_ref) = mean_rgb(&rgba_ref, 35, 65, 35, 65);
 
-    let delta =
-        (r_actual - r_ref).abs() + (g_actual - g_ref).abs() + (b_actual - b_ref).abs();
+    let delta = (r_actual - r_ref).abs() + (g_actual - g_ref).abs() + (b_actual - b_ref).abs();
 
     // Bound: under additive-clamp (no ICC) the inversion is exact and
     // delta would be 0. Under the non-linear ICC the bound is observable

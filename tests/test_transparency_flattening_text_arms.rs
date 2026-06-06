@@ -241,17 +241,13 @@ fn assert_smask_modulates(rgba: &[u8], op_name: &str) {
 
 #[test]
 fn qa_round3_smask_modulates_tj_text() {
-    let rgba = render_rgba_200(fixture_smask_text(
-        "BT /F1 48 Tf 30 80 Td (HELLO) Tj ET",
-    ));
+    let rgba = render_rgba_200(fixture_smask_text("BT /F1 48 Tf 30 80 Td (HELLO) Tj ET"));
     assert_smask_modulates(&rgba, "Tj");
 }
 
 #[test]
 fn qa_round3_smask_modulates_tj_array_text() {
-    let rgba = render_rgba_200(fixture_smask_text(
-        "BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET",
-    ));
+    let rgba = render_rgba_200(fixture_smask_text("BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET"));
     assert_smask_modulates(&rgba, "TJ");
 }
 
@@ -260,9 +256,8 @@ fn qa_round3_smask_modulates_apostrophe_text() {
     // ' (apostrophe / NextLineShowText) — moves to next line and shows.
     // Requires a Tw / Tc set explicitly per PDF spec. Provide a leading
     // initial Tj so the apostrophe-line is the second visible band.
-    let rgba = render_rgba_200(fixture_smask_text(
-        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj (BTM) ' ET",
-    ));
+    let rgba =
+        render_rgba_200(fixture_smask_text("BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj (BTM) ' ET"));
     assert_smask_modulates(&rgba, "'");
 }
 
@@ -270,9 +265,8 @@ fn qa_round3_smask_modulates_apostrophe_text() {
 fn qa_round3_smask_modulates_quote_text() {
     // " (quote / SetSpacingNextLineShowText) — takes Tw, Tc, string
     // operands. Same structural pattern as '.
-    let rgba = render_rgba_200(fixture_smask_text(
-        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj 0 0 (BTM) \" ET",
-    ));
+    let rgba =
+        render_rgba_200(fixture_smask_text("BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj 0 0 (BTM) \" ET"));
     assert_smask_modulates(&rgba, "\"");
 }
 
@@ -339,31 +333,24 @@ fn assert_overprint_modulates(rgba_op: &[u8], rgba_no_op: &[u8], op_name: &str) 
 
 #[test]
 fn qa_round3_overprint_modulates_tj_text() {
-    let rgba_op = render_rgba_200(fixture_overprint_text(
-        "BT /F1 48 Tf 30 80 Td (HELLO) Tj ET",
-    ));
-    let rgba_no = render_rgba_200(fixture_no_overprint_text(
-        "BT /F1 48 Tf 30 80 Td (HELLO) Tj ET",
-    ));
+    let rgba_op = render_rgba_200(fixture_overprint_text("BT /F1 48 Tf 30 80 Td (HELLO) Tj ET"));
+    let rgba_no = render_rgba_200(fixture_no_overprint_text("BT /F1 48 Tf 30 80 Td (HELLO) Tj ET"));
     assert_overprint_modulates(&rgba_op, &rgba_no, "Tj");
 }
 
 #[test]
 fn qa_round3_overprint_modulates_tj_array_text() {
-    let rgba_op = render_rgba_200(fixture_overprint_text(
-        "BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET",
-    ));
-    let rgba_no = render_rgba_200(fixture_no_overprint_text(
-        "BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET",
-    ));
+    let rgba_op =
+        render_rgba_200(fixture_overprint_text("BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET"));
+    let rgba_no =
+        render_rgba_200(fixture_no_overprint_text("BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET"));
     assert_overprint_modulates(&rgba_op, &rgba_no, "TJ");
 }
 
 #[test]
 fn qa_round3_overprint_modulates_apostrophe_text() {
-    let rgba_op = render_rgba_200(fixture_overprint_text(
-        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj (BTM) ' ET",
-    ));
+    let rgba_op =
+        render_rgba_200(fixture_overprint_text("BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj (BTM) ' ET"));
     let rgba_no = render_rgba_200(fixture_no_overprint_text(
         "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj (BTM) ' ET",
     ));
