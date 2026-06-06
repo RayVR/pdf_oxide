@@ -70,23 +70,28 @@ pub const QA_BUG_BM_ARRAY_NOT_HONOURED: &str =
      should either (a) unwrap arrays and pick first-recognised in the \
      parser, or (b) declare a HONEST_GAP for malformed /BM array.";
 
-/// `discover_page_spot_inks` swallows every error from
-/// `get_page_inks_deep` with `unwrap_or_default()`. A page whose
-/// content stream truly contains spot colorants but whose resource
-/// tree has a parse error or recursion-bound trip would silently
-/// allocate a zero-spot-lane sidecar. Round 2 will write to the spot
-/// lanes — without a spot lane to write to, the writes will go
-/// nowhere. The error path should at minimum log a warning; round 1
-/// today swallows it silently.
-pub const QA_GAP_DISCOVER_ERROR_SWALLOWED_SILENTLY: &str =
-    "QA_GAP_DISCOVER_ERROR_SWALLOWED_SILENTLY: \
-     discover_page_spot_inks falls back to an empty vec on every \
-     error from get_page_inks_deep (recursion-bound trip, malformed \
-     stream, parse error). A page that actually has spots then \
-     allocates zero spot lanes; round 2's spot writes will have \
-     nowhere to land. Round 1 should at minimum surface the error \
-     (warning log or Result return) so silent miscompositing does \
-     not ship.";
+/// Round-1 closed the silent-swallow gap by emitting `log::warn!`
+/// on the error path AND returning an empty Vec; the warning surfaces
+/// the silent fidelity loss so the host log pipeline can see it,
+/// while the empty-vec return matches how the separation renderer
+/// already degrades on the same `get_page_inks_deep` failure.
+///
+/// The pin probe lives at
+/// `src/rendering/sidecar.rs::tests::discover_page_spot_inks_warns_on_deep_walk_error`
+/// — it calls `discover_page_spot_inks` directly (the function is
+/// `pub(crate)`) and asserts both halves of the contract: empty Vec
+/// return AND a captured warn record naming the page index. Round 2
+/// can then trust that any non-empty spot writes will only land on
+/// pages where discovery actually succeeded.
+pub const QA_GAP_DISCOVER_ERROR_SURFACED_VIA_WARN: &str =
+    "QA_GAP_DISCOVER_ERROR_SURFACED_VIA_WARN: round-1 fix landed: \
+     discover_page_spot_inks now log::warn!s on every error from \
+     get_page_inks_deep (parse error, malformed stream, recursion- \
+     bound trip, page lookup miss) before returning the empty Vec. \
+     The warning carries the page index and the underlying error so \
+     a log scrape can pinpoint the affected page; round 2's per-paint \
+     spot writes consistently see the empty spot set and degrade in \
+     lockstep with the diagnostic signal.";
 
 // ===========================================================================
 // Synthetic PDF builder — re-uses the same shape as

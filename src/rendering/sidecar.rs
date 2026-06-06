@@ -323,19 +323,37 @@ impl CmykSidecar {
 /// Black). The four process inks are NOT surfaced here — they live
 /// on the CMYK plane, not in the spot list.
 ///
-/// # Errors
+/// # Error handling
 ///
-/// Returns an error if the content stream cannot be parsed or the
-/// Form XObject tree exceeds the recursion limit. The caller treats
-/// any failure here as "no spots discovered" — the sidecar still
-/// allocates with a zero-length spot stack, which matches the
-/// detection-OFF / no-spots-declared shape.
+/// On a parse error, malformed colorant array, or recursion-bound
+/// trip from [`PdfDocument::get_page_inks_deep`], this function emits
+/// a `log::warn!` naming the page and the underlying error, then
+/// returns an empty vector. The render continues with degraded spot
+/// fidelity (the sidecar allocates a zero-length spot stack and any
+/// downstream paint-op writes that target spot lanes will find no
+/// lane to write to — i.e. the spot ink quietly drops out of the
+/// composite). This matches how the separation renderer handles the
+/// same error (its per-plate path also degrades on a malformed
+/// resource tree). The warning is the diagnostic signal that lets the
+/// caller see the silent fidelity loss in a log scrape.
 pub(crate) fn discover_page_spot_inks(doc: &PdfDocument, page_index: usize) -> Vec<String> {
     // get_page_inks_deep already enforces the §8.6.6.4 rules: filters
-    // /All and /None, dedups, sorts. Any error is treated as "no
-    // spots" so a malformed resource tree degrades gracefully to the
-    // CMYK-only sidecar shape rather than aborting the render.
-    doc.get_page_inks_deep(page_index).unwrap_or_default()
+    // /All and /None, dedups, sorts. On error, surface via log::warn
+    // so the silent-degradation is visible to the host application's
+    // log pipeline — a silent unwrap_or_default would let the spot
+    // lanes drop out of the composite without any signal.
+    match doc.get_page_inks_deep(page_index) {
+        Ok(inks) => inks,
+        Err(e) => {
+            log::warn!(
+                "sidecar: failed to discover spot inks for page {}: {}; the \
+                 transparency composite will proceed with no spot lanes",
+                page_index,
+                e
+            );
+            Vec::new()
+        },
+    }
 }
 
 /// Conservative detection: does this page declare any resource that
@@ -587,5 +605,102 @@ mod tests {
         assert_eq!(s.cmyk().len(), 4 * 7 * 3);
         assert!(s.spot_names().is_empty());
         assert!(s.spot_plane(0).is_none());
+    }
+
+    /// A test-only `log::Log` that captures every record into a
+    /// shared buffer. Lets the discover-error probe assert "warn!
+    /// emitted the expected diagnostic" without pulling in a test
+    /// crate. `log::set_boxed_logger` is idempotent once-only, so the
+    /// installation is gated on `OnceLock`.
+    struct CapturingLogger {
+        buf: std::sync::Mutex<Vec<String>>,
+    }
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Warn
+        }
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                let mut g = self.buf.lock().unwrap();
+                g.push(format!("{}", record.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURING_LOGGER: std::sync::OnceLock<&'static CapturingLogger> =
+        std::sync::OnceLock::new();
+    fn install_capturing_logger() -> &'static CapturingLogger {
+        CAPTURING_LOGGER.get_or_init(|| {
+            let leaked: &'static CapturingLogger = Box::leak(Box::new(CapturingLogger {
+                buf: std::sync::Mutex::new(Vec::new()),
+            }));
+            // Tolerate prior installation (other tests may install their own
+            // logger first). If installation fails, the buffer stays empty
+            // and the probe will fail loudly with a clear message.
+            let _ = log::set_logger(leaked);
+            log::set_max_level(log::LevelFilter::Warn);
+            leaked
+        })
+    }
+
+    /// Round-1 QA — surface, don't swallow, the deep-walk error.
+    ///
+    /// `discover_page_spot_inks` previously called
+    /// `get_page_inks_deep(...).unwrap_or_default()`, silently mapping
+    /// every error to an empty vec. A page that genuinely has spots
+    /// but whose deep walk trips (parse error, recursion bound, page
+    /// lookup miss) would then allocate a zero-length spot stack — and
+    /// any downstream paint-op writes to those lanes would quietly
+    /// drop on the floor.
+    ///
+    /// The fix emits `log::warn!` on the error path AND returns the
+    /// empty vec (matching how the separation renderer handles the
+    /// same `get_page_inks_deep` failure). This probe pins both halves
+    /// of the contract: empty-vec return, AND a warn record surfaces.
+    #[test]
+    fn discover_page_spot_inks_warns_on_deep_walk_error() {
+        let logger = install_capturing_logger();
+        // Snapshot any prior records so we only inspect ours.
+        let start_len = logger.buf.lock().unwrap().len();
+
+        // Single-page synthetic PDF. We will then ask for page 42 — out
+        // of range — so `get_page_inks_deep` returns Err on the page
+        // tree walk.
+        let pdf = b"%PDF-1.4\n\
+                    1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+                    2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+                    3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n\
+                    xref\n0 4\n\
+                    0000000000 65535 f \n\
+                    0000000010 00000 n \n\
+                    0000000059 00000 n \n\
+                    0000000110 00000 n \n\
+                    trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n175\n%%EOF\n"
+            .to_vec();
+        let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF parses");
+
+        let spots = discover_page_spot_inks(&doc, 42);
+        assert!(
+            spots.is_empty(),
+            "discover_page_spot_inks must return an empty vec on \
+             deep-walk error (not panic, not propagate); got {:?}",
+            spots
+        );
+
+        // The warning message names the page index and includes the
+        // word "spot inks" so a log scrape can find it.
+        let new_records: Vec<String> = {
+            let guard = logger.buf.lock().unwrap();
+            guard[start_len..].to_vec()
+        };
+        let saw_warning = new_records
+            .iter()
+            .any(|m| m.contains("page 42") && m.contains("spot inks"));
+        assert!(
+            saw_warning,
+            "expected log::warn! naming page 42 and 'spot inks' on the \
+             deep-walk error path; captured records since start: {:?}",
+            new_records
+        );
     }
 }
