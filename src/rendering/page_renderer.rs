@@ -229,6 +229,25 @@ pub struct PageRenderer {
     /// numeric cap; 32 levels is well above any realistic nesting and
     /// keeps the stack usage bounded.
     smask_depth: u32,
+    /// CMYK sidecar plane for press-accurate transparency + overprint
+    /// composition. When present, every opaque CMYK paint mirrors its
+    /// plate values into this buffer so the compose-first and
+    /// overprint-correction paths can read the backdrop CMYK
+    /// quadruple directly instead of inverting the post-ICC RGB
+    /// (which is lossy under non-linear OutputIntent profiles).
+    /// Layout matches the RGBA pixmap: 4 bytes per pixel (C, M, Y,
+    /// K), row-major, width × height.
+    ///
+    /// Lazy allocation: stays `None` for pages without OutputIntent
+    /// or pages whose only paints land on the no-transparency convert-
+    /// first path. The detection-OFF path is byte-identical to the
+    /// pre-Priority-4 behaviour because the compose / overprint
+    /// helpers fall back to additive-clamp inversion when the sidecar
+    /// is `None`.
+    cmyk_plane: Option<Vec<u8>>,
+    /// Cached page pixmap dimensions for sidecar allocation. Filled
+    /// at the top of `render_page_with_options`.
+    cmyk_plane_dims: (u32, u32),
 }
 
 /// Maximum SMask materialisation recursion depth. A cyclic
@@ -251,6 +270,8 @@ impl PageRenderer {
             excluded_layers_snapshot: None,
             icc_transform_cache: IccTransformCache::new(),
             smask_depth: 0,
+            cmyk_plane: None,
+            cmyk_plane_dims: (0, 0),
         }
     }
 
@@ -369,6 +390,32 @@ impl PageRenderer {
 
         // Pre-load resources (v0.3.18 synchronization)
         self.load_resources(doc, &resources)?;
+
+        // Decide whether to allocate the CMYK sidecar plane. The plane
+        // costs `4·width·height` bytes per page and mirrors every
+        // opaque CMYK paint so the compose-first and overprint
+        // correction helpers can read the backdrop CMYK quadruple
+        // directly instead of inverting the post-ICC RGB. Allocation
+        // is gated on (a) the OutputIntent declares a CMYK profile —
+        // without one, neither helper would fire at all — and (b) the
+        // page resources declare ExtGState entries that could drive
+        // transparency or overprint, or the page's Form XObjects
+        // declare /Group dicts (which trigger transparency-group
+        // compositing). When either condition is false the sidecar
+        // stays `None` and the per-paint mirror is a no-op; the
+        // detection-OFF path is byte-identical to the pre-Priority-4
+        // behaviour.
+        self.cmyk_plane = None;
+        self.cmyk_plane_dims = (width, height);
+        let needs_cmyk_plane = doc.output_intent_cmyk_profile().is_some()
+            && page_declares_transparency_or_overprint(doc, &resources);
+        if needs_cmyk_plane {
+            // Sidecar initialised to (0, 0, 0, 0) = no ink = paper
+            // white. Pixels never touched by a CMYK paint stay at
+            // paper-white in the sidecar, which matches the implicit
+            // page backdrop.
+            self.cmyk_plane = Some(vec![0u8; (width as usize) * (height as usize) * 4]);
+        }
 
         // Get page content stream
         let content_data = doc.get_page_content_data(page_num)?;
@@ -1175,15 +1222,45 @@ impl PageRenderer {
                             let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, false);
                             let cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, false);
+                            let cmyk_sidecar_snap =
+                                self.cmyk_sidecar_snapshot(pixmap, &gs_clone, false);
+                            let cmyk_coverage = self.rasterise_stroke_coverage(
+                                &path,
+                                transform,
+                                &gs_clone,
+                                clip,
+                            );
                             self.path_rasterizer
                                 .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
                             if let Some(snap) = cmyk_compose_snap {
-                                self.apply_cmyk_compose_after_paint(
-                                    pixmap, &snap, &gs_clone, doc, false,
+                                self.apply_cmyk_compose_after_paint_with_coverage(
+                                    pixmap,
+                                    &snap,
+                                    cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    false,
                                 );
                             }
                             if let Some(snap) = overprint_snap {
-                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, false);
+                                self.apply_overprint_after_paint_with_coverage(
+                                    pixmap,
+                                    &snap,
+                                    cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    false,
+                                );
+                            }
+                            if let Some(snap) = cmyk_sidecar_snap {
+                                self.mirror_cmyk_paint_into_sidecar_with_coverage(
+                                    pixmap,
+                                    &snap,
+                                    cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    false,
+                                );
                             }
                             if let Some(snap) = smask_snap {
                                 self.apply_smask_after_paint(
@@ -1228,6 +1305,14 @@ impl PageRenderer {
                             let overprint_snap = self.overprint_snapshot(pixmap, &gs_clone, true);
                             let cmyk_compose_snap =
                                 self.cmyk_compose_snapshot(pixmap, &gs_clone, doc, true);
+                            let cmyk_sidecar_snap =
+                                self.cmyk_sidecar_snapshot(pixmap, &gs_clone, true);
+                            let cmyk_coverage = self.rasterise_fill_coverage(
+                                &path,
+                                transform,
+                                tiny_skia::FillRule::Winding,
+                                clip,
+                            );
                             self.path_rasterizer.fill_path_clipped(
                                 pixmap,
                                 &path,
@@ -1237,12 +1322,34 @@ impl PageRenderer {
                                 clip,
                             );
                             if let Some(snap) = cmyk_compose_snap {
-                                self.apply_cmyk_compose_after_paint(
-                                    pixmap, &snap, &gs_clone, doc, true,
+                                self.apply_cmyk_compose_after_paint_with_coverage(
+                                    pixmap,
+                                    &snap,
+                                    cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    true,
                                 );
                             }
                             if let Some(snap) = overprint_snap {
-                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
+                                self.apply_overprint_after_paint_with_coverage(
+                                    pixmap,
+                                    &snap,
+                                    cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    true,
+                                );
+                            }
+                            if let Some(snap) = cmyk_sidecar_snap {
+                                self.mirror_cmyk_paint_into_sidecar_with_coverage(
+                                    pixmap,
+                                    &snap,
+                                    cmyk_coverage.as_deref(),
+                                    &gs_clone,
+                                    doc,
+                                    true,
+                                );
                             }
                             if let Some(snap) = smask_snap {
                                 self.apply_smask_after_paint(
@@ -1330,7 +1437,7 @@ impl PageRenderer {
                                 );
                             }
                             if let Some(snap) = fill_overprint_snap {
-                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
+                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, doc, true);
                             }
                             if let Some(snap) = fill_smask_snap {
                                 self.apply_smask_after_paint(
@@ -1353,7 +1460,7 @@ impl PageRenderer {
                                 );
                             }
                             if let Some(snap) = stroke_overprint_snap {
-                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, false);
+                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, doc, false);
                             }
                             if let Some(snap) = stroke_smask_snap {
                                 self.apply_smask_after_paint(
@@ -1418,7 +1525,7 @@ impl PageRenderer {
                                 );
                             }
                             if let Some(snap) = fill_overprint_snap {
-                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
+                                self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, doc, true);
                             }
                             if let Some(snap) = fill_smask_snap {
                                 self.apply_smask_after_paint(
@@ -1443,7 +1550,7 @@ impl PageRenderer {
                                 }
                                 if let Some(snap) = stroke_overprint_snap {
                                     self.apply_overprint_after_paint(
-                                        pixmap, &snap, &gs_clone, false,
+                                        pixmap, &snap, &gs_clone, doc, false,
                                     );
                                 }
                                 if let Some(snap) = stroke_smask_snap {
@@ -1562,6 +1669,7 @@ impl PageRenderer {
                                     pixmap,
                                     &snap,
                                     &gs_for_apply,
+                                    doc,
                                     true,
                                 );
                             }
@@ -1642,6 +1750,7 @@ impl PageRenderer {
                                     pixmap,
                                     &snap,
                                     &gs_for_apply,
+                                    doc,
                                     true,
                                 );
                             }
@@ -1718,6 +1827,7 @@ impl PageRenderer {
                                     pixmap,
                                     &snap,
                                     &gs_for_apply,
+                                    doc,
                                     true,
                                 );
                             }
@@ -1807,6 +1917,7 @@ impl PageRenderer {
                                     pixmap,
                                     &snap,
                                     &gs_for_apply,
+                                    doc,
                                     true,
                                 );
                             }
@@ -1861,7 +1972,7 @@ impl PageRenderer {
                             );
                         }
                         if let Some(snap) = overprint_snap {
-                            self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
+                            self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, doc, true);
                         }
                         if let Some(snap) = smask_snap {
                             self.apply_smask_after_paint(
@@ -2000,7 +2111,7 @@ impl PageRenderer {
                             );
                         }
                         if let Some(snap) = overprint_snap {
-                            self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, true);
+                            self.apply_overprint_after_paint(pixmap, &snap, &gs_clone, doc, true);
                         }
                         if let Some(snap) = smask_snap {
                             self.apply_smask_after_paint(
@@ -3326,6 +3437,175 @@ impl PageRenderer {
         }
     }
 
+    /// Snapshot the pixmap when the CMYK sidecar plane is present and
+    /// the paint side carries a CMYK colour. The plane mirror runs at
+    /// every CMYK paint (opaque or transparent) so the sidecar stays
+    /// in sync with the page's plate state. The mirror helper
+    /// [`Self::mirror_cmyk_paint_into_sidecar`] consumes the snapshot
+    /// + post-paint pixmap to identify the painted region and writes
+    /// updated CMYK quadruples at those pixels.
+    fn cmyk_sidecar_snapshot(&self, pixmap: &Pixmap, gs: &GraphicsState, fill_side: bool) -> Option<Vec<u8>> {
+        if self.cmyk_plane.is_none() {
+            return None;
+        }
+        let has_cmyk = if fill_side {
+            gs.fill_color_cmyk.is_some()
+        } else {
+            gs.stroke_color_cmyk.is_some()
+        };
+        if !has_cmyk {
+            return None;
+        }
+        Some(pixmap.data().to_vec())
+    }
+
+    /// After a CMYK paint (opaque or transparent), write updated CMYK
+    /// quadruples to the sidecar plane at painted pixels. The
+    /// effective coverage is recovered from the snapshot vs post-paint
+    /// pixmap diff so AA-edge pixels carry the correct partial CMYK.
+    /// Skipped silently when the sidecar is None (detection-OFF) or
+    /// when the painted-pixel-recovery cannot proceed (e.g. the
+    /// rasteriser produced no observable diff).
+    ///
+    /// Called only when the paint is OPAQUE (no transparency
+    /// composition needed). For transparent paints, the compose-first
+    /// path is the source of truth for sidecar updates — it already
+    /// mirrors the composed quadruple after compositing.
+    ///
+    /// For overprint paints, sidecar update happens inside
+    /// [`Self::apply_overprint_after_paint`] which handles plate
+    /// merging.
+    fn mirror_cmyk_paint_into_sidecar(
+        &mut self,
+        pixmap: &Pixmap,
+        snapshot: &[u8],
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        fill_side: bool,
+    ) {
+        let (sc, sm, sy, sk) = if fill_side {
+            match gs.fill_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        } else {
+            match gs.stroke_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        };
+
+        // Skip when compose-first or overprint paths handle the
+        // sidecar update themselves. Those paths run within their
+        // own `apply_*_after_paint` helpers and write composed /
+        // merged CMYK directly.
+        let alpha = if fill_side {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
+        let overprint = if fill_side {
+            gs.fill_overprint
+        } else {
+            gs.stroke_overprint
+        };
+        let transparent = alpha < 1.0 || gs.blend_mode != "Normal" || gs.smask.is_some();
+        if transparent || overprint {
+            return;
+        }
+
+        // For opaque CMYK paints the post-paint RGB came through the
+        // ICC convert-first (or additive-clamp fallback) path. To
+        // detect painted pixels we look at the snapshot vs post-paint
+        // diff; for AA-edge pixels we need to recover the effective
+        // coverage so the sidecar carries the right partial-coverage
+        // CMYK.
+        let src_rgb_ic = {
+            let c_u8 = (sc.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let m_u8 = (sm.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let y_u8 = (sy.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let k_u8 = (sk.clamp(0.0, 1.0) * 255.0).round() as u8;
+            if let Some(profile) = doc.output_intent_cmyk_profile() {
+                let intent = crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent);
+                let transform = self.icc_transform_cache.get_or_build(&profile, intent);
+                let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
+                [
+                    rgb[0] as f32 / 255.0,
+                    rgb[1] as f32 / 255.0,
+                    rgb[2] as f32 / 255.0,
+                ]
+            } else {
+                let (r, g, b) = cmyk_to_rgb(sc, sm, sy, sk);
+                [r, g, b]
+            }
+        };
+
+        let post = pixmap.data();
+        let plane = match self.cmyk_plane.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
+        debug_assert_eq!(post.len(), snapshot.len());
+        debug_assert_eq!(post.len(), plane.len());
+
+        for px in 0..(post.len() / 4) {
+            let off = px * 4;
+            let painted = post[off] != snapshot[off]
+                || post[off + 1] != snapshot[off + 1]
+                || post[off + 2] != snapshot[off + 2]
+                || post[off + 3] != snapshot[off + 3];
+            if !painted {
+                continue;
+            }
+
+            // Recover effective coverage c from the source-over blend
+            // on the channel with maximum |snap - src|.
+            let snap_r = snapshot[off] as f32 / 255.0;
+            let snap_g = snapshot[off + 1] as f32 / 255.0;
+            let snap_b = snapshot[off + 2] as f32 / 255.0;
+            let post_r = post[off] as f32 / 255.0;
+            let post_g = post[off + 1] as f32 / 255.0;
+            let post_b = post[off + 2] as f32 / 255.0;
+
+            let diffs = [
+                (snap_r - src_rgb_ic[0]).abs(),
+                (snap_g - src_rgb_ic[1]).abs(),
+                (snap_b - src_rgb_ic[2]).abs(),
+            ];
+            let (max_idx, max_diff) = diffs
+                .iter()
+                .enumerate()
+                .fold((0usize, 0.0_f32), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc });
+            let coverage = if max_diff > 1.0 / 255.0 {
+                let (snap_ch, post_ch, src_ch) = match max_idx {
+                    0 => (snap_r, post_r, src_rgb_ic[0]),
+                    1 => (snap_g, post_g, src_rgb_ic[1]),
+                    _ => (snap_b, post_b, src_rgb_ic[2]),
+                };
+                ((snap_ch - post_ch) / (snap_ch - src_ch)).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+
+            // Sidecar backdrop CMYK.
+            let dc = plane[off] as f32 / 255.0;
+            let dm = plane[off + 1] as f32 / 255.0;
+            let dy = plane[off + 2] as f32 / 255.0;
+            let dk = plane[off + 3] as f32 / 255.0;
+
+            // Source-over CMYK blend at effective coverage.
+            let mc = coverage * sc + (1.0 - coverage) * dc;
+            let mm = coverage * sm + (1.0 - coverage) * dm;
+            let my = coverage * sy + (1.0 - coverage) * dy;
+            let mk = coverage * sk + (1.0 - coverage) * dk;
+
+            plane[off] = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 1] = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 2] = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 3] = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+
     /// Recompute every painted pixel through the §11.4 compose-first
     /// rule. The naive paint path converted CMYK→RGB through the
     /// OutputIntent ICC before alpha-blending; under a non-linear ICC
@@ -3345,8 +3625,175 @@ impl PageRenderer {
     /// Alpha channel is preserved from the post-paint pixmap because
     /// the alpha composition rule is the same in either ordering
     /// (`α_out = c·α_src + (1-c·α_src)·α_dst`).
-    fn apply_cmyk_compose_after_paint(
+    /// Rasterise a fill path to a coverage byte buffer when the CMYK
+    /// sidecar is active. Returns `None` when the sidecar is
+    /// detection-OFF — the diff-driven compose-first path is the
+    /// only one used in that case and a coverage mask would be
+    /// unused work.
+    fn rasterise_fill_coverage(
         &self,
+        path: &tiny_skia::Path,
+        transform: Transform,
+        fill_rule: tiny_skia::FillRule,
+        clip: Option<&tiny_skia::Mask>,
+    ) -> Option<Vec<u8>> {
+        if self.cmyk_plane.is_none() {
+            return None;
+        }
+        let (w, h) = self.cmyk_plane_dims;
+        let mut mask = tiny_skia::Mask::new(w, h)?;
+        mask.fill_path(path, fill_rule, true, transform);
+        let mut buf = mask.data().to_vec();
+        // Intersect with the active clip mask. tiny_skia's clip mask
+        // is per-pixel coverage; pixel-wise min gives the
+        // intersection.
+        if let Some(c) = clip {
+            for (b, cv) in buf.iter_mut().zip(c.data().iter()) {
+                *b = (*b).min(*cv);
+            }
+        }
+        Some(buf)
+    }
+
+    /// Rasterise a stroke path to a coverage byte buffer. Mirror of
+    /// [`Self::rasterise_fill_coverage`] for the stroke-side compose-
+    /// first / overprint paths. tiny_skia's `Mask` does not expose
+    /// `stroke_path` directly, so this routes through a scratch
+    /// alpha-only `Pixmap`: paint the stroke with full-alpha black,
+    /// then extract the alpha channel as the coverage buffer.
+    fn rasterise_stroke_coverage(
+        &self,
+        path: &tiny_skia::Path,
+        transform: Transform,
+        gs: &GraphicsState,
+        clip: Option<&tiny_skia::Mask>,
+    ) -> Option<Vec<u8>> {
+        if self.cmyk_plane.is_none() {
+            return None;
+        }
+        let (w, h) = self.cmyk_plane_dims;
+        let mut scratch = Pixmap::new(w, h)?;
+        let dash = if !gs.dash_pattern.0.is_empty() {
+            tiny_skia::StrokeDash::new(gs.dash_pattern.0.clone(), gs.dash_pattern.1)
+        } else {
+            None
+        };
+        let stroke = tiny_skia::Stroke {
+            width: gs.line_width,
+            line_cap: match gs.line_cap {
+                1 => tiny_skia::LineCap::Round,
+                2 => tiny_skia::LineCap::Square,
+                _ => tiny_skia::LineCap::Butt,
+            },
+            line_join: match gs.line_join {
+                1 => tiny_skia::LineJoin::Round,
+                2 => tiny_skia::LineJoin::Bevel,
+                _ => tiny_skia::LineJoin::Miter,
+            },
+            miter_limit: gs.miter_limit,
+            dash,
+        };
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color(tiny_skia::Color::from_rgba8(0, 0, 0, 255));
+        paint.anti_alias = true;
+        scratch.stroke_path(path, &paint, &stroke, transform, clip);
+        let buf: Vec<u8> = scratch.data().chunks_exact(4).map(|px| px[3]).collect();
+        Some(buf)
+    }
+
+    /// Coverage-aware compose-first that takes a pre-rasterised path
+    /// coverage mask. Used when the CMYK sidecar is allocated so the
+    /// "painted region" is identified independent of the snap-vs-dest
+    /// diff (which fails when source and backdrop ICC-RGB collide,
+    /// producing painted=false at pixels that the path actually
+    /// covered). Falls through to the standard
+    /// [`Self::apply_cmyk_compose_after_paint`] when the sidecar is
+    /// None.
+    fn apply_cmyk_compose_after_paint_with_coverage(
+        &mut self,
+        pixmap: &mut Pixmap,
+        snapshot: &[u8],
+        coverage: Option<&[u8]>,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        fill_side: bool,
+    ) {
+        if self.cmyk_plane.is_none() || coverage.is_none() {
+            // Fall back to the diff-driven path. Detection-OFF
+            // byte-identical behaviour.
+            self.apply_cmyk_compose_after_paint(pixmap, snapshot, gs, doc, fill_side);
+            return;
+        }
+
+        let (sc, sm, sy, sk) = if fill_side {
+            match gs.fill_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        } else {
+            match gs.stroke_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        };
+        let alpha_g = if fill_side {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
+        let profile = match doc.output_intent_cmyk_profile() {
+            Some(p) => p,
+            None => return,
+        };
+        let intent = crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent);
+        let coverage = coverage.expect("checked above");
+        let dest = pixmap.data_mut();
+
+        for px in 0..(dest.len() / 4) {
+            let off = px * 4;
+            let cov = coverage[px];
+            if cov == 0 {
+                continue;
+            }
+            let coverage_frac = cov as f32 / 255.0;
+            let c_alpha = (coverage_frac * alpha_g).clamp(0.0, 1.0);
+
+            // Backdrop CMYK from sidecar.
+            let plane = self.cmyk_plane.as_ref().expect("checked above");
+            let dc = plane[off] as f32 / 255.0;
+            let dm = plane[off + 1] as f32 / 255.0;
+            let dy = plane[off + 2] as f32 / 255.0;
+            let dk = plane[off + 3] as f32 / 255.0;
+
+            let mc = c_alpha * sc + (1.0 - c_alpha) * dc;
+            let mm = c_alpha * sm + (1.0 - c_alpha) * dm;
+            let my = c_alpha * sy + (1.0 - c_alpha) * dy;
+            let mk = c_alpha * sk + (1.0 - c_alpha) * dk;
+
+            let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+
+            let transform = self.icc_transform_cache.get_or_build(&profile, intent);
+            let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
+
+            dest[off] = rgb[0];
+            dest[off + 1] = rgb[1];
+            dest[off + 2] = rgb[2];
+
+            // Mirror composed CMYK back to sidecar.
+            let plane = self.cmyk_plane.as_mut().expect("re-borrow");
+            plane[off] = mc_u8;
+            plane[off + 1] = mm_u8;
+            plane[off + 2] = my_u8;
+            plane[off + 3] = mk_u8;
+        }
+        let _ = snapshot; // diff-path no longer consults the snapshot
+    }
+
+    fn apply_cmyk_compose_after_paint(
+        &mut self,
         pixmap: &mut Pixmap,
         snapshot: &[u8],
         gs: &GraphicsState,
@@ -3456,16 +3903,33 @@ impl PageRenderer {
                 alpha_g
             };
 
-            // Invert snapshot RGB → CMYK via §10.3.5 additive clamp.
-            // For backdrops produced by previous CMYK-via-ICC paints
-            // this inversion is lossy; the bound is captured by the
-            // composite-overprint reconstruction-loss probe. For the
-            // baseline-white backdrop the inversion is exact: white
-            // (255,255,255) maps to CMYK(0,0,0,0).
-            let dc = (1.0 - snap_r).max(0.0);
-            let dm = (1.0 - snap_g).max(0.0);
-            let dy = (1.0 - snap_b).max(0.0);
-            let dk = 0.0_f32;
+            // Backdrop CMYK source. Two paths:
+            //
+            //  (a) Sidecar plane present — read CMYK quadruple directly
+            //      from the page-resident plate buffer. This is the
+            //      press-accurate path; under a non-linear ICC the
+            //      additive-clamp inversion below is lossy.
+            //  (b) No sidecar — fall back to §10.3.5 additive-clamp
+            //      inversion of the snapshot RGB. Exact for the
+            //      baseline-white backdrop and the additive-clamp
+            //      fallback OutputIntent path; bounded-loss when the
+            //      backdrop went through a non-linear ICC. Documented
+            //      gap, kept for the detection-OFF path.
+            let (dc, dm, dy, dk) = if let Some(plane) = self.cmyk_plane.as_ref() {
+                (
+                    plane[off] as f32 / 255.0,
+                    plane[off + 1] as f32 / 255.0,
+                    plane[off + 2] as f32 / 255.0,
+                    plane[off + 3] as f32 / 255.0,
+                )
+            } else {
+                (
+                    (1.0 - snap_r).max(0.0),
+                    (1.0 - snap_g).max(0.0),
+                    (1.0 - snap_b).max(0.0),
+                    0.0_f32,
+                )
+            };
 
             // Compose in CMYK source space at effective coverage·alpha.
             let mc = c_alpha * sc + (1.0 - c_alpha) * dc;
@@ -3487,6 +3951,17 @@ impl PageRenderer {
             // Alpha unchanged — the source-over alpha rule is identical
             // in convert-first vs compose-first, so the tiny_skia
             // rasteriser's alpha output is correct as-is.
+
+            // Mirror the composed CMYK into the sidecar so subsequent
+            // paints see the press-accurate backdrop. The mirror is
+            // bypassed when the sidecar is None (detection-OFF
+            // byte-identical path).
+            if let Some(plane) = self.cmyk_plane.as_mut() {
+                plane[off] = mc_u8;
+                plane[off + 1] = mm_u8;
+                plane[off + 2] = my_u8;
+                plane[off + 3] = mk_u8;
+            }
         }
     }
 
@@ -3529,11 +4004,194 @@ impl PageRenderer {
     ///
     /// The merged CMYK is converted back to RGB and written to the
     /// destination pixel, replacing the naïve over-paint result.
+    /// Coverage-aware overprint correction. Like
+    /// [`Self::apply_cmyk_compose_after_paint_with_coverage`] but for
+    /// the §11.7.4 plate merge. Reads backdrop CMYK from the sidecar
+    /// instead of the additive-clamp inversion of the snapshot RGB.
+    /// Falls back to [`Self::apply_overprint_after_paint`] when the
+    /// sidecar is None.
+    fn apply_overprint_after_paint_with_coverage(
+        &mut self,
+        pixmap: &mut Pixmap,
+        snapshot: &[u8],
+        coverage: Option<&[u8]>,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        fill_side: bool,
+    ) {
+        if self.cmyk_plane.is_none() || coverage.is_none() {
+            self.apply_overprint_after_paint(pixmap, snapshot, gs, doc, fill_side);
+            return;
+        }
+
+        let (sc, sm, sy, sk) = if fill_side {
+            match gs.fill_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        } else {
+            match gs.stroke_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        };
+        let opm = gs.overprint_mode;
+        let coverage = coverage.expect("checked above");
+
+        let icc_path = doc.output_intent_cmyk_profile().is_some();
+        let icc_profile = if icc_path {
+            doc.output_intent_cmyk_profile()
+        } else {
+            None
+        };
+        let icc_intent = if icc_path {
+            Some(crate::color::RenderingIntent::from_pdf_name(
+                &gs.rendering_intent,
+            ))
+        } else {
+            None
+        };
+
+        let dest = pixmap.data_mut();
+        for px in 0..(dest.len() / 4) {
+            let off = px * 4;
+            if coverage[px] == 0 {
+                continue;
+            }
+
+            // Backdrop CMYK from sidecar.
+            let plane = self.cmyk_plane.as_ref().expect("checked above");
+            let dc = plane[off] as f32 / 255.0;
+            let dm = plane[off + 1] as f32 / 255.0;
+            let dy = plane[off + 2] as f32 / 255.0;
+            let dk_existing = plane[off + 3] as f32 / 255.0;
+
+            let merge = |src: f32, dst: f32| -> f32 {
+                if opm == 1 {
+                    if src == 0.0 {
+                        dst
+                    } else {
+                        src
+                    }
+                } else {
+                    (src + dst).min(1.0)
+                }
+            };
+            let mc = merge(sc, dc);
+            let mm = merge(sm, dm);
+            let my = merge(sy, dy);
+            let mk = merge(sk, dk_existing);
+
+            let (r_byte, g_byte, b_byte) = if let (Some(profile), Some(intent)) =
+                (icc_profile.as_ref(), icc_intent)
+            {
+                let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let transform = self.icc_transform_cache.get_or_build(profile, intent);
+                let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
+                (rgb[0], rgb[1], rgb[2])
+            } else {
+                let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
+                (
+                    (rr * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (rg * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (rb * 255.0).round().clamp(0.0, 255.0) as u8,
+                )
+            };
+
+            dest[off] = r_byte;
+            dest[off + 1] = g_byte;
+            dest[off + 2] = b_byte;
+
+            // Mirror merged CMYK into sidecar.
+            let plane = self.cmyk_plane.as_mut().expect("re-borrow");
+            plane[off] = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 1] = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 2] = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 3] = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+        let _ = snapshot;
+    }
+
+    /// Coverage-aware mirror of opaque CMYK paints into the sidecar.
+    /// Like [`Self::mirror_cmyk_paint_into_sidecar`] but uses the
+    /// pre-rasterised coverage instead of the snap-vs-dest diff.
+    fn mirror_cmyk_paint_into_sidecar_with_coverage(
+        &mut self,
+        pixmap: &Pixmap,
+        snapshot: &[u8],
+        coverage: Option<&[u8]>,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        fill_side: bool,
+    ) {
+        if self.cmyk_plane.is_none() || coverage.is_none() {
+            self.mirror_cmyk_paint_into_sidecar(pixmap, snapshot, gs, doc, fill_side);
+            return;
+        }
+
+        let (sc, sm, sy, sk) = if fill_side {
+            match gs.fill_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        } else {
+            match gs.stroke_color_cmyk {
+                Some(v) => v,
+                None => return,
+            }
+        };
+        // Skip when the paint is transparent or overprint — those
+        // paths handle the sidecar update themselves.
+        let alpha = if fill_side {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
+        let overprint = if fill_side {
+            gs.fill_overprint
+        } else {
+            gs.stroke_overprint
+        };
+        let transparent = alpha < 1.0 || gs.blend_mode != "Normal" || gs.smask.is_some();
+        if transparent || overprint {
+            return;
+        }
+
+        let coverage = coverage.expect("checked above");
+        let plane = self.cmyk_plane.as_mut().expect("checked above");
+        for px in 0..(plane.len() / 4) {
+            let cov = coverage[px];
+            if cov == 0 {
+                continue;
+            }
+            let cov_f = cov as f32 / 255.0;
+            let off = px * 4;
+            let dc = plane[off] as f32 / 255.0;
+            let dm = plane[off + 1] as f32 / 255.0;
+            let dy = plane[off + 2] as f32 / 255.0;
+            let dk = plane[off + 3] as f32 / 255.0;
+            let mc = cov_f * sc + (1.0 - cov_f) * dc;
+            let mm = cov_f * sm + (1.0 - cov_f) * dm;
+            let my = cov_f * sy + (1.0 - cov_f) * dy;
+            let mk = cov_f * sk + (1.0 - cov_f) * dk;
+            plane[off] = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 1] = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 2] = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+            plane[off + 3] = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+        let _ = snapshot;
+        let _ = doc;
+    }
+
     fn apply_overprint_after_paint(
-        &self,
+        &mut self,
         pixmap: &mut Pixmap,
         snapshot: &[u8],
         gs: &GraphicsState,
+        doc: &PdfDocument,
         fill_side: bool,
     ) {
         let (sc, sm, sy, sk) = if fill_side {
@@ -3548,6 +4206,24 @@ impl PageRenderer {
             }
         };
         let opm = gs.overprint_mode;
+        // Press-accurate path active when the CMYK sidecar plane is
+        // present AND an OutputIntent CMYK profile is available. The
+        // merged CMYK then runs through the ICC; otherwise the
+        // additive-clamp `cmyk_to_rgb` round-trip stays in place.
+        let icc_path = self.cmyk_plane.is_some() && doc.output_intent_cmyk_profile().is_some();
+        let icc_profile = if icc_path {
+            doc.output_intent_cmyk_profile()
+        } else {
+            None
+        };
+        let icc_intent = if icc_path {
+            Some(crate::color::RenderingIntent::from_pdf_name(
+                &gs.rendering_intent,
+            ))
+        } else {
+            None
+        };
+
         let dest = pixmap.data_mut();
         debug_assert_eq!(dest.len(), snapshot.len());
 
@@ -3565,16 +4241,27 @@ impl PageRenderer {
                 continue;
             }
 
-            // Reconstruct the snapshot's CMYK from its RGB. We use the
-            // same simple additive-clamp inversion used by
-            // cmyk_to_rgb so the round-trip is consistent.
-            let dr = snapshot[off] as f32 / 255.0;
-            let dg = snapshot[off + 1] as f32 / 255.0;
-            let db = snapshot[off + 2] as f32 / 255.0;
-            let dc = (1.0 - dr).max(0.0);
-            let dm = (1.0 - dg).max(0.0);
-            let dy = (1.0 - db).max(0.0);
-            let dk_existing = 0.0_f32;
+            // Backdrop CMYK source. Same dual path as
+            // apply_cmyk_compose_after_paint: sidecar when available,
+            // additive-clamp inversion otherwise.
+            let (dc, dm, dy, dk_existing) = if let Some(plane) = self.cmyk_plane.as_ref() {
+                (
+                    plane[off] as f32 / 255.0,
+                    plane[off + 1] as f32 / 255.0,
+                    plane[off + 2] as f32 / 255.0,
+                    plane[off + 3] as f32 / 255.0,
+                )
+            } else {
+                let dr = snapshot[off] as f32 / 255.0;
+                let dg = snapshot[off + 1] as f32 / 255.0;
+                let db = snapshot[off + 2] as f32 / 255.0;
+                (
+                    (1.0 - dr).max(0.0),
+                    (1.0 - dg).max(0.0),
+                    (1.0 - db).max(0.0),
+                    0.0_f32,
+                )
+            };
 
             // Per-plate merge. OPM=1 nonzero overprint: zero source
             // plate keeps dest plate; nonzero source plate replaces.
@@ -3597,14 +4284,43 @@ impl PageRenderer {
             let my = merge(sy, dy);
             let mk = merge(sk, dk_existing);
 
-            let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
+            // CMYK → RGB conversion. ICC path for the press-accurate
+            // case; additive-clamp `cmyk_to_rgb` for the fallback.
+            let (r_byte, g_byte, b_byte) = if let (Some(profile), Some(intent)) =
+                (icc_profile.as_ref(), icc_intent)
+            {
+                let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let transform = self.icc_transform_cache.get_or_build(profile, intent);
+                let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
+                (rgb[0], rgb[1], rgb[2])
+            } else {
+                let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
+                (
+                    (rr * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (rg * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (rb * 255.0).round().clamp(0.0, 255.0) as u8,
+                )
+            };
+
             // Preserve the painted pixel's alpha (post-paint alpha
             // already accounts for the paint's contribution); just
             // overwrite RGB with the per-plate merged value.
-            dest[off] = (rr * 255.0).round().clamp(0.0, 255.0) as u8;
-            dest[off + 1] = (rg * 255.0).round().clamp(0.0, 255.0) as u8;
-            dest[off + 2] = (rb * 255.0).round().clamp(0.0, 255.0) as u8;
+            dest[off] = r_byte;
+            dest[off + 1] = g_byte;
+            dest[off + 2] = b_byte;
             // Alpha unchanged.
+
+            // Mirror merged CMYK into the sidecar so subsequent paints
+            // see the post-overprint backdrop.
+            if let Some(plane) = self.cmyk_plane.as_mut() {
+                plane[off] = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+                plane[off + 1] = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+                plane[off + 2] = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+                plane[off + 3] = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
         }
     }
 
@@ -4545,6 +5261,106 @@ fn build_logical_color<'a>(
 /// the hot path in `execute_operators` uses `parse_ext_g_state_inner` against
 /// a pre-resolved resource dict (the per-form ExtGState dict has 10 000+
 /// entries on heavy vector figures and deep-cloning it on every `gs` op was
+/// Page-walk detection: does this page declare any resource that
+/// could drive transparency or overprint? A `true` return triggers
+/// CMYK-sidecar allocation in [`PageRenderer::render_page_with_options`]
+/// so the compose-first and overprint helpers can read the backdrop
+/// CMYK quadruple directly. Detection criteria:
+///
+///   * Any ExtGState in `/Resources /ExtGState` declares one of:
+///     - `/OP true` or `/op true` (overprint)
+///     - `/CA < 1.0` or `/ca < 1.0` (transparent paint)
+///     - `/SMask` non-null (soft mask)
+///     - `/BM` non-Normal (non-trivial blend mode)
+///   * Any Form XObject in `/Resources /XObject` declares a `/Group`
+///     dict (transparency group).
+///
+/// A conservative TRUE return drives sidecar allocation; a FALSE
+/// return keeps the page on the zero-cost path. The detection-OFF
+/// path is byte-identical to the pre-Priority-4 behaviour because
+/// the sidecar-consuming helpers fall back to the additive-clamp
+/// inversion when the sidecar is `None`.
+fn page_declares_transparency_or_overprint(doc: &PdfDocument, resources: &Object) -> bool {
+    let res_dict = match resources {
+        Object::Dictionary(d) => d,
+        _ => return false,
+    };
+
+    if let Some(ext_gs_obj) = res_dict.get("ExtGState") {
+        if let Ok(ext_gs_resolved) = doc.resolve_object(ext_gs_obj) {
+            if let Some(ext_g_states) = ext_gs_resolved.as_dict() {
+                for state in ext_g_states.values() {
+                    if let Ok(state_resolved) = doc.resolve_object(state) {
+                        if let Some(state_dict) = state_resolved.as_dict() {
+                            if state_dict
+                                .get("OP")
+                                .map(|o| matches!(o, Object::Boolean(true)))
+                                .unwrap_or(false)
+                                || state_dict
+                                    .get("op")
+                                    .map(|o| matches!(o, Object::Boolean(true)))
+                                    .unwrap_or(false)
+                            {
+                                return true;
+                            }
+                            for key in ["CA", "ca"] {
+                                if let Some(v) = state_dict.get(key) {
+                                    let alpha = match v {
+                                        Object::Real(r) => *r as f32,
+                                        Object::Integer(i) => *i as f32,
+                                        _ => 1.0,
+                                    };
+                                    if alpha < 1.0 {
+                                        return true;
+                                    }
+                                }
+                            }
+                            if let Some(smask) = state_dict.get("SMask") {
+                                // /SMask /None is the spec sentinel for
+                                // "no soft mask". Any other value
+                                // (dictionary, indirect reference) is a
+                                // soft mask declaration.
+                                if !matches!(smask, Object::Name(n) if n == "None") {
+                                    return true;
+                                }
+                            }
+                            if let Some(Object::Name(bm)) = state_dict.get("BM") {
+                                if bm != "Normal" {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(xobj_obj) = res_dict.get("XObject") {
+        if let Ok(xobj_resolved) = doc.resolve_object(xobj_obj) {
+            if let Some(xobj_dict) = xobj_resolved.as_dict() {
+                for obj in xobj_dict.values() {
+                    if let Ok(resolved) = doc.resolve_object(obj) {
+                        // Form XObject /Group dict, or image /SMask:
+                        // either triggers transparency compositing.
+                        let dict = match &resolved {
+                            Object::Stream { dict, .. } => Some(dict),
+                            _ => None,
+                        };
+                        if let Some(dict) = dict {
+                            if dict.contains_key("Group") || dict.contains_key("SMask") {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// the previous bottleneck).
 fn parse_ext_g_state(
     dict_name: &str,
