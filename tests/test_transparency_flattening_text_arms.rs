@@ -179,3 +179,99 @@ fn text_helvetica_fixture_paints_glyph_pixels() {
          overprint probes below cannot discriminate."
     );
 }
+
+// ===========================================================================
+// Text-arm SMask probes — Tj / TJ / ' / "
+// ===========================================================================
+//
+// Each probe lays a white background, declares an ExtGState with
+// /SMask /S /Luminosity /G <50% grey form>, then runs the text-
+// showing operator. With the round-3 wiring, the painted glyph
+// pixels should be modulated by the 50% luminance soft-mask:
+// black-on-white text becomes mid-grey.
+//
+// Without wiring, the glyph pixels would be fully opaque black
+// (~0, 0, 0). The probe asserts the mean PAINTED-pixel RGB is
+// significantly lighter than fully-opaque black AND distinct from
+// fully-white (proves there ARE painted pixels and they got
+// modulated).
+
+fn fixture_smask_text(text_op: &str) -> Vec<u8> {
+    let smask_form = "0.5 g\n0 0 200 200 re\nf\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        smask_form.len(),
+        smask_form
+    );
+    let content = format!(
+        "1 1 1 rg\n0 0 200 200 re\nf\n\
+         /Sm gs\n\
+         0 0 0 rg\n\
+         {}\n",
+        text_op
+    );
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>";
+    build_text_pdf(&content, resources, &[&obj_6])
+}
+
+fn assert_smask_modulates(rgba: &[u8], op_name: &str) {
+    let (mean_r, mean_g, mean_b, n) = mean_painted_rgb(rgba, 30, 180, 80, 130);
+    assert!(
+        n >= 50,
+        "{op_name} text under SMask: expected ≥ 50 painted pixels in \
+         the text band; got {n}. If the text didn't render, the SMask \
+         probe cannot discriminate the wiring."
+    );
+    // 50% luminance SMask on black-text-on-white ⇒ painted pixels
+    // composite to mid-grey (~128). Without wiring, painted pixels
+    // stay opaque black (~0). Assert mean is meaningfully above the
+    // unwired baseline.
+    let unwired_threshold = 60.0;
+    assert!(
+        mean_r > unwired_threshold && mean_g > unwired_threshold && mean_b > unwired_threshold,
+        "{op_name} text under SMask: expected mean painted-pixel RGB \
+         elevated above unwired-black baseline (>{unwired_threshold} on \
+         each channel ⇒ SMask 50% luminance modulation visible); got \
+         mean=({mean_r:.0}, {mean_g:.0}, {mean_b:.0}) over n={n} pixels. \
+         If close to (0, 0, 0) the SMask wiring on {op_name} is broken."
+    );
+}
+
+#[test]
+fn qa_round3_smask_modulates_tj_text() {
+    let rgba = render_rgba_200(fixture_smask_text(
+        "BT /F1 48 Tf 30 80 Td (HELLO) Tj ET",
+    ));
+    assert_smask_modulates(&rgba, "Tj");
+}
+
+#[test]
+fn qa_round3_smask_modulates_tj_array_text() {
+    let rgba = render_rgba_200(fixture_smask_text(
+        "BT /F1 48 Tf 30 80 Td [(HE) -50 (LLO)] TJ ET",
+    ));
+    assert_smask_modulates(&rgba, "TJ");
+}
+
+#[test]
+fn qa_round3_smask_modulates_apostrophe_text() {
+    // ' (apostrophe / NextLineShowText) — moves to next line and shows.
+    // Requires a Tw / Tc set explicitly per PDF spec. Provide a leading
+    // initial Tj so the apostrophe-line is the second visible band.
+    let rgba = render_rgba_200(fixture_smask_text(
+        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj (BTM) ' ET",
+    ));
+    assert_smask_modulates(&rgba, "'");
+}
+
+#[test]
+fn qa_round3_smask_modulates_quote_text() {
+    // " (quote / SetSpacingNextLineShowText) — takes Tw, Tc, string
+    // operands. Same structural pattern as '.
+    let rgba = render_rgba_200(fixture_smask_text(
+        "BT /F1 48 Tf 12 TL 30 80 Td (TOP) Tj 0 0 (BTM) \" ET",
+    ));
+    assert_smask_modulates(&rgba, "\"");
+}
