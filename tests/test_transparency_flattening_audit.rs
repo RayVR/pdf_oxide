@@ -23,6 +23,9 @@
 //! | Transparency group `/I` (isolated flag)         | §11.4.5   | yes          | LIVE        | regression sentry         |
 //! | Transparency group `/K` (knockout flag)         | §11.4.5/6 | NO           | IGNORED     | HONEST_GAP_GROUP_KNOCKOUT |
 //! | Form XObject `/Group` dict                      | §11.4.5   | yes          | LIVE        | regression sentry         |
+//! | Separable blend: Multiply / Screen              | §11.3.5.2 | yes          | LIVE        | regression sentry         |
+//! | Separable blend: Darken / Lighten               | §11.3.5.2 | yes          | LIVE        | regression sentry         |
+//! | Separable blend: Difference                     | §11.3.5.2 | yes          | LIVE        | regression sentry         |
 //!
 //! ### Source citations for the inventory
 //!
@@ -48,6 +51,13 @@
 //!   group and its parent is `PixmapPaint::default()` (i.e. SourceOver),
 //!   which is the right separable-blend default but loses the
 //!   `/Group /S /Transparency /CS /...` colour-space override.
+//! - `src/rendering/mod.rs:80-95` — `pdf_blend_mode_to_skia` dispatch
+//!   maps the twelve separable PDF blend modes (Normal, Multiply,
+//!   Screen, Overlay, Darken, Lighten, ColorDodge, ColorBurn,
+//!   HardLight, SoftLight, Difference, Exclusion) onto
+//!   `tiny_skia::BlendMode` counterparts. The probes below pin three
+//!   high-signal modes (Multiply, Screen, Darken/Lighten,
+//!   Difference) against byte-anchored reference values.
 //!
 //! ## Reading the assertions
 //!
@@ -741,4 +751,145 @@ fn form_xobject_group_dict_with_transparency_paints_blue() {
         b > 200 && r < 80 && g < 80,
         "Form-XObject /Group /S /Transparency must paint blue; got ({r}, {g}, {b})"
     );
+}
+
+// ===========================================================================
+// §11.3.5.2 separable blend modes
+// ===========================================================================
+//
+// All twelve separable PDF blend modes dispatch through
+// `pdf_blend_mode_to_skia` (src/rendering/mod.rs:80-95) to the
+// corresponding tiny_skia::BlendMode. We pin five high-signal modes —
+// Multiply, Screen, Darken, Lighten, Difference — against
+// deterministic over-white / over-blue / over-green references.
+// (HardLight / SoftLight / ColorDodge / ColorBurn / Overlay /
+// Exclusion would each need an extra fixture; the five chosen are a
+// representative sample of the parser/dispatch path. A per-mode
+// matrix is in scope for a later round.)
+
+/// Multiply blend of red (255, 0, 0) over white (255, 255, 255):
+/// per §11.3.5.2 the per-channel result is `Cb · Cs`. With Cb=white
+/// and Cs=red, the result is exactly red — Multiply against white is
+/// identity. This pins the dispatch + paint chain.
+fn fixture_blend_multiply_red_over_white() -> Vec<u8> {
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Mul gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Mul << /Type /ExtGState /BM /Multiply >> >>";
+    build_pdf(content, resources, &[])
+}
+
+#[test]
+fn blend_multiply_red_over_white_yields_red() {
+    let rgba = render_rgba(fixture_blend_multiply_red_over_white());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(r, 255, "Multiply red×white: R must be 255; got ({r}, {g}, {b})");
+    assert!(g < 10 && b < 10, "Multiply red×white: G/B must be ~0; got ({r}, {g}, {b})");
+}
+
+/// Multiply blend of red over a grey backdrop must darken: per-channel
+/// result is `Cb · Cs / 255`. Red (255, 0, 0) over grey (128, 128, 128)
+/// = (128·255/255, 128·0/255, 128·0/255) = (128, 0, 0).
+fn fixture_blend_multiply_red_over_grey() -> Vec<u8> {
+    let content = "0.5 g\n0 0 100 100 re\nf\n\
+                   /Mul gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Mul << /Type /ExtGState /BM /Multiply >> >>";
+    build_pdf(content, resources, &[])
+}
+
+#[test]
+fn blend_multiply_red_over_grey_yields_dark_red() {
+    let rgba = render_rgba(fixture_blend_multiply_red_over_grey());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // 0.5 g in PDF DeviceGray → RGB (127.5, 127.5, 127.5) → byte 127 or 128.
+    // Red × grey at byte-level: R = 127 or 128, G = 0, B = 0.
+    assert!((r as i32 - 127).abs() <= 2, "Multiply red×grey: R ≈ 127; got ({r}, {g}, {b})");
+    assert!(g < 5 && b < 5, "Multiply red×grey: G/B ≈ 0; got ({r}, {g}, {b})");
+}
+
+/// Screen blend of red over blue: per-channel `1 - (1-Cb)(1-Cs)`.
+/// Cb=blue (0,0,255) Cs=red (255,0,0): R = 1-(1-0)(1-1) = 1 → 255,
+/// G = 1-(1-0)(1-0) = 0, B = 1-(1-1)(1-0) = 1 → 255. Result = magenta
+/// (255, 0, 255).
+fn fixture_blend_screen_red_over_blue() -> Vec<u8> {
+    let content = "0 0 1 rg\n0 0 100 100 re\nf\n\
+                   /Scr gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Scr << /Type /ExtGState /BM /Screen >> >>";
+    build_pdf(content, resources, &[])
+}
+
+#[test]
+fn blend_screen_red_over_blue_yields_magenta() {
+    let rgba = render_rgba(fixture_blend_screen_red_over_blue());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(r, 255, "Screen red over blue: R=255; got ({r}, {g}, {b})");
+    assert!(g < 10, "Screen red over blue: G ≈ 0; got G={g}");
+    assert_eq!(b, 255, "Screen red over blue: B=255; got ({r}, {g}, {b})");
+}
+
+/// Difference blend of red over red: |Cb-Cs| = 0 per channel → black.
+fn fixture_blend_difference_red_over_red() -> Vec<u8> {
+    let content = "1 0 0 rg\n0 0 100 100 re\nf\n\
+                   /Diff gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Diff << /Type /ExtGState /BM /Difference >> >>";
+    build_pdf(content, resources, &[])
+}
+
+#[test]
+fn blend_difference_red_over_red_yields_black() {
+    let rgba = render_rgba(fixture_blend_difference_red_over_red());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert!(
+        r < 10 && g < 10 && b < 10,
+        "Difference red-red: must be ~black; got ({r}, {g}, {b})"
+    );
+}
+
+/// Darken of red over green: per-channel min(Cb, Cs). Cb=green
+/// (0,255,0), Cs=red (255,0,0) → (min(0,255), min(255,0), min(0,0)) =
+/// (0, 0, 0) → black.
+fn fixture_blend_darken_red_over_green() -> Vec<u8> {
+    let content = "0 1 0 rg\n0 0 100 100 re\nf\n\
+                   /Dk gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Dk << /Type /ExtGState /BM /Darken >> >>";
+    build_pdf(content, resources, &[])
+}
+
+#[test]
+fn blend_darken_red_over_green_yields_black() {
+    let rgba = render_rgba(fixture_blend_darken_red_over_green());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert!(
+        r < 10 && g < 10 && b < 10,
+        "Darken red-green: must be ~black; got ({r}, {g}, {b})"
+    );
+}
+
+/// Lighten of red over green: per-channel max. Cb=green (0,255,0),
+/// Cs=red (255,0,0) → (255, 255, 0) → yellow.
+fn fixture_blend_lighten_red_over_green() -> Vec<u8> {
+    let content = "0 1 0 rg\n0 0 100 100 re\nf\n\
+                   /Lt gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Lt << /Type /ExtGState /BM /Lighten >> >>";
+    build_pdf(content, resources, &[])
+}
+
+#[test]
+fn blend_lighten_red_over_green_yields_yellow() {
+    let rgba = render_rgba(fixture_blend_lighten_red_over_green());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(r, 255, "Lighten red-green: R=255; got ({r}, {g}, {b})");
+    assert_eq!(g, 255, "Lighten red-green: G=255; got ({r}, {g}, {b})");
+    assert!(b < 10, "Lighten red-green: B ≈ 0; got ({r}, {g}, {b})");
 }
