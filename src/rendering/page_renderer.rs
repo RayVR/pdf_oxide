@@ -756,6 +756,15 @@ impl PageRenderer {
                     // The sidecar's per-paint spot mirror reads this
                     // empty list as "no spot lane writes for this paint".
                     gs.fill_spot_inks.clear();
+                    // ISO 32000-1 §8.6.3: the fill colour and colour
+                    // space are coupled — switching to /DeviceRGB
+                    // invalidates any prior /DeviceCMYK identity. Failing
+                    // to clear `fill_color_cmyk` here means the §11.7.4.3
+                    // overprint path would still see the prior paint's
+                    // CMYK quadruple as the "current source colour",
+                    // producing wrong B(c_b, c_s) = c_s values for the
+                    // new RGB paint's region.
+                    gs.fill_color_cmyk = None;
                     log::debug!("SetFillRgb: [{}, {}, {}]", r, g, b);
                 },
                 Operator::SetStrokeRgb { r, g, b } => {
@@ -765,6 +774,7 @@ impl PageRenderer {
                     gs.stroke_color_components.clear();
                     gs.stroke_color_components.extend_from_slice(&[*r, *g, *b]);
                     gs.stroke_spot_inks.clear();
+                    gs.stroke_color_cmyk = None;
                     log::debug!("SetStrokeRgb: [{}, {}, {}]", r, g, b);
                 },
                 Operator::SetFillGray { gray } => {
@@ -775,6 +785,7 @@ impl PageRenderer {
                     gs.fill_color_components.clear();
                     gs.fill_color_components.push(g);
                     gs.fill_spot_inks.clear();
+                    gs.fill_color_cmyk = None;
                     log::debug!("SetFillGray: {}", g);
                 },
                 Operator::SetStrokeGray { gray } => {
@@ -785,6 +796,7 @@ impl PageRenderer {
                     gs.stroke_color_components.clear();
                     gs.stroke_color_components.push(g);
                     gs.stroke_spot_inks.clear();
+                    gs.stroke_color_cmyk = None;
                     log::debug!("SetStrokeGray: {}", g);
                 },
                 Operator::SetFillCmyk { c, m, y, k } => {
@@ -859,6 +871,15 @@ impl PageRenderer {
                     let resolved_space = self.color_spaces.get(&space_name);
                     gs.fill_color_components.clear();
                     gs.fill_color_components.extend_from_slice(components);
+                    // ISO 32000-1 §8.6.3 + §11.7.4.3: `sc` mutates the
+                    // current fill colour for the active colour space.
+                    // Clear any stale CMYK identity left over from a
+                    // prior DeviceCMYK paint; the DeviceCMYK arm below
+                    // refills it. Without this clear, a SetFillColor on
+                    // a non-CMYK space leaves the prior CMYK quadruple
+                    // visible to the §11.7.4.3 overprint path and
+                    // corrupts the per-channel B(c_b, c_s) result.
+                    gs.fill_color_cmyk = None;
 
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
@@ -875,6 +896,8 @@ impl PageRenderer {
                                 components[2],
                                 components[3],
                             );
+                            gs.fill_color_cmyk =
+                                Some((components[0], components[1], components[2], components[3]));
                         },
                         _ => {
                             let mut handled = false;
@@ -979,6 +1002,7 @@ impl PageRenderer {
                     let resolved_space = self.color_spaces.get(&space_name);
                     gs.stroke_color_components.clear();
                     gs.stroke_color_components.extend_from_slice(components);
+                    gs.stroke_color_cmyk = None;
 
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
@@ -995,6 +1019,8 @@ impl PageRenderer {
                                 components[2],
                                 components[3],
                             );
+                            gs.stroke_color_cmyk =
+                                Some((components[0], components[1], components[2], components[3]));
                         },
                         _ => {
                             let mut handled = false;
@@ -1066,6 +1092,7 @@ impl PageRenderer {
                     let resolved_space = self.color_spaces.get(&space_name);
                     gs.fill_color_components.clear();
                     gs.fill_color_components.extend_from_slice(components);
+                    gs.fill_color_cmyk = None;
 
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
@@ -1082,6 +1109,8 @@ impl PageRenderer {
                                 components[2],
                                 components[3],
                             );
+                            gs.fill_color_cmyk =
+                                Some((components[0], components[1], components[2], components[3]));
                         },
                         _ => {
                             let mut handled = false;
@@ -1171,6 +1200,7 @@ impl PageRenderer {
                     let resolved_space = self.color_spaces.get(&space_name);
                     gs.stroke_color_components.clear();
                     gs.stroke_color_components.extend_from_slice(components);
+                    gs.stroke_color_cmyk = None;
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
                             let g = components[0];
@@ -1186,6 +1216,8 @@ impl PageRenderer {
                                 components[2],
                                 components[3],
                             );
+                            gs.stroke_color_cmyk =
+                                Some((components[0], components[1], components[2], components[3]));
                         },
                         _ => {
                             let mut handled = false;
@@ -3837,6 +3869,22 @@ impl PageRenderer {
         if !has_cmyk {
             return false;
         }
+        // ISO 32000-1 §11.7.4.3: when overprint is active the
+        // CompatibleOverprint blend function takes over the per-channel
+        // composition (`α · B(c_b, c_s) + (1 - α) · c_b`). Running the
+        // compose-first helper additionally would double-touch the
+        // sidecar and corrupt the OPM=1 preserve-on-zero rule (compose
+        // would write `(1-α)·c_b`, then overprint would read that as
+        // the new backdrop). The overprint helper handles compose
+        // itself for overprint paints.
+        let overprint = if fill_side {
+            gs.fill_overprint
+        } else {
+            gs.stroke_overprint
+        };
+        if overprint {
+            return false;
+        }
         let alpha = if fill_side {
             gs.fill_alpha
         } else {
@@ -4418,23 +4466,25 @@ impl PageRenderer {
         }
     }
 
-    /// Take a snapshot of `pixmap` if the graphics state has fill
-    /// overprint active and a CMYK fill colour. Used by
-    /// [`Self::apply_overprint_after_paint`] to reconstruct the
-    /// pre-paint CMYK plate state in the painted region so the spec
-    /// per-plate composition can be applied.
+    /// Take a snapshot of `pixmap` when the graphics state has the
+    /// overprint parameter active for the targeted side. Used by
+    /// [`Self::apply_overprint_after_paint`] to recover the pre-paint
+    /// pixel state in the painted region so the §11.7.4.3
+    /// CompatibleOverprint blend function can be applied.
+    ///
+    /// The snapshot fires for every source colour space class
+    /// classified by [`source_for_overprint`] — DeviceCMYK direct,
+    /// DeviceGray/RGB/CIE/ICCBased process spaces, and
+    /// Separation/DeviceN. The per-channel blend function dispatches
+    /// on the source class; without the snapshot the painted region
+    /// could not be identified for compositing.
     fn overprint_snapshot(
         &self,
         pixmap: &Pixmap,
         gs: &GraphicsState,
         fill_side: bool,
     ) -> Option<Vec<u8>> {
-        let active = if fill_side {
-            gs.fill_overprint && gs.fill_color_cmyk.is_some()
-        } else {
-            gs.stroke_overprint && gs.stroke_color_cmyk.is_some()
-        };
-        if active {
+        if source_for_overprint(gs, fill_side).is_some() {
             Some(pixmap.data().to_vec())
         } else {
             None
@@ -4477,18 +4527,16 @@ impl PageRenderer {
             return;
         }
 
-        let (sc, sm, sy, sk) = if fill_side {
-            match gs.fill_color_cmyk {
-                Some(v) => v,
-                None => return,
-            }
-        } else {
-            match gs.stroke_color_cmyk {
-                Some(v) => v,
-                None => return,
-            }
+        let Some(source) = source_for_overprint(gs, fill_side) else {
+            return;
         };
         let opm = gs.overprint_mode;
+        let alpha_g = if fill_side {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
+        let (sc, sm, sy, sk) = source.cmyk;
         let coverage = coverage.expect("checked above");
 
         let icc_path = doc.output_intent_cmyk_profile().is_some();
@@ -4506,9 +4554,12 @@ impl PageRenderer {
         let dest = pixmap.data_mut();
         for px in 0..(dest.len() / 4) {
             let off = px * 4;
-            if coverage[px] == 0 {
+            let cov = coverage[px];
+            if cov == 0 {
                 continue;
             }
+            // Effective alpha for this pixel — §11.3.3's α'.
+            let c_alpha = ((cov as f32 / 255.0) * alpha_g).clamp(0.0, 1.0);
 
             // Backdrop CMYK from sidecar.
             let plane = self.cmyk_sidecar.as_ref().expect("checked above").cmyk();
@@ -4517,21 +4568,21 @@ impl PageRenderer {
             let dy = plane[off + 2] as f32 / 255.0;
             let dk_existing = plane[off + 3] as f32 / 255.0;
 
-            let merge = |src: f32, dst: f32| -> f32 {
-                if opm == 1 {
-                    if src == 0.0 {
-                        dst
-                    } else {
-                        src
-                    }
-                } else {
-                    (src + dst).min(1.0)
-                }
-            };
-            let mc = merge(sc, dc);
-            let mm = merge(sm, dm);
-            let my = merge(sy, dy);
-            let mk = merge(sk, dk_existing);
+            // §11.7.4.3 per-channel CompatibleOverprint composed with α.
+            let mc =
+                compose_overprint_channel(source.class, ProcessChannel::C, sc, dc, opm, c_alpha);
+            let mm =
+                compose_overprint_channel(source.class, ProcessChannel::M, sm, dm, opm, c_alpha);
+            let my =
+                compose_overprint_channel(source.class, ProcessChannel::Y, sy, dy, opm, c_alpha);
+            let mk = compose_overprint_channel(
+                source.class,
+                ProcessChannel::K,
+                sk,
+                dk_existing,
+                opm,
+                c_alpha,
+            );
 
             let (r_byte, g_byte, b_byte) =
                 if let (Some(profile), Some(intent)) = (icc_profile.as_ref(), icc_intent) {
@@ -4821,6 +4872,46 @@ impl PageRenderer {
         }
     }
 
+    /// Apply ISO 32000-1 §11.7.4.3 CompatibleOverprint to every painted
+    /// pixel.
+    ///
+    /// The §11.7.4.3 blend function `B(c_b, c_s)` returns a subtractive
+    /// tint per Table 149, dispatched on source colour space × OP × OPM:
+    ///
+    /// |Source CS                            |Component          |OP=true OPM=0|OP=true OPM=1                |
+    /// |-------------------------------------|-------------------|-------------|-----------------------------|
+    /// |DeviceCMYK direct                    |C, M, Y, K         |c_s          |c_s if c_s≠0 else c_b        |
+    /// |DeviceCMYK direct                    |Process not in CMYK|c_s          |c_s                          |
+    /// |DeviceCMYK direct                    |Spot               |c_b          |c_b                          |
+    /// |Any other process CS (e.g. DeviceGray|Process            |c_s          |c_s                          |
+    /// |  DeviceRGB, ICCBased, DeviceCMYK    |Spot               |c_b          |c_b                          |
+    /// |  via sampled image)                 |                   |             |                             |
+    /// |Separation / DeviceN                 |Process            |c_b          |c_b                          |
+    /// |                                     |Named spot         |c_s          |c_s                          |
+    /// |                                     |Unnamed spot       |c_b          |c_b                          |
+    ///
+    /// The OPM=1 zero-source-preserve rule is specific to row 1
+    /// (DeviceCMYK directly specified). §11.7.4.5 makes this explicit:
+    /// "Nonzero overprint mode shall apply only to painting operations
+    /// that use the current colour in the graphics state when the
+    /// current colour space is DeviceCMYK".
+    ///
+    /// Each painted pixel composes per §11.3.3 as
+    /// `c_r = α · B(c_b, c_s) + (1 − α) · c_b`, where α is the effective
+    /// shape×opacity at the pixel. This helper recovers α from the
+    /// snapshot-vs-post-paint diff like the coverage-less compose path
+    /// does; the coverage-aware variant
+    /// ([`Self::apply_overprint_after_paint_with_coverage`]) reads α
+    /// directly from the path coverage mask + `gs` alpha.
+    ///
+    /// The process lanes (CMYK) are written to the sidecar plane and
+    /// converted to RGB via the OutputIntent ICC (falling back to the
+    /// additive-clamp `cmyk_to_rgb` round-trip when no profile is
+    /// available). Spot lanes are handled separately by
+    /// [`Self::mirror_spot_paint_into_sidecar_with_coverage`] — for
+    /// Separation / DeviceN sources the named spot lane carries c_s; for
+    /// all other source classes the spot lane is preserved (no write),
+    /// matching Table 149's spot row.
     fn apply_overprint_after_paint(
         &mut self,
         pixmap: &mut Pixmap,
@@ -4829,22 +4920,20 @@ impl PageRenderer {
         doc: &PdfDocument,
         fill_side: bool,
     ) {
-        let (sc, sm, sy, sk) = if fill_side {
-            match gs.fill_color_cmyk {
-                Some(v) => v,
-                None => return,
-            }
-        } else {
-            match gs.stroke_color_cmyk {
-                Some(v) => v,
-                None => return,
-            }
+        let Some(source) = source_for_overprint(gs, fill_side) else {
+            return;
         };
         let opm = gs.overprint_mode;
-        // Press-accurate path active when the CMYK sidecar plane is
-        // present AND an OutputIntent CMYK profile is available. The
-        // merged CMYK then runs through the ICC; otherwise the
-        // additive-clamp `cmyk_to_rgb` round-trip stays in place.
+        let alpha_g = if fill_side {
+            gs.fill_alpha
+        } else {
+            gs.stroke_alpha
+        };
+        let (sc, sm, sy, sk) = source.cmyk;
+        // ICC path active when the CMYK sidecar plane is present AND an
+        // OutputIntent CMYK profile is available. The merged CMYK then
+        // runs through the ICC; otherwise the additive-clamp
+        // `cmyk_to_rgb` round-trip stays in place.
         let icc_path = self.cmyk_sidecar.is_some() && doc.output_intent_cmyk_profile().is_some();
         let icc_profile = if icc_path {
             doc.output_intent_cmyk_profile()
@@ -4855,6 +4944,28 @@ impl PageRenderer {
             Some(crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent))
         } else {
             None
+        };
+
+        // Pre-compute the convert-first source RGB the rasteriser
+        // actually wrote. Used to invert the source-over alpha blend
+        // and recover effective coverage·alpha per pixel. Mirrors the
+        // `apply_cmyk_compose_after_paint` recovery for byte-identity
+        // with the compose-first path.
+        let src_rgb_ic = if let (Some(profile), Some(intent)) = (icc_profile.as_ref(), icc_intent) {
+            let c_u8 = (sc.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let m_u8 = (sm.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let y_u8 = (sy.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let k_u8 = (sk.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let transform = self.icc_transform_cache.get_or_build(profile, intent);
+            let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
+            [
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            ]
+        } else {
+            let (r, g, b) = cmyk_to_rgb(sc, sm, sy, sk);
+            [r, g, b]
         };
 
         let dest = pixmap.data_mut();
@@ -4874,9 +4985,39 @@ impl PageRenderer {
                 continue;
             }
 
-            // Backdrop CMYK source. Same dual path as
-            // apply_cmyk_compose_after_paint: sidecar when available,
-            // additive-clamp inversion otherwise.
+            // Recover effective coverage·alpha from the source-over
+            // alpha blend on the most-stable channel — same shape as
+            // apply_cmyk_compose_after_paint.
+            let snap_r = snapshot[off] as f32 / 255.0;
+            let snap_g = snapshot[off + 1] as f32 / 255.0;
+            let snap_b = snapshot[off + 2] as f32 / 255.0;
+            let post_r = dest[off] as f32 / 255.0;
+            let post_g = dest[off + 1] as f32 / 255.0;
+            let post_b = dest[off + 2] as f32 / 255.0;
+            let diffs = [
+                (snap_r - src_rgb_ic[0]).abs(),
+                (snap_g - src_rgb_ic[1]).abs(),
+                (snap_b - src_rgb_ic[2]).abs(),
+            ];
+            let (max_idx, max_diff) = diffs
+                .iter()
+                .enumerate()
+                .fold((0usize, 0.0_f32), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc });
+            let c_alpha = if max_diff > 1.0 / 255.0 {
+                let (snap_ch, post_ch, src_ch) = match max_idx {
+                    0 => (snap_r, post_r, src_rgb_ic[0]),
+                    1 => (snap_g, post_g, src_rgb_ic[1]),
+                    _ => (snap_b, post_b, src_rgb_ic[2]),
+                };
+                ((snap_ch - post_ch) / (snap_ch - src_ch)).clamp(0.0, 1.0)
+            } else {
+                // Source RGB ≈ snapshot RGB — coverage is moot. Use the
+                // graphics-state alpha as a sensible fallback.
+                alpha_g
+            };
+
+            // Backdrop CMYK from sidecar; additive-clamp fallback when
+            // the sidecar is None.
             let (dc, dm, dy, dk_existing) =
                 if let Some(plane) = self.cmyk_sidecar.as_ref().map(CmykSidecar::cmyk) {
                     (
@@ -4892,26 +5033,22 @@ impl PageRenderer {
                     ((1.0 - dr).max(0.0), (1.0 - dg).max(0.0), (1.0 - db).max(0.0), 0.0_f32)
                 };
 
-            // Per-plate merge. OPM=1 nonzero overprint: zero source
-            // plate keeps dest plate; nonzero source plate replaces.
-            // OPM=0 standard overprint: paint = (source + dest) per
-            // plate (additive then clamp). Both differ from "replace
-            // every plate" which is the no-overprint behaviour.
-            let merge = |src: f32, dst: f32| -> f32 {
-                if opm == 1 {
-                    if src == 0.0 {
-                        dst
-                    } else {
-                        src
-                    }
-                } else {
-                    (src + dst).min(1.0)
-                }
-            };
-            let mc = merge(sc, dc);
-            let mm = merge(sm, dm);
-            let my = merge(sy, dy);
-            let mk = merge(sk, dk_existing);
+            // Per-channel §11.7.4.3 CompatibleOverprint blend function,
+            // then §11.3.3 composition with effective alpha.
+            let mc =
+                compose_overprint_channel(source.class, ProcessChannel::C, sc, dc, opm, c_alpha);
+            let mm =
+                compose_overprint_channel(source.class, ProcessChannel::M, sm, dm, opm, c_alpha);
+            let my =
+                compose_overprint_channel(source.class, ProcessChannel::Y, sy, dy, opm, c_alpha);
+            let mk = compose_overprint_channel(
+                source.class,
+                ProcessChannel::K,
+                sk,
+                dk_existing,
+                opm,
+                c_alpha,
+            );
 
             // CMYK → RGB conversion. ICC path for the press-accurate
             // case; additive-clamp `cmyk_to_rgb` for the fallback.
@@ -4935,14 +5072,14 @@ impl PageRenderer {
 
             // Preserve the painted pixel's alpha (post-paint alpha
             // already accounts for the paint's contribution); just
-            // overwrite RGB with the per-plate merged value.
+            // overwrite RGB with the per-channel composed value.
             dest[off] = r_byte;
             dest[off + 1] = g_byte;
             dest[off + 2] = b_byte;
             // Alpha unchanged.
 
-            // Mirror merged CMYK into the sidecar so subsequent paints
-            // see the post-overprint backdrop.
+            // Mirror the composed CMYK into the sidecar so subsequent
+            // paints see the post-overprint backdrop.
             if let Some(plane) = self.cmyk_sidecar.as_mut().map(CmykSidecar::cmyk_mut) {
                 plane[off] = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
                 plane[off + 1] = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -6171,6 +6308,230 @@ fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
     let g = 1.0 - (m + k).min(1.0);
     let b = 1.0 - (y + k).min(1.0);
     (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
+}
+
+/// ISO 32000-1 §11.7.4.3 / Table 149 source colour space classes.
+///
+/// The CompatibleOverprint blend function `B(c_b, c_s)` selects between
+/// source replace (`c_s`) and backdrop preserve (`c_b`) per-channel
+/// based on (a) which source CS class the paint operator uses and (b)
+/// whether OPM=1's zero-source-preserve rule applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceCsClass {
+    /// `DeviceCMYK` specified directly via `k` / `K` / `sc` / `scn` on
+    /// a `/DeviceCMYK` colour space. This is Table 149 row 1 — the only
+    /// class for which the OPM=1 zero-source-preserve rule applies. The
+    /// process colour components (C, M, Y, K) of the group colour space
+    /// receive `B = c_s` under OPM=0 and `B = (c_s if c_s≠0 else c_b)`
+    /// under OPM=1.
+    DeviceCmykDirect,
+    /// Any other process colour space — `DeviceGray`, `DeviceRGB`,
+    /// `CalGray`, `CalRGB`, `ICCBased` of any N, or `DeviceCMYK`
+    /// not-directly-specified (e.g. a sampled image's pixel colours).
+    /// Table 149 row 2: all process colour components of the group CS
+    /// get `B = c_s` regardless of OPM. The OPM=1 zero-source-preserve
+    /// rule does not apply (§11.7.4.5: "Nonzero overprint mode shall
+    /// apply only to painting operations that use the current colour
+    /// in the graphics state when the current colour space is
+    /// DeviceCMYK").
+    OtherProcess,
+    /// `Separation` or non-process `DeviceN`. Table 149 row 3: process
+    /// colour components preserve backdrop (`B = c_b`); the named-spot
+    /// lanes carry `c_s`; unnamed spot lanes preserve backdrop. The
+    /// process-side override is the dispositive difference from the
+    /// process-CS classes — a Separation paint must NOT mark process
+    /// plates even when its alternate colour space rasterised an RGB
+    /// approximation into the composite buffer.
+    SeparationOrDeviceN,
+}
+
+/// One of the four DeviceCMYK process channels. Used by
+/// [`compose_overprint_channel`] to identify which channel index of the
+/// `Source` CMYK quadruple a per-channel call concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessChannel {
+    C,
+    M,
+    Y,
+    K,
+}
+
+/// Resolved source colour for the §11.7.4.3 CompatibleOverprint path.
+///
+/// The CMYK quadruple is the source colour expressed in DeviceCMYK
+/// regardless of the original colour space — for DeviceGray it is
+/// `(0, 0, 0, 1-g)`, for DeviceRGB it is the §10.3.5 additive-clamp
+/// inverse, and for Separation/DeviceN it is the alternate-space
+/// evaluation (or `(0, 0, 0, 0)` when the alternate path produces
+/// nothing — in that case the process-lane preserve rule does the work).
+#[derive(Debug, Clone, Copy)]
+struct OverprintSource {
+    class: SourceCsClass,
+    cmyk: (f32, f32, f32, f32),
+}
+
+/// Determine the §11.7.4.3 source colour for an overprint paint.
+///
+/// Returns `None` when no `B(c_b, c_s)` would fire — the caller should
+/// skip the per-channel pass.
+///
+/// The dispatch reads `gs.fill_color_space` / `gs.stroke_color_space`
+/// to classify the source. For DeviceCMYK direct we also require
+/// `fill_color_cmyk` / `stroke_color_cmyk` populated; if it is missing
+/// (e.g. a stale state where the colour space name is "DeviceCMYK" but
+/// the components vector is empty) we degrade gracefully to
+/// `OtherProcess` so the source CMYK is recovered from the RGB
+/// fallback below.
+fn source_for_overprint(gs: &GraphicsState, fill_side: bool) -> Option<OverprintSource> {
+    let (space_name, color_cmyk, color_rgb, components, spot_inks) = if fill_side {
+        (
+            gs.fill_color_space.as_str(),
+            gs.fill_color_cmyk,
+            gs.fill_color_rgb,
+            &gs.fill_color_components,
+            &gs.fill_spot_inks,
+        )
+    } else {
+        (
+            gs.stroke_color_space.as_str(),
+            gs.stroke_color_cmyk,
+            gs.stroke_color_rgb,
+            &gs.stroke_color_components,
+            &gs.stroke_spot_inks,
+        )
+    };
+    let overprint_active = if fill_side {
+        gs.fill_overprint
+    } else {
+        gs.stroke_overprint
+    };
+    if !overprint_active {
+        return None;
+    }
+
+    match space_name {
+        "DeviceCMYK" | "CMYK" => {
+            // Table 149 row 1: DeviceCMYK specified directly. The
+            // graphics-state CMYK quadruple is the source. When the
+            // colour space is named DeviceCMYK but no component vector
+            // landed yet (initial-colour edge case after a `cs` without
+            // an `scn`), fall back to (0, 0, 0, 1) — the spec's §8.6.8
+            // initial colour for DeviceCMYK.
+            let cmyk = color_cmyk.unwrap_or((0.0, 0.0, 0.0, 1.0));
+            Some(OverprintSource {
+                class: SourceCsClass::DeviceCmykDirect,
+                cmyk,
+            })
+        },
+        "DeviceGray" | "G" | "CalGray" => {
+            // Table 149 row 2: DeviceGray maps to CMYK as (0, 0, 0, 1-g)
+            // per the standard gray→CMYK conversion (used by the
+            // device-space paint pipeline and §10.3.5).
+            let g = components.first().copied().unwrap_or(color_rgb.0);
+            let k = (1.0 - g).clamp(0.0, 1.0);
+            Some(OverprintSource {
+                class: SourceCsClass::OtherProcess,
+                cmyk: (0.0, 0.0, 0.0, k),
+            })
+        },
+        "DeviceRGB" | "RGB" | "CalRGB" => {
+            // Table 149 row 2: DeviceRGB maps to CMYK via the §10.3.5
+            // additive-clamp inverse `C = 1 - R`, `M = 1 - G`,
+            // `Y = 1 - B`, `K = 0`.
+            let r = components.first().copied().unwrap_or(color_rgb.0);
+            let g = components.get(1).copied().unwrap_or(color_rgb.1);
+            let b = components.get(2).copied().unwrap_or(color_rgb.2);
+            let c = (1.0 - r).clamp(0.0, 1.0);
+            let m = (1.0 - g).clamp(0.0, 1.0);
+            let y = (1.0 - b).clamp(0.0, 1.0);
+            Some(OverprintSource {
+                class: SourceCsClass::OtherProcess,
+                cmyk: (c, m, y, 0.0),
+            })
+        },
+        _ => {
+            // Composite-named space — Separation, DeviceN, ICCBased,
+            // Indexed, Pattern. The spot lanes (if any) are mirrored
+            // separately by `mirror_spot_paint_into_sidecar_with_coverage`;
+            // here we only need to know that the process-side rule is
+            // "preserve backdrop" for Separation/DeviceN, and "B = c_s
+            // for every process colour component" otherwise.
+            if !spot_inks.is_empty() {
+                // Separation or non-process DeviceN — the gs records the
+                // colorant identity. Process lanes preserve backdrop;
+                // the c_s value here is unused for process channels.
+                Some(OverprintSource {
+                    class: SourceCsClass::SeparationOrDeviceN,
+                    cmyk: (0.0, 0.0, 0.0, 0.0),
+                })
+            } else {
+                // ICCBased / Pattern / Indexed / DeviceN /Process — falls
+                // under Table 149 row 2 "any other process colour space".
+                // Recover CMYK from the convert-from-RGB additive-clamp
+                // inverse so the per-process-channel B = c_s rule has a
+                // defensible source value. This is the same conversion
+                // the no-OutputIntent fallback uses.
+                let (r, g, b) = color_rgb;
+                let c = (1.0 - r).clamp(0.0, 1.0);
+                let m = (1.0 - g).clamp(0.0, 1.0);
+                let y = (1.0 - b).clamp(0.0, 1.0);
+                Some(OverprintSource {
+                    class: SourceCsClass::OtherProcess,
+                    cmyk: (c, m, y, 0.0),
+                })
+            }
+        },
+    }
+}
+
+/// ISO 32000-1 §11.7.4.3 + §11.3.3 per-channel composed result.
+///
+/// Computes `c_r = α · B(c_b, c_s) + (1 − α) · c_b` for one process
+/// channel, where `B` is the CompatibleOverprint blend function per
+/// Table 149. The dispatch closely follows Table 149's rows; see the
+/// docstring on [`PageRenderer::apply_overprint_after_paint`] for the
+/// table layout.
+///
+/// - `class` — which Table 149 row applies.
+/// - `channel` — the C/M/Y/K identity of this call.
+/// - `c_s`, `c_b` — source and backdrop subtractive tints for this
+///   channel.
+/// - `opm` — graphics-state `/OPM` value (0 or 1).
+/// - `alpha` — effective shape × opacity for the pixel.
+fn compose_overprint_channel(
+    class: SourceCsClass,
+    _channel: ProcessChannel,
+    c_s: f32,
+    c_b: f32,
+    opm: u8,
+    alpha: f32,
+) -> f32 {
+    let b = match class {
+        SourceCsClass::DeviceCmykDirect => {
+            // Table 149 row 1: B = c_s for C/M/Y/K under OPM=0 or when
+            // c_s ≠ 0 under OPM=1; B = c_b for c_s == 0 under OPM=1.
+            // The §11.7.4.5 NOTE 1 explicitly restricts the OPM=1
+            // preserve rule to the directly-specified-DeviceCMYK case.
+            if opm == 1 && c_s == 0.0 {
+                c_b
+            } else {
+                c_s
+            }
+        },
+        SourceCsClass::OtherProcess => {
+            // Table 149 row 2: B = c_s for every process colour
+            // component of the group CS regardless of OPM.
+            c_s
+        },
+        SourceCsClass::SeparationOrDeviceN => {
+            // Table 149 row 3: process colour components preserve
+            // backdrop. The named-spot lanes are handled by the spot
+            // sidecar mirror, not by this per-process-channel pass.
+            c_b
+        },
+    };
+    let alpha = alpha.clamp(0.0, 1.0);
+    alpha * b + (1.0 - alpha) * c_b
 }
 
 fn apply_pending_clip(
