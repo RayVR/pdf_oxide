@@ -4324,14 +4324,26 @@ impl PageRenderer {
 
     /// Build a coverage-only `GraphicsState` clone from `gs`. The clone
     /// forces full opacity (`fill_alpha` / `stroke_alpha` = 1.0),
-    /// `/Normal` blend, opaque-black fill colour, and visible render
-    /// mode (`render_mode = 0`). Re-running a paint with this gs into a
-    /// fresh transparent scratch pixmap produces an alpha channel that
-    /// equals geometry coverage at every pixel — the same per-pixel
-    /// coverage `tiny_skia::Mask::fill_path` and the stroke-side
-    /// scratch-Pixmap helper produce for path-side coverage. The
-    /// caller extracts the alpha channel via
+    /// `/Normal` blend, and opaque-black fill colour. Re-running a paint
+    /// with this gs into a fresh transparent scratch pixmap produces an
+    /// alpha channel that equals geometry coverage at every pixel — the
+    /// same per-pixel coverage `tiny_skia::Mask::fill_path` and the
+    /// stroke-side scratch-Pixmap helper produce for path-side coverage.
+    /// The caller extracts the alpha channel via
     /// [`Self::extract_alpha_as_coverage`].
+    ///
+    /// `gs.render_mode` is preserved verbatim. ISO 32000-1 §9.3.6 text
+    /// rendering mode 3 ("neither fill nor stroke; add to path for
+    /// clipping") produces no visible mark, and under the §11.3.3
+    /// single shape/opacity per pixel rule the spot lane must see no
+    /// mark either (§11.7.3 composes the spot lane with the same shape
+    /// / opacity as the page). The text rasteriser already collapses
+    /// the paint to fully transparent for `render_mode == 3` (see
+    /// `text_rasterizer.rs` — `paint.set_color(rgba 0,0,0,0)`), so the
+    /// scratch alpha channel correctly resolves to zero coverage and no
+    /// spot lane write fires. Overriding `render_mode` to 0 here would
+    /// paint visible glyphs into the coverage scratch while the visible
+    /// pixmap shows nothing, leaking a spurious spot-lane write.
     fn coverage_only_gs(gs: &GraphicsState) -> GraphicsState {
         let mut cov = gs.clone();
         cov.fill_alpha = 1.0;
@@ -4339,11 +4351,6 @@ impl PageRenderer {
         cov.blend_mode = "Normal".to_string();
         cov.fill_color_rgb = (0.0, 0.0, 0.0);
         cov.stroke_color_rgb = (0.0, 0.0, 0.0);
-        // Render mode 3 ("invisible text", §9.3.6) makes the text
-        // rasteriser set paint to fully transparent black — that would
-        // collapse the coverage buffer to all zero. Force visible fill
-        // for the coverage path.
-        cov.render_mode = 0;
         // Strip SMask so the scratch render doesn't kick off a
         // recursive SMask compose with a different geometry.
         cov.smask = None;

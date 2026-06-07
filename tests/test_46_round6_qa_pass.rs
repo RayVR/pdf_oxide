@@ -306,10 +306,6 @@ fn round6_qa_b1_shading_fill_spot_inks_does_not_leak_to_next_path_fill() {
 //
 // This probe is `#[ignore]`'d pending the fix; the fix agent should
 // flip it on.
-#[ignore = "QA_BUG_INVISIBLE_TEXT_WRITES_SPOT_LANE — round 6 \
-            coverage_only_gs override forces render_mode = 0, causing \
-            invisible text to write the spot lane. Fix in \
-            src/rendering/page_renderer.rs::coverage_only_gs."]
 #[test]
 fn round6_qa_invisible_text_must_not_write_spot_lane() {
     let icc = build_constant_cmyk_icc(135);
@@ -447,7 +443,8 @@ fn round6_qa_tj_multi_span_negative_kern_writes_both_spans() {
          positions (negative kern moves the second glyph horizontally \
          but does not erase the first). Expected ≥ 2 pixels carrying \
          u8 {} (full coverage compose). Got {} occurrences.",
-        expected, occurrences
+        expected,
+        occurrences
     );
 }
 
