@@ -32,6 +32,7 @@
 //!  - ISO 32000-1 §8.6.6.3 / §8.6.6.4 — Separation colour space +
 //!    initial colour
 //!  - ISO 32000-1 §8.7.3.1 — Pattern colour space + uncoloured Tiling
+//!  - ISO 32000-1 §8.9.6.2 — Stencil Masking (ImageMask /Decode default)
 //!  - ISO 32000-1 §10.5     — separated plate output
 //!  - ISO 32000-1 §11.3.3   — single shape / opacity per pixel
 //!  - ISO 32000-1 §11.4.6.2 — knockout groups (last-paint-wins
@@ -197,9 +198,11 @@ fn centre(plate: &pdf_oxide::rendering::SeparationPlate) -> u8 {
 //   The group's initial backdrop has PMS185 tint = 0 (no prior paint).
 //   Element 2 composes 0.7 against backdrop 0 at α=1.0 (no /ca
 //   declared on element 2): t_r = 1.0·0.7 + 0.0·0 = 0.7.
-//   In f32 0.7 × 255 = 178.5 exactly → u8 round = 179 (Rust f32
-//   `round` rounds 0.5 half-away-from-zero). Byte-exact reference
-//   is 179.
+//   0.7 is NOT exactly representable in f32: 0.7_f32 = 0.69999998807…
+//   But 0.7_f32 × 255.0_f32 evaluates to the f32 value 178.5 exactly
+//   (the input's rounding error cancels out in the multiplication),
+//   so u8 round(178.5) = 179 (Rust f32 `round` rounds 0.5
+//   half-away-from-zero). Byte-exact reference is 179.
 //
 // (If the /K reset is broken and element 1's contribution survives:
 //  the spot lane would accumulate element 1's 0.4 + element 2's 0.7
@@ -227,7 +230,7 @@ fn b1_imagemask_do_inside_k_knockout_last_paint_wins_byte_exact() {
                     /C0 [1 1 1] /C1 [0 1 0] /N 1 >>";
 
     // ImageMask stream: 4×4 1-bit, all bits clear (every pixel paints).
-    // PDF §8.9.6.4 + /Decode [0 1] (default): bit 0 = paint with fill,
+    // PDF §8.9.6.2 + /Decode [0 1] (default): bit 0 = paint with fill,
     // bit 1 = leave transparent. So 0x00 across all 4 row-bytes gives
     // a fully-opaque stencil.
     let imgmask = "/CS_A cs\n\
@@ -289,9 +292,11 @@ fn b1_imagemask_do_inside_k_knockout_last_paint_wins_byte_exact() {
          covered pixel — last-paint-wins composition against the \
          group's initial backdrop (which has PMS185 = 0). Composite \
          t_r = 1·0.7 + 0·0 = 0.7 → u8 round(178.5) = 179 (Rust f32 \
-         `round` rounds 0.5 half-away-from-zero, AND 0.7 is \
-         representable in f32 to within rounding so 0.7×255 = 178.5 \
-         exactly). Got u8 {}. \
+         `round` rounds 0.5 half-away-from-zero. 0.7 is NOT exactly \
+         representable in f32: 0.7_f32 = 0.69999998807…, but \
+         0.7_f32 × 255.0_f32 rounds to the f32 value 178.5 exactly, \
+         so the u8 conversion lands on 179 regardless of the input \
+         rounding). Got u8 {}. \
          Regression to a value between 102 (=0.4) and 179 indicates \
          the second paint did NOT fully overwrite the first — the /K \
          lane reset was incomplete for Image/ImageMask Do paint \
