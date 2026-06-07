@@ -468,56 +468,122 @@ fn qa2_smask_alpha_uniform_half_modulates_spot_lane() {
 // / text / Do / sh paint sites.
 // ===========================================================================
 
-/// Text-show / `Do` (image and Form XObject) / `sh` (shading) paint
-/// sites still use the snapshot-vs-post-paint diff (treating every
-/// changed pixel as full coverage). The combo `B`/`b`/`B*`/`b*`
-/// arms were upgraded to use the same rasterised coverage path the
-/// plain `f`/`S` arms use; text / Do / sh remain on the diff path
-/// because:
-///  - text-show coverage needs glyph rasterisation through the font
-///    cache (not directly exposed by `tiny_skia::Mask`),
-///  - image / Form `Do` coverage is the XObject's own footprint
-///    convolved with its internal compositing — non-trivial,
-///  - shading `sh` coverage is the gradient's geometry, which the
-///    shading engine renders inline.
+/// AA-edge fidelity on Image Do paint sites — closes
+/// `QA_BUG_SPOT_MIRROR_AA_EDGE_BINARY_COVERAGE` for the image surface.
 ///
-/// The spot lane therefore over-deposits at AA edges for these
-/// paint sites by exactly the (1 − pix_alpha) factor. This is
-/// pinned as [`HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE`] in the
-/// design+impl probes file. The placeholder name and the
-/// QA_BUG_SPOT_MIRROR_AA_EDGE_BINARY_COVERAGE marker remain so a
-/// future round can flip the constant to "fixed" when the helpers
-/// route through rasterised coverage.
+/// Round 6 wired a rasterised coverage helper for Image / ImageMask
+/// Do paints; the spot mirror now sees geometry-true per-pixel
+/// coverage at glyph / image / shading boundaries. This probe pins
+/// the byte-exact AA-edge behaviour on an ImageMask whose footprint
+/// is upscaled 10× (Bicubic) — the resulting per-pixel coverage at
+/// the footprint boundary is fractional, and the spot lane carries
+/// strictly-between (0, full-coverage) values.
+///
+/// Construction:
+///  - ImageMask, 8×8 uniform paint (every bit 0 per §8.9.6.2
+///    /Decode [0 1] default).
+///  - CTM `80 0 0 80 10 10` upscales the 8×8 stencil to a 80×80
+///    user-space footprint on a 100×100 page (raster y/x ∈ [10, 90)).
+///  - /Separation /InkA at tint 1.0, /ca = 0.99.
+///  - Interior pixel (50, 50) → full coverage → u8 round(0.99·255) =
+///    252 byte-exact.
+///  - Pixels along the upscaled footprint boundary should carry
+///    STRICTLY FRACTIONAL coverage (lane ∈ (0, 252)) from Bicubic
+///    AA at the source-pixel boundary inside the bilinear/bicubic
+///    resampling path.
+///
+/// Under the pre-round-6 diff branch this probe failed in two ways:
+///  (a) interior centre was 252 (would still match, because the diff
+///      branch's binary coverage at interior pixels coincides with
+///      the rasterised full-coverage value here);
+///  (b) AA-edge pixels were ALL 252 (binary 255 coverage clamped to
+///      full); no fractional values existed.
 #[test]
-fn qa3_text_show_spot_paint_documented_aa_edge_gap() {
-    // The text-show / `Do` / `sh` paint sites still call
-    // `mirror_spot_paint_into_sidecar_with_coverage(..., None,
-    // ...)` — the snapshot-vs-post-paint diff branch fires. AA-edge
-    // pixels at glyph / image / shading boundaries receive full
-    // coverage = 255 on the spot lane while the visible pixmap has
-    // fractional alpha.
-    //
-    // The combo arms (`B`/`b`/`B*`/`b*`) were promoted to the
-    // rasterised coverage path, so they no longer hit this corner.
-    // The qa3b probe verifies the combo fix; this probe pins the
-    // standing gap on text / Do / sh.
-    //
-    // HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE — declared in
-    // `tests/test_46_round2_spot_paint_writes.rs`.
-    //
-    // No end-to-end test surface for text-show exists in this
-    // corpus (text-show needs a font dict resolved through the
-    // font cache; the synthetic-PDF helpers do not synthesise
-    // fonts). Document the gap by asserting the call-site shape:
-    // the source file must still carry the gap constant.
-    let source = include_str!("test_46_round2_spot_paint_writes.rs");
+fn qa3_image_do_aa_edge_gets_fractional_coverage_after_fix() {
+    let icc = build_constant_cmyk_icc(135);
+    let psfunc = "<< /FunctionType 2 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] \
+                  /C0 [0.0 0.0 0.0 0.0] /C1 [0.0 1.0 0.0 0.0] /N 1 >>";
+    // Striped stencil — bit 0 = paint, bit 1 = no-paint (default
+    // /Decode). The top 4 rows are paint, bottom 4 rows are no-paint
+    // — a single internal boundary in the middle of the image. The
+    // Bicubic resampler mixes paint and no-paint source samples at
+    // the boundary, producing strictly fractional coverage on a band
+    // of raster pixels centered on the boundary.
+    let mask_bytes: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+    let form_hdr = format!(
+        "6 0 obj\n\
+        << /Type /XObject /Subtype /Image /Width 8 /Height 8 \
+           /ImageMask true /BitsPerComponent 1 \
+           /Length {} >>\nstream\n",
+        mask_bytes.len()
+    );
+    let mut form_full: Vec<u8> = Vec::new();
+    form_full.extend_from_slice(form_hdr.as_bytes());
+    form_full.extend_from_slice(&mask_bytes);
+    form_full.extend_from_slice(b"\nendstream\nendobj\n");
+    let form_str = unsafe { String::from_utf8_unchecked(form_full) };
+    // Axis-aligned CTM. With a striped stencil the row boundaries
+    // produce internal AA bands where Bicubic resampling mixes
+    // paint and no-paint source samples.
+    let content = "/Trig gs\n\
+                   /CS_PMS cs\n1.0 scn\n\
+                   q\n80 0 0 80 10 10 cm\n/Img Do\nQ\n";
+    let resources = format!(
+        "/ExtGState << /Trig << /Type /ExtGState /ca 0.99 >> >> \
+         /XObject << /Img 6 0 R >> \
+         /ColorSpace << /CS_PMS [/Separation /InkA /DeviceCMYK {} ] >>",
+        psfunc
+    );
+    let pdf = build_pdf_with_output_intent(content, &resources, &icc, &[&form_str]);
+    let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF parses");
+    let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72).as_raw());
+    let _img = renderer.render_page(&doc, 0).expect("render succeeds");
+    let plane = renderer.cmyk_sidecar_spot_plane(0).expect("InkA plane");
+    let dims = renderer.cmyk_sidecar_dims().unwrap();
+
+    // Paint-band centre (50, 20) — image row 1 (paint), well inside
+    // the 4-row paint band (rows 0..3), far enough from the inner
+    // boundary at image y=4 that the Bicubic kernel only sees paint
+    // samples. §11.3.3 at α = 0.99, t_b = 0, t_s = 1.0:
+    //   t_r = 0.99·1.0 → u8 252.
+    let expected_centre = tint_to_u8(compose_normal(0.0, 1.0, 0.99));
+    assert_eq!(expected_centre, 252);
+    let centre_off = (20usize * dims.0 as usize) + 50;
+    assert_eq!(
+        plane[centre_off], expected_centre,
+        "{} — paint-band interior pixel uses the rasterised image \
+         coverage (full inside the paint band). t_r = 0.99·1.0 = u8 \
+         {}. Got {}.",
+        QA_BUG_SPOT_MIRROR_AA_EDGE_BINARY_COVERAGE, expected_centre, plane[centre_off]
+    );
+
+    // Footprint-boundary AA: with the rotated image footprint, the
+    // boundary diagonally crosses pixel grid cells, producing
+    // fractional coverage along the whole rotated rectangle edge.
+    // Scan the whole page for AT LEAST ONE pixel with lane value
+    // strictly between 0 and 252 — proving the coverage is geometry-
+    // true rather than binary.
+    let mut fractional_count = 0usize;
+    let mut max_fractional: u8 = 0;
+    for y in 0..(dims.1 as usize) {
+        for x in 0..(dims.0 as usize) {
+            let v = plane[y * dims.0 as usize + x];
+            if v > 0 && v < 252 {
+                fractional_count += 1;
+                if v > max_fractional {
+                    max_fractional = v;
+                }
+            }
+        }
+    }
     assert!(
-        source.contains("HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE"),
-        "{} — the HONEST_GAP constant must be declared so future \
-         readers understand the diff-branch over-deposit at AA \
-         edges on text / Do / sh paint sites is intentional pending \
-         a coverage-rasterise pass.",
-        QA_BUG_SPOT_MIRROR_AA_EDGE_BINARY_COVERAGE
+        fractional_count > 0,
+        "{} — at least one pixel along the upscaled image footprint \
+         boundary must carry strictly fractional coverage (lane ∈ \
+         (0, 252)) under Bicubic resampling. Got 0 fractional \
+         pixels. max_fractional = {}.",
+        QA_BUG_SPOT_MIRROR_AA_EDGE_BINARY_COVERAGE,
+        max_fractional
     );
 }
 

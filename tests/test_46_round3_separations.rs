@@ -84,23 +84,12 @@ pub const HONEST_GAP_KNOCKOUT_DIFFERENT_INK_SPOT_INTERACTION: &str =
      intact. The InkB lane gets paint 2's tint composed against the \
      group's InkB backdrop (the /K rule for paint 2 itself).";
 
-/// Text-show / `Do` / `sh` paint sites still use the snapshot-vs-
-/// post-paint diff for coverage recovery; round 2 documented this as
-/// HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE and
-/// HONEST_GAP_SPOT_MIRROR_IDENTICAL_RGB_COLLISION. Round 3 does NOT
-/// close those; the composite-then-decompose path inherits whatever
-/// the round-2 spot mirror produces on those sites. A future round
-/// wires real coverage masks through font cache / XObject footprint /
-/// shading geometry.
-pub const HONEST_GAP_SEPARATION_TEXT_DO_SH_COVERAGE: &str =
-    "HONEST_GAP_SEPARATION_TEXT_DO_SH_COVERAGE: round 3 routes the \
-     separation entry point through the composite path on \
-     transparency-bearing pages; the text-show / Do / sh AA-edge \
-     coverage gaps round 2 declared (HONEST_GAP_SPOT_MIRROR_AA_EDGE_\
-     COVERAGE, HONEST_GAP_SPOT_MIRROR_IDENTICAL_RGB_COLLISION) are \
-     inherited unchanged. Real coverage masks via font cache / \
-     XObject footprint / shading geometry are deferred to a later \
-     round.";
+// HONEST_GAP_SEPARATION_TEXT_DO_SH_COVERAGE is closed: text /
+// Image Do / shading sh paint sites now feed rasterised per-pixel
+// coverage masks into the spot mirror, and the
+// composite-then-decompose separation path inherits that fix
+// directly. See `tests/test_46_round6_real_coverage.rs` for the
+// byte-exact pin set.
 
 // ===========================================================================
 // Synthetic PDF builder — re-uses the round-1/2 shape for corpus

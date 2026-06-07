@@ -112,58 +112,14 @@ pub const HONEST_GAP_SPOT_LANE_UNSOURCED_PRESERVE_BACKDROP: &str =
      erasing what the source literally requested is the only reading \
      that does not silently drop the operator's intent.";
 
-/// Combo (`B`/`b`/`B*`/`b*`), text-show (`Tj`/`TJ`/`'`/`\"`),
-/// image+Form (`Do`) and shading (`sh`) paint sites that lack a
-/// pre-rasterised coverage mask: the round-2 spot mirror's diff
-/// branch treats every changed pixel as full coverage = 255. The
-/// combo arms were upgraded to use the same rasterised coverage path
-/// the path-Fill / path-Stroke helpers use (so combos now hit the
-/// spec-correct fractional coverage at AA edges); text / Do / sh
-/// remain on the diff path until a future round wires:
-///  - glyph rasterisation through the font cache for text-show,
-///  - the XObject footprint mask for `Do`,
-///  - the shading-engine geometry for `sh`.
-///
-/// At AA-edge pixels of these remaining paint sites the spot lane
-/// receives full ink while the visible pixmap composes at fractional
-/// alpha — a (1 − pix_alpha) per-edge over-deposit relative to the
-/// visible composite. Interior pixels are byte-exact. Real prepress
-/// artwork typically only sees AA edges at glyph boundaries, image
-/// edges, and shading boundaries; the absolute over-deposit is
-/// bounded by the AA pixel count, which is geometry-dependent.
-pub const HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE: &str =
-    "HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE: ISO 32000-1 §11.7.3 + \
-     §11.3.3 require a per-pixel coverage on every lane. The round-2 \
-     spot mirror's diff branch (snapshot-vs-post-paint byte compare) \
-     treats every changed pixel as coverage = 255, which over-deposits \
-     ink on the spot lane at AA-edge pixels by (1 − pix_alpha). The \
-     diff branch still fires at text / Do / sh paint sites; the combo \
-     arms (`B`/`b`/`B*`/`b*`) were promoted to the rasterised \
-     coverage path. Fix: rasterise an explicit coverage mask for the \
-     remaining paint sites — glyph rasterisation for text-show, the \
-     XObject footprint for `Do`, the gradient geometry for `sh`. \
-     Interior pixels are byte-exact under the current behaviour.";
-
-/// Identical-RGB collision: when a /Separation paint's alternate-CS
-/// RGB happens to equal the backdrop RGB at every pixel, the diff
-/// branch records coverage = 0 and the spot lane is NOT written.
-/// The combo arms now use rasterised coverage and so do not hit this
-/// corner; text / Do / sh paint sites still diff and would lose the
-/// paint in this collision. Real prepress artwork rarely hits this
-/// because spot inks are usually visually distinct from the
-/// alternate-CS approximation (the alternate is a fallback for
-/// devices that don't carry the spot plate; using a fallback colour
-/// identical to the backdrop defeats the spot's purpose). But a
-/// designer painting a white-on-white spot varnish would hit it.
-pub const HONEST_GAP_SPOT_MIRROR_IDENTICAL_RGB_COLLISION: &str =
-    "HONEST_GAP_SPOT_MIRROR_IDENTICAL_RGB_COLLISION: a /Separation \
-     paint whose alternate-CS RGB equals the backdrop RGB at every \
-     painted pixel hits a byte-equality miss in the diff branch — \
-     the spot lane is not written even though the paint conceptually \
-     covered the path. Combo paints (`B`/`b`/`B*`/`b*`) were promoted \
-     to use rasterised coverage and so do not hit this corner; text / \
-     Do / sh paint sites still do. Fix: same rasterise-real-coverage \
-     work as HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE.";
+// HONEST_GAP_SPOT_MIRROR_AA_EDGE_COVERAGE and
+// HONEST_GAP_SPOT_MIRROR_IDENTICAL_RGB_COLLISION are closed: the
+// text-show / Image Do / shading sh paint sites now feed rasterised
+// per-pixel coverage masks into
+// `mirror_spot_paint_into_sidecar_with_coverage`. AA-edge fractional
+// coverage and identical-RGB collisions are pinned byte-exact by
+// `tests/test_46_round6_real_coverage.rs`. The constants were
+// removed from this file when the gap closed.
 
 // ===========================================================================
 // Synthetic PDF builder — re-uses the round-1 shape for corpus
