@@ -2593,9 +2593,7 @@ impl PageRenderer {
                         // `gs.fill_spot_inks`, which is otherwise
                         // populated only by `cs`/`scn` colour-set
                         // operators — none of which fire before `sh`.
-                        if !self.spot_paint_active(&gs_clone, true)
-                            && self.cmyk_sidecar.is_some()
-                        {
+                        if !self.spot_paint_active(&gs_clone, true) && self.cmyk_sidecar.is_some() {
                             if let Some(inks) = self.resolve_shading_spot_inks(name, resources, doc)
                             {
                                 if !inks.is_empty() {
