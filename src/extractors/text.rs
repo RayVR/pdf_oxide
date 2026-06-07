@@ -1052,6 +1052,23 @@ fn should_insert_space(
         return SpaceDecision::no_space(SpaceSource::AlreadyPresent, 1.0);
     }
 
+    // Rule 0.3: Complex-script combining-mark guard (#656-class Indic gap).
+    // A Brahmic/Thai/Khmer dependent vowel sign, virama, or tone mark followed
+    // by another character of a complex script is intra-word — the mark carries
+    // its own advance, so the geometric gap and consensus paths below would
+    // otherwise emit a spurious word space (the dominant matra→consonant error
+    // for Tamil/Bengali/Devanagari). Genuine word breaks carry an explicit
+    // space glyph, already handled by Rule 0. This guards the strong-geometric
+    // and consensus branches, which never consult `WordBoundaryDetector`.
+    if let (Some(pc), Some(nc)) =
+        (preceding_text.chars().next_back(), following_text.chars().next())
+    {
+        use crate::text::complex_script_detector::{detect_complex_script, is_complex_script_mark};
+        if is_complex_script_mark(pc as u32) && detect_complex_script(nc as u32).is_some() {
+            return SpaceDecision::no_space(SpaceSource::NoSpace, 0.9);
+        }
+    }
+
     // Rule 0.4: Emoji / pictographic → letter boundary.
     // A wide pictographic glyph (e.g. 📄) advances far, so the residual gap to
     // the next token falls below the proportional-font space threshold and the
@@ -4445,6 +4462,27 @@ impl<'doc> TextExtractor<'doc> {
 
                 current.bbox.width = new_width;
                 current.bbox.height = new_height;
+
+                // Keep `char_widths` in lockstep with the merged text. The
+                // downstream width-based splitters `is_column_spanning_decimal`
+                // and `char_widths_boundary_split` (document.rs) fire when
+                // `char_widths.len() < char_count`, so a merged multi-glyph span
+                // (e.g. per-glyph `Td <hex> Tj` table cells like "0.99" / "Q1")
+                // would otherwise be wrongly split — dropping the decimal point
+                // ("0.99" → "0 99") or gluing a space at the letter→digit
+                // boundary ("Q1" → "Q 1"). Append this span's per-glyph widths,
+                // then pad to the exact char count to cover any inserted '.'/
+                // ' ' separator (or a source span whose widths were sparse).
+                current.char_widths.extend_from_slice(&span.char_widths);
+                let merged_char_count = current.text.chars().count();
+                if current.char_widths.len() != merged_char_count {
+                    let pad = if current.font_size > 0.0 {
+                        current.font_size * 0.25
+                    } else {
+                        1.0
+                    };
+                    current.char_widths.resize(merged_char_count, pad);
+                }
 
                 // After a cross-font glue, adopt the longer run's font
                 // metadata. The single-letter side was typographic

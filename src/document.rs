@@ -7075,13 +7075,34 @@ impl PdfDocument {
             }
         }
         if rtl >= 2 && !has_latin {
-            let reversed: String = span.text.chars().rev().collect();
             let mut tmp = span.clone();
-            tmp.text = reversed;
+            tmp.text = Self::reverse_rtl_keeping_marks(&span.text);
             Self::push_span_text(out, &tmp);
         } else {
             Self::push_span_text(out, span);
         }
+    }
+
+    /// Reverse a pure-RTL run from visual to logical order while keeping each
+    /// Arabic/Hebrew combining mark attached to its base letter (#656).
+    ///
+    /// A naive `chars().rev()` reverses by Unicode scalar value, so a base
+    /// letter's diacritics (which follow it in logical order — kasra/shadda
+    /// U+0650/U+0651, Hebrew points U+05B0..) jump *in front* of the base and
+    /// float off as standalone marks. Grouping each base char with the
+    /// combining marks that trail it, then reversing the group order (each
+    /// group's internal order preserved), keeps marks bound to their base.
+    fn reverse_rtl_keeping_marks(text: &str) -> String {
+        use crate::text::rtl_detector::is_rtl_diacritic;
+        let mut groups: Vec<Vec<char>> = Vec::new();
+        for c in text.chars() {
+            if is_rtl_diacritic(c as u32) && !groups.is_empty() {
+                groups.last_mut().unwrap().push(c);
+            } else {
+                groups.push(vec![c]);
+            }
+        }
+        groups.iter().rev().flatten().collect()
     }
 
     /// Parse font size from a /DA (Default Appearance) string.
@@ -8626,17 +8647,35 @@ impl PdfDocument {
     /// span MCIDs and for any MCID containing RTL text (whose span order is
     /// handled by the bidi passes) — both stay byte-identical.
     fn order_mcid_spans(spans: &[crate::layout::TextSpan]) -> Vec<&crate::layout::TextSpan> {
+        use crate::text::rtl_detector::is_rtl_text;
         let mut ordered: Vec<&crate::layout::TextSpan> = spans.iter().collect();
-        let has_rtl = |s: &crate::layout::TextSpan| {
-            s.text
-                .chars()
-                .any(|c| crate::text::rtl_detector::is_rtl_text(c as u32))
-        };
-        if spans.len() > 1 && !spans.iter().any(has_rtl) {
+        if spans.len() <= 1 {
+            return ordered;
+        }
+        let has_rtl = spans
+            .iter()
+            .any(|s| s.text.chars().any(|c| is_rtl_text(c as u32)));
+        let has_latin = spans
+            .iter()
+            .any(|s| s.text.chars().any(|c| c.is_ascii_alphabetic()));
+        if !has_rtl {
+            // LTR multi-span MCID: left-to-right row-aware reading order.
             ordered.sort_by(|a, b| {
                 crate::utils::row_aware_span_cmp(a.bbox.y, a.bbox.x, b.bbox.y, b.bbox.x)
             });
+        } else if !has_latin {
+            // #656/#657: pure-RTL MCID. The tagged struct-tree path never
+            // reaches `reverse_rtl_visual_order_runs`, so without an explicit
+            // span-order pass the words emerge in visual (reversed) sequence.
+            // Emitting each row right-to-left (X descending) reconstructs
+            // logical reading order from geometry, independent of whether the
+            // producer stored the run visually or logically. Per-span glyph
+            // order is corrected separately by `push_span_text_bidi`.
+            ordered.sort_by(|a, b| {
+                crate::utils::row_aware_span_cmp_rtl(a.bbox.y, a.bbox.x, b.bbox.y, b.bbox.x)
+            });
         }
+        // Mixed RTL+Latin MCIDs keep raw order (full UAX #9 bidi deferred).
         ordered
     }
 
@@ -9415,22 +9454,41 @@ impl PdfDocument {
         lower.starts_with("cm") || lower.contains("symbol")
     }
 
-    /// Replace a `¬` (U+00AC) that sits directly between two ASCII digits with
-    /// `.` (the decimal point a math subset drew from its `logicalnot` slot).
-    /// Leaves every other `¬` untouched.
+    /// Replace a `¬` (U+00AC) that a math subset drew from its `logicalnot`
+    /// slot as a decimal point. Two shapes are recovered:
+    ///
+    ///   - `digit ¬ digit`         → `digit.digit` (e.g. `1¬00` → `1.00`)
+    ///   - `digit ¬ <space> digit` → `digit.digit` (e.g. `1¬ 00` → `1.00`)
+    ///
+    /// The second form covers subsets that emit a single space between the
+    /// decimal glyph and the fractional digits; the lone separating space is
+    /// dropped so the number reads as one token. The leading digit must abut
+    /// `¬` directly in both shapes, so a genuinely spaced negation (`5 ¬ 3`,
+    /// `A ¬ B`) is left untouched. Every other `¬` is preserved.
     fn fix_digit_logicalnot_decimal(text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
         let mut out = String::with_capacity(text.len());
-        for (i, &c) in chars.iter().enumerate() {
-            if c == '\u{00AC}'
-                && i > 0
-                && chars[i - 1].is_ascii_digit()
-                && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit())
-            {
-                out.push('.');
-            } else {
-                out.push(c);
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\u{00AC}' && i > 0 && chars[i - 1].is_ascii_digit() {
+                // Unspaced: digit ¬ digit.
+                if chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
+                    out.push('.');
+                    i += 1;
+                    continue;
+                }
+                // Spaced: digit ¬ <single space> digit — drop the lone space.
+                if chars.get(i + 1) == Some(&' ')
+                    && chars.get(i + 2).is_some_and(|n| n.is_ascii_digit())
+                {
+                    out.push('.');
+                    i += 2; // skip the ¬ and the single separating space
+                    continue;
+                }
             }
+            out.push(c);
+            i += 1;
         }
         out
     }
@@ -15446,6 +15504,16 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        // Encrypted-and-undecryptable parity: extract_text / to_markdown / to_html
+        // all short-circuit to an empty string here (ISO 32000-1:2008 §7.6); the
+        // geometric plain-text path below would also yield empty (no decryptable
+        // content) but went through the full pipeline first. Guard explicitly so
+        // every text surface returns the same empty result on the same input.
+        if self.is_encrypted_unreadable() {
+            log::warn!("PDF is encrypted and could not be decrypted; returning empty text");
+            return Ok(String::new());
+        }
+
         // #608: for a trustworthy tagged PDF, read in logical structure order
         // (§14.8.2.3.1) by assembling directly from the structure tree — the
         // same path `extract_text` uses. The geometric plain-text converter
@@ -19459,6 +19527,65 @@ mod tests {
         );
     }
 
+    // #656/#657: the tagged struct-tree path collapses a page into one MCID
+    // whose pure-RTL word-spans are laid out left-to-right (visual, X
+    // ascending). `order_mcid_spans` must emit them right-to-left (logical)
+    // using geometry, since the tagged path never reaches the untagged
+    // `reverse_rtl_visual_order_runs`. (Per-span glyph order is handled
+    // separately by `push_span_text_bidi`; this test asserts span ORDER.)
+    #[test]
+    fn test_order_mcid_spans_pure_rtl_emitted_right_to_left() {
+        // One Hebrew row, three words placed left-to-right by X.
+        let spans = vec![
+            make_rtl_test_span("שלוש", 100.0, 700.0), // leftmost  → logically last
+            make_rtl_test_span("שתיים", 200.0, 700.0),
+            make_rtl_test_span("אחת", 300.0, 700.0), // rightmost → logically first
+        ];
+        let ordered = PdfDocument::order_mcid_spans(&spans);
+        let texts: Vec<&str> = ordered.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["אחת", "שתיים", "שלוש"],
+            "pure-RTL MCID spans must emit rightmost-first (logical RTL order), got {texts:?}"
+        );
+    }
+
+    // #656: grapheme-aware RTL reversal keeps Arabic combining marks bound to
+    // their base letter (vs. a naive chars().rev() that floats them off).
+    #[test]
+    fn test_reverse_rtl_keeping_marks_keeps_diacritics_attached() {
+        // قِطّ = QAF + KASRA(U+0650) + TAH + SHADDA(U+0651). Reversing must
+        // keep each mark immediately after its base, not lead the string.
+        let src = "\u{0642}\u{0650}\u{0637}\u{0651}"; // قِطّ
+        let out = PdfDocument::reverse_rtl_keeping_marks(src);
+        // Expected: base order reversed (TAH+SHADDA group, then QAF+KASRA group).
+        assert_eq!(out, "\u{0637}\u{0651}\u{0642}\u{0650}");
+        // No combining mark ever leads a base it doesn't belong to: every
+        // diacritic is immediately preceded by a non-diacritic.
+        let chars: Vec<char> = out.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if crate::text::rtl_detector::is_rtl_diacritic(*c as u32) {
+                assert!(
+                    i > 0 && !crate::text::rtl_detector::is_rtl_diacritic(chars[i - 1] as u32),
+                    "diacritic at {i} is detached from its base"
+                );
+            }
+        }
+    }
+
+    // Mixed RTL+Latin MCIDs are left in raw order (full UAX #9 deferred) —
+    // guards against the pure-RTL reorder accidentally firing on mixed runs.
+    #[test]
+    fn test_order_mcid_spans_mixed_rtl_latin_kept_raw() {
+        let spans = vec![
+            make_rtl_test_span("שלום", 100.0, 700.0),
+            make_rtl_test_span("World", 200.0, 700.0),
+        ];
+        let ordered = PdfDocument::order_mcid_spans(&spans);
+        let texts: Vec<&str> = ordered.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["שלום", "World"], "mixed RTL+Latin must stay in raw order");
+    }
+
     // #553: bare page-number detection (applied only inside the margin band).
     #[test]
     fn test_is_bare_page_number_text() {
@@ -22669,6 +22796,20 @@ mod tests {
         assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("5 \u{00AC} 3"), "5 \u{00AC} 3");
         // Leading/trailing `¬` with only one digit neighbour: untouched.
         assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("\u{00AC}5"), "\u{00AC}5");
+        // Spaced decimal: a subset that emits a single space between the decimal
+        // glyph and the fractional digits → drop the lone space, recover `.`.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("1\u{00AC} 00"), "1.00");
+        assert_eq!(
+            PdfDocument::fix_digit_logicalnot_decimal("0\u{00AC} 75 1\u{00AC} 00"),
+            "0.75 1.00"
+        );
+        // Still NOT a decimal when the leading digit does not abut `¬`
+        // (genuine spaced negation): `5 ¬ 3` stays untouched even though a
+        // digit follows the space.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("5 \u{00AC} 3"), "5 \u{00AC} 3");
+        // Only a single separating space is absorbed; two spaces is not a
+        // decimal rendering and is left alone.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("1\u{00AC}  00"), "1\u{00AC}  00");
     }
 
     #[test]
