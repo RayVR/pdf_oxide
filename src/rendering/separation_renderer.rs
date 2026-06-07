@@ -787,10 +787,22 @@ fn classify_resolved(
             // (uncoloured Tiling carries the underlying space's
             // tints). For separation-ink scanning, recurse so a
             // Pattern[/Separation /Foo] marks /Foo as referenced.
-            // Round 5 brings this into parity with the round-5
-            // sidecar extractor's Pattern arm.
+            // Brings this into parity with the sidecar extractor's
+            // Pattern arm.
+            //
+            // Real-world PDFs commonly share a Pattern's underlying
+            // colour space via an indirect reference
+            // (`/Pattern [<obj> <gen> R]`). Dereference before
+            // recursing so the indirect form classifies identically
+            // to an inline-array underlying. The sidecar's analogous
+            // arm performs the same deref via its `deref` closure.
             match arr.get(1) {
-                Some(underlying) => classify_resolved(underlying, color_spaces, resources, doc),
+                Some(underlying) => {
+                    let resolved = doc
+                        .resolve_object(underlying)
+                        .unwrap_or_else(|_| underlying.clone());
+                    classify_resolved(&resolved, color_spaces, resources, doc)
+                },
                 None => ResolvedSpace::Unknown,
             }
         },

@@ -497,3 +497,66 @@ fn b3_composite_preview_separation_tint_transform_byte_exact() {
         b
     );
 }
+
+// ===========================================================================
+// B2-indirect — Pattern colour space whose underlying space is an
+// indirect reference (`/Pattern <obj> <gen> R`) instead of an inline
+// array. Real-world PDFs commonly share the underlying space across
+// multiple Pattern declarations via an indirect ref. Both the sidecar
+// extractor (`extract_paint_spot_inks`) and the renderer's
+// `classify_resolved` must dereference the indirect ref before
+// recursing into the underlying space. The byte-exact reference is
+// identical to B2 — the indirect form must be semantically equivalent
+// to the inline array form per ISO 32000-1 §7.3.10 (Indirect Objects).
+//
+// Spec citations:
+//   - ISO 32000-1 §7.3.10 — Indirect Objects (resolution semantics)
+//   - ISO 32000-1 §8.7.3.1 — Pattern colour space underlying
+// ===========================================================================
+
+#[test]
+fn b2_pattern_with_separation_underlying_indirect_ref_byte_exact() {
+    let icc = build_constant_cmyk_icc(135);
+    let tint_fn = "<< /FunctionType 2 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] \
+                  /C0 [0 0 0 0] /C1 [0 0.8 1 0] /N 1 >>";
+    // Underlying colour space (Separation /PMS185 with /DeviceCMYK
+    // alternate) lives as a free-standing indirect object 6. The page
+    // resource dict then declares /CS_PA = [/Pattern 6 0 R] — the
+    // index-1 underlying is an indirect reference, not an inline
+    // array. This is the production-realistic shape: a shared
+    // underlying space referenced by several Pattern declarations.
+    let underlying_obj =
+        format!("6 0 obj\n[/Separation /PMS185 /DeviceCMYK {}]\nendobj\n", tint_fn);
+    // Same paint sequence as B2 (the inline-array case). Byte-exact
+    // outcome must match B2: the indirect ref classifies and walks
+    // identically.
+    let content = "/Ov gs\n/CS_PA cs\n0.6 scn /MyPatt\n0 0 m 100 0 l 100 100 l 0 100 l h f\n";
+    let resources = "/ExtGState << /Ov << /Type /ExtGState /ca 0.5 >> >> \
+                     /ColorSpace << /CS_PA [/Pattern 6 0 R] >>"
+        .to_string();
+    let pdf = build_pdf_with_output_intent(content, &resources, &icc, &[underlying_obj.as_str()]);
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let pms185 = centre(plate(&plates, "PMS185"));
+
+    // Byte-exact reference is identical to B2 (inline-array case): 77.
+    // The indirect-ref form must classify and walk identically per
+    // §7.3.10 (any indirect reference resolves to the referenced
+    // object before semantic interpretation).
+    assert_eq!(
+        pms185, 77,
+        "ISO 32000-1 §7.3.10 + §8.7.3.1: a Pattern colour space whose \
+         underlying space is an indirect reference must dereference \
+         before recursing. The byte-exact reference matches the inline \
+         array case (B2): u8 77. Got u8 {}. \
+         Regression to 0 indicates `classify_resolved` (or the sidecar \
+         spot extractor) is treating the indirect ref as an unknown / \
+         opaque object instead of resolving it — the Pattern arm \
+         returns ResolvedSpace::Unknown and the spot lane is never \
+         written. Real-world PDFs frequently share a Pattern's \
+         underlying space via an indirect ref so this regression \
+         drops spot ink on the common production case while the \
+         inline-array case (B2) keeps working.",
+        pms185
+    );
+}
