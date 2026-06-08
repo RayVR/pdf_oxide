@@ -20,7 +20,7 @@
 //! | `/SMask /S /Alpha` (Form XObject soft mask)     | §11.5.2   | live   |
 //! | `/SMask /S /Luminosity` (Form XObject soft mask)| §11.5.3   | live   |
 //! | `/SMask /BC` backdrop colour (n=1/3/4 + DeviceN)| §11.6.5.2 | live (malformed arity narrows to HONEST_GAP_SMASK_BC_MALFORMED_ARITY) |
-//! | `/SMask /TR` transfer function (Type 0/2/4)     | §11.6.5.2 | live (Type 3 stitching narrows to HONEST_GAP_SMASK_TR_TYPE_3_STITCHING) |
+//! | `/SMask /TR` transfer function (Type 0/2/3/4)   | §11.6.5.2 | live   |
 //! | Transparency group `/I` (isolated flag)         | §11.4.5   | live   |
 //! | Transparency group `/K` (knockout flag)         | §11.4.6   | live   |
 //! | Form XObject `/Group` dict                      | §11.4.5   | live   |
@@ -103,26 +103,6 @@ use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 // Narrow HONEST_GAP tracking constants — narrowly-scoped remainders
 // after the bulk-feature work landed.
 // ===========================================================================
-
-/// `/SMask /TR` Type 3 (stitching function) per §7.10.4 is the only
-/// transfer-function arm still falling to Identity. A stitching
-/// function composes sub-functions over disjoint subdomains; for an
-/// SMask transfer this would let producers concatenate per-mask-region
-/// curves. Real-world SMask /TR streams overwhelmingly carry Type 0
-/// sampled or Type 2 exponential — Type 3 stitching is uncommon for
-/// monotonic opacity curves. The fallback to Identity is correctness-
-/// safe in the sense that a malformed /TR is required by §11.4.7 to
-/// default to Identity; closing the gap is a feature additive, not a
-/// correctness fix.
-pub const HONEST_GAP_SMASK_TR_TYPE_3_STITCHING: &str =
-    "HONEST_GAP_SMASK_TR_TYPE_3_STITCHING: /SMask /TR Type 3 stitching \
-     functions (§7.10.4) fall through to Identity. The renderer evaluates \
-     Type 0 sampled (§7.10.2), Type 2 exponential interpolation (§7.10.3), \
-     and Type 4 PostScript calculator (§7.10.5); a Type 3 /TR is treated \
-     as Identity per §11.4.7's default-on-unrecognised rule. Closing this \
-     gap requires a stitching evaluator that dispatches the input through \
-     the sub-function whose /Bounds covers it, with /Encode remapping the \
-     sub-function's input range.";
 
 /// `/SMask /BC` whose array length does not match the Form's /Group
 /// /CS component count is a producer-side malformation per §11.6.5.2
@@ -798,6 +778,261 @@ fn smask_tr_type0_sampled_inverted_ramp() {
         "ISO 32000-1 §7.10.2 + §11.6.5.2 /SMask /TR Type 0 inverted-ramp \
          LUT must invert modulation; expected byte-exact (255, 128, 128); \
          got ({r}, {g}, {b})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §7.10.4 SMask /TR Type 3 stitching — four byte-exact probes
+// ---------------------------------------------------------------------------
+//
+// Type 3 stitches `k` subfunctions over disjoint subintervals of /Domain.
+// The dispatcher clips the input to /Domain, finds which subinterval
+// covers it (a boundary belongs to the right subinterval), linearly
+// remaps the input from the subinterval to the subfunction's /Encode
+// range, and evaluates that subfunction. The four probes below pin
+// each axis of the dispatch:
+//
+//   1. Subfunctions of Type 2 (the common shape for SMask /TR) +
+//      verifies the subinterval lookup.
+//   2. Subfunctions of Type 4 (PostScript) + verifies recursive
+//      subfunction parsing across function-type families.
+//   3. /Domain that doesn't cover [0, 1] + verifies input clipping.
+//   4. A zero-width subinterval + verifies the encode-lo fallback for
+//      the malformed-but-spec-permitted degenerate case.
+
+/// Fixture: SMask /TR Type 3 with two Type 2 subfunctions over
+/// /Domain [0 1] split at /Bounds [0.75]:
+///   - f0 = Type 2 (C0=0, C1=1, N=0.5) — gamma 0.5 on [0, 0.75]
+///   - f1 = Type 2 (C0=0, C1=1, N=2)   — gamma 2 on [0.75, 1]
+///
+/// /Encode [0 1 0 1] passes each subinterval through unchanged onto
+/// the subfunction's native [0, 1] input range.
+///
+/// Form 50% grey paints mask byte 128 → m_initial = 128/255 ≈ 0.5020,
+/// which falls into subinterval 0 (0.5020 < 0.75). Encoded input =
+/// (0.5020 - 0) · (1 - 0) / (0.75 - 0) = 0.6693; gamma 0.5 →
+/// sqrt(0.6693) ≈ 0.8181. m_out ≈ 0.8181. inv_m ≈ 0.1819. G =
+/// 0.1819·255 = 46.39 → byte 46. R stays 255 (red painted over
+/// white). Reference (255, 46, 46). Identity-fallback yields the
+/// Type-2-no-/TR baseline (255, 127, 127) — sensitivity check.
+fn fixture_smask_tr_type3_two_type2_subfunctions() -> Vec<u8> {
+    let form_content = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    // Type 3 stitching with two inline Type 2 subfunctions in the
+    // /Functions array. Inline dicts in /Functions are spec-legal
+    // (Table 39 only requires "an array of k functions"; indirect refs
+    // are a representation choice, not a requirement).
+    let obj_6 = "6 0 obj\n<< /FunctionType 3 /Domain [0 1] /Range [0 1] \
+                 /Functions [ \
+                   << /FunctionType 2 /Domain [0 1] /Range [0 1] /C0 [0] /C1 [1] /N 0.5 >> \
+                   << /FunctionType 2 /Domain [0 1] /Range [0 1] /C0 [0] /C1 [1] /N 2 >> \
+                 ] /Bounds [0.75] /Encode [0 1 0 1] >>\nendobj\n";
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R /TR 6 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5, obj_6])
+}
+
+/// `/SMask /TR` Type 3 stitching with two Type 2 subfunctions per
+/// §7.10.4 + §7.10.3. Byte-exact reference computed by hand from the
+/// spec algorithm — see fixture docstring.
+#[test]
+fn smask_tr_type3_stitching_with_type2_subfunctions_byte_exact() {
+    let rgba = render_rgba(fixture_smask_tr_type3_two_type2_subfunctions());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 46, 46),
+        "ISO 32000-1 §7.10.4 /SMask /TR Type 3 with Type 2 subfunctions \
+         (gamma 0.5 on [0, 0.75], gamma 2 on [0.75, 1]) must dispatch \
+         m≈0.502 through subinterval 0, remap to encoded≈0.6693, gamma 0.5 \
+         → m_out≈0.818, inv_m·255 → byte 46; expected byte-exact \
+         (255, 46, 46); got ({r}, {g}, {b})"
+    );
+}
+
+/// Fixture: SMask /TR Type 3 with two Type 4 PostScript subfunctions
+/// over /Domain [0 1] split at /Bounds [0.75]:
+///   - f0 = `{ 0.5 mul }` — halves the input
+///   - f1 = `{ 1 sub abs }` — `|1 - x|`
+///
+/// Form 50% grey → m_initial ≈ 0.5020 → subinterval 0. Encoded
+/// (0.5020 - 0)/0.75 ≈ 0.6693. `0.5 mul` → 0.3346. inv_m = 0.6654.
+/// G = 0.6654·255 ≈ 169.67 → byte 170. R stays 255. Reference
+/// (255, 170, 170). Identity-fallback yields (255, 127, 127).
+fn fixture_smask_tr_type3_two_type4_subfunctions() -> Vec<u8> {
+    let form_content = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    // The two subfunction streams (Type 4 is stream-based).
+    let prog_0 = "{ 0.5 mul }";
+    let obj_6 = format!(
+        "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        prog_0.len(),
+        prog_0
+    );
+    let prog_1 = "{ 1 sub abs }";
+    let obj_7 = format!(
+        "7 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        prog_1.len(),
+        prog_1
+    );
+    let obj_8 = "8 0 obj\n<< /FunctionType 3 /Domain [0 1] /Range [0 1] \
+                 /Functions [6 0 R 7 0 R] /Bounds [0.75] /Encode [0 1 0 1] >>\nendobj\n";
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R /TR 8 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5, &obj_6, &obj_7, obj_8])
+}
+
+/// `/SMask /TR` Type 3 stitching with two Type 4 PostScript subfunctions
+/// per §7.10.4 + §7.10.5. Verifies recursive subfunction parsing
+/// across function-type families and PostScript dispatch from inside
+/// the stitching arm.
+#[test]
+fn smask_tr_type3_stitching_with_type4_subfunctions_byte_exact() {
+    let rgba = render_rgba(fixture_smask_tr_type3_two_type4_subfunctions());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 170, 170),
+        "ISO 32000-1 §7.10.4 + §7.10.5 /SMask /TR Type 3 with two Type 4 \
+         PostScript subfunctions ({{ 0.5 mul }}, {{ 1 sub abs }}) must \
+         dispatch m≈0.502 through subinterval 0, encoded≈0.669, 0.5 mul \
+         → m_out≈0.335, inv_m·255 → byte 170; expected byte-exact \
+         (255, 170, 170); got ({r}, {g}, {b})"
+    );
+}
+
+/// Fixture: SMask /TR Type 3 with /Domain [0.3 0.8] (the function's
+/// declared domain doesn't cover [0, 1]). Per §7.10.4 step 1 the input
+/// is clipped to the domain before subinterval lookup. The fixture
+/// hands the function an input of m_initial ≈ 0.102 (form 10% grey,
+/// byte 26) which lies below the domain's lower endpoint 0.3 and must
+/// clip to 0.3.
+///
+/// Subfunctions:
+///   - f0 = Type 2 (C0=0, C1=1, N=1) — identity over the encoded range
+///   - f1 = Type 2 (C0=0, C1=1, N=2) — gamma 2 over the encoded range
+///
+/// /Bounds [0.5], /Encode [0.5 1.0  0 1].
+///
+/// After clipping to 0.3: 0.3 < 0.5 → subinterval 0. Encoded =
+/// 0.5 + (0.3 - 0.3)·(1.0 - 0.5)/(0.5 - 0.3) = 0.5. f0(0.5) = 0.5.
+/// m_out = 0.5. inv_m = 0.5. G = 0.5·255 = 127.5 → byte 128. R stays
+/// 255. Reference (255, 128, 128). Identity-fallback (no clip, no
+/// transfer): m_initial=0.102, inv_m=0.898, G=228.99 → byte 229.
+/// Type-3-dispatched output (128) is unambiguously distinct from the
+/// Identity baseline (229).
+fn fixture_smask_tr_type3_clips_input_to_domain() -> Vec<u8> {
+    let form_content = "0.1 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let obj_6 = "6 0 obj\n<< /FunctionType 3 /Domain [0.3 0.8] /Range [0 1] \
+                 /Functions [ \
+                   << /FunctionType 2 /Domain [0 1] /Range [0 1] /C0 [0] /C1 [1] /N 1 >> \
+                   << /FunctionType 2 /Domain [0 1] /Range [0 1] /C0 [0] /C1 [1] /N 2 >> \
+                 ] /Bounds [0.5] /Encode [0.5 1.0 0 1] >>\nendobj\n";
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R /TR 6 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5, obj_6])
+}
+
+/// `/SMask /TR` Type 3 stitching with /Domain [0.3 0.8] verifies the
+/// input clip per §7.10.4 step 1.
+#[test]
+fn smask_tr_type3_stitching_clips_input_to_domain_byte_exact() {
+    let rgba = render_rgba(fixture_smask_tr_type3_clips_input_to_domain());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 128, 128),
+        "ISO 32000-1 §7.10.4 step 1 /SMask /TR Type 3 with /Domain [0.3 0.8] \
+         must clip m≈0.102 up to 0.3, encode (0.3, 0.3, 0.5, /Encode \
+         [0.5 1.0 ...]) → 0.5, f0(0.5) = 0.5, inv_m·255 → byte 128; \
+         expected byte-exact (255, 128, 128); got ({r}, {g}, {b})"
+    );
+}
+
+/// Fixture: SMask /TR Type 3 where one subinterval is degenerate
+/// (zero-width). The construction is /Domain [0 0.5] with /Bounds
+/// [0.5]; subinterval 1's bounds become `[bounds[0], domain[1]]` =
+/// `[0.5, 0.5]` — zero-width. Per the implementation's malformed-input
+/// policy (documented in `SMaskTransfer::Type3`'s `eval` arm) the
+/// linear remap collapses, so the dispatcher uses the subfunction's
+/// `encode_lo` directly.
+///
+/// Form 50% grey → m_initial ≈ 0.502, clipped to [0, 0.5] = 0.5.
+/// Boundary 0.5 belongs to the right subinterval (i = 1, k - 1).
+/// Subfunctions:
+///   - f0 = Type 2 (C0=0, C1=1, N=1) — identity (unused at i=1)
+///   - f1 = Type 2 (C0=0, C1=1, N=2) — gamma 2
+///
+/// /Encode [0 1 0 1]. Zero-width subinterval 1 → encoded = e_lo_1 =
+/// 0.0. f1(0.0) = 0^2 = 0. m_out = 0. inv_m = 1. G = 255, R = 255,
+/// B = 255 → reference (255, 255, 255). Identity-fallback (no Type 3
+/// dispatch): m_initial = 0.502, inv_m = 0.498, G = 127. The two
+/// answers are unambiguously distinct.
+fn fixture_smask_tr_type3_zero_width_subinterval() -> Vec<u8> {
+    let form_content = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    let obj_6 = "6 0 obj\n<< /FunctionType 3 /Domain [0 0.5] /Range [0 1] \
+                 /Functions [ \
+                   << /FunctionType 2 /Domain [0 1] /Range [0 1] /C0 [0] /C1 [1] /N 1 >> \
+                   << /FunctionType 2 /Domain [0 1] /Range [0 1] /C0 [0] /C1 [1] /N 2 >> \
+                 ] /Bounds [0.5] /Encode [0 1 0 1] >>\nendobj\n";
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R /TR 6 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5, obj_6])
+}
+
+/// `/SMask /TR` Type 3 stitching with a zero-width subinterval per
+/// the malformed-but-spec-permitted edge case in §7.10.4. The
+/// implementation's defensible policy is to use the subfunction's
+/// `encode_lo` directly when `(hi_i - lo_i) == 0`.
+#[test]
+fn smask_tr_type3_zero_width_subinterval_uses_encode_lo_byte_exact() {
+    let rgba = render_rgba(fixture_smask_tr_type3_zero_width_subinterval());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 255, 255),
+        "ISO 32000-1 §7.10.4 /SMask /TR Type 3 with zero-width subinterval \
+         (Bounds [0.5] on Domain [0 0.5]) must use encode_lo when the \
+         subinterval collapses; encoded = 0 → f1(0) = 0 → m_out = 0 → \
+         destination = backdrop (255, 255, 255); got ({r}, {g}, {b})"
     );
 }
 

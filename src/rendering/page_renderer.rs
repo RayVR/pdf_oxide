@@ -5997,7 +5997,7 @@ impl PageRenderer {
             .transfer
             .as_ref()
             .and_then(|tr_obj| doc.resolve_object(tr_obj).ok())
-            .and_then(|resolved| parse_transfer_function(&resolved));
+            .and_then(|resolved| parse_transfer_function(doc, &resolved));
 
         // Apply the mask: pixmap = mask * pixmap + (1 - mask) * snapshot.
         let mask_data = mask_pixmap.data();
@@ -6745,6 +6745,31 @@ pub(crate) enum SMaskTransfer {
         /// input through `evaluate` and reads one f64 output.
         program: crate::functions::Program,
     },
+    /// Type 3 stitching function (§7.10.4). Combines `k` subfunctions
+    /// over disjoint subintervals of `/Domain`. For an SMask /TR the
+    /// outer function is 1-input 1-output; each subfunction must also
+    /// be 1-input 1-output (verified at parse time). Subfunctions can
+    /// themselves be any function type the parser accepts, including
+    /// Type 3 — recursive stitching is unusual but spec-legal.
+    Type3 {
+        /// Subfunctions in domain order. The `Vec`'s heap allocation
+        /// breaks the recursive type's would-be infinite size; no
+        /// extra `Box` is required (clippy `vec_box`). Length is `k`,
+        /// where `k = bounds.len() + 1`.
+        subfunctions: Vec<SMaskTransfer>,
+        /// `k - 1` boundary values dividing `/Domain` into `k`
+        /// subintervals. The i-th subinterval per §7.10.4 step 2 is
+        /// `[x0, b0)`, ..., `[b(k-2), x1]` — a boundary value belongs
+        /// to the subinterval on its right.
+        bounds: Vec<f32>,
+        /// `k` pairs of `(e_lo, e_hi)` that linearly remap each
+        /// subinterval onto the corresponding subfunction's native
+        /// input range. Indexed by subfunction position.
+        encode: Vec<(f32, f32)>,
+        /// `/Domain` as `(x0, x1)`. Inputs outside this range are
+        /// clipped to the nearest endpoint before dispatch.
+        domain: (f32, f32),
+    },
 }
 
 impl SMaskTransfer {
@@ -6788,17 +6813,80 @@ impl SMaskTransfer {
                     _ => x,
                 }
             },
+            SMaskTransfer::Type3 {
+                subfunctions,
+                bounds,
+                encode,
+                domain,
+            } => {
+                // §7.10.4 Type 3 stitching. Steps follow the spec:
+                //   1. Clip input to `/Domain` (the outer clamp to
+                //      [0, 1] at the top of `eval` already constrains
+                //      the SMask /TR input to its [0, 1] range; this
+                //      tighter clip enforces the function's own
+                //      declared /Domain).
+                //   2. Find the subinterval index `i` such that
+                //      `b(i-1) <= x < b(i)`, with the convention that
+                //      a boundary value belongs to the subinterval on
+                //      its right and the final subinterval is
+                //      half-open at its upper end (`x >= b(k-2)` →
+                //      `i = k-1`).
+                //   3. Compute the subinterval bounds and linearly
+                //      remap `x` from `[lo_i, hi_i]` to the
+                //      subfunction's native input range
+                //      `[encode_lo_i, encode_hi_i]`.
+                //   4. Evaluate the i-th subfunction at the encoded
+                //      input; the result is the function's output.
+                //
+                // Malformed-input policy: an empty subfunctions vec
+                // (which the parser rejects, but defensively guarded
+                // here) returns the clipped input unchanged. A
+                // zero-width subinterval — possible if a /Bounds entry
+                // equals one of its neighbouring endpoints — degenerates
+                // the linear remap (division by zero); in that case we
+                // use the subfunction's `encode_lo` directly, which is
+                // the only well-defined point in the remap.
+                let (x0, x1) = *domain;
+                let x_clipped = x.clamp(x0, x1);
+                let k = subfunctions.len();
+                if k == 0 {
+                    return x_clipped;
+                }
+                // Step 2: locate subinterval index via the half-open
+                // convention. `partition_point` returns the count of
+                // bounds strictly ≤ x_clipped; that count IS the
+                // subinterval index because every boundary belongs to
+                // the right subinterval.
+                let i = bounds
+                    .iter()
+                    .copied()
+                    .filter(|b| x_clipped >= *b)
+                    .count()
+                    .min(k - 1);
+                let lo_i = if i == 0 { x0 } else { bounds[i - 1] };
+                let hi_i = if i == k - 1 { x1 } else { bounds[i] };
+                let (e_lo, e_hi) = encode.get(i).copied().unwrap_or((0.0, 1.0));
+                let encoded = if (hi_i - lo_i).abs() <= f32::EPSILON {
+                    // Zero-width subinterval — use the encode-lo
+                    // endpoint directly. Any input that falls into a
+                    // collapsed subinterval is the boundary point
+                    // itself, so this is the only spec-coherent choice.
+                    e_lo
+                } else {
+                    e_lo + (x_clipped - lo_i) * (e_hi - e_lo) / (hi_i - lo_i)
+                };
+                subfunctions[i].eval(encoded)
+            },
         }
     }
 }
 
 /// Parse a `/SMask /TR` function. Type 0 (sampled), Type 2 (exponential
-/// interpolation), and Type 4 (PostScript calculator) are recognised
-/// per ISO 32000-1:2008 §7.10. Type 3 (stitching) falls to Identity
-/// (the spec default for absent or unrecognised /TR) — the SMask
-/// transfer is monotonic in practice; stitching of multiple sub-
-/// functions over disjoint subdomains is uncommon for opacity curves.
-fn parse_transfer_function(obj: &Object) -> Option<SMaskTransfer> {
+/// interpolation), Type 3 (stitching), and Type 4 (PostScript calculator)
+/// are recognised per ISO 32000-1:2008 §7.10. Unrecognised function
+/// types fall to Identity, the spec default for an absent or
+/// unrecognised /TR per §11.4.7.
+fn parse_transfer_function(doc: &PdfDocument, obj: &Object) -> Option<SMaskTransfer> {
     // Identity is a Name `/Identity` per Table 109. Anything else
     // should be a function dictionary.
     if let Some("Identity") = obj.as_name() {
@@ -6839,6 +6927,7 @@ fn parse_transfer_function(obj: &Object) -> Option<SMaskTransfer> {
                 .unwrap_or(1.0);
             Some(SMaskTransfer::Type2 { c0, c1, n })
         },
+        3 => parse_type3_transfer_function(doc, dict).or(Some(SMaskTransfer::Identity)),
         4 => parse_type4_transfer_function(obj).or(Some(SMaskTransfer::Identity)),
         _ => Some(SMaskTransfer::Identity),
     }
@@ -6962,6 +7051,88 @@ fn parse_type4_transfer_function(obj: &Object) -> Option<SMaskTransfer> {
     };
     let program = crate::functions::Program::compile(&stream_bytes).ok()?;
     Some(SMaskTransfer::Type4 { program })
+}
+
+/// Parse a Type 3 stitching function (§7.10.4) as a transfer function.
+/// A stitching function combines `k` subfunctions over disjoint
+/// subintervals of `/Domain`, dispatching the input through whichever
+/// subfunction's subinterval contains it after a linear remap. The
+/// SMask /TR contract is 1-input 1-output (§11.6.5.2 Table 144), so
+/// the outer function's `/Domain` is a 2-element array and each
+/// subfunction must itself parse as a 1-input 1-output transfer.
+///
+/// Required entries per Table 39:
+///  - `/Domain [x0 x1]` — 2-element array.
+///  - `/Functions [f0 ... f(k-1)]` — array of `k` subfunctions, each
+///    parsed recursively (any type the dispatcher accepts is valid).
+///  - `/Bounds [b0 ... b(k-2)]` — `k - 1` boundary values dividing
+///    `/Domain` into `k` subintervals; per §7.10.4 the spec requires
+///    `x0 < b0 < b1 < ... < b(k-2) < x1`. We do NOT enforce strict
+///    monotonicity here: a zero-width subinterval (e.g. `b(j-1) ==
+///    b(j)`, or a boundary equal to an endpoint) is malformed but
+///    spec-permitted; the `eval` arm handles the zero-width case by
+///    using the subfunction's `encode_lo` directly.
+///  - `/Encode [e0_lo e0_hi ... e(k-1)_lo e(k-1)_hi]` — `2k` values
+///    mapping each subinterval to its subfunction's native input range.
+///
+/// Returns `None` for any shape the /TR contract rejects:
+/// multi-input outer function, mismatched `/Bounds` or `/Encode`
+/// arity, a subfunction that fails to parse, or zero subfunctions.
+/// The caller falls back to Identity on `None`.
+fn parse_type3_transfer_function(
+    doc: &PdfDocument,
+    dict: &std::collections::HashMap<String, Object>,
+) -> Option<SMaskTransfer> {
+    // Outer /Domain must be 1-input (2 values) for a /TR function.
+    let domain_arr = dict.get("Domain").and_then(|o| o.as_array())?;
+    if domain_arr.len() != 2 {
+        return None;
+    }
+    let x0 = obj_to_f32(domain_arr.first()?)?;
+    let x1 = obj_to_f32(domain_arr.get(1)?)?;
+
+    // /Functions — recursively parse each subfunction. Subfunctions
+    // can be indirect refs so we resolve before recursing.
+    let funcs_arr = dict.get("Functions").and_then(|o| o.as_array())?;
+    if funcs_arr.is_empty() {
+        return None;
+    }
+    let k = funcs_arr.len();
+    let mut subfunctions: Vec<SMaskTransfer> = Vec::with_capacity(k);
+    for f in funcs_arr {
+        let resolved = doc.resolve_object(f).ok()?;
+        let parsed = parse_transfer_function(doc, &resolved)?;
+        subfunctions.push(parsed);
+    }
+
+    // /Bounds — k-1 entries.
+    let bounds_arr = dict.get("Bounds").and_then(|o| o.as_array())?;
+    if bounds_arr.len() != k - 1 {
+        return None;
+    }
+    let mut bounds: Vec<f32> = Vec::with_capacity(k - 1);
+    for b in bounds_arr {
+        bounds.push(obj_to_f32(b)?);
+    }
+
+    // /Encode — 2k entries (k pairs of (lo, hi)).
+    let encode_arr = dict.get("Encode").and_then(|o| o.as_array())?;
+    if encode_arr.len() != 2 * k {
+        return None;
+    }
+    let mut encode: Vec<(f32, f32)> = Vec::with_capacity(k);
+    for i in 0..k {
+        let lo = obj_to_f32(encode_arr.get(2 * i)?)?;
+        let hi = obj_to_f32(encode_arr.get(2 * i + 1)?)?;
+        encode.push((lo, hi));
+    }
+
+    Some(SMaskTransfer::Type3 {
+        subfunctions,
+        bounds,
+        encode,
+        domain: (x0, x1),
+    })
 }
 
 fn obj_to_f32(o: &Object) -> Option<f32> {
