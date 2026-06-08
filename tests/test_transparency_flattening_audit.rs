@@ -757,6 +757,444 @@ fn smask_bc_devicen_5_components_evaluates_tint_transform() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// §11.6.5.2 + §7.10 /BC n=5 DeviceN tint-transform type coverage.
+//
+// The four probes below pin the renderer's evaluation of Type 0 sampled,
+// Type 2 exponential, Type 3 stitching, and Type 4 PostScript tint
+// transforms against a five-component DeviceN /BC backdrop. Type 2 + 4
+// are covered by `smask_bc_devicen_5_components_evaluates_tint_transform`
+// above; the new Type 0 + Type 3 probes close `evaluate_devicen_bc_to_rgb`
+// gaps that previously fell through to the (0, 0, 0) black-point default.
+// ---------------------------------------------------------------------------
+
+/// Build a /SMask /BC n=5 fixture with a Type 0 sampled tint transform.
+///
+/// Layout: Size [2 1 1 1 1] over a 4-output (DeviceCMYK alternate)
+/// function. The 2-grid case is the minimal CLUT that exercises the
+/// N-linear interpolation engine — both grid points emit the same
+/// per-channel byte so the output is constant regardless of bc[0]
+/// fractional position (proves the byte path), while a non-uniform
+/// stream (changing the second sample's K byte) would surface a
+/// different output (proves the LUT is read).
+fn fixture_smask_bc_devicen_5_components_type0_sampled() -> Vec<u8> {
+    // 2 grid points × 4 outputs = 8 packed bytes, BitsPerSample 8.
+    // Stream: g0_C, g0_M, g0_Y, g0_K, g1_C, g1_M, g1_Y, g1_K
+    //       = 10,   30,   50,   70,   10,   30,   50,   70.
+    let sample_bytes: [u8; 8] = [10, 30, 50, 70, 10, 30, 50, 70];
+    let obj_5 = {
+        let header = format!(
+            "5 0 obj\n<< /FunctionType 0 /Domain [0 1 0 1 0 1 0 1 0 1] \
+             /Range [0 1 0 1 0 1 0 1] /Size [2 1 1 1 1] /BitsPerSample 8 \
+             /Length {} >>\nstream\n",
+            sample_bytes.len()
+        );
+        let mut buf = header.into_bytes();
+        buf.extend_from_slice(&sample_bytes);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+        unsafe { String::from_utf8_unchecked(buf) }
+    };
+    let cs_arr = "[/DeviceN [/Ink1 /Ink2 /Ink3 /Ink4 /Ink5] /DeviceCMYK 5 0 R]";
+    let form_content = "% empty form\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS {} >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        cs_arr,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 6 0 R \
+                     /BC [0.5 0.5 0.5 0.5 0.5] >> >> >>";
+    build_pdf(content, resources, &[obj_5.as_str(), &obj_6])
+}
+
+/// §7.10.2 + §11.6.5.2 /BC n=5 DeviceN with a Type 0 sampled tint
+/// transform.
+///
+/// Reference:
+///   Stream = [10, 30, 50, 70, 10, 30, 50, 70]. Both grid points
+///   carry identical 4-output samples, so any bc tuple produces output
+///   CMYK = (10, 30, 50, 70) / 255.
+///   §10.3.5 additive-clamp CMYK → RGB:
+///     R_byte = ((1 - 80/255) · 255).round() = 175
+///     G_byte = ((1 - 100/255) · 255).round() = 155
+///     B_byte = ((1 - 120/255) · 255).round() = 135
+///   §11.5.3 Luminosity m = (0.30·175 + 0.59·155 + 0.11·135) / 255
+///                       = 158.80 / 255 ≈ 0.62275.
+///   Red painted (255, 0, 0) over white (255, 255, 255) snapshot at
+///   m ≈ 0.62275:
+///     R_out = m·255 + (1-m)·255 = 255
+///     G_out = m·0   + (1-m)·255 = 96.21 → byte 96
+///     B_out = same as G_out                = 96
+#[test]
+fn smask_bc_devicen_5_components_type0_sampled_byte_exact() {
+    let rgba = render_rgba(fixture_smask_bc_devicen_5_components_type0_sampled());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 96, 96),
+        "§7.10.2 Type 0 sampled /BC tint-transform evaluation; expected \
+         byte-exact (255, 96, 96); got ({r}, {g}, {b}). A regression to \
+         (255, 255, 255) means the Type 0 evaluator fell to None and the \
+         /BC pre-fill collapsed to the (0, 0, 0) black point — paint then \
+         shows through unmasked."
+    );
+}
+
+/// Build a /SMask /BC n=5 fixture with a Type 3 stitching tint
+/// transform.
+///
+/// /Domain [0 1] split at /Bounds [0.4]:
+///
+///   - sub-0: Type 2 (C0=[0 0 0 0], C1=[0.3 0.4 0.5 0.6], N=1)
+///   - sub-1: Type 2 (C0=[0 0 0 0.5], C1=[0 0 0 1.0], N=1)
+///
+/// /Encode [0 1 0 1] — each subinterval passes through unchanged.
+///
+/// With bc[0] = 0.6 (the first /BC tint; Type 3 is single-input by
+/// spec), 0.6 > 0.4 → subinterval 1. Linear remap:
+///   encoded = 0 + (0.6 - 0.4) · (1 - 0) / (1 - 0.4) = 0.3333...
+/// Subfunction 1 emits CMYK (0, 0, 0, 0.5 + 0.3333·(1 - 0.5))
+///                      = (0, 0, 0, 0.6667).
+fn fixture_smask_bc_devicen_5_components_type3_stitching() -> Vec<u8> {
+    let obj_5 = "5 0 obj\n<< /FunctionType 3 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] \
+                 /Functions [ \
+                   << /FunctionType 2 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] \
+                      /C0 [0 0 0 0] /C1 [0.3 0.4 0.5 0.6] /N 1 >> \
+                   << /FunctionType 2 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] \
+                      /C0 [0 0 0 0.5] /C1 [0 0 0 1] /N 1 >> \
+                 ] /Bounds [0.4] /Encode [0 1 0 1] >>\nendobj\n";
+    let cs_arr = "[/DeviceN [/Ink1 /Ink2 /Ink3 /Ink4 /Ink5] /DeviceCMYK 5 0 R]";
+    let form_content = "% empty form\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS {} >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        cs_arr,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 6 0 R \
+                     /BC [0.6 0 0 0 0] >> >> >>";
+    build_pdf(content, resources, &[obj_5, &obj_6])
+}
+
+/// §7.10.4 + §11.6.5.2 /BC n=5 DeviceN with a Type 3 stitching tint
+/// transform.
+///
+/// Reference:
+///   bc[0] = 0.6 → subinterval 1 (since 0.6 > 0.4). Linear remap onto
+///   sub-1's [0, 1] /Encode: t = (0.6 - 0.4) / (1 - 0.4) = 0.33333.
+///   Sub-1 Type 2 (C0=[0 0 0 0.5], C1=[0 0 0 1], N=1):
+///     K = 0.5 + 0.33333·(1 - 0.5) = 0.66667.
+///   §10.3.5 additive-clamp CMYK (0, 0, 0, 0.66667) → RGB:
+///     R_byte = ((1 - 0.66667) · 255).round() = 85
+///     G_byte = 85, B_byte = 85.
+///   §11.5.3 Luminosity m = (0.30 + 0.59 + 0.11) · 85 / 255 = 85/255
+///                       ≈ 0.33333.
+///   Red (255, 0, 0) over white (255, 255, 255) at m ≈ 0.33333:
+///     R_out = 255, G_out = (1 - 0.33333) · 255 = 170, B_out = 170.
+#[test]
+fn smask_bc_devicen_5_components_type3_stitching_byte_exact() {
+    let rgba = render_rgba(fixture_smask_bc_devicen_5_components_type3_stitching());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 170, 170),
+        "§7.10.4 Type 3 stitching /BC tint-transform evaluation; expected \
+         byte-exact (255, 170, 170); got ({r}, {g}, {b}). A regression to \
+         (255, 255, 255) means the Type 3 evaluator fell to None and the \
+         /BC pre-fill collapsed to the (0, 0, 0) black point."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §8.6.5.2-5 /BC alternate-space projection — Lab / CalGray / CalRGB /
+// ICCBased coverage.
+// ---------------------------------------------------------------------------
+
+/// Build a /SMask /BC n=5 fixture with a Type 4 tint transform that
+/// emits Lab values and a /Lab alternate space.
+fn fixture_smask_bc_devicen_5_components_lab_alternate() -> Vec<u8> {
+    // PostScript: pop 5 inputs, push L=0.5 a=0 b=0. L is stored on the
+    // [0, 100] range per /Range, a/b on [-128, 127]. We emit
+    // (50, 0, 0) so the resulting Lab is mid-grey.
+    let tint = "{ pop pop pop pop pop 50 0 0 }";
+    let obj_5 = format!(
+        "5 0 obj\n<< /FunctionType 4 /Domain [0 1 0 1 0 1 0 1 0 1] \
+         /Range [0 100 -128 127 -128 127] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        tint.len(),
+        tint
+    );
+    let cs_arr = "[/DeviceN [/Ink1 /Ink2 /Ink3 /Ink4 /Ink5] \
+                  [/Lab << /WhitePoint [0.9505 1.0 1.0890] /Range [-128 127 -128 127] >>] \
+                  5 0 R]";
+    let form_content = "% empty form\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS {} >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        cs_arr,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 6 0 R \
+                     /BC [0.5 0.5 0.5 0.5 0.5] >> >> >>";
+    build_pdf(content, resources, &[obj_5.as_str(), &obj_6])
+}
+
+/// §8.6.5.4 Lab → XYZ → sRGB closed-form projection on the /BC path.
+/// The tint transform emits (L=50, a=0, b=0); §8.6.5.4 inverse:
+///   M = (50 + 16) / 116 = 0.5690
+///   inv_f(M) = M^3 (since M > 6/29) = 0.18419
+///   XYZ = (0.9505, 1.0, 1.0890) · 0.18419 = (0.17506, 0.18419, 0.20059)
+/// sRGB linear via the standard primaries matrix yields ≈
+///   r_lin = g_lin = b_lin = 0.18419 (neutral grey).
+/// IEC 61966-2-1 gamma compress (since 0.18419 > 0.0031308):
+///   s = 1.055 · 0.18419^(1/2.4) - 0.055 = 0.46625
+/// Byte: round(0.46625 · 255) = 119.
+/// Mask byte (119, 119, 119) → m = 119/255 = 0.46667.
+/// Red (255, 0, 0) over white (255, 255, 255) at m ≈ 0.46667:
+///   G_out = (1 - 0.46667) · 255 = 136.0 → byte 136.
+/// Reference: (255, 136, 136). Sensitivity: with the closed-form
+/// projection short-circuited to (0, 0, 0) the mask collapses to m=0
+/// and the paint shows through unmasked = (255, 255, 255).
+#[test]
+fn smask_bc_devicen_5_components_lab_alternate_byte_exact() {
+    let rgba = render_rgba(fixture_smask_bc_devicen_5_components_lab_alternate());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 136, 136),
+        "§8.6.5.4 Lab /BC alternate-space projection; expected byte-exact \
+         (255, 136, 136); got ({r}, {g}, {b}). A regression to \
+         (255, 255, 255) means the Lab projection short-circuited to \
+         (0, 0, 0) — closed-form Lab → XYZ → sRGB is not firing."
+    );
+}
+
+fn fixture_smask_bc_devicen_5_components_calrgb_alternate() -> Vec<u8> {
+    // Tint transform: pop 5 inputs, push CalRGB (0.5, 0.5, 0.5).
+    let tint = "{ pop pop pop pop pop 0.5 0.5 0.5 }";
+    let obj_5 = format!(
+        "5 0 obj\n<< /FunctionType 4 /Domain [0 1 0 1 0 1 0 1 0 1] \
+         /Range [0 1 0 1 0 1] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        tint.len(),
+        tint
+    );
+    // /CalRGB with identity matrix and gamma 1 — so the calibrated
+    // (a, b, c) tuple becomes XYZ = (X_w·a, Y_w·b, Z_w·c). The constant
+    // grey 0.5 input keeps the maths checkable without an opaque
+    // matrix layer.
+    let cs_arr = "[/DeviceN [/Ink1 /Ink2 /Ink3 /Ink4 /Ink5] \
+                  [/CalRGB << /WhitePoint [0.9505 1.0 1.0890] \
+                              /Gamma [1.0 1.0 1.0] \
+                              /Matrix [1 0 0 0 1 0 0 0 1] >>] \
+                  5 0 R]";
+    let form_content = "% empty form\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS {} >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        cs_arr,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 6 0 R \
+                     /BC [0.5 0.5 0.5 0.5 0.5] >> >> >>";
+    build_pdf(content, resources, &[obj_5.as_str(), &obj_6])
+}
+
+/// §8.6.5.3 CalRGB → linear XYZ → sRGB closed-form projection on the
+/// /BC path.
+///
+/// Reference:
+///   Gamma=[1 1 1] and Matrix=identity makes the gamma-applied
+///   (A, B, C) tuple equal the XYZ tristimulus directly:
+///     XYZ = identity · (0.5, 0.5, 0.5) = (0.5, 0.5, 0.5).
+///   sRGB linear via the BT.709 / sRGB primaries matrix:
+///     r_lin = (3.2404542 - 1.5371385 - 0.4985314) · 0.5 ≈ 0.60239
+///     g_lin = (-0.9692660 + 1.8760108 + 0.0415560) · 0.5 ≈ 0.47415
+///     b_lin = (0.0556434 - 0.2040259 + 1.0572252) · 0.5 ≈ 0.45442
+///   IEC 61966-2-1 gamma compress (u > 0.0031308):
+///     r ≈ 1.055·0.60239^(1/2.4) - 0.055 ≈ 0.799 → byte 204
+///     g ≈ 1.055·0.47415^(1/2.4) - 0.055 ≈ 0.718 → byte 183
+///     b ≈ 1.055·0.45442^(1/2.4) - 0.055 ≈ 0.705 → byte 180
+///   Mask (≈ 204, 183, 180) — chromatic because the identity matrix
+///   does NOT correct CalRGB into a D65 sRGB neutral; the D65 white
+///   point is only honoured implicitly through the inverse XYZ → sRGB
+///   step. §11.5.3 Luminosity Y on the chromatic mask byte:
+///     m = (0.30·204 + 0.59·183 + 0.11·180) / 255 ≈ 0.7411.
+///   Red (255, 0, 0) over white (255, 255, 255) at m ≈ 0.7411:
+///     G_out = (1 - 0.7411)·255 ≈ 66.0 → byte 66.
+///   Reference: (255, 66, 66). Sensitivity: with the projection
+///   short-circuited to (0, 0, 0) the mask collapses to m=0 → paint
+///   shows through unmasked = (255, 255, 255).
+#[test]
+fn smask_bc_devicen_5_components_calrgb_alternate_byte_exact() {
+    let rgba = render_rgba(fixture_smask_bc_devicen_5_components_calrgb_alternate());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 66, 66),
+        "§8.6.5.3 CalRGB /BC alternate-space projection; expected \
+         byte-exact (255, 66, 66); got ({r}, {g}, {b})"
+    );
+}
+
+fn fixture_smask_bc_devicen_5_components_calgray_alternate() -> Vec<u8> {
+    // Tint transform: pop 5 inputs, push CalGray = 0.5.
+    let tint = "{ pop pop pop pop pop 0.5 }";
+    let obj_5 = format!(
+        "5 0 obj\n<< /FunctionType 4 /Domain [0 1 0 1 0 1 0 1 0 1] \
+         /Range [0 1] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        tint.len(),
+        tint
+    );
+    let cs_arr = "[/DeviceN [/Ink1 /Ink2 /Ink3 /Ink4 /Ink5] \
+                  [/CalGray << /WhitePoint [0.9505 1.0 1.0890] /Gamma 1.0 >>] \
+                  5 0 R]";
+    let form_content = "% empty form\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS {} >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        cs_arr,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 6 0 R \
+                     /BC [0.5 0.5 0.5 0.5 0.5] >> >> >>";
+    build_pdf(content, resources, &[obj_5.as_str(), &obj_6])
+}
+
+/// §8.6.5.2 CalGray → linear XYZ → sRGB closed-form projection on the
+/// /BC path.
+///
+/// Reference:
+///   With Gamma=1, CalGray a maps to A_g = a^1 = a. Then
+///     XYZ = (X_w, Y_w, Z_w) · A_g = (0.9505, 1.0, 1.0890) · 0.5
+///         = (0.47525, 0.5, 0.54450).
+///   sRGB linear via the BT.709 / sRGB primaries matrix at D65:
+///     r_lin = 3.2404542·0.47525 - 1.5371385·0.5 - 0.4985314·0.54450 ≈ 0.4997
+///     g_lin = -0.9692660·0.47525 + 1.8760108·0.5 + 0.0415560·0.54450 ≈ 0.4999
+///     b_lin = 0.0556434·0.47525 - 0.2040259·0.5 + 1.0572252·0.54450 ≈ 0.5001
+///   The D65-aligned WhitePoint makes the CalGray a=0.5 land at neutral
+///   sRGB linear ≈ (0.5, 0.5, 0.5) — distinct from the CalRGB identity-
+///   matrix probe above, which lands chromatic. Gamma compress:
+///     s ≈ 1.055·0.5^(1/2.4) - 0.055 ≈ 0.7353 → byte 188.
+///   Mask (188, 188, 187) — the b channel rounds to 187 due to the
+///   tiny offset that the inexact b_lin ≈ 0.5001 introduces. §11.5.3
+///   Luminosity:
+///     m = (0.30·188 + 0.59·188 + 0.11·187) / 255 ≈ 0.7368.
+///   Red (255, 0, 0) over white (255, 255, 255) at m ≈ 0.7368:
+///     G_out = (1 - 0.7368)·255 ≈ 67.1 → byte 67.
+///   Reference: (255, 67, 67).
+#[test]
+fn smask_bc_devicen_5_components_calgray_alternate_byte_exact() {
+    let rgba = render_rgba(fixture_smask_bc_devicen_5_components_calgray_alternate());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 67, 67),
+        "§8.6.5.2 CalGray /BC alternate-space projection; expected \
+         byte-exact (255, 67, 67); got ({r}, {g}, {b})"
+    );
+}
+
+fn fixture_smask_bc_devicen_5_components_iccbased_alternate() -> Vec<u8> {
+    // Tint transform: pop 5 inputs, push CMYK (0, 0, 0, 0.5).
+    let tint = "{ pop pop pop pop pop 0 0 0 0.5 }";
+    let obj_5 = format!(
+        "5 0 obj\n<< /FunctionType 4 /Domain [0 1 0 1 0 1 0 1 0 1] \
+         /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        tint.len(),
+        tint
+    );
+    // ICCBased N=4 stream — no embedded profile bytes (we don't ship a
+    // CMYK profile inline). The /Alternate /DeviceCMYK declares the
+    // fallback path the projection takes when no CMM can resolve the
+    // empty stream; this is the spec §8.6.5.5 "no profile → fall to
+    // alternate" path. Byte-exact reference is derived from the
+    // additive-clamp CMYK → RGB at the /Alternate fallback, identical
+    // to the round-trip of the same tint transform against a bare
+    // /DeviceCMYK alternate.
+    let icc_obj =
+        "7 0 obj\n<< /N 4 /Alternate /DeviceCMYK /Length 0 >>\nstream\n\nendstream\nendobj\n";
+    let cs_arr = "[/DeviceN [/Ink1 /Ink2 /Ink3 /Ink4 /Ink5] \
+                  [/ICCBased 7 0 R] \
+                  5 0 R]";
+    let form_content = "% empty form\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS {} >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        cs_arr,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 6 0 R \
+                     /BC [0.5 0.5 0.5 0.5 0.5] >> >> >>";
+    build_pdf(content, resources, &[obj_5.as_str(), &obj_6, icc_obj])
+}
+
+/// §8.6.5.5 ICCBased /BC alternate-space projection.
+///
+/// Reference: the ICCBased stream carries no actual profile bytes, so
+/// the CMM (lcms2 or qcms) refuses the parse and the projection falls
+/// through to /Alternate /DeviceCMYK per the §8.6.5.5 contract. The
+/// tint transform output (0, 0, 0, 0.5) projects via §10.3.5 additive
+/// clamp:
+///   R = 1 - 0.5 = 0.5 → byte 128 (round(127.5) = 128 banker's-round
+///                             matches f32::round() = round-half-away).
+///   G = 128, B = 128.
+/// Mask (128, 128, 128) → m = 128/255 ≈ 0.50196.
+/// Red over white at m ≈ 0.50196:
+///   G_out = (1 - 0.50196)·255 = 127.0 → byte 127.
+/// Reference: (255, 127, 127).
+#[test]
+fn smask_bc_devicen_5_components_iccbased_alternate_byte_exact() {
+    let rgba = render_rgba(fixture_smask_bc_devicen_5_components_iccbased_alternate());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (255, 127, 127),
+        "§8.6.5.5 ICCBased /BC projection via /Alternate fallback; \
+         expected byte-exact (255, 127, 127); got ({r}, {g}, {b})"
+    );
+}
+
 /// `/SMask /TR` Type-0 sampled function per §7.10.2. The 256-byte
 /// inverted-ramp LUT (sample[i] = 255-i) approximates f(x) = 1 - x.
 #[test]
@@ -1415,67 +1853,155 @@ fn blend_saturation_grey_source_desaturates_red_to_grey() {
 }
 
 fn fixture_blend_color_blue_source_over_red() -> Vec<u8> {
-    // Color: take source H+S, destination L. Source=blue (H=240°, S=1,
-    // L=0.5). Dest=red (H=0°, S=1, L=0.5). Result H=240°, S=1, L=0.5 →
-    // pure blue (0, 0, 255). SourceOver fallback also yields blue,
-    // making this a degenerate case visually — the probe is a
-    // dispatch-trace pin and the degeneracy is documented.
-    let content = "1 0 0 rg\n0 0 100 100 re\nf\n\
+    // Non-degenerate Color-blend fixture per §11.3.5.3:
+    //
+    //   backdrop = (0.9, 0.4, 0.4)  — light red, Lum_b = 0.55
+    //   source   = (0.0, 0.0, 0.6)  — dark blue,  Lum_s = 0.066
+    //
+    // Color blend takes the source's hue+saturation but PRESERVES the
+    // backdrop's luminance, so the output is a *light* blue distinct
+    // from the dark-blue source. SourceOver fallback (the degenerate
+    // path) just paints the dark-blue source — byte-distinct from the
+    // Color-blend reference.
+    let content = "0.9 0.4 0.4 rg\n0 0 100 100 re\nf\n\
                    /Col gs\n\
-                   0 0 1 rg\n\
+                   0 0 0.6 rg\n\
                    20 20 60 60 re\nf\n";
     let resources = "/ExtGState << /Col << /Type /ExtGState /BM /Color >> >>";
     build_pdf(content, resources, &[])
 }
 
-/// IGNORED — Color: source blue applied to dest red, L from red →
-/// pure blue. This is degenerate vs SourceOver visually; the probe
-/// remains an explicit per-mode pin so the dispatch-side fix is
-/// observable when the divergent fixture lands.
+fn fixture_blend_color_blue_source_over_red_sourceover_baseline() -> Vec<u8> {
+    // Same fixture, no /BM declaration — exercises the SourceOver
+    // fallback so the assert_ne! pins the dispatch-side fix.
+    let content = "0.9 0.4 0.4 rg\n0 0 100 100 re\nf\n\
+                   0 0 0.6 rg\n\
+                   20 20 60 60 re\nf\n";
+    build_pdf(content, "", &[])
+}
+
+/// §11.3.5.3 Color blend: source's hue + saturation, backdrop's
+/// luminance.
+///
+/// Reference computation (BT.601 luma weights per §11.3.5.3):
+///   Cb = (0.9, 0.4, 0.4)   Lum_b = 0.30·0.9 + 0.59·0.4 + 0.11·0.4 = 0.55
+///   Cs = (0.0, 0.0, 0.6)   Lum_s = 0.30·0   + 0.59·0   + 0.11·0.6 = 0.066
+///
+///   SetLum(Cs, 0.55):
+///     d         = 0.55 - 0.066 = 0.484
+///     shifted   = (0.484, 0.484, 1.084)
+///     ClipColor: x = 1.084 > 1; l = 0.55; denom = 1.084 - 0.55 = 0.534
+///       scale   = (1 - l) / denom = 0.45 / 0.534 ≈ 0.84269...
+///       r = 0.55 + (0.484 - 0.55) · 0.84269 = 0.55 - 0.05562 = 0.49438
+///       g = 0.49438
+///       b = 0.55 + (1.084 - 0.55) · 0.84269 = 0.55 + 0.45 = 1.0
+///   Out · 255   → (126, 126, 255).
+///
+/// SourceOver baseline (degenerate fallback): the opaque dark-blue
+/// source replaces the backdrop in the painted region → (0, 0, 153).
+///
+/// assert_ne! across the two outputs confirms the §11.3.5.3 dispatch is
+/// non-degenerate against SourceOver for this fixture pair.
 #[test]
 fn blend_color_blue_source_over_red_yields_blue() {
-    let rgba = render_rgba(fixture_blend_color_blue_source_over_red());
-    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        b > 200 && r < 80 && g < 80,
-        "ISO 32000-1 §11.3.5.3 Color blend: source-blue + dest-red → blue \
-         dominant; got ({r}, {g}, {b})"
+    let rgba_color = render_rgba(fixture_blend_color_blue_source_over_red());
+    let (r, g, b, _) = pixel_at(&rgba_color, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (126, 126, 255),
+        "§11.3.5.3 Color blend SetLum((0,0,0.6), 0.55) must produce \
+         byte-exact (126, 126, 255); got ({r}, {g}, {b})"
+    );
+
+    let rgba_sourceover =
+        render_rgba(fixture_blend_color_blue_source_over_red_sourceover_baseline());
+    let (r_so, g_so, b_so, _) = pixel_at(&rgba_sourceover, 50, 50);
+    assert_eq!(
+        (r_so, g_so, b_so),
+        (0, 0, 153),
+        "SourceOver baseline: opaque (0,0,0.6) over (0.9,0.4,0.4) must \
+         produce byte-exact (0, 0, 153); got ({r_so}, {g_so}, {b_so})"
+    );
+
+    assert_ne!(
+        (r, g, b),
+        (r_so, g_so, b_so),
+        "§11.3.5.3 Color blend must differ from SourceOver for the chosen \
+         non-degenerate fixture; the two outputs collapsed — the \
+         non-separable dispatch is not firing"
     );
 }
 
 fn fixture_blend_luminosity_grey_source_over_red() -> Vec<u8> {
-    // Luminosity: take destination H+S, source L. Source=mid-grey (L=0.5
-    // by BT.601 luminance Y=128). Dest=red (H=0°, S=1, L_red).
-    // Per §11.3.5.3 the formula uses Y' = 0.30·R + 0.59·G + 0.11·B,
-    // and SetLum maps the destination's H+S to match the source's
-    // luminance. The non-degenerate case: a correct HSY-space
-    // implementation produces a red-dominant output; the SourceOver
-    // fallback produces a *grey* output. Asserting red-dominance is
-    // the cleanest non-degenerate signal.
-    let content = "1 0 0 rg\n0 0 100 100 re\nf\n\
+    // Non-degenerate Luminosity-blend fixture per §11.3.5.3:
+    //
+    //   backdrop = (0.9, 0.2, 0.2)  — bright saturated red, Lum_b = 0.41
+    //   source   = (0.2, 0.2, 0.2)  — dark grey,            Lum_s = 0.20
+    //
+    // Luminosity takes backdrop's hue+saturation but the SOURCE's
+    // luminance, producing a *dark* red byte-distinct from the dark-grey
+    // source. SourceOver fallback paints the dark grey itself.
+    let content = "0.9 0.2 0.2 rg\n0 0 100 100 re\nf\n\
                    /Lum gs\n\
-                   0.5 g\n\
+                   0.2 0.2 0.2 rg\n\
                    20 20 60 60 re\nf\n";
     let resources = "/ExtGState << /Lum << /Type /ExtGState /BM /Luminosity >> >>";
     build_pdf(content, resources, &[])
 }
 
-/// IGNORED — Luminosity: a grey source applied to a red dest should
-/// produce a brightened *red* whose luminance matches the source
-/// (~Y=128), not the grey itself. The non-degenerate case: a correct
-/// HSY-space implementation produces a red-dominant output; the
-/// SourceOver fallback produces a *grey* output. Asserting
-/// red-dominance + low B is the cleanest non-degenerate signal.
+fn fixture_blend_luminosity_grey_source_over_red_sourceover_baseline() -> Vec<u8> {
+    let content = "0.9 0.2 0.2 rg\n0 0 100 100 re\nf\n\
+                   0.2 0.2 0.2 rg\n\
+                   20 20 60 60 re\nf\n";
+    build_pdf(content, "", &[])
+}
+
+/// §11.3.5.3 Luminosity blend: backdrop's hue + saturation, source's
+/// luminance.
+///
+/// Reference computation:
+///   Cb = (0.9, 0.2, 0.2)   Lum_b = 0.30·0.9 + 0.59·0.2 + 0.11·0.2 = 0.41
+///   Cs = (0.2, 0.2, 0.2)   Lum_s = 0.20
+///
+///   SetLum(Cb, 0.20):
+///     d         = 0.20 - 0.41 = -0.21
+///     shifted   = (0.69, -0.01, -0.01)
+///     ClipColor: n = -0.01 < 0; l = 0.20; denom = l - n = 0.21
+///       scale   = l / denom = 0.20 / 0.21 ≈ 0.95238
+///       r = 0.20 + (0.69  - 0.20) · 0.95238 = 0.20 + 0.46667 = 0.66667
+///       g = 0.20 + (-0.01 - 0.20) · 0.95238 = 0.20 - 0.20000 = 0.0
+///       b = 0.0
+///   Out · 255   → (170, 0, 0).
+///
+/// SourceOver baseline: opaque dark grey replaces backdrop → (51, 51, 51).
+///
+/// assert_ne! confirms Luminosity dispatch is non-degenerate.
 #[test]
 fn blend_luminosity_grey_source_over_red_keeps_red_hue() {
-    let rgba = render_rgba(fixture_blend_luminosity_grey_source_over_red());
-    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    assert!(
-        dominates(r as f32, &[g as f32, b as f32], DOMINANCE_MARGIN),
-        "ISO 32000-1 §11.3.5.3 Luminosity: grey source + red dest must \
-         preserve red HUE (R dominates G and B by ≥ {DOMINANCE_MARGIN}); \
-         got ({r}, {g}, {b}). A SourceOver fallback would output ~(128, \
-         128, 128) — grey — which fails the dominance assertion."
+    let rgba_lum = render_rgba(fixture_blend_luminosity_grey_source_over_red());
+    let (r, g, b, _) = pixel_at(&rgba_lum, 50, 50);
+    assert_eq!(
+        (r, g, b),
+        (170, 0, 0),
+        "§11.3.5.3 Luminosity SetLum((0.9, 0.2, 0.2), 0.20) must produce \
+         byte-exact (170, 0, 0); got ({r}, {g}, {b})"
+    );
+
+    let rgba_so = render_rgba(fixture_blend_luminosity_grey_source_over_red_sourceover_baseline());
+    let (r_so, g_so, b_so, _) = pixel_at(&rgba_so, 50, 50);
+    assert_eq!(
+        (r_so, g_so, b_so),
+        (51, 51, 51),
+        "SourceOver baseline: opaque (0.2, 0.2, 0.2) over (0.9, 0.2, 0.2) \
+         must produce byte-exact (51, 51, 51); got ({r_so}, {g_so}, {b_so})"
+    );
+
+    assert_ne!(
+        (r, g, b),
+        (r_so, g_so, b_so),
+        "§11.3.5.3 Luminosity must differ from SourceOver for the chosen \
+         non-degenerate fixture; the two outputs collapsed — the \
+         non-separable dispatch is not firing"
     );
 }
 
@@ -1513,24 +2039,56 @@ fn fixture_overprint_composite_two_cmyk_paints_no_op() -> Vec<u8> {
     build_pdf(content_without_op, "", &[])
 }
 
-/// IGNORED — composite path does not honour `/op`. The probe expects
-/// the *with-overprint* render to differ from the *without-overprint*
-/// render in the overlap region (the cyan must show through where
-/// overprint preserves it). As-shipped, the two renders produce
-/// identical bytes.
+/// §11.7.4.3 CompatibleOverprint dispatch with OPM=1 on the composite
+/// path. Reference values are derived directly from ISO 32000-1:2008
+/// §11.7.4.3 Table 149 row 1 (DeviceCMYK direct) plus §10.3.5
+/// additive-clamp at the final CMYK→RGB step (no OutputIntent declared).
+///
+/// Fixture: backdrop paint CMYK(0.5, 0, 0, 0) — cyan only. Overlapping
+/// paint CMYK(0, 0, 1, 0) — yellow only, with `/OP true /op true /OPM 1`.
+///
+/// With overprint (OPM=1), per Table 149 row 1:
+/// - C plate: c_s=0 → preserve backdrop c_b=0.5
+/// - M plate: c_s=0 → preserve backdrop c_b=0
+/// - Y plate: c_s=1 → use c_s=1
+/// - K plate: c_s=0 → preserve backdrop c_b=0
+///
+/// Composed CMYK = (0.5, 0, 1, 0). §10.3.5 additive-clamp:
+/// - R = 1 - (0.5 + 0) = 0.5 → round(127.5) = 128
+/// - G = 1 - (0   + 0) = 1.0 → 255
+/// - B = 1 - (1.0 + 0) = 0.0 → 0
+///
+/// Without overprint, the second paint replaces (opaque SourceOver) in
+/// the overlap. CMYK = (0, 0, 1, 0) → additive-clamp RGB (255, 255, 0).
+///
+/// The two outputs MUST differ in the C-plate channel projection (R
+/// byte), confirming overprint changed which plates received the paint.
 #[test]
 fn overprint_composite_overlap_differs_from_no_overprint() {
     let rgba_op = render_rgba(fixture_overprint_composite_two_cmyk_paints());
     let rgba_no = render_rgba(fixture_overprint_composite_two_cmyk_paints_no_op());
-    // Overlap region: PDF (30..70, 30..70) → image (30..70, 30..70).
-    let (r_op, g_op, b_op) = mean_rgb(&rgba_op, 35, 65, 35, 65);
-    let (r_no, g_no, b_no) = mean_rgb(&rgba_no, 35, 65, 35, 65);
-    let delta = (r_op - r_no).abs() + (g_op - g_no).abs() + (b_op - b_no).abs();
-    assert!(
-        delta > 30.0,
-        "ISO 32000-1 §11.7.4 composite overprint must change the overlap \
-         region vs no-overprint; got delta {delta:.1} between \
-         ({r_op:.0},{g_op:.0},{b_op:.0}) and ({r_no:.0},{g_no:.0},{b_no:.0})"
+    let (r_op, g_op, b_op, _) = pixel_at(&rgba_op, 50, 50);
+    let (r_no, g_no, b_no, _) = pixel_at(&rgba_no, 50, 50);
+    assert_eq!(
+        (r_op, g_op, b_op),
+        (128, 255, 0),
+        "§11.7.4.3 OPM=1: CMYK(0.5,0,0,0) + CMYK(0,0,1,0) under /op true \
+         must compose to byte-exact RGB (128, 255, 0) at the overlap; \
+         got ({r_op}, {g_op}, {b_op})"
+    );
+    assert_eq!(
+        (r_no, g_no, b_no),
+        (255, 255, 0),
+        "§10.3.5 baseline: CMYK(0,0,1,0) opaque SourceOver over cyan must \
+         yield byte-exact RGB (255, 255, 0) at the overlap; got \
+         ({r_no}, {g_no}, {b_no})"
+    );
+    assert_ne!(
+        (r_op, g_op, b_op),
+        (r_no, g_no, b_no),
+        "§11.7.4.3 OPM=1 must change the C-plate (R-byte) projection at \
+         the overlap vs no-overprint; the two outputs collapsed to the \
+         same triple — overprint dispatch is not firing"
     );
 }
 
