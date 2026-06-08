@@ -840,8 +840,19 @@ impl PageRenderer {
                     // round 2 QA pinned that the spot mirror would then
                     // write the prior /CS_A's spot lane.
                     let resolved = self.color_spaces.get(name).cloned();
-                    let initial =
-                        sidecar_mod::initial_colour_for_space(name, resolved.as_ref(), doc);
+                    // §10.7.3: the §8.6.8 initial-colour evaluation runs an
+                    // ICC retarget for DeviceN /Process /ICCBased; thread
+                    // the live gs intent through so a prior `/Perceptual ri`
+                    // / ExtGState /RI propagates into the retarget tag pick.
+                    let intent_for_initial = crate::color::RenderingIntent::from_pdf_name(
+                        &gs_stack.current().rendering_intent,
+                    );
+                    let initial = sidecar_mod::initial_colour_for_space(
+                        name,
+                        resolved.as_ref(),
+                        doc,
+                        intent_for_initial,
+                    );
                     let gs = gs_stack.current_mut();
                     gs.fill_color_space = name.clone();
                     gs.fill_color_rgb = initial.rgb;
@@ -854,8 +865,15 @@ impl PageRenderer {
                 },
                 Operator::SetStrokeColorSpace { name } => {
                     let resolved = self.color_spaces.get(name).cloned();
-                    let initial =
-                        sidecar_mod::initial_colour_for_space(name, resolved.as_ref(), doc);
+                    let intent_for_initial = crate::color::RenderingIntent::from_pdf_name(
+                        &gs_stack.current().rendering_intent,
+                    );
+                    let initial = sidecar_mod::initial_colour_for_space(
+                        name,
+                        resolved.as_ref(),
+                        doc,
+                        intent_for_initial,
+                    );
                     let gs = gs_stack.current_mut();
                     gs.stroke_color_space = name.clone();
                     gs.stroke_color_rgb = initial.rgb;
@@ -1173,9 +1191,16 @@ impl PageRenderer {
                                                 // constant `(1,1,1,0)` source CMYK
                                                 // regardless of actual scn tints.
                                                 if type_name == "DeviceN" {
+                                                    let intent_for_extract =
+                                                        crate::color::RenderingIntent::from_pdf_name(
+                                                            &gs.rendering_intent,
+                                                        );
                                                     if let Some(cmyk) =
                                                         crate::rendering::sidecar::extract_process_paint_cmyk(
-                                                            rs, components, doc,
+                                                            rs,
+                                                            components,
+                                                            doc,
+                                                            intent_for_extract,
                                                         )
                                                     {
                                                         gs.fill_color_cmyk = Some(cmyk);
@@ -1295,9 +1320,16 @@ impl PageRenderer {
                                                 // fill side; see the comment in
                                                 // `SetFillColorN` above.
                                                 if type_name == "DeviceN" {
+                                                    let intent_for_extract =
+                                                        crate::color::RenderingIntent::from_pdf_name(
+                                                            &gs.rendering_intent,
+                                                        );
                                                     if let Some(cmyk) =
                                                         crate::rendering::sidecar::extract_process_paint_cmyk(
-                                                            rs, components, doc,
+                                                            rs,
+                                                            components,
+                                                            doc,
+                                                            intent_for_extract,
                                                         )
                                                     {
                                                         gs.stroke_color_cmyk = Some(cmyk);

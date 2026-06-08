@@ -1069,6 +1069,7 @@ pub(crate) fn extract_process_paint_cmyk(
     space: &Object,
     components: &[f32],
     doc: &PdfDocument,
+    rendering_intent: crate::color::RenderingIntent,
 ) -> Option<(f32, f32, f32, f32)> {
     let arr = space.as_array()?;
     if arr.first().and_then(Object::as_name)? != "DeviceN" {
@@ -1239,9 +1240,12 @@ pub(crate) fn extract_process_paint_cmyk(
                     //
                     // See HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH
                     // for the three-state matrix.
-                    if let Some(retargeted) =
-                        try_retarget_cmyk_via_embedded_profile(cs_arr, &proc_tints, doc)
-                    {
+                    if let Some(retargeted) = try_retarget_cmyk_via_embedded_profile(
+                        cs_arr,
+                        &proc_tints,
+                        doc,
+                        rendering_intent,
+                    ) {
                         return Some(retargeted);
                     }
                     Some((proc_tints[0], proc_tints[1], proc_tints[2], proc_tints[3]))
@@ -1301,6 +1305,7 @@ fn try_retarget_cmyk_via_embedded_profile(
     cs_arr: &[Object],
     proc_tints: &[f32],
     doc: &PdfDocument,
+    rendering_intent: crate::color::RenderingIntent,
 ) -> Option<(f32, f32, f32, f32)> {
     if !crate::color::active_backend_supports_cmyk_retarget() {
         return None;
@@ -1343,20 +1348,19 @@ fn try_retarget_cmyk_via_embedded_profile(
         return None;
     }
 
-    // The PDF spec doesn't pin a per-paint rendering intent for the
-    // /Process retarget; the document-level §10.7.3 intent governs.
-    // We default to `RelativeColorimetric` (the press default —
-    // and what §8.6.5.8 falls back to for unrecognised intents)
-    // with BPC on. A future refinement could thread the live gs
-    // intent through, but the operator dispatcher doesn't currently
-    // hand `extract_process_paint_cmyk` a graphics state, and the
-    // common-case correctness gain of "retarget at all" dwarfs the
-    // intent-precision gain on top.
-    let transform = crate::color::CmykRetargetTransform::new(
-        src_profile,
-        dst_profile,
-        crate::color::RenderingIntent::RelativeColorimetric,
-    )?;
+    // §10.7.3: the live `ri` operator (and any prior /RI ExtGState
+    // entry) declares the rendering intent for the operator that
+    // follows. The dispatcher reads `gs.rendering_intent` at paint
+    // time and threads it here through `extract_process_paint_cmyk`,
+    // so a `/Perceptual ri` before a /DeviceN /Process /ICCBased
+    // paint retargets with the perceptual BToA tag. §8.6.5.8 pins
+    // `RelativeColorimetric` as the fallback when the gs intent is
+    // unset or unrecognised — that mapping is in
+    // `RenderingIntent::from_pdf_name`, applied at the call site
+    // before threading into here. BPC stays on for the press
+    // default `TransformFlags::press_default()`.
+    let transform =
+        crate::color::CmykRetargetTransform::new(src_profile, dst_profile, rendering_intent)?;
     let out = transform.retarget_pixel([
         proc_tints[0].clamp(0.0, 1.0),
         proc_tints[1].clamp(0.0, 1.0),
@@ -1419,6 +1423,7 @@ pub(crate) fn initial_colour_for_space(
     space_name: &str,
     resolved_space: Option<&Object>,
     doc: &PdfDocument,
+    rendering_intent: crate::color::RenderingIntent,
 ) -> InitialColour {
     let deref =
         |obj: &Object| -> Object { doc.resolve_object(obj).unwrap_or_else(|_| obj.clone()) };
@@ -1595,7 +1600,12 @@ pub(crate) fn initial_colour_for_space(
             // the same evaluator the paint-time path uses so the
             // mapping (named device families + ICCBased N=1/3/4) is
             // identical to the post-`scn` behaviour.
-            let cmyk = extract_process_paint_cmyk(resolved_space.unwrap(), &components, doc);
+            let cmyk = extract_process_paint_cmyk(
+                resolved_space.unwrap(),
+                &components,
+                doc,
+                rendering_intent,
+            );
             InitialColour {
                 components,
                 rgb: (0.0, 0.0, 0.0),
