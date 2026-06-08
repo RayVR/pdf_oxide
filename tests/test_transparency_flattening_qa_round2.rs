@@ -38,21 +38,6 @@ use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 // HONEST_GAP tracking constants
 // ===========================================================================
 
-/// Gap 1 from the round-1 audit, deferred by the round-2 implementation
-/// agent. The agent's claim: "additive-clamp OutputIntent fallback is
-/// linear in CMYK, so convert-first and composite-first are
-/// byte-identical." That holds for the additive-clamp path. With a
-/// non-linear ICC OutputIntent (input curves that are not identity, so
-/// the per-channel mapping into the CLUT diverges between paints), the
-/// composite-first vs convert-first ordering produces different bytes —
-/// the spec requires composite-first per §11.4 + Annex G.
-pub const HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE_NONLINEAR_ICC: &str =
-    "HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE_NONLINEAR_ICC: under a \
-     non-linear OutputIntent ICC the composite path still converts each \
-     CMYK paint via OutputIntent before alpha compositing. The probe \
-     proves the divergence with a non-identity input-curve CMYK ICC \
-     profile. Round 3 must defer CMYK→RGB until after composition.";
-
 macro_rules! smask_op_gap {
     ($name:ident, $op_desc:literal) => {
         pub const $name: &str = concat!(
@@ -103,43 +88,6 @@ overprint_op_gap!(
     "b* (close+fill+stroke EvenOdd)"
 );
 overprint_op_gap!(HONEST_GAP_OVERPRINT_FILL_EVENODD_NOT_WIRED, "f* (fill EvenOdd)");
-
-/// Composite overprint reconstruction loss: the round-2 fix recovers
-/// CMYK from the destination RGB snapshot via additive-clamp inversion.
-/// When the snapshot was produced through a non-trivial ICC OutputIntent
-/// (the RGB carries colorimetric information the inversion can't
-/// reproduce), the reconstructed CMYK is approximate. The agent
-/// acknowledged this. The probe pins the magnitude of the loss under a
-/// non-linear ICC.
-pub const HONEST_GAP_OVERPRINT_COMPOSITE_RECONSTRUCTION_LOSS: &str =
-    "HONEST_GAP_OVERPRINT_COMPOSITE_RECONSTRUCTION_LOSS: the composite \
-     overprint correction uses additive-clamp inversion of the \
-     destination RGB to recover CMYK. Under a non-trivial ICC \
-     OutputIntent the recovered CMYK is approximate; press-accurate \
-     overprint preview needs the separation backend route.";
-
-/// Compose-first precedence has the same bounded recovery loss as the
-/// composite-overprint reconstruction: when the backdrop pixel was
-/// itself produced by a previous CMYK-via-ICC paint, the round-3
-/// compose-first apply_cmyk_compose_after_paint helper inverts that
-/// post-ICC RGB through the §10.3.5 additive-clamp formula to recover
-/// CMYK, then composites in source space, then re-runs the ICC
-/// transform. The additive-clamp inversion is exact only for backdrops
-/// that came through the additive-clamp path (the baseline-white case);
-/// backdrops that went through a non-linear ICC carry colorimetric
-/// information the inversion can't reproduce.
-///
-/// The proper fix is the Priority 4 separation-backend route: keep
-/// CMYK plates resident through the page composite so the backdrop's
-/// original CMYK is available without inversion. Until that lands the
-/// bound here pins the magnitude of the loss.
-pub const HONEST_GAP_PRECEDENCE_BACKDROP_ICC_RECOVERY: &str =
-    "HONEST_GAP_PRECEDENCE_BACKDROP_ICC_RECOVERY: the round-3 \
-     compose-first apply_cmyk_compose_after_paint inverts the snapshot \
-     RGB → CMYK through §10.3.5 additive-clamp. When the backdrop pixel \
-     was produced by a previous CMYK-via-ICC paint the inversion is \
-     bounded-loss; the spec-correct fix is the separation-backend route \
-     (Priority 4 / round 4) that keeps CMYK plates resident.";
 
 // ===========================================================================
 // Synthetic PDF + ICC profile helpers
@@ -551,12 +499,11 @@ fn qa_round2_compose_before_convert_under_nonlinear_icc() {
     assert_eq!(
         (or_int_r, or_int_g, or_int_b),
         (66, 66, 66),
-        "compose-first overlap under non-linear ICC: expected byte-exact \
-         RGB(66, 66, 66) (single-paint reference). Got ({or_int_r}, \
-         {or_int_g}, {or_int_b}); single-paint reference ({cs_int_r}, \
-         {cs_int_g}, {cs_int_b}); convert-first reference (128, 128, \
-         128). {}",
-        HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE_NONLINEAR_ICC
+        "ISO 32000-1 §11.4 compose-first overlap under non-linear ICC: \
+         expected byte-exact RGB(66, 66, 66) (single-paint reference). Got \
+         ({or_int_r}, {or_int_g}, {or_int_b}); single-paint reference \
+         ({cs_int_r}, {cs_int_g}, {cs_int_b}); convert-first reference \
+         (128, 128, 128)."
     );
 }
 
@@ -1038,10 +985,9 @@ fn qa_round2_overprint_reconstruction_under_nonlinear_icc() {
     // loss. The Priority-4 plate-retention fix drives delta to zero.
     assert_eq!(
         actual, press,
-        "composite overprint under non-linear ICC must hit the \
-         press-accurate single-paint reference; got overlap={actual:?} \
-         vs reference={press:?}. {}",
-        HONEST_GAP_OVERPRINT_COMPOSITE_RECONSTRUCTION_LOSS
+        "ISO 32000-1 §11.7.4.3 CompatibleOverprint under non-linear ICC \
+         must hit the press-accurate single-paint reference; got \
+         overlap={actual:?} vs reference={press:?}"
     );
 }
 
@@ -1105,9 +1051,8 @@ fn qa_round3_compose_first_under_icc_backdrop_press_accurate() {
 
     assert_eq!(
         actual, press,
-        "compose-first under ICC backdrop must hit the press-accurate \
-         single-paint reference; got overlap={actual:?} vs \
-         reference={press:?}. {}",
-        HONEST_GAP_PRECEDENCE_BACKDROP_ICC_RECOVERY
+        "ISO 32000-1 §11.4 compose-first under ICC backdrop must hit the \
+         press-accurate single-paint reference; got overlap={actual:?} vs \
+         reference={press:?}"
     );
 }

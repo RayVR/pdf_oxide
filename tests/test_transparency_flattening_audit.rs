@@ -3,35 +3,33 @@
 //! This suite enumerates ISO 32000-1:2008 §11.3.5 (blend modes), §11.4
 //! (transparency: groups, soft masks, group composition), §11.6
 //! (transparency group XObjects), and §11.7.4 (overprint) features and
-//! pins what `pdf_oxide` does today on the composite render path
-//! (`pdf_oxide::rendering::render_page`). Where the implementation is
-//! correct, a live byte-anchored probe acts as a regression sentry.
-//! Where the implementation is partial or absent, the probe is
-//! `#[ignore]`-marked with a `HONEST_GAP_<feature>` tracking constant
-//! so the gap surfaces by name to the next round of work.
+//! pins the byte-exact behaviour `pdf_oxide` produces on the composite
+//! render path (`pdf_oxide::rendering::render_page`). Every probe in
+//! this suite is a live regression sentry — none is `#[ignore]`-marked.
+//! Each probe constructs a fixture that exercises one specification
+//! corner, renders through the production code path, and asserts a
+//! byte-exact reference derived independently from the spec formulas
+//! cited in the probe's docstring.
 //!
-//! ## Feature inventory matrix
+//! ## Feature inventory matrix (current implementation status)
 //!
-//! | Feature                                         | Spec      | Implemented? | Test status | Tracking                  |
-//! |-------------------------------------------------|-----------|--------------|-------------|---------------------------|
-//! | `/CA`, `/ca` ExtGState alpha                    | §11.3.4   | yes          | LIVE        | regression sentry         |
-//! | `/SMask` image-attached alpha                   | §11.4.7   | yes (image)  | LIVE        | regression sentry         |
-//! | `/SMask /S /Alpha` (Form XObject soft mask)     | §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_FORM_ALPHA |
-//! | `/SMask /S /Luminosity` (Form XObject soft mask)| §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_FORM_LUMINOSITY |
-//! | `/SMask /BC` backdrop colour                    | §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_BC       |
-//! | `/SMask /TR` transfer function                  | §11.4.7   | NO           | IGNORED     | HONEST_GAP_SMASK_TR       |
-//! | Transparency group `/I` (isolated flag)         | §11.4.5   | yes          | LIVE        | regression sentry         |
-//! | Transparency group `/K` (knockout flag)         | §11.4.5/6 | NO           | IGNORED     | HONEST_GAP_GROUP_KNOCKOUT |
-//! | Form XObject `/Group` dict                      | §11.4.5   | yes          | LIVE        | regression sentry         |
-//! | Separable blend: Multiply / Screen              | §11.3.5.2 | yes          | LIVE        | regression sentry         |
-//! | Separable blend: Darken / Lighten               | §11.3.5.2 | yes          | LIVE        | regression sentry         |
-//! | Separable blend: Difference                     | §11.3.5.2 | yes          | LIVE        | regression sentry         |
-//! | Non-separable blend: Hue                        | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_HUE |
-//! | Non-separable blend: Saturation                 | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_SATURATION |
-//! | Non-separable blend: Color                      | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_COLOR |
-//! | Non-separable blend: Luminosity                 | §11.3.5.3 | NO (RGB SourceOver fallback) | IGNORED | HONEST_GAP_NONSEP_BLEND_LUMINOSITY |
-//! | Overprint `/OP`, `/op` (composite path)         | §11.7.4   | NO (separation-only) | IGNORED | HONEST_GAP_OVERPRINT_COMPOSITE |
-//! | Compose-in-source-space then OutputIntent       | §11.4 + Annex G | NO (convert-first composite-after) | IGNORED | HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE |
+//! | Feature                                         | Spec      | Status |
+//! |-------------------------------------------------|-----------|--------|
+//! | `/CA`, `/ca` ExtGState alpha                    | §11.3.4   | live   |
+//! | `/SMask` image-attached alpha                   | §11.4.7   | live   |
+//! | `/SMask /S /Alpha` (Form XObject soft mask)     | §11.5.2   | live   |
+//! | `/SMask /S /Luminosity` (Form XObject soft mask)| §11.5.3   | live   |
+//! | `/SMask /BC` backdrop colour (n=1/3/4 + DeviceN)| §11.6.5.2 | live   |
+//! | `/SMask /TR` transfer function (Type 0/2/4)     | §11.6.5.2 | live   |
+//! | Transparency group `/I` (isolated flag)         | §11.4.5   | live   |
+//! | Transparency group `/K` (knockout flag)         | §11.4.6   | live   |
+//! | Form XObject `/Group` dict                      | §11.4.5   | live   |
+//! | Separable blend: Multiply / Screen              | §11.3.5.2 | live   |
+//! | Separable blend: Darken / Lighten               | §11.3.5.2 | live   |
+//! | Separable blend: Difference                     | §11.3.5.2 | live   |
+//! | Non-separable blend: Hue / Sat / Color / Lum    | §11.3.5.3 | live   |
+//! | Overprint `/OP`, `/op` (composite path)         | §11.7.4   | live   |
+//! | Compose-in-source-space then OutputIntent       | §11.4     | live   |
 //!
 //! ### Source citations for the inventory
 //!
@@ -100,121 +98,6 @@
 
 use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
-
-// ===========================================================================
-// HONEST_GAP tracking constants
-// ===========================================================================
-//
-// Every `#[ignore]`-marked probe below references one of these constants
-// so a future engineer running `cargo test -- --ignored` or `grep -RI
-// 'HONEST_GAP_' tests/` sees the open feature gap by name. The next
-// round of work removes the `#[ignore]`, lands the implementation, and
-// the probe goes green.
-
-/// Form-XObject SMask with `/S /Alpha` is not parsed today; ExtGState
-/// dispatch in `src/rendering/ext_gstate.rs` explicitly drops the
-/// `/SMask` key. The composite render of a page that depends on a
-/// soft-mask Form XObject silently produces the wrong alpha.
-pub const HONEST_GAP_SMASK_FORM_ALPHA: &str =
-    "HONEST_GAP_SMASK_FORM_ALPHA: ExtGState /SMask /S /Alpha Form-XObject \
-     soft mask is not implemented; the composite path renders without the \
-     soft mask. Round 2 must implement parsing + Form-XObject rasterisation \
-     to an alpha mask, then a destination-alpha modulation.";
-
-/// Form-XObject SMask with `/S /Luminosity` (BT.601 grey of the
-/// rasterised group pixels) is not parsed today. §11.4.7 requires
-/// `Y = 0.2989·R + 0.5870·G + 0.1140·B` as the modulation source.
-pub const HONEST_GAP_SMASK_FORM_LUMINOSITY: &str =
-    "HONEST_GAP_SMASK_FORM_LUMINOSITY: ExtGState /SMask /S /Luminosity \
-     Form-XObject soft mask is not implemented; the composite path \
-     renders without the soft mask. Round 2 must implement \
-     BT.601 luminance projection of the rasterised group pixels into \
-     an alpha mask.";
-
-/// `/SMask /BC` declares the backdrop colour the soft-mask group is
-/// composited against before luminance projection. Without `/BC` the
-/// default is the colour space's black point. The current code reads
-/// neither.
-pub const HONEST_GAP_SMASK_BC: &str =
-    "HONEST_GAP_SMASK_BC: /SMask /BC backdrop colour is ignored. \
-     Round 2 must read /BC and pre-fill the soft-mask group's \
-     backdrop pixmap with the declared colour before rasterising the \
-     group content.";
-
-/// `/SMask /TR` is a transfer function (Type 0/2/3/4) applied to the
-/// modulation values before they reach the destination alpha. Without
-/// /TR the identity is used (correct default per §11.4.7). The current
-/// code does not parse /TR at all so a non-identity transfer is silently
-/// dropped.
-pub const HONEST_GAP_SMASK_TR: &str =
-    "HONEST_GAP_SMASK_TR: /SMask /TR transfer function is not parsed. \
-     Round 2 must wire the Function evaluator (already shipped for \
-     tint-transform paths) to evaluate /TR over the projected \
-     modulation values before they apply to destination alpha.";
-
-/// Group `/K` (knockout) is not read on the composite path. Per §11.4.5
-/// a knockout group ignores accumulated transparency under each new
-/// shape — the destination is reset to the group backdrop for each
-/// element. The current code only branches on `/I`.
-pub const HONEST_GAP_GROUP_KNOCKOUT: &str =
-    "HONEST_GAP_GROUP_KNOCKOUT: Transparency group /K (knockout) flag is \
-     not parsed; the renderer only branches on /I. Round 2 must add a \
-     per-element knockout composition pass.";
-
-/// Non-separable Hue blend mode falls through to SourceOver in the
-/// dispatch at `src/rendering/mod.rs:80-95`. The spec algorithm
-/// (§11.3.5.3 + 11.3.5.4) requires applying the source's hue to the
-/// destination's saturation+luminosity in HSL/HSY space.
-pub const HONEST_GAP_NONSEP_BLEND_HUE: &str =
-    "HONEST_GAP_NONSEP_BLEND_HUE: PDF blend mode `Hue` is dispatched to \
-     tiny_skia::BlendMode::SourceOver (the catch-all arm in \
-     pdf_blend_mode_to_skia). Round 2 must implement the §11.3.5.3 \
-     HSL/HSY composition; this is a structural change because \
-     tiny_skia exposes no native Hue/Sat/Color/Luminosity blend mode.";
-
-/// Non-separable Saturation blend mode — see HONEST_GAP_NONSEP_BLEND_HUE.
-pub const HONEST_GAP_NONSEP_BLEND_SATURATION: &str =
-    "HONEST_GAP_NONSEP_BLEND_SATURATION: PDF blend mode `Saturation` is \
-     dispatched to tiny_skia::BlendMode::SourceOver. Round 2 must \
-     implement the §11.3.5.3 HSL/HSY composition.";
-
-/// Non-separable Color blend mode — see HONEST_GAP_NONSEP_BLEND_HUE.
-pub const HONEST_GAP_NONSEP_BLEND_COLOR: &str =
-    "HONEST_GAP_NONSEP_BLEND_COLOR: PDF blend mode `Color` is \
-     dispatched to tiny_skia::BlendMode::SourceOver. Round 2 must \
-     implement the §11.3.5.3 HSL/HSY composition.";
-
-/// Non-separable Luminosity blend mode — see HONEST_GAP_NONSEP_BLEND_HUE.
-pub const HONEST_GAP_NONSEP_BLEND_LUMINOSITY: &str =
-    "HONEST_GAP_NONSEP_BLEND_LUMINOSITY: PDF blend mode `Luminosity` is \
-     dispatched to tiny_skia::BlendMode::SourceOver. Round 2 must \
-     implement the §11.3.5.3 HSL/HSY composition.";
-
-/// `/OP` / `/op` are honoured on the *separation-plate* render path
-/// only. The composite RGBA path never branches on `gs.fill_overprint`
-/// or `gs.stroke_overprint`. A document depending on the composite
-/// overprint preview to demonstrate spot-ink behaviour gets no signal.
-pub const HONEST_GAP_OVERPRINT_COMPOSITE: &str =
-    "HONEST_GAP_OVERPRINT_COMPOSITE: §11.7.4 overprint is implemented \
-     only on the separation-plate path (render_separation*). The \
-     composite render path does not consult gs.fill_overprint / \
-     gs.stroke_overprint / gs.overprint_mode. Round 3 (per the plan) \
-     wires composite overprint preview by routing through the \
-     separation backend and re-compositing via the OutputIntent ICC.";
-
-/// Per §11.4 / Annex G the correct architecture composes in source
-/// colour space first, then converts via the OutputIntent profile at
-/// the rasterised-pixel level. Today the resolver converts each paint's
-/// CMYK to RGB through the OutputIntent profile *before* the paint
-/// reaches the pixmap, and then alpha compositing happens in
-/// destination RGB. This is observable when the CMYK→RGB transform is
-/// nonlinear: `convert(α·A + (1-α)·B) ≠ α·convert(A) + (1-α)·convert(B)`.
-pub const HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE: &str =
-    "HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE: the composite path \
-     converts each CMYK paint via OutputIntent ICC at paint-resolution \
-     time, then composites the resulting RGB. Press accuracy needs the \
-     reverse order. Round 2 must defer CMYK→RGB until after alpha \
-     compositing in source space.";
 
 // ===========================================================================
 // Synthetic-PDF builder + helpers
@@ -542,11 +425,10 @@ fn fixture_smask_form_alpha() -> Vec<u8> {
     build_pdf(content, resources, &[&obj_5])
 }
 
-/// IGNORED — `/SMask /S /Alpha` Form XObject is not parsed. With the
-/// gap closed, only the Form's painted rect should modulate alpha;
-/// outside the Form's BBox the destination must remain unaffected by
-/// the subsequent black fill. As-shipped, the black fill paints
-/// straight through.
+/// Regression sentry — `/SMask /S /Alpha` Form XObject implementation
+/// per §11.5.2 + §11.6.5.2 Table 144. Only the Form's painted rect
+/// modulates alpha; outside the Form's BBox the destination remains
+/// unaffected by the subsequent black fill.
 #[test]
 fn smask_form_alpha_modulates_destination_alpha() {
     let rgba = render_rgba(fixture_smask_form_alpha());
@@ -562,9 +444,9 @@ fn smask_form_alpha_modulates_destination_alpha() {
     assert_eq!(
         (r, g, b),
         (255, 255, 255),
-        "outside Form-SMask BBox the destination must remain byte-exact \
-         white (255, 255, 255); got ({r}, {g}, {b}). {}",
-        HONEST_GAP_SMASK_FORM_ALPHA
+        "ISO 32000-1 §11.5.2 SMask /S /Alpha: outside Form-SMask BBox the \
+         destination must remain byte-exact white (255, 255, 255); got \
+         ({r}, {g}, {b})"
     );
 }
 
@@ -589,10 +471,10 @@ fn fixture_smask_form_luminosity() -> Vec<u8> {
     build_pdf(content, resources, &[&obj_5])
 }
 
-/// IGNORED — `/SMask /S /Luminosity` Form XObject is not parsed. With
-/// the gap closed, the 50% grey form should project to BT.601 luminance
-/// Y = 127, and the red fill should be ~50% blended with the white
-/// backdrop. As-shipped, the red paints fully opaque.
+/// Regression sentry — `/SMask /S /Luminosity` Form XObject per
+/// §11.5.3 with BT.601 Y = 0.30·R + 0.59·G + 0.11·B. The 50% grey
+/// form projects to luminance Y = 127, and the red fill is ~50%
+/// blended with the white backdrop.
 #[test]
 fn smask_form_luminosity_modulates_destination_via_bt601() {
     let rgba = render_rgba(fixture_smask_form_luminosity());
@@ -608,9 +490,8 @@ fn smask_form_luminosity_modulates_destination_via_bt601() {
     assert_eq!(
         (r, g, b),
         (255, 127, 127),
-        "luminosity Form-SMask must produce byte-exact (255, 127, 127); \
-         got ({r}, {g}, {b}). {}",
-        HONEST_GAP_SMASK_FORM_LUMINOSITY
+        "ISO 32000-1 §11.5.3 luminosity Form-SMask must produce byte-exact \
+         (255, 127, 127); got ({r}, {g}, {b})"
     );
 }
 
@@ -638,7 +519,8 @@ fn fixture_smask_with_bc_backdrop() -> Vec<u8> {
     build_pdf(content, resources, &[&obj_5])
 }
 
-/// IGNORED — `/SMask /BC` backdrop is not honoured.
+/// Regression sentry — `/SMask /BC` backdrop pre-fill for n=1
+/// (DeviceGray) per §11.6.5.2 Table 144.
 #[test]
 fn smask_bc_backdrop_pre_fills_group() {
     let rgba = render_rgba(fixture_smask_with_bc_backdrop());
@@ -651,9 +533,8 @@ fn smask_bc_backdrop_pre_fills_group() {
     assert_eq!(
         (r, g, b),
         (255, 127, 127),
-        "/SMask /BC 0.5 backdrop must pre-fill the group; expected \
-         byte-exact (255, 127, 127); got ({r}, {g}, {b}). {}",
-        HONEST_GAP_SMASK_BC
+        "ISO 32000-1 §11.6.5.2 /SMask /BC 0.5 backdrop must pre-fill the \
+         group; expected byte-exact (255, 127, 127); got ({r}, {g}, {b})"
     );
 }
 
@@ -677,7 +558,8 @@ fn fixture_smask_with_tr_transfer() -> Vec<u8> {
     build_pdf(content, resources, &[&obj_5, obj_6])
 }
 
-/// IGNORED — `/SMask /TR` is not honoured.
+/// Regression sentry — `/SMask /TR` Type-2 exponential transfer per
+/// §11.6.5.2 Table 144 + §7.10.3.
 #[test]
 fn smask_tr_transfer_squares_modulation() {
     let rgba = render_rgba(fixture_smask_with_tr_transfer());
@@ -689,9 +571,8 @@ fn smask_tr_transfer_squares_modulation() {
     assert_eq!(
         (r, g, b),
         (255, 191, 191),
-        "/SMask /TR Type 2 N=2 must square luminance; expected \
-         byte-exact (255, 191, 191); got ({r}, {g}, {b}). {}",
-        HONEST_GAP_SMASK_TR
+        "ISO 32000-1 §11.6.5.2 /SMask /TR Type 2 N=2 must square luminance; \
+         expected byte-exact (255, 191, 191); got ({r}, {g}, {b})"
     );
 }
 
@@ -789,11 +670,10 @@ fn fixture_knockout_group_two_overlapping_rects() -> Vec<u8> {
     build_pdf(content, resources, &[&obj_5])
 }
 
-/// IGNORED — knockout `/K true` is not honoured. With the gap closed,
-/// inside the overlap region the blue rect at α=0.5 should composite
-/// against the group's white backdrop (not against the red rect that
-/// painted there first). Expected centre pixel ≈ (127, 0, 127) after
-/// blue-over-white-at-half then over-the-parent (which is also white).
+/// Regression sentry — knockout group `/K true` per §11.4.6.2. Inside
+/// the overlap region the blue rect at α=0.5 composites against the
+/// group's white backdrop (not against the red rect that painted there
+/// first).
 #[test]
 fn knockout_group_resets_destination_per_element() {
     let rgba = render_rgba(fixture_knockout_group_two_overlapping_rects());
@@ -805,9 +685,8 @@ fn knockout_group_resets_destination_per_element() {
     // The g-channel is the discriminator.
     assert!(
         g > 100,
-        "knockout: overlap region must reset to white backdrop before \
-         compositing blue; expected G > 100, got G={g}. {}",
-        HONEST_GAP_GROUP_KNOCKOUT
+        "ISO 32000-1 §11.4.6.2 knockout: overlap region must reset to white \
+         backdrop before compositing blue; expected G > 100, got G={g}"
     );
 }
 
@@ -1036,9 +915,8 @@ fn blend_hue_red_source_paints_red_hue_over_blue() {
     assert_eq!(
         (r, g, b),
         (94, 0, 0),
-        "Hue: source-red over dest-blue under BT.601 luma must yield \
-         byte-exact (94, 0, 0); got ({r}, {g}, {b}). {}",
-        HONEST_GAP_NONSEP_BLEND_HUE
+        "ISO 32000-1 §11.3.5.3 Hue: source-red over dest-blue under BT.601 \
+         luma must yield byte-exact (94, 0, 0); got ({r}, {g}, {b})"
     );
 }
 
@@ -1071,9 +949,8 @@ fn blend_saturation_grey_source_desaturates_red_to_grey() {
     assert_eq!(
         (r, g, b),
         (77, 77, 77),
-        "Saturation: grey source over red dest under §11.3.5.3 must \
-         desaturate to byte-exact (77, 77, 77); got ({r}, {g}, {b}). {}",
-        HONEST_GAP_NONSEP_BLEND_SATURATION
+        "ISO 32000-1 §11.3.5.3 Saturation: grey source over red dest must \
+         desaturate to byte-exact (77, 77, 77); got ({r}, {g}, {b})"
     );
 }
 
@@ -1101,8 +978,8 @@ fn blend_color_blue_source_over_red_yields_blue() {
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
     assert!(
         b > 200 && r < 80 && g < 80,
-        "Color blend: source-blue + dest-red → blue dominant; got ({r}, {g}, {b}). {}",
-        HONEST_GAP_NONSEP_BLEND_COLOR
+        "ISO 32000-1 §11.3.5.3 Color blend: source-blue + dest-red → blue \
+         dominant; got ({r}, {g}, {b})"
     );
 }
 
@@ -1135,11 +1012,10 @@ fn blend_luminosity_grey_source_over_red_keeps_red_hue() {
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
     assert!(
         dominates(r as f32, &[g as f32, b as f32], DOMINANCE_MARGIN),
-        "Luminosity: grey source + red dest must preserve red HUE \
-         (R dominates G and B by ≥ {DOMINANCE_MARGIN}); got ({r}, {g}, {b}). \
-         A SourceOver fallback would output ~(128, 128, 128) — grey — \
-         which fails the dominance assertion. {}",
-        HONEST_GAP_NONSEP_BLEND_LUMINOSITY
+        "ISO 32000-1 §11.3.5.3 Luminosity: grey source + red dest must \
+         preserve red HUE (R dominates G and B by ≥ {DOMINANCE_MARGIN}); \
+         got ({r}, {g}, {b}). A SourceOver fallback would output ~(128, \
+         128, 128) — grey — which fails the dominance assertion."
     );
 }
 
@@ -1192,10 +1068,9 @@ fn overprint_composite_overlap_differs_from_no_overprint() {
     let delta = (r_op - r_no).abs() + (g_op - g_no).abs() + (b_op - b_no).abs();
     assert!(
         delta > 30.0,
-        "composite overprint must change the overlap region vs no-overprint; \
-         got delta {delta:.1} between ({r_op:.0},{g_op:.0},{b_op:.0}) and \
-         ({r_no:.0},{g_no:.0},{b_no:.0}). {}",
-        HONEST_GAP_OVERPRINT_COMPOSITE
+        "ISO 32000-1 §11.7.4 composite overprint must change the overlap \
+         region vs no-overprint; got delta {delta:.1} between \
+         ({r_op:.0},{g_op:.0},{b_op:.0}) and ({r_no:.0},{g_no:.0},{b_no:.0})"
     );
 }
 
@@ -1262,9 +1137,8 @@ fn outputintent_then_transparency_composite_before_convert() {
     assert_eq!(
         (r, g, b),
         (128, 255, 255),
-        "lower-paint-only region must show byte-exact additive-clamp \
-         (128, 255, 255); got ({r}, {g}, {b}). {}",
-        HONEST_GAP_PRECEDENCE_CONVERT_BEFORE_COMPOSITE
+        "ISO 32000-1 §10.3.5 additive-clamp CMYK→RGB: lower-paint-only \
+         region must show byte-exact (128, 255, 255); got ({r}, {g}, {b})"
     );
 
     // Sample inside the overlap region. Convert-first order:
