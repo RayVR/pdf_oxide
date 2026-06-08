@@ -2,14 +2,14 @@
 //!
 //! Two backends ship behind feature flags:
 //!
-//!  - [`QcmsBackend`] (`icc-qcms`, the default): Firefox's pure-Rust
+//!  - `QcmsBackend` (`icc-qcms`, the default): Firefox's pure-Rust
 //!    qcms 0.3 engine. Covers source-profile → sRGB conversion for
 //!    every ICC class real PDFs ship (CMYK / RGB / Gray inputs).
 //!    Cannot do CMYK → CMYK retargeting (qcms 0.3 has no CMYK output
 //!    path) and silently ignores the rendering-intent parameter for
 //!    CMYK sources.
 //!
-//!  - [`Lcms2Backend`] (`icc-lcms2`, opt-in): Little CMS via the
+//!  - `Lcms2Backend` (`icc-lcms2`, opt-in): Little CMS via the
 //!    `lcms2` crate. Press-grade — CMYK→CMYK profile retargeting
 //!    through the Lab PCS, Black Point Compensation for relative-
 //!    colorimetric (the press default), and rendering-intent dispatch
@@ -23,7 +23,7 @@
 //! The [`IccBackend`] trait shape exists so the rest of `crate::color`
 //! never imports `qcms` or `lcms2` directly: every call site goes
 //! through [`Transform`](super::Transform) which is built on top of
-//! [`ActiveIccBackend`]. This keeps `color.rs` free of backend cfg
+//! `ActiveIccBackend`. This keeps `color.rs` free of backend cfg
 //! gates and confines the qcms/lcms2 differences to this file.
 
 use super::{IccProfile, RenderingIntent};
