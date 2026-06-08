@@ -165,7 +165,7 @@ jobs:
 
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake nasm golang-go
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y cmake nasm golang-go
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
@@ -186,7 +186,7 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
 
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           cache: false
           rustflags: ''
@@ -365,7 +365,7 @@ jobs:
 
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake nasm golang-go
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y cmake nasm golang-go
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
@@ -376,7 +376,7 @@ jobs:
         run: choco install nasm -y
 
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           cache: false
           rustflags: ''
@@ -618,7 +618,7 @@ jobs:
 
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake nasm golang-go
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y cmake nasm golang-go
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
@@ -629,7 +629,7 @@ jobs:
         run: choco install nasm -y
 
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           cache: false
           rustflags: ''
@@ -672,7 +672,7 @@ jobs:
           ref: ${{ inputs.version || (github.event_name != 'pull_request' && github.ref_name || github.sha) }}
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5
         with:
           dotnet-version: '8.0'
 
@@ -738,7 +738,7 @@ jobs:
           path: dist-nuget
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5
         with:
           dotnet-version: '8.0'
 
@@ -788,7 +788,7 @@ jobs:
 
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake nasm golang-go
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y cmake nasm golang-go
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
@@ -799,7 +799,7 @@ jobs:
         run: choco install nasm -y
 
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           cache: false
           rustflags: ''

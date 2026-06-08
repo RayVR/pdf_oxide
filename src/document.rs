@@ -7123,13 +7123,34 @@ impl PdfDocument {
             }
         }
         if rtl >= 2 && !has_latin {
-            let reversed: String = span.text.chars().rev().collect();
             let mut tmp = span.clone();
-            tmp.text = reversed;
+            tmp.text = Self::reverse_rtl_keeping_marks(&span.text);
             Self::push_span_text(out, &tmp);
         } else {
             Self::push_span_text(out, span);
         }
+    }
+
+    /// Reverse a pure-RTL run from visual to logical order while keeping each
+    /// Arabic/Hebrew combining mark attached to its base letter (#656).
+    ///
+    /// A naive `chars().rev()` reverses by Unicode scalar value, so a base
+    /// letter's diacritics (which follow it in logical order — kasra/shadda
+    /// U+0650/U+0651, Hebrew points U+05B0..) jump *in front* of the base and
+    /// float off as standalone marks. Grouping each base char with the
+    /// combining marks that trail it, then reversing the group order (each
+    /// group's internal order preserved), keeps marks bound to their base.
+    fn reverse_rtl_keeping_marks(text: &str) -> String {
+        use crate::text::rtl_detector::is_rtl_diacritic;
+        let mut groups: Vec<Vec<char>> = Vec::new();
+        for c in text.chars() {
+            if is_rtl_diacritic(c as u32) && !groups.is_empty() {
+                groups.last_mut().unwrap().push(c);
+            } else {
+                groups.push(vec![c]);
+            }
+        }
+        groups.iter().rev().flatten().collect()
     }
 
     /// Parse font size from a /DA (Default Appearance) string.
@@ -7486,6 +7507,7 @@ impl PdfDocument {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             });
         }
 
@@ -7652,6 +7674,7 @@ impl PdfDocument {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             });
         }
 
@@ -8672,17 +8695,35 @@ impl PdfDocument {
     /// span MCIDs and for any MCID containing RTL text (whose span order is
     /// handled by the bidi passes) — both stay byte-identical.
     fn order_mcid_spans(spans: &[crate::layout::TextSpan]) -> Vec<&crate::layout::TextSpan> {
+        use crate::text::rtl_detector::is_rtl_text;
         let mut ordered: Vec<&crate::layout::TextSpan> = spans.iter().collect();
-        let has_rtl = |s: &crate::layout::TextSpan| {
-            s.text
-                .chars()
-                .any(|c| crate::text::rtl_detector::is_rtl_text(c as u32))
-        };
-        if spans.len() > 1 && !spans.iter().any(has_rtl) {
+        if spans.len() <= 1 {
+            return ordered;
+        }
+        let has_rtl = spans
+            .iter()
+            .any(|s| s.text.chars().any(|c| is_rtl_text(c as u32)));
+        let has_latin = spans
+            .iter()
+            .any(|s| s.text.chars().any(|c| c.is_ascii_alphabetic()));
+        if !has_rtl {
+            // LTR multi-span MCID: left-to-right row-aware reading order.
             ordered.sort_by(|a, b| {
                 crate::utils::row_aware_span_cmp(a.bbox.y, a.bbox.x, b.bbox.y, b.bbox.x)
             });
+        } else if !has_latin {
+            // #656/#657: pure-RTL MCID. The tagged struct-tree path never
+            // reaches `reverse_rtl_visual_order_runs`, so without an explicit
+            // span-order pass the words emerge in visual (reversed) sequence.
+            // Emitting each row right-to-left (X descending) reconstructs
+            // logical reading order from geometry, independent of whether the
+            // producer stored the run visually or logically. Per-span glyph
+            // order is corrected separately by `push_span_text_bidi`.
+            ordered.sort_by(|a, b| {
+                crate::utils::row_aware_span_cmp_rtl(a.bbox.y, a.bbox.x, b.bbox.y, b.bbox.x)
+            });
         }
+        // Mixed RTL+Latin MCIDs keep raw order (full UAX #9 bidi deferred).
         ordered
     }
 
@@ -9461,22 +9502,41 @@ impl PdfDocument {
         lower.starts_with("cm") || lower.contains("symbol")
     }
 
-    /// Replace a `¬` (U+00AC) that sits directly between two ASCII digits with
-    /// `.` (the decimal point a math subset drew from its `logicalnot` slot).
-    /// Leaves every other `¬` untouched.
+    /// Replace a `¬` (U+00AC) that a math subset drew from its `logicalnot`
+    /// slot as a decimal point. Two shapes are recovered:
+    ///
+    ///   - `digit ¬ digit`         → `digit.digit` (e.g. `1¬00` → `1.00`)
+    ///   - `digit ¬ <space> digit` → `digit.digit` (e.g. `1¬ 00` → `1.00`)
+    ///
+    /// The second form covers subsets that emit a single space between the
+    /// decimal glyph and the fractional digits; the lone separating space is
+    /// dropped so the number reads as one token. The leading digit must abut
+    /// `¬` directly in both shapes, so a genuinely spaced negation (`5 ¬ 3`,
+    /// `A ¬ B`) is left untouched. Every other `¬` is preserved.
     fn fix_digit_logicalnot_decimal(text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
         let mut out = String::with_capacity(text.len());
-        for (i, &c) in chars.iter().enumerate() {
-            if c == '\u{00AC}'
-                && i > 0
-                && chars[i - 1].is_ascii_digit()
-                && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit())
-            {
-                out.push('.');
-            } else {
-                out.push(c);
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\u{00AC}' && i > 0 && chars[i - 1].is_ascii_digit() {
+                // Unspaced: digit ¬ digit.
+                if chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
+                    out.push('.');
+                    i += 1;
+                    continue;
+                }
+                // Spaced: digit ¬ <single space> digit — drop the lone space.
+                if chars.get(i + 1) == Some(&' ')
+                    && chars.get(i + 2).is_some_and(|n| n.is_ascii_digit())
+                {
+                    out.push('.');
+                    i += 2; // skip the ¬ and the single separating space
+                    continue;
+                }
             }
+            out.push(c);
+            i += 1;
         }
         out
     }
@@ -9561,14 +9621,41 @@ impl PdfDocument {
             }
         }
 
-        // Reading order: XY-cut when the page has multiple columns (B4);
-        // otherwise the cheap row-aware sort. XY-cut is spatial recursion
-        // that correctly orders multi-column layouts (newspapers, academic
-        // papers, dashboards) but is overkill for single-column pages
-        // doesn't handle tabular rowspan labels specifically. Heuristic:
-        // count distinct X-center clusters with vertical overlap; ≥2
-        // clusters → multi-column.
-        if Self::is_multi_column_page(&spans) {
+        // Tategaki (vertical writing) intercept. Pages whose majority of
+        // spans were emitted under WMode 1 (font /Encoding ends in -V or
+        // the CMap declares /WMode 1) need right-to-left, top-to-bottom
+        // ordering. Row-aware / XY-cut sorts assume horizontal flow and
+        // scramble vertical text; per-span wmode lets us route just those
+        // pages through a tategaki comparator while leaving every existing
+        // horizontal corpus untouched.
+        let vertical_count = spans.iter().filter(|s| s.wmode == 1).count();
+        if !spans.is_empty() && vertical_count * 2 >= spans.len() {
+            // Cluster tolerance: median span width. Wide enough to keep one
+            // vertical column together, narrow enough to separate adjacent
+            // columns. Robust to single rotated outliers.
+            //
+            // Assumption (M7): tategaki CJK body text is functionally
+            // monospaced (full-width kanji/kana, half-width digits all
+            // advance by similar widths), so the median span width
+            // approximates the column pitch. Mixed-pitch tategaki (rare —
+            // typically only ruby annotations) may overcluster; that
+            // would be an explicit follow-up if it shows up in real
+            // corpora.
+            let mut widths: Vec<f32> = spans.iter().map(|s| s.bbox.width.max(1.0)).collect();
+            widths.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
+            let tol = widths[widths.len() / 2].max(1.0);
+            spans.sort_by(|a, b| {
+                let ax = a.bbox.x + a.bbox.width * 0.5;
+                let bx = b.bbox.x + b.bbox.width * 0.5;
+                if (ax - bx).abs() <= tol {
+                    // Same column: top first (descending y in PDF user space).
+                    crate::utils::safe_float_cmp(b.bbox.y, a.bbox.y)
+                } else {
+                    // Different column: rightmost first.
+                    crate::utils::safe_float_cmp(bx, ax)
+                }
+            });
+        } else if Self::is_multi_column_page(&spans) {
             use crate::pipeline::reading_order::{
                 ReadingOrderContext as ROContext, ReadingOrderStrategy, XYCutStrategy,
             };
@@ -12967,6 +13054,7 @@ impl PdfDocument {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             })
             .collect();
 
@@ -13752,11 +13840,175 @@ impl PdfDocument {
             return Some(h);
         }
         let font = self.load_object(font_ref).ok()?;
-        let h = Self::font_identity_hash_cheap(&font);
+        let h = self.font_identity_hash_with_descendants(&font);
         self.font_id_hash_cache
             .lock_or_recover()
             .insert(font_ref, h);
         Some(h)
+    }
+
+    /// Document-aware extension of `font_identity_hash_cheap` that resolves
+    /// `/DescendantFonts` references on Type0 fonts and folds the descendant
+    /// CIDFont's width metrics (`/DW`, `/DW2`, `/W`, `/W2`) into the hash.
+    ///
+    /// Without this, two Type0 fonts whose Type0 dicts have identical inline
+    /// shape (same BaseFont, Encoding, ToUnicode/DescendantFonts refs) but
+    /// whose referenced CIDFonts carry different vertical metrics collide on
+    /// the Layer 5/6 caches — the second document silently inherits the
+    /// first's `w1y` and renders vertical text at the wrong advance. This is
+    /// the same bug class as the ToUnicode-stream poisoning fixed in
+    /// `a327bcd` and the `/Widths` poisoning fixed in #598, applied to the
+    /// descendant CIDFont's horizontal AND vertical width arrays.
+    ///
+    /// Cost: one `load_object` per descendant CIDFont (typically one) on the
+    /// first call; subsequent calls hit `font_id_hash_cache`. The descendant
+    /// load is the same work `FontInfo::from_dict` will do later, so the
+    /// marginal cost when a font actually needs parsing is zero; the only
+    /// new work is on cache *hits* that previously skipped descendant
+    /// resolution entirely. In return we trade off one indirect-ref load per
+    /// unique Type0 font per process for correctness on /W2 + /DW2.
+    fn font_identity_hash_with_descendants(&self, font_obj: &Object) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Seed with the cheap inline hash so existing identity coverage is
+        // preserved bit-for-bit when there are no descendants to fold in.
+        let base = Self::font_identity_hash_cheap(font_obj);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        base.hash(&mut hasher);
+
+        if let Some(d) = font_obj.as_dict() {
+            if let Some(Object::Array(arr)) = d.get("DescendantFonts") {
+                // Domain separator for the descendant section.
+                11u8.hash(&mut hasher);
+                for item in arr {
+                    let resolved = match item {
+                        Object::Reference(r) => self.load_object(*r).ok(),
+                        Object::Dictionary(_) => Some(item.clone()),
+                        _ => None,
+                    };
+                    let desc = match resolved {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    let dd = match desc.as_dict() {
+                        Some(dd) => dd,
+                        None => continue,
+                    };
+
+                    // /DW — default horizontal width on the CIDFont. Always
+                    // int in well-formed PDFs; we accept Real defensively.
+                    if let Some(dw) = dd.get("DW") {
+                        12u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(dw, &mut hasher);
+                    }
+                    // /DW2 — default vertical metrics [v_y w1y]. Two-element
+                    // numeric array per ISO 32000-1 §9.7.4.3.
+                    if let Some(dw2) = dd.get("DW2") {
+                        13u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(dw2, &mut hasher);
+                    }
+                    // /W — per-CID horizontal widths, may use form-a
+                    // (c [w1 w2 …]) or form-b (c_first c_last w).
+                    if let Some(w) = dd.get("W") {
+                        14u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(w, &mut hasher);
+                    }
+                    // /W2 — per-CID vertical metrics, analogous to /W.
+                    if let Some(w2) = dd.get("W2") {
+                        15u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(w2, &mut hasher);
+                    }
+                    // /CIDSystemInfo — folded so otherwise-identical dicts
+                    // targeting different registries don't collide.
+                    if let Some(csi) = dd.get("CIDSystemInfo") {
+                        16u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(csi, &mut hasher);
+                    }
+                }
+            }
+        }
+
+        hasher.finish()
+    }
+
+    /// Hash a PDF `Object` deterministically. Used by the descendant-aware
+    /// font identity hash to fold raw width-array content into the key.
+    ///
+    /// Cycles are not possible for /W, /W2, /DW2 or /CIDSystemInfo content
+    /// in any conformant PDF: these are pure data subtrees (numbers,
+    /// arrays of numbers, occasional name/integer dicts), never indirect
+    /// references back to a font dict. We still avoid recursing into
+    /// streams (whose data we deliberately exclude from the cheap hash)
+    /// and into unresolved references (we hash the ref's id/gen, not the
+    /// pointed-to bytes — the per-font cache key already covers the
+    /// referenced descendant CIDFont).
+    fn hash_pdf_object_deterministic<H: std::hash::Hasher>(obj: &Object, hasher: &mut H) {
+        use std::hash::Hash;
+        match obj {
+            Object::Null => 0u8.hash(hasher),
+            Object::Boolean(b) => {
+                1u8.hash(hasher);
+                b.hash(hasher);
+            },
+            Object::Integer(i) => {
+                2u8.hash(hasher);
+                i.hash(hasher);
+            },
+            // Bit-pattern hash so two equal values hash identically without
+            // tripping over f64's missing `Hash` impl. NaN is not produced
+            // by PDF parsers from numeric tokens.
+            Object::Real(r) => {
+                3u8.hash(hasher);
+                r.to_bits().hash(hasher);
+            },
+            Object::String(s) => {
+                4u8.hash(hasher);
+                s.hash(hasher);
+            },
+            Object::Name(n) => {
+                5u8.hash(hasher);
+                n.hash(hasher);
+            },
+            Object::Array(arr) => {
+                6u8.hash(hasher);
+                (arr.len() as u64).hash(hasher);
+                for item in arr {
+                    Self::hash_pdf_object_deterministic(item, hasher);
+                }
+            },
+            Object::Dictionary(d) => {
+                7u8.hash(hasher);
+                // Sort keys for deterministic ordering — HashMap iteration
+                // is randomized per process.
+                let mut keys: Vec<&str> = d.keys().map(|k| k.as_str()).collect();
+                keys.sort_unstable();
+                (keys.len() as u64).hash(hasher);
+                for k in keys {
+                    k.hash(hasher);
+                    if let Some(v) = d.get(k) {
+                        Self::hash_pdf_object_deterministic(v, hasher);
+                    }
+                }
+            },
+            Object::Reference(r) => {
+                8u8.hash(hasher);
+                r.id.hash(hasher);
+                r.gen.hash(hasher);
+            },
+            // Streams: dict shape only; we do not pull stream data into
+            // the font identity hash (kept consistent with the cheap path).
+            Object::Stream { dict, .. } => {
+                9u8.hash(hasher);
+                let mut keys: Vec<&str> = dict.keys().map(|k| k.as_str()).collect();
+                keys.sort_unstable();
+                (keys.len() as u64).hash(hasher);
+                for k in keys {
+                    k.hash(hasher);
+                    if let Some(v) = dict.get(k) {
+                        Self::hash_pdf_object_deterministic(v, hasher);
+                    }
+                }
+            },
+        }
     }
 
     fn font_identity_hash_cheap(font_obj: &Object) -> u64 {
@@ -14069,8 +14321,14 @@ impl PdfDocument {
                         all_from_cache = false;
                         let font = self.load_object(font_ref)?;
 
-                        // Compute identity hash (cheap: 3-6 dict lookups, ~200ns)
-                        let id_hash = Self::font_identity_hash_cheap(&font);
+                        // Compute identity hash. For Type0 fonts this also
+                        // resolves the descendant CIDFont and folds its
+                        // /DW, /DW2, /W, /W2 into the key — otherwise two
+                        // Type0 fonts whose top-level dicts have identical
+                        // inline shape but whose CIDFonts ship different
+                        // horizontal or vertical metrics would collide on
+                        // the Layer 5/6 caches.
+                        let id_hash = self.font_identity_hash_with_descendants(&font);
 
                         // Type 3 fonts and subset fonts must not cross
                         // PdfDocument boundaries via the global cache — their
@@ -14410,6 +14668,7 @@ impl PdfDocument {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             })
             .collect();
 
@@ -15293,6 +15552,16 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        // Encrypted-and-undecryptable parity: extract_text / to_markdown / to_html
+        // all short-circuit to an empty string here (ISO 32000-1:2008 §7.6); the
+        // geometric plain-text path below would also yield empty (no decryptable
+        // content) but went through the full pipeline first. Guard explicitly so
+        // every text surface returns the same empty result on the same input.
+        if self.is_encrypted_unreadable() {
+            log::warn!("PDF is encrypted and could not be decrypted; returning empty text");
+            return Ok(String::new());
+        }
+
         // #608: for a trustworthy tagged PDF, read in logical structure order
         // (§14.8.2.3.1) by assembling directly from the structure tree — the
         // same path `extract_text` uses. The geometric plain-text converter
@@ -18740,6 +19009,7 @@ mod tests {
             char_widths: vec![],
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 
@@ -18950,6 +19220,7 @@ mod tests {
             char_widths,
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 
@@ -19302,6 +19573,65 @@ mod tests {
             "#557: per-word RTL spans must be reordered into logical word order \
              without char-flipping (got {texts:?})"
         );
+    }
+
+    // #656/#657: the tagged struct-tree path collapses a page into one MCID
+    // whose pure-RTL word-spans are laid out left-to-right (visual, X
+    // ascending). `order_mcid_spans` must emit them right-to-left (logical)
+    // using geometry, since the tagged path never reaches the untagged
+    // `reverse_rtl_visual_order_runs`. (Per-span glyph order is handled
+    // separately by `push_span_text_bidi`; this test asserts span ORDER.)
+    #[test]
+    fn test_order_mcid_spans_pure_rtl_emitted_right_to_left() {
+        // One Hebrew row, three words placed left-to-right by X.
+        let spans = vec![
+            make_rtl_test_span("שלוש", 100.0, 700.0), // leftmost  → logically last
+            make_rtl_test_span("שתיים", 200.0, 700.0),
+            make_rtl_test_span("אחת", 300.0, 700.0), // rightmost → logically first
+        ];
+        let ordered = PdfDocument::order_mcid_spans(&spans);
+        let texts: Vec<&str> = ordered.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["אחת", "שתיים", "שלוש"],
+            "pure-RTL MCID spans must emit rightmost-first (logical RTL order), got {texts:?}"
+        );
+    }
+
+    // #656: grapheme-aware RTL reversal keeps Arabic combining marks bound to
+    // their base letter (vs. a naive chars().rev() that floats them off).
+    #[test]
+    fn test_reverse_rtl_keeping_marks_keeps_diacritics_attached() {
+        // قِطّ = QAF + KASRA(U+0650) + TAH + SHADDA(U+0651). Reversing must
+        // keep each mark immediately after its base, not lead the string.
+        let src = "\u{0642}\u{0650}\u{0637}\u{0651}"; // قِطّ
+        let out = PdfDocument::reverse_rtl_keeping_marks(src);
+        // Expected: base order reversed (TAH+SHADDA group, then QAF+KASRA group).
+        assert_eq!(out, "\u{0637}\u{0651}\u{0642}\u{0650}");
+        // No combining mark ever leads a base it doesn't belong to: every
+        // diacritic is immediately preceded by a non-diacritic.
+        let chars: Vec<char> = out.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if crate::text::rtl_detector::is_rtl_diacritic(*c as u32) {
+                assert!(
+                    i > 0 && !crate::text::rtl_detector::is_rtl_diacritic(chars[i - 1] as u32),
+                    "diacritic at {i} is detached from its base"
+                );
+            }
+        }
+    }
+
+    // Mixed RTL+Latin MCIDs are left in raw order (full UAX #9 deferred) —
+    // guards against the pure-RTL reorder accidentally firing on mixed runs.
+    #[test]
+    fn test_order_mcid_spans_mixed_rtl_latin_kept_raw() {
+        let spans = vec![
+            make_rtl_test_span("שלום", 100.0, 700.0),
+            make_rtl_test_span("World", 200.0, 700.0),
+        ];
+        let ordered = PdfDocument::order_mcid_spans(&spans);
+        let texts: Vec<&str> = ordered.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["שלום", "World"], "mixed RTL+Latin must stay in raw order");
     }
 
     // #553: bare page-number detection (applied only inside the margin band).
@@ -22174,6 +22504,7 @@ mod tests {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             }
         }
 
@@ -22238,6 +22569,7 @@ mod tests {
             char_widths: vec![],
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 
@@ -22512,6 +22844,20 @@ mod tests {
         assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("5 \u{00AC} 3"), "5 \u{00AC} 3");
         // Leading/trailing `¬` with only one digit neighbour: untouched.
         assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("\u{00AC}5"), "\u{00AC}5");
+        // Spaced decimal: a subset that emits a single space between the decimal
+        // glyph and the fractional digits → drop the lone space, recover `.`.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("1\u{00AC} 00"), "1.00");
+        assert_eq!(
+            PdfDocument::fix_digit_logicalnot_decimal("0\u{00AC} 75 1\u{00AC} 00"),
+            "0.75 1.00"
+        );
+        // Still NOT a decimal when the leading digit does not abut `¬`
+        // (genuine spaced negation): `5 ¬ 3` stays untouched even though a
+        // digit follows the space.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("5 \u{00AC} 3"), "5 \u{00AC} 3");
+        // Only a single separating space is absorbed; two spaces is not a
+        // decimal rendering and is left alone.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("1\u{00AC}  00"), "1\u{00AC}  00");
     }
 
     #[test]
@@ -22611,6 +22957,7 @@ mod tests {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             }
         }
 
@@ -22681,6 +23028,7 @@ mod tests {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             }
         }
 

@@ -16,20 +16,25 @@ npm install pdf-oxide
 ```
 
 ```javascript
-const { PdfDocument } = require("pdf-oxide");
+import { PdfDocument } from "pdf-oxide";
 
-const doc = new PdfDocument("paper.pdf");
+const doc = PdfDocument.open("paper.pdf");
 const text = doc.extractText(0);
 const markdown = doc.toMarkdown(0);
 doc.close();
 ```
+
+> `pdf-oxide` is an ES module. Use `import` (shown above). From CommonJS, load it
+> with a dynamic import: `const { PdfDocument } = await import("pdf-oxide");`.
+> Open a file with the `PdfDocument.open(path)` factory — the constructor is
+> internal and does not take a path.
 
 TypeScript:
 
 ```typescript
 import { PdfDocument } from "pdf-oxide";
 
-const doc = new PdfDocument("paper.pdf");
+const doc = PdfDocument.open("paper.pdf");
 const text: string = doc.extractText(0);
 const markdown: string = doc.toMarkdown(0);
 doc.close();
@@ -82,9 +87,9 @@ Requires Node.js 18 or newer. No system dependencies. No Rust toolchain required
 ### Open a document
 
 ```javascript
-const { PdfDocument } = require("pdf-oxide");
+import { PdfDocument } from "pdf-oxide";
 
-const doc = new PdfDocument("report.pdf");
+const doc = PdfDocument.open("report.pdf");
 console.log(`Pages: ${doc.getPageCount()}`);
 
 const { major, minor } = doc.getVersion();
@@ -97,7 +102,7 @@ Use `using` for automatic cleanup (Node.js 22+):
 
 ```javascript
 {
-  using doc = new PdfDocument("report.pdf");
+  using doc = PdfDocument.open("report.pdf");
   const text = doc.extractText(0);
 } // doc.close() called automatically
 ```
@@ -117,7 +122,7 @@ const allHtml = doc.toHtmlAll();
 ### Iterate all pages
 
 ```javascript
-const doc = new PdfDocument("document.pdf");
+const doc = PdfDocument.open("document.pdf");
 const pageCount = doc.getPageCount();
 
 const pages = [];
@@ -132,7 +137,7 @@ doc.close();
 
 ```javascript
 async function extractAll(filePath) {
-  const doc = new PdfDocument(filePath);
+  const doc = PdfDocument.open(filePath);
   try {
     const pageCount = doc.getPageCount();
     const pages = [];
