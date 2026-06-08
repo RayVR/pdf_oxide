@@ -47,29 +47,6 @@ use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
 
 // ===========================================================================
-// HONEST_GAP markers
-// ===========================================================================
-
-/// Documents the sidecar's behaviour when an RGB paint precedes a CMYK
-/// transparent paint. The sidecar tracks CMYK plate values; RGB paints
-/// leave the sidecar at its previous value (paper-white at start of
-/// page). The /ca-modulated CMYK paint over an RGB backdrop therefore
-/// composites against paper-white in CMYK space, then the ICC
-/// transform emits a press-accurate RGB. The result is NOT the
-/// per-paint RGB source-over of the RGB backdrop and the CMYK paint;
-/// it is the CMYK-paint composited over paper-white. The spec is
-/// ambiguous on RGB+CMYK mixing under transparency; the probe pins
-/// the impl's choice so any future change surfaces as a value drift.
-pub const HONEST_GAP_RGB_PLUS_CMYK_MIXING_UNDER_TRANSPARENCY: &str =
-    "HONEST_GAP_RGB_PLUS_CMYK_MIXING_UNDER_TRANSPARENCY: when an RGB \
-     paint precedes a CMYK transparent paint on an OutputIntents page, \
-     the sidecar's backdrop is paper-white (zeros) at the RGB pixel \
-     because no CMYK paint touched it. The composite-first helper \
-     therefore composes the CMYK source over paper-white in CMYK \
-     space and emits the press-accurate RGB. The spec is ambiguous on \
-     mixed-space transparency; this probe pins the impl's choice.";
-
-// ===========================================================================
 // Synthetic PDF builder helpers (mirror the audit suite)
 // ===========================================================================
 
@@ -288,18 +265,14 @@ fn build_constant_cmyk_icc(l_byte: u8) -> Vec<u8> {
 // WORKSTREAM A1 — RGB backdrop, CMYK opaque paint (sidecar mirror)
 // ===========================================================================
 //
-// Probe: paint an opaque RGB rect, then a transparent CMYK overlap on a
-// page with /OutputIntents. The sidecar fires when /ca < 1.0 is
-// declared on the page resources, so we declare /Half /ca 0.5 to
-// drive allocation. The RGB rect does not update the sidecar (mirror
-// returns early when fill_color_cmyk is None — see
-// page_renderer.rs:3461). The subsequent CMYK transparent paint then
-// reads the sidecar at the RGB pixel and finds CMYK(0, 0, 0, 0) =
-// paper-white. The composite-first helper composes the source CMYK
-// over paper-white in CMYK space.
-//
-// The probe pins the impl's choice — see HONEST_GAP_RGB_PLUS_CMYK
-// for the spec disposition.
+// Per ISO 32000-1:2008 §11.3.4 compositing must happen in ONE blend
+// space (the group's CS). On a CMYK OutputIntents page the group blend
+// space IS CMYK, so an RGB-source paint must be converted to CMYK at
+// paint-resolution time and mirrored into the sidecar so a subsequent
+// transparent CMYK paint composites against the converted backdrop
+// (not against paper-white). The composite render path implements this
+// via `mirror_rgb_paint_into_sidecar_with_coverage` at the Fill /
+// Stroke wiring.
 
 fn fixture_rgb_then_cmyk_transparent() -> Vec<u8> {
     let icc = build_constant_cmyk_icc(135); // L* ≈ 53 → ~mid-grey
@@ -313,45 +286,234 @@ fn fixture_rgb_then_cmyk_transparent() -> Vec<u8> {
 }
 
 /// Workstream A1: mixed RGB + CMYK paint on a sidecar-active page.
-/// The RGB rect leaves the sidecar at zeros (no CMYK mirror); the
-/// CMYK transparent paint reads zeros and composes in CMYK over
-/// paper-white. The composed CMYK(0, 0, 0, 0.5) runs through the
-/// constant-grey ICC and emits the near-neutral grey from
-/// `build_constant_cmyk_icc(135)`.
+/// The constant-grey ICC profile maps every CMYK input to the same
+/// near-neutral L*≈53 sRGB grey, so the visible composite emits R=G=B
+/// regardless of whether the RGB backdrop was mirrored. The probe
+/// confirms the rendering still satisfies the constant-CLUT round-trip
+/// and the unaffected non-overlap region carries pure green. The
+/// byte-exact RGB→CMYK mirror behaviour is verified by the
+/// `qa_round4_a1_nonlinear_*` probes below which use a non-constant
+/// ICC where the converted backdrop survives as observable RGB drift.
 #[test]
-fn qa_round4_a1_rgb_then_cmyk_transparent_uses_paper_white_backdrop() {
+fn qa_round4_a1_rgb_then_cmyk_transparent_constant_icc_grey_round_trip() {
     let rgba = render_rgba(fixture_rgb_then_cmyk_transparent());
     // Inside the overlap region (CMYK paint over RGB green over white).
     let (r, g, b, _) = pixel_at(&rgba, 50, 50);
-    // The sidecar is zero at this pixel because the RGB paint does not
-    // touch it. The CMYK black-50% transparent paint composes against
-    // paper-white in CMYK space → (0, 0, 0, 0.5), then through the
-    // constant-grey ICC → near-grey. The resulting RGB is determined
-    // by the constant CLUT, NOT by the green RGB backdrop. Pin the
-    // impl's value so any future change surfaces.
-    //
-    // Decision-pin only: the probe documents the impl's choice (CMYK
-    // composite over paper-white, ignoring the RGB backdrop). The
-    // spec is ambiguous on mixed-space transparency.
+    // Constant-grey ICC: every CMYK quadruple maps to the same Lab
+    // (L*≈53, a*=0, b*=0) so the composite emits R=G=B independent of
+    // the sidecar backdrop. The probe checks the round-trip integrity
+    // but does NOT discriminate the sidecar's backdrop value — that's
+    // the role of the non-linear ICC probes.
     assert!(
         r == g && g == b,
-        "RGB+CMYK mixing: CMYK paint over paper-white backdrop through \
-         constant-grey ICC must emit R=G=B (near-neutral grey from \
-         constant CLUT); got ({r}, {g}, {b}). {}",
-        HONEST_GAP_RGB_PLUS_CMYK_MIXING_UNDER_TRANSPARENCY
+        "ISO 32000-1 §11.3.4 RGB+CMYK mixing: constant-grey ICC must emit \
+         R=G=B; got ({r}, {g}, {b})"
     );
-    // The green RGB rect is at PDF (10..90, 10..90) → image (10..90,
-    // 10..90). The sample (50, 50) is inside both the green rect and
-    // the CMYK overlap. If the sidecar consulted the green RGB it would
-    // emit a green-tinted result; the impl emits a grey (R=G=B).
-    // Verify by sampling outside the CMYK overlap but inside the green
-    // rect: must remain pure green.
+    // Outside the CMYK overlap the RGB paint is observable directly.
     let (r_g, g_g, b_g, _) = pixel_at(&rgba, 15, 15);
     assert_eq!(
         (r_g, g_g, b_g),
         (0, 255, 0),
         "outside CMYK overlap, RGB paint must remain byte-exact pure \
          green; got ({r_g}, {g_g}, {b_g})"
+    );
+}
+
+// ===========================================================================
+// WORKSTREAM A1B — RGB → CMYK sidecar mirror under non-linear ICC
+// ===========================================================================
+//
+// Byte-exact §11.3.4 probes: with a non-linear OutputIntent the
+// converted RGB backdrop survives as observable RGB drift after the
+// transparent CMYK paint runs through `apply_cmyk_compose_after_paint`.
+// The mirror's correctness is observable end-to-end on the pixmap.
+//
+// Profile shape (mirrored from `test_transparency_flattening_qa_round2.rs`'s
+// non-linear builder): CMYK → Lab with gamma-2.2 input curves and a
+// 2^4 CLUT whose corners satisfy L_corner = 255 − 63·(c+m+y+k). Linear
+// interpolation between corners in the CLUT body means the composite
+// `(c, m, y, k) → 255 − 63·Σ post-gamma byte`. Distinct CMYK
+// quadruples thus produce distinct L values, which the Lab→sRGB
+// transform amplifies into byte-distinct RGB.
+
+fn build_nonlinear_cmyk_to_lab_profile_a1b() -> Vec<u8> {
+    let in_chan: u8 = 4;
+    let out_chan: u8 = 3;
+    let grid: u8 = 2;
+    let mut lut = Vec::with_capacity(2048);
+    lut.extend_from_slice(&0x6d66_7431u32.to_be_bytes()); // 'mft1'
+    lut.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    lut.push(in_chan);
+    lut.push(out_chan);
+    lut.push(grid);
+    lut.push(0);
+    let identity: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+    for v in identity {
+        lut.extend_from_slice(&(v as u32).to_be_bytes());
+    }
+    // Gamma-2.2 forward input curves — `entry[i] = (i/255)^(1/2.2)·255`.
+    for _ in 0..in_chan {
+        for i in 0..256u16 {
+            let v = ((i as f64) / 255.0).powf(1.0 / 2.2);
+            let byte = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+            lut.push(byte);
+        }
+    }
+    // 16 CLUT corners: L = 255 − 63·(c+m+y+k); a* = b* = 128.
+    let grid_size = (grid as usize).pow(in_chan as u32);
+    for idx in 0..grid_size {
+        let c = (idx >> 3) & 1;
+        let m = (idx >> 2) & 1;
+        let y = (idx >> 1) & 1;
+        let k = idx & 1;
+        let total = c + m + y + k;
+        let l_byte = (255 - total * 63).min(255) as u8;
+        lut.push(l_byte);
+        lut.push(128);
+        lut.push(128);
+    }
+    // Identity output tables.
+    for _ in 0..out_chan {
+        for i in 0..256u16 {
+            lut.push(i as u8);
+        }
+    }
+    let mut profile = vec![0u8; 128];
+    let total_size: u32 = 128 + 4 + 12 + lut.len() as u32;
+    profile[0..4].copy_from_slice(&total_size.to_be_bytes());
+    profile[8..12].copy_from_slice(&0x0240_0000u32.to_be_bytes()); // v2
+    profile[12..16].copy_from_slice(b"prtr");
+    profile[16..20].copy_from_slice(b"CMYK");
+    profile[20..24].copy_from_slice(b"Lab ");
+    profile[36..40].copy_from_slice(b"acsp");
+    profile[64..68].copy_from_slice(&0u32.to_be_bytes());
+    profile[68..72].copy_from_slice(&0x0000_F6D6u32.to_be_bytes());
+    profile[72..76].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    profile[76..80].copy_from_slice(&0x0000_D32Du32.to_be_bytes());
+    profile.extend_from_slice(&1u32.to_be_bytes());
+    profile.extend_from_slice(&0x4132_4230u32.to_be_bytes()); // 'A2B0'
+    profile.extend_from_slice(&144u32.to_be_bytes());
+    profile.extend_from_slice(&(lut.len() as u32).to_be_bytes());
+    profile.extend_from_slice(&lut);
+    profile
+}
+
+/// Render a single-paint CMYK fixture through the non-linear ICC and
+/// return the RGB sample at (50, 50). Used to derive the byte-exact
+/// reference value for any composed CMYK quadruple — we run the
+/// composition by hand and then ask the renderer what RGB the same ICC
+/// produces for that single-paint result.
+fn nonlinear_a1b_rgb_for_cmyk(c: f32, m: f32, y: f32, k: f32) -> (u8, u8, u8) {
+    let icc = build_nonlinear_cmyk_to_lab_profile_a1b();
+    let content = format!("{c} {m} {y} {k} k\n10 10 80 80 re\nf\n");
+    let pdf = build_pdf_with_output_intent(&content, "", &icc, &[]);
+    let rgba = render_rgba(pdf);
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    (r, g, b)
+}
+
+/// Workstream A1B: RGB paint precedes a transparent CMYK overlap on a
+/// non-linear ICC. The §11.3.4 mirror converts the RGB backdrop via
+/// §10.3.5 inverse (qcms / no-CMM build) or via lcms2's sRGB→CMYK
+/// transform, and the compose-first helper composes the source CMYK
+/// against the converted backdrop. The overlap region's rendered RGB
+/// must match the single-paint render of the composed CMYK quadruple.
+///
+/// Source CMYK = (0, 0, 0, 1) at α=0.5; RGB backdrop = green (0, 1, 0).
+///   §10.3.5 inverse: green RGB(0, 1, 0) → CMYK(1, 0, 1, 0).
+///   Composed CMYK = 0.5·(0, 0, 0, 1) + 0.5·(1, 0, 1, 0)
+///                = (0.5, 0, 0.5, 0.5).
+/// Under lcms2 with no destination B2A tag the transform also returns
+/// None and the §10.3.5 inverse path runs — same byte reference.
+#[test]
+fn qa_round4_a1_nonlinear_rgb_then_cmyk_transparent_mirrors_converted_backdrop() {
+    let icc = build_nonlinear_cmyk_to_lab_profile_a1b();
+    // Background white, then opaque RGB green, then transparent black
+    // K-only paint at /ca 0.5 overlapping the green.
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   0 1 0 rg\n10 10 80 80 re\nf\n\
+                   /Half gs\n\
+                   0 0 0 1 k\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Half << /Type /ExtGState /ca 0.5 >> >>";
+    let pdf = build_pdf_with_output_intent(content, resources, &icc, &[]);
+    let rgba = render_rgba(pdf);
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+
+    // Byte-exact reference: single-paint render of the composed CMYK
+    // (0.5, 0, 0.5, 0.5) through the same non-linear ICC. This is what
+    // §11.3.4 mandates: composition in the group's blend space then a
+    // single ICC conversion.
+    let (rr, gr, br) = nonlinear_a1b_rgb_for_cmyk(0.5, 0.0, 0.5, 0.5);
+    assert_eq!(
+        (r, g, b),
+        (rr, gr, br),
+        "ISO 32000-1 §11.3.4 RGB→CMYK sidecar mirror: overlap of K-50% over \
+         green RGB must match single-paint CMYK(0.5, 0, 0.5, 0.5) byte-exact. \
+         Got composite=({r}, {g}, {b}); single-paint reference=({rr}, {gr}, \
+         {br}); paper-white-backdrop reference=({}, {}, {}) — the third \
+         value documents the pre-mirror behaviour and must NOT match.",
+        nonlinear_a1b_rgb_for_cmyk(0.0, 0.0, 0.0, 0.5).0,
+        nonlinear_a1b_rgb_for_cmyk(0.0, 0.0, 0.0, 0.5).1,
+        nonlinear_a1b_rgb_for_cmyk(0.0, 0.0, 0.0, 0.5).2,
+    );
+
+    // Sensitivity: the converted-backdrop reference and the paper-
+    // white-backdrop reference MUST differ — otherwise the probe
+    // can't discriminate the closure from the prior behaviour.
+    let (rp, gp, bp) = nonlinear_a1b_rgb_for_cmyk(0.0, 0.0, 0.0, 0.5);
+    assert_ne!(
+        (rr, gr, br),
+        (rp, gp, bp),
+        "non-linear ICC fixture must produce distinguishable RGB for \
+         CMYK(0.5, 0, 0.5, 0.5) vs CMYK(0, 0, 0, 0.5); got both=({rr}, \
+         {gr}, {br}) — fixture drift, redo the L-corner spread."
+    );
+}
+
+/// Workstream A1B reverse direction: CMYK paint at α<1 over an opaque
+/// RGB backdrop. Same mirror requirement, same byte-exact composition
+/// reference. This is the direction the audit's HONEST_GAP_RGB_PLUS_CMYK
+/// docstring narrated as the structural break — the probe pins the fix.
+#[test]
+fn qa_round4_a1_nonlinear_rgb_under_cmyk_transparent_uses_converted_backdrop() {
+    let icc = build_nonlinear_cmyk_to_lab_profile_a1b();
+    // Same fixture as above; the assertion below pins the centre pixel
+    // of the overlap region where the green rect is the backdrop and
+    // the K paint at /ca 0.5 is the source.
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   0 1 0 rg\n10 10 80 80 re\nf\n\
+                   /Half gs\n\
+                   0 0 0 1 k\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Half << /Type /ExtGState /ca 0.5 >> >>";
+    let pdf = build_pdf_with_output_intent(content, resources, &icc, &[]);
+    let rgba = render_rgba(pdf);
+    // Outside the green rect, OUTSIDE the K rect: stays white.
+    let (rw, gw, bw, _) = pixel_at(&rgba, 5, 5);
+    let (rwr, gwr, bwr) = nonlinear_a1b_rgb_for_cmyk(0.0, 0.0, 0.0, 0.0);
+    assert_eq!(
+        (rw, gw, bw),
+        (rwr, gwr, bwr),
+        "background corner: expected byte-exact white reference \
+         ({rwr}, {gwr}, {bwr}); got ({rw}, {gw}, {bw})"
+    );
+    // Inside the green rect, OUTSIDE the K rect: pure green RGB (no
+    // CMYK paint touched this pixel).
+    let (rg, gg, bg, _) = pixel_at(&rgba, 15, 15);
+    assert_eq!(
+        (rg, gg, bg),
+        (0, 255, 0),
+        "RGB-only region must remain byte-exact green; got ({rg}, {gg}, {bg})"
+    );
+    // Inside the overlap region: the composed CMYK reference.
+    let (ro, go, bo, _) = pixel_at(&rgba, 50, 50);
+    let (rr, gr, br) = nonlinear_a1b_rgb_for_cmyk(0.5, 0.0, 0.5, 0.5);
+    assert_eq!(
+        (ro, go, bo),
+        (rr, gr, br),
+        "overlap region: expected byte-exact composed-CMYK reference \
+         ({rr}, {gr}, {br}); got ({ro}, {go}, {bo})"
     );
 }
 

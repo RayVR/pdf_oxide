@@ -454,6 +454,86 @@ pub const fn active_backend_supports_cmyk_retarget() -> bool {
     cfg!(feature = "icc-lcms2")
 }
 
+/// A compiled sRGB → destination-CMYK transform.
+///
+/// Used by the transparency sidecar's RGB-paint mirror path to convert
+/// the rasterised sRGB composite into the document's OutputIntent CMYK
+/// space so subsequent transparent CMYK paints over an RGB backdrop
+/// composite against the converted backdrop per ISO 32000-1 §11.3.4
+/// (compositing happens in ONE blend space — the group's CS).
+///
+/// Only `icc-lcms2` builds construct a real CMM transform. Under
+/// `icc-qcms` or no-CMM builds the constructor returns `None`; the
+/// call site at `mirror_rgb_paint_into_sidecar` falls through to the
+/// §10.3.5 inverse `(C, M, Y) = (1-R, 1-G, 1-B)` with `K = 0`. The
+/// fallback loses ink-coverage information in dark areas (no K
+/// component) but is colorimetrically sound for the common case where
+/// the press recovers K via the same press's GCR/UCR after composition.
+pub struct SrgbToCmykTransform {
+    /// Destination profile kept for diagnostics + cache key.
+    #[allow(dead_code)]
+    dst_profile: Arc<IccProfile>,
+    intent: RenderingIntent,
+    inner: <ActiveIccBackend as IccBackend>::SrgbToCmykTransform,
+}
+
+impl SrgbToCmykTransform {
+    /// Build an sRGB→destination-CMYK transform using the press
+    /// default (relative-colorimetric intent + BPC on). Returns `None`
+    /// when the backend can't compile the transform — qcms / no-CMM
+    /// builds, or destination profiles that aren't valid CMYK printer
+    /// profiles.
+    pub fn new(dst_profile: Arc<IccProfile>, intent: RenderingIntent) -> Option<Self> {
+        Self::new_with_flags(dst_profile, intent, TransformFlags::press_default())
+    }
+
+    /// Build an sRGB→destination-CMYK transform with explicit flags.
+    /// The destination profile must declare CMYK by header signature.
+    pub fn new_with_flags(
+        dst_profile: Arc<IccProfile>,
+        intent: RenderingIntent,
+        flags: TransformFlags,
+    ) -> Option<Self> {
+        let inner =
+            <ActiveIccBackend as IccBackend>::build_srgb_to_cmyk(&dst_profile, intent, flags)?;
+        Some(Self {
+            dst_profile,
+            intent,
+            inner,
+        })
+    }
+
+    /// Convert a single sRGB pixel to the destination CMYK profile.
+    /// Inputs and outputs are unit-interval f32. Caller quantises to
+    /// 8-bit at the storage boundary.
+    pub fn convert_pixel(&self, rgb: [f32; 3]) -> [f32; 4] {
+        <ActiveIccBackend as IccBackend>::convert_srgb_to_cmyk_pixel(&self.inner, rgb)
+    }
+
+    /// The rendering intent the transform was built for.
+    pub fn intent(&self) -> RenderingIntent {
+        self.intent
+    }
+}
+
+impl std::fmt::Debug for SrgbToCmykTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SrgbToCmykTransform")
+            .field("intent", &self.intent)
+            .field("dst_bytes", &self.dst_profile.bytes.len())
+            .field("backend", &backend::active_backend_name())
+            .finish()
+    }
+}
+
+/// Whether the active backend supports sRGB → destination-CMYK
+/// conversion through a real CMM transform (vs the §10.3.5 inverse
+/// fallback). Compile-time constant so the rendering hot path can be
+/// branched at the call site without a runtime check.
+pub const fn active_backend_supports_srgb_to_cmyk() -> bool {
+    cfg!(feature = "icc-lcms2")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::color::{IccProfile, RenderingIntent, Transform};
+use crate::color::{IccProfile, RenderingIntent, SrgbToCmykTransform, Transform};
 use crate::document::PdfDocument;
 use crate::object::Object;
 
@@ -87,6 +87,15 @@ use crate::object::Object;
 /// shared across threads within a render call.
 pub(crate) struct IccTransformCache {
     entries: RefCell<HashMap<(u64, RenderingIntent), Arc<Transform>>>,
+    /// sRGB → destination-CMYK transforms keyed by the destination
+    /// profile content hash + intent. The transparency sidecar's
+    /// RGB-paint mirror path consults this cache to convert RGB-source
+    /// paints into the OutputIntent CMYK space so subsequent
+    /// transparent CMYK paints over an RGB backdrop composite against
+    /// the converted backdrop per §11.3.4. Built on miss (lcms2 builds
+    /// only — qcms returns `None`); cached for the page lifetime.
+    srgb_to_cmyk_entries:
+        RefCell<HashMap<(u64, RenderingIntent), Option<Arc<SrgbToCmykTransform>>>>,
     /// Test-support counter: every cache miss (i.e. every call that
     /// actually constructs a fresh `Transform`) increments this
     /// instance-local counter. Distinct from the global
@@ -101,6 +110,7 @@ impl IccTransformCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: RefCell::new(HashMap::new()),
+            srgb_to_cmyk_entries: RefCell::new(HashMap::new()),
             #[cfg(feature = "test-support")]
             build_count: std::cell::Cell::new(0),
         }
@@ -128,10 +138,31 @@ impl IccTransformCache {
         t
     }
 
+    /// Look up or build the compiled sRGB→destination-CMYK transform
+    /// for the document's OutputIntent CMYK profile. Returns `None`
+    /// (cached) on backends that can't build the transform (qcms /
+    /// no-CMM); call sites then fall back to the §10.3.5 inverse.
+    pub(crate) fn get_or_build_srgb_to_cmyk(
+        &self,
+        dst_profile: &Arc<IccProfile>,
+        intent: RenderingIntent,
+    ) -> Option<Arc<SrgbToCmykTransform>> {
+        let key = (dst_profile.content_hash(), intent);
+        if let Some(slot) = self.srgb_to_cmyk_entries.borrow().get(&key) {
+            return slot.clone();
+        }
+        let built = SrgbToCmykTransform::new(Arc::clone(dst_profile), intent).map(Arc::new);
+        self.srgb_to_cmyk_entries
+            .borrow_mut()
+            .insert(key, built.clone());
+        built
+    }
+
     /// Drop every entry. Called per page so the cache doesn't leak
     /// transforms across renders when `PageRenderer` is reused.
     pub(crate) fn clear(&self) {
         self.entries.borrow_mut().clear();
+        self.srgb_to_cmyk_entries.borrow_mut().clear();
         #[cfg(feature = "test-support")]
         self.build_count.set(0);
     }

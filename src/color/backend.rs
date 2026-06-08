@@ -74,6 +74,12 @@ pub trait IccBackend {
     /// Backend-specific opaque CMYK-to-CMYK retargeting transform
     /// handle.
     type CmykRetarget;
+    /// Backend-specific opaque sRGB-to-destination-CMYK transform
+    /// handle. Used by the transparency sidecar to mirror RGB-source
+    /// paints into the CMYK plane so subsequent transparent CMYK
+    /// paints composite against the converted backdrop rather than
+    /// paper-white per §11.3.4.
+    type SrgbToCmykTransform;
 
     /// Build a source-profile → sRGB transform honouring `intent`.
     /// Returns `None` when the backend can't compile the profile
@@ -119,6 +125,26 @@ pub trait IccBackend {
     /// caller's responsibility — the trait operates in f32 so
     /// quantisation only happens at the storage boundary.
     fn retarget_cmyk_pixel(transform: &Self::CmykRetarget, cmyk: [f32; 4]) -> [f32; 4];
+
+    /// Build an sRGB → destination-CMYK transform honouring `intent`
+    /// and `flags`. The destination is a printer-class CMYK profile
+    /// (typically the document `/OutputIntents` profile). Returns
+    /// `None` when the backend can't build the transform — qcms 0.3
+    /// has no CMYK output path so it always returns None. lcms2 builds
+    /// the transform through sRGB → Lab PCS → destination CMYK.
+    fn build_srgb_to_cmyk(
+        dst_profile: &IccProfile,
+        intent: RenderingIntent,
+        flags: TransformFlags,
+    ) -> Option<Self::SrgbToCmykTransform>;
+
+    /// Apply an sRGB→destination-CMYK transform to a single sRGB
+    /// pixel. Inputs are unit-interval f32 (R, G, B); outputs are
+    /// unit-interval f32 (C, M, Y, K). Round-trips through 8-bit at
+    /// the lcms2 boundary for the same reason as `retarget_cmyk_pixel`
+    /// — the press pipeline serialises plate values as 8-bit.
+    fn convert_srgb_to_cmyk_pixel(transform: &Self::SrgbToCmykTransform, rgb: [f32; 3])
+        -> [f32; 4];
 }
 
 // ============================================================================
@@ -149,6 +175,11 @@ mod qcms_impl {
     /// `build_cmyk_retarget` call on `QcmsBackend` returns `None`.
     pub struct CmykRetarget(pub(super) core::convert::Infallible);
 
+    /// qcms has no CMYK output path so RGB → CMYK is also unsupported.
+    /// `core::convert::Infallible` makes the type uninhabited so the
+    /// `convert_srgb_to_cmyk_pixel` arm is unreachable at runtime.
+    pub struct SrgbToCmykTransform(pub(super) core::convert::Infallible);
+
     fn qcms_intent(intent: RenderingIntent) -> qcms::Intent {
         match intent {
             RenderingIntent::Perceptual => qcms::Intent::Perceptual,
@@ -161,6 +192,7 @@ mod qcms_impl {
     impl IccBackend for QcmsBackend {
         type SrgbTransform = SrgbTransform;
         type CmykRetarget = CmykRetarget;
+        type SrgbToCmykTransform = SrgbToCmykTransform;
 
         fn build_srgb_transform(
             profile: &IccProfile,
@@ -239,11 +271,34 @@ mod qcms_impl {
             // on the Infallible inhabitant to teach the compiler that.
             match transform.0 {}
         }
+
+        fn build_srgb_to_cmyk(
+            _dst_profile: &IccProfile,
+            _intent: RenderingIntent,
+            _flags: TransformFlags,
+        ) -> Option<Self::SrgbToCmykTransform> {
+            // qcms 0.3 has no CMYK output path. Call sites fall through
+            // to the §10.3.5 inverse `(C, M, Y) = (1-R, 1-G, 1-B)`,
+            // `K = 0` formula at the caller.
+            None
+        }
+
+        fn convert_srgb_to_cmyk_pixel(
+            transform: &Self::SrgbToCmykTransform,
+            _rgb: [f32; 3],
+        ) -> [f32; 4] {
+            // Uninhabited under qcms — `build_srgb_to_cmyk` always
+            // returns None.
+            match transform.0 {}
+        }
     }
 }
 
 #[cfg(feature = "icc-qcms")]
-pub use qcms_impl::{CmykRetarget as QcmsCmykRetarget, SrgbTransform as QcmsSrgbTransform};
+pub use qcms_impl::{
+    CmykRetarget as QcmsCmykRetarget, SrgbToCmykTransform as QcmsSrgbToCmykTransform,
+    SrgbTransform as QcmsSrgbTransform,
+};
 
 // ============================================================================
 // Lcms2Backend — Little CMS via the `lcms2` crate. Press-grade CMM.
@@ -291,6 +346,20 @@ mod lcms2_impl {
             lcms2::Transform<[u8; 4], [u8; 4], lcms2::GlobalContext, lcms2::DisallowCache>,
     }
 
+    /// sRGB → destination CMYK. The source is always sRGB (i.e. the
+    /// composite pixmap's actual colour space — every RGB-source paint
+    /// has been resolved to sRGB by the rasteriser), and the
+    /// destination is the document's OutputIntent CMYK profile. The
+    /// transform flows sRGB → Lab PCS → destination CMYK so the §11.3.4
+    /// blend-space conversion happens through the same canonical PCS
+    /// path the press uses. Like the `CmykRetarget` above, we quantise
+    /// at the 8-bit boundary because press hardware ultimately consumes
+    /// 8-bit plates.
+    pub struct SrgbToCmykTransform {
+        pub(super) inner:
+            lcms2::Transform<[u8; 3], [u8; 4], lcms2::GlobalContext, lcms2::DisallowCache>,
+    }
+
     fn lcms2_intent(intent: RenderingIntent) -> lcms2::Intent {
         match intent {
             RenderingIntent::Perceptual => lcms2::Intent::Perceptual,
@@ -335,6 +404,7 @@ mod lcms2_impl {
     impl IccBackend for Lcms2Backend {
         type SrgbTransform = SrgbTransform;
         type CmykRetarget = CmykRetarget;
+        type SrgbToCmykTransform = SrgbToCmykTransform;
 
         fn build_srgb_transform(
             profile: &IccProfile,
@@ -457,11 +527,62 @@ mod lcms2_impl {
                 dst[0][3] as f32 / 255.0,
             ]
         }
+
+        fn build_srgb_to_cmyk(
+            dst_profile: &IccProfile,
+            intent: RenderingIntent,
+            flags: TransformFlags,
+        ) -> Option<Self::SrgbToCmykTransform> {
+            // Destination must be CMYK by header signature — bail
+            // otherwise so callers don't unwittingly write a non-CMYK
+            // quadruple into the CMYK sidecar.
+            if dst_profile.n_components() != 4 {
+                return None;
+            }
+            let src = lcms2::Profile::new_srgb();
+            let dst = lcms2::Profile::new_icc(dst_profile.bytes()).ok()?;
+            if !matches!(dst.color_space(), lcms2::ColorSpaceSignature::CmykData) {
+                return None;
+            }
+            let inner = lcms2::Transform::new_flags_context(
+                lcms2::GlobalContext::new(),
+                &src,
+                lcms2::PixelFormat::RGB_8,
+                &dst,
+                lcms2::PixelFormat::CMYK_8,
+                lcms2_intent(intent),
+                lcms2_flags(flags),
+            )
+            .ok()?;
+            Some(SrgbToCmykTransform { inner })
+        }
+
+        fn convert_srgb_to_cmyk_pixel(
+            transform: &Self::SrgbToCmykTransform,
+            rgb: [f32; 3],
+        ) -> [f32; 4] {
+            let src = [[
+                (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]];
+            let mut dst = [[0u8; 4]; 1];
+            transform.inner.transform_pixels(&src, &mut dst);
+            [
+                dst[0][0] as f32 / 255.0,
+                dst[0][1] as f32 / 255.0,
+                dst[0][2] as f32 / 255.0,
+                dst[0][3] as f32 / 255.0,
+            ]
+        }
     }
 }
 
 #[cfg(feature = "icc-lcms2")]
-pub use lcms2_impl::{CmykRetarget as Lcms2CmykRetarget, SrgbTransform as Lcms2SrgbTransform};
+pub use lcms2_impl::{
+    CmykRetarget as Lcms2CmykRetarget, SrgbToCmykTransform as Lcms2SrgbToCmykTransform,
+    SrgbTransform as Lcms2SrgbTransform,
+};
 
 // ============================================================================
 // NoOpBackend — fallback when neither icc-qcms nor icc-lcms2 is enabled.
@@ -483,10 +604,13 @@ mod noop_impl {
     pub struct SrgbTransform(pub(super) core::convert::Infallible);
     /// Uninhabited — the `NoOpBackend` never constructs one of these.
     pub struct CmykRetarget(pub(super) core::convert::Infallible);
+    /// Uninhabited — the `NoOpBackend` never constructs one of these.
+    pub struct SrgbToCmykTransform(pub(super) core::convert::Infallible);
 
     impl IccBackend for NoOpBackend {
         type SrgbTransform = SrgbTransform;
         type CmykRetarget = CmykRetarget;
+        type SrgbToCmykTransform = SrgbToCmykTransform;
 
         fn build_srgb_transform(
             _profile: &IccProfile,
@@ -518,11 +642,27 @@ mod noop_impl {
         fn retarget_cmyk_pixel(transform: &Self::CmykRetarget, _cmyk: [f32; 4]) -> [f32; 4] {
             match transform.0 {}
         }
+        fn build_srgb_to_cmyk(
+            _dst_profile: &IccProfile,
+            _intent: RenderingIntent,
+            _flags: TransformFlags,
+        ) -> Option<Self::SrgbToCmykTransform> {
+            None
+        }
+        fn convert_srgb_to_cmyk_pixel(
+            transform: &Self::SrgbToCmykTransform,
+            _rgb: [f32; 3],
+        ) -> [f32; 4] {
+            match transform.0 {}
+        }
     }
 }
 
 #[cfg(not(any(feature = "icc-qcms", feature = "icc-lcms2")))]
-pub use noop_impl::{CmykRetarget as NoOpCmykRetarget, SrgbTransform as NoOpSrgbTransform};
+pub use noop_impl::{
+    CmykRetarget as NoOpCmykRetarget, SrgbToCmykTransform as NoOpSrgbToCmykTransform,
+    SrgbTransform as NoOpSrgbTransform,
+};
 
 // ============================================================================
 // ActiveIccBackend — compile-time selection. lcms2 wins when both are on.
