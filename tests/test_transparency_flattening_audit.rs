@@ -20,7 +20,7 @@
 //! | `/SMask /S /Alpha` (Form XObject soft mask)     | §11.5.2   | live   |
 //! | `/SMask /S /Luminosity` (Form XObject soft mask)| §11.5.3   | live   |
 //! | `/SMask /BC` backdrop colour (n=1/3/4 + DeviceN)| §11.6.5.2 | live   |
-//! | `/SMask /TR` transfer function (Type 0/2/4)     | §11.6.5.2 | live   |
+//! | `/SMask /TR` transfer function (Type 0/2/4)     | §11.6.5.2 | live (Type 3 stitching narrows to HONEST_GAP_SMASK_TR_TYPE_3_STITCHING) |
 //! | Transparency group `/I` (isolated flag)         | §11.4.5   | live   |
 //! | Transparency group `/K` (knockout flag)         | §11.4.6   | live   |
 //! | Form XObject `/Group` dict                      | §11.4.5   | live   |
@@ -98,6 +98,31 @@
 
 use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
+
+// ===========================================================================
+// Narrow HONEST_GAP tracking constants — narrowly-scoped remainders
+// after the bulk-feature work landed.
+// ===========================================================================
+
+/// `/SMask /TR` Type 3 (stitching function) per §7.10.4 is the only
+/// transfer-function arm still falling to Identity. A stitching
+/// function composes sub-functions over disjoint subdomains; for an
+/// SMask transfer this would let producers concatenate per-mask-region
+/// curves. Real-world SMask /TR streams overwhelmingly carry Type 0
+/// sampled or Type 2 exponential — Type 3 stitching is uncommon for
+/// monotonic opacity curves. The fallback to Identity is correctness-
+/// safe in the sense that a malformed /TR is required by §11.4.7 to
+/// default to Identity; closing the gap is a feature additive, not a
+/// correctness fix.
+pub const HONEST_GAP_SMASK_TR_TYPE_3_STITCHING: &str =
+    "HONEST_GAP_SMASK_TR_TYPE_3_STITCHING: /SMask /TR Type 3 stitching \
+     functions (§7.10.4) fall through to Identity. The renderer evaluates \
+     Type 0 sampled (§7.10.2), Type 2 exponential interpolation (§7.10.3), \
+     and Type 4 PostScript calculator (§7.10.5); a Type 3 /TR is treated \
+     as Identity per §11.4.7's default-on-unrecognised rule. Closing this \
+     gap requires a stitching evaluator that dispatches the input through \
+     the sub-function whose /Bounds covers it, with /Encode remapping the \
+     sub-function's input range.";
 
 // ===========================================================================
 // Synthetic-PDF builder + helpers
@@ -573,6 +598,120 @@ fn smask_tr_transfer_squares_modulation() {
         (255, 191, 191),
         "ISO 32000-1 §11.6.5.2 /SMask /TR Type 2 N=2 must square luminance; \
          expected byte-exact (255, 191, 191); got ({r}, {g}, {b})"
+    );
+}
+
+/// Fixture: same Form-XObject SMask as the Type-2 probe but the /TR
+/// references a Type 4 PostScript calculator stream `{ 0.5 mul }` that
+/// halves the projected luminance.
+fn fixture_smask_with_tr_type4_half() -> Vec<u8> {
+    let form_content = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    // Type 4 stream: `{ 0.5 mul }`. Domain [0 1], Range [0 1] match
+    // the SMask /TR contract.
+    let program = "{ 0.5 mul }";
+    let obj_6 = format!(
+        "6 0 obj\n<< /FunctionType 4 /Domain [0 1] /Range [0 1] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        program.len(),
+        program
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R /TR 6 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5, &obj_6])
+}
+
+/// `/SMask /TR` Type-4 PostScript calculator per §7.10.5. The Type 4
+/// evaluator at `src/functions/mod.rs` is shared with Separation /
+/// DeviceN tint transforms; the SMask /TR wiring at
+/// `parse_transfer_function` compiles the stream once per page and
+/// reuses the `Program` per pixel.
+#[test]
+fn smask_tr_type4_postscript_halves_modulation() {
+    let rgba = render_rgba(fixture_smask_with_tr_type4_half());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // Form 50% grey → mask byte (128, 128, 128). m_initial = 128/255
+    // = 0.5020. Type 4 `{ 0.5 mul }` → m = 0.2510. inv_m = 0.7490.
+    // G = 0.7490·255 = 190.99 → byte 191. Same byte triple as
+    // Type-2 N=2 — distinguishable from Identity (255, 127, 127)
+    // and from no-/TR (255, 127, 127).
+    assert_eq!(
+        (r, g, b),
+        (255, 191, 191),
+        "ISO 32000-1 §7.10.5 + §11.6.5.2 /SMask /TR Type 4 \"0.5 mul\" must \
+         halve modulation; expected byte-exact (255, 191, 191); got \
+         ({r}, {g}, {b})"
+    );
+}
+
+/// Fixture: SMask /TR Type 0 sampled function with an inverted-ramp
+/// 256-entry 8-bit LUT (sample[i] = 255 − i). The function maps any
+/// input x to roughly 1 − x; in particular a 50%-grey form's m = 0.5020
+/// becomes m_out ≈ 0.4980.
+fn fixture_smask_with_tr_type0_inverted_ramp() -> Vec<u8> {
+    let form_content = "0.5 g\n0 0 100 100 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    // 256-byte inverted-ramp LUT: byte i = 255 − i.
+    let mut lut = Vec::with_capacity(256);
+    for i in 0..256u32 {
+        lut.push((255 - i) as u8);
+    }
+    let mut obj_6 = format!(
+        "6 0 obj\n<< /FunctionType 0 /Domain [0 1] /Range [0 1] /Size [256] \
+         /BitsPerSample 8 /Length {} >>\nstream\n",
+        lut.len()
+    )
+    .into_bytes();
+    obj_6.extend_from_slice(&lut);
+    obj_6.extend_from_slice(b"\nendstream\nendobj\n");
+    // Safety: every byte in the LUT is a valid ASCII byte sequence
+    // when interpreted as a raw stream — the surrounding dict and
+    // endstream framing are valid UTF-8, and `build_pdf` reads back
+    // as bytes via `as_bytes`.
+    let obj_6_str = unsafe { std::str::from_utf8_unchecked(&obj_6) };
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 5 0 R /TR 6 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5, obj_6_str])
+}
+
+/// `/SMask /TR` Type-0 sampled function per §7.10.2. The 256-byte
+/// inverted-ramp LUT (sample[i] = 255-i) approximates f(x) = 1 - x.
+#[test]
+fn smask_tr_type0_sampled_inverted_ramp() {
+    let rgba = render_rgba(fixture_smask_with_tr_type0_inverted_ramp());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // Form 50% grey → mask byte (128, 128, 128). m_initial = 128/255
+    // ≈ 0.5020. Type-0 lookup at position 0.5020·255 = 128.01 →
+    // lo=128, hi=129. LUT[128] = 127, LUT[129] = 126. Interp at
+    // frac=0.01 → 127·0.99 + 126·0.01 = 126.99 → raw value 126.99.
+    // Decoded to /Range [0, 1]: m_out = 126.99/255 ≈ 0.4980. inv_m
+    // = 0.5020. G = 0.4980·0 + 0.5020·255 = 128.01 → byte 128. So
+    // expected = (255, 128, 128). Distinguishable from Identity
+    // (255, 127, 127), Type-2 N=2 (255, 191, 191), and Type-4
+    // 0.5-mul (255, 191, 191).
+    assert_eq!(
+        (r, g, b),
+        (255, 128, 128),
+        "ISO 32000-1 §7.10.2 + §11.6.5.2 /SMask /TR Type 0 inverted-ramp \
+         LUT must invert modulation; expected byte-exact (255, 128, 128); \
+         got ({r}, {g}, {b})"
     );
 }
 

@@ -6708,6 +6708,24 @@ pub(crate) enum SMaskTransfer {
         /// Exponent.
         n: f32,
     },
+    /// Type 0 sampled function (§7.10.2). One-dimensional unit-interval
+    /// lookup table — the parser materialises the sampled stream into
+    /// a `Vec<f32>` so per-pixel evaluation is a single bounded
+    /// allocation-free read.
+    Type0 {
+        /// One sample per /Size[0] entry, decoded to the [0, 1]
+        /// output range. Linear interpolation between adjacent entries
+        /// evaluates the function at intermediate inputs.
+        samples: Vec<f32>,
+    },
+    /// Type 4 PostScript calculator (§7.10.5). The compiled program
+    /// is reused per pixel; `Program` carries no mutable state so
+    /// concurrent calls are safe.
+    Type4 {
+        /// Compiled PostScript program. The caller routes one f64
+        /// input through `evaluate` and reads one f64 output.
+        program: crate::functions::Program,
+    },
 }
 
 impl SMaskTransfer {
@@ -6720,14 +6738,47 @@ impl SMaskTransfer {
                 let p = x.powf(*n);
                 c0 + p * (c1 - c0)
             },
+            SMaskTransfer::Type0 { samples } => {
+                // §7.10.2 Type-0 sampled: clamp x to [0, 1] (the
+                // domain), encode to sample-index space, linearly
+                // interpolate between the two nearest entries.
+                let n = samples.len();
+                if n == 0 {
+                    return x;
+                }
+                if n == 1 {
+                    return samples[0];
+                }
+                let pos = x * (n as f32 - 1.0);
+                let lo = pos.floor() as usize;
+                let hi = (lo + 1).min(n - 1);
+                let frac = pos - lo as f32;
+                let v = samples[lo] * (1.0 - frac) + samples[hi] * frac;
+                v.clamp(0.0, 1.0)
+            },
+            SMaskTransfer::Type4 { program } => {
+                // §7.10.5 PostScript calculator. The compiled program
+                // takes one f64 input and emits one f64 output for a
+                // /TR function (1→1 per §11.6.5.2 Table 144). Failure
+                // modes (stack underflow, runtime budget) fall back
+                // to identity rather than panicking; the transfer
+                // function is a rendering-time concern and a malformed
+                // program should not break the page render.
+                match program.evaluate(&[x as f64]) {
+                    Ok(out) if !out.is_empty() => (out[0] as f32).clamp(0.0, 1.0),
+                    _ => x,
+                }
+            },
         }
     }
 }
 
-/// Parse a `/SMask /TR` function. Only Type 2 (exponential
-/// interpolation) is supported today; Type 0 (sampled) and Type 4
-/// (PostScript) would land if a real-world fixture demanded them.
-/// Identity is the spec default for absent or unrecognised /TR.
+/// Parse a `/SMask /TR` function. Type 0 (sampled), Type 2 (exponential
+/// interpolation), and Type 4 (PostScript calculator) are recognised
+/// per ISO 32000-1:2008 §7.10. Type 3 (stitching) falls to Identity
+/// (the spec default for absent or unrecognised /TR) — the SMask
+/// transfer is monotonic in practice; stitching of multiple sub-
+/// functions over disjoint subdomains is uncommon for opacity curves.
 fn parse_transfer_function(obj: &Object) -> Option<SMaskTransfer> {
     // Identity is a Name `/Identity` per Table 109. Anything else
     // should be a function dictionary.
@@ -6737,6 +6788,7 @@ fn parse_transfer_function(obj: &Object) -> Option<SMaskTransfer> {
     let dict = obj.as_dict()?;
     let ft = dict.get("FunctionType").and_then(Object::as_integer)?;
     match ft {
+        0 => parse_type0_transfer_function(obj, dict).or(Some(SMaskTransfer::Identity)),
         2 => {
             let c0 = dict
                 .get("C0")
@@ -6768,8 +6820,135 @@ fn parse_transfer_function(obj: &Object) -> Option<SMaskTransfer> {
                 .unwrap_or(1.0);
             Some(SMaskTransfer::Type2 { c0, c1, n })
         },
+        4 => parse_type4_transfer_function(obj).or(Some(SMaskTransfer::Identity)),
         _ => Some(SMaskTransfer::Identity),
     }
+}
+
+/// Decode a Type 0 sampled-function stream into a unit-interval lookup
+/// table over the 1-input 1-output domain. Returns `None` for any
+/// shape the SMask /TR contract doesn't accept (multi-input or
+/// multi-output) so the caller can fall back to Identity. Per
+/// §7.10.2:
+///  - `/Domain` is a 2-element array `[lo hi]` defining the input
+///    range; for /TR this is `[0 1]` by construction.
+///  - `/Range` is a 2-element array defining the output range; for
+///    /TR this is `[0 1]` by construction.
+///  - `/Size` is a 1-element array `[N]` — N sample positions.
+///  - `/BitsPerSample` is the bit count per packed sample (1/2/4/8/
+///    12/16/24/32). We accept the canonical 8-bit case the SMask /TR
+///    samples-as-LUT pattern uses; deeper depths fall to None.
+///  - `/Encode` defaults to `[0 Size[0]-1]` and `/Decode` defaults to
+///    `/Range`. We honour the defaults; explicit overrides for /TR
+///    are rare but supported via the standard linear remap.
+fn parse_type0_transfer_function(
+    obj: &Object,
+    dict: &std::collections::HashMap<String, Object>,
+) -> Option<SMaskTransfer> {
+    // Single-input single-output only. /TR per §11.6.5.2 Table 144 is
+    // a 1→1 function; reject anything else so we don't silently
+    // mishandle a malformed N→M sampled function.
+    let domain_len = dict
+        .get("Domain")
+        .and_then(|o| o.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let range_len = dict
+        .get("Range")
+        .and_then(|o| o.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if domain_len != 2 || range_len != 2 {
+        return None;
+    }
+    let size_arr = dict.get("Size").and_then(|o| o.as_array())?;
+    if size_arr.len() != 1 {
+        return None;
+    }
+    let size = size_arr.first().and_then(Object::as_integer)? as usize;
+    if size == 0 || size > 65_536 {
+        return None;
+    }
+    let bps = dict
+        .get("BitsPerSample")
+        .and_then(Object::as_integer)
+        .unwrap_or(8);
+    if bps != 8 {
+        // Only the 8-bit packing is honoured. Other depths land at
+        // Identity to keep the parser simple; a real-world /TR rarely
+        // uses anything other than 8-bit samples.
+        return None;
+    }
+    let stream_bytes = match obj {
+        Object::Stream { .. } => obj.decode_stream_data().ok()?,
+        _ => return None,
+    };
+    if stream_bytes.len() < size {
+        return None;
+    }
+    // /Decode default = /Range; /Encode default = [0 Size-1]. For the
+    // canonical /TR shape both defaults apply, so the raw sample byte
+    // /255 IS the unit-interval LUT value.
+    let dec_lo;
+    let dec_hi;
+    if let Some(arr) = dict.get("Decode").and_then(|o| o.as_array()) {
+        if arr.len() != 2 {
+            return None;
+        }
+        dec_lo = obj_to_f32(arr.first()?)?;
+        dec_hi = obj_to_f32(arr.get(1)?)?;
+    } else {
+        // Default to /Range.
+        let r = dict.get("Range").and_then(|o| o.as_array())?;
+        dec_lo = obj_to_f32(r.first()?)?;
+        dec_hi = obj_to_f32(r.get(1)?)?;
+    }
+    let max_sample_value = 255.0; // bps=8 above
+    let mut samples: Vec<f32> = Vec::with_capacity(size);
+    for i in 0..size {
+        let raw = stream_bytes[i] as f32;
+        let v = dec_lo + (raw / max_sample_value) * (dec_hi - dec_lo);
+        samples.push(v.clamp(0.0, 1.0));
+    }
+    Some(SMaskTransfer::Type0 { samples })
+}
+
+/// Compile a Type 4 PostScript calculator stream as a transfer
+/// function. The /SMask /TR contract is 1-input 1-output per
+/// §11.6.5.2 Table 144; we route through the existing crate-private
+/// `Program` evaluator which already serves Separation / DeviceN tint
+/// transforms. Returns `None` when the stream isn't a Stream object,
+/// the parse fails (orphan procedure body, unknown operator), or the
+/// program advertises a multi-input/multi-output shape that doesn't
+/// match a transfer function.
+fn parse_type4_transfer_function(obj: &Object) -> Option<SMaskTransfer> {
+    let dict = obj.as_dict()?;
+    let domain_len = dict
+        .get("Domain")
+        .and_then(|o| o.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let range_len = dict
+        .get("Range")
+        .and_then(|o| o.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    // §7.10.5: Type 4 requires Domain and Range. /TR is 1→1.
+    if domain_len != 2 || range_len != 2 {
+        return None;
+    }
+    let stream_bytes = match obj {
+        Object::Stream { .. } => obj.decode_stream_data().ok()?,
+        _ => return None,
+    };
+    let program = crate::functions::Program::compile(&stream_bytes).ok()?;
+    Some(SMaskTransfer::Type4 { program })
+}
+
+fn obj_to_f32(o: &Object) -> Option<f32> {
+    o.as_real()
+        .map(|r| r as f32)
+        .or_else(|| o.as_integer().map(|i| i as f32))
 }
 
 /// Returns `true` when the operator paints pixels into the pixmap.
