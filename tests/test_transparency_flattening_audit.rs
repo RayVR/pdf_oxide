@@ -19,7 +19,7 @@
 //! | `/SMask` image-attached alpha                   | §11.4.7   | live   |
 //! | `/SMask /S /Alpha` (Form XObject soft mask)     | §11.5.2   | live   |
 //! | `/SMask /S /Luminosity` (Form XObject soft mask)| §11.5.3   | live   |
-//! | `/SMask /BC` backdrop colour (n=1/3/4 + DeviceN)| §11.6.5.2 | live   |
+//! | `/SMask /BC` backdrop colour (n=1/3/4 + DeviceN)| §11.6.5.2 | live (malformed arity narrows to HONEST_GAP_SMASK_BC_MALFORMED_ARITY) |
 //! | `/SMask /TR` transfer function (Type 0/2/4)     | §11.6.5.2 | live (Type 3 stitching narrows to HONEST_GAP_SMASK_TR_TYPE_3_STITCHING) |
 //! | Transparency group `/I` (isolated flag)         | §11.4.5   | live   |
 //! | Transparency group `/K` (knockout flag)         | §11.4.6   | live   |
@@ -123,6 +123,25 @@ pub const HONEST_GAP_SMASK_TR_TYPE_3_STITCHING: &str =
      gap requires a stitching evaluator that dispatches the input through \
      the sub-function whose /Bounds covers it, with /Encode remapping the \
      sub-function's input range.";
+
+/// `/SMask /BC` whose array length does not match the Form's /Group
+/// /CS component count is a producer-side malformation per §11.6.5.2
+/// Table 144 + §8.6.6.5. The renderer's /BC dispatch keys on the BC
+/// array length and assumes the matching device family (n=1 →
+/// DeviceGray, n=3 → DeviceRGB, n=4 → DeviceCMYK, n≥5 → DeviceN via
+/// the Group's CS). A BC=[0.5 0.5] (arity 2) over a DeviceRGB group,
+/// or a BC=[0.5 0.5 0.5 0.5 0.5] over a DeviceCMYK group, gets
+/// misinterpreted. The spec is silent on reader behaviour for
+/// malformed /BC; the chosen reading is "dispatch on array length"
+/// which is the same heuristic Acrobat-class viewers apply.
+pub const HONEST_GAP_SMASK_BC_MALFORMED_ARITY: &str =
+    "HONEST_GAP_SMASK_BC_MALFORMED_ARITY: /SMask /BC arity that disagrees \
+     with the Form's /Group /CS component count (e.g. /BC [0.5 0.5] over a \
+     DeviceRGB group, or /BC [a b c d e] over a DeviceCMYK group) is \
+     dispatched on array length, not on /CS. §8.6.6.5 + §11.6.5.2 specify \
+     the well-formed shape but are silent on reader response to \
+     malformed-arity /BC; the impl picks the array-length dispatch and \
+     documents the choice.";
 
 // ===========================================================================
 // Synthetic-PDF builder + helpers
@@ -689,6 +708,73 @@ fn fixture_smask_with_tr_type0_inverted_ramp() -> Vec<u8> {
     let resources = "/ExtGState << /Sm << /Type /ExtGState \
                      /SMask << /Type /Mask /S /Luminosity /G 5 0 R /TR 6 0 R >> >> >>";
     build_pdf(content, resources, &[&obj_5, obj_6_str])
+}
+
+/// Fixture: SMask with a 5-component DeviceN /BC backdrop. The Form
+/// XObject's /Group /CS declares DeviceN with five colorants over a
+/// /DeviceCMYK alternate; the tint transform emits CMYK(0, 0, 0, 0.25)
+/// regardless of input. /BC carries five tints that the tint transform
+/// reads and discards.
+fn fixture_smask_with_bc_devicen_5_components() -> Vec<u8> {
+    // Tint transform: pop five inputs, push CMYK(0, 0, 0, 0.25).
+    // PostScript `{ pop pop pop pop pop 0 0 0 0.25 }`.
+    let tint_program = "{ pop pop pop pop pop 0 0 0 0.25 }";
+    let obj_5 = format!(
+        "5 0 obj\n<< /FunctionType 4 /Domain [0 1 0 1 0 1 0 1 0 1] \
+         /Range [0 1 0 1 0 1 0 1] /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        tint_program.len(),
+        tint_program
+    );
+    // 5-component DeviceN colour space:
+    //   [/DeviceN [/Ink1 /Ink2 /Ink3 /Ink4 /Ink5] /DeviceCMYK 5 0 R]
+    let cs_arr = "[/DeviceN [/Ink1 /Ink2 /Ink3 /Ink4 /Ink5] /DeviceCMYK 5 0 R]";
+    // The Form's content is empty — the /BC pre-fill is what we test.
+    let form_content = "% empty form\n";
+    let obj_6 = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Group << /Type /Group /S /Transparency /CS {} >> \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        cs_arr,
+        form_content.len(),
+        form_content
+    );
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   20 20 60 60 re\nf\n";
+    // /BC has 5 tints — one per colorant in the DeviceN CS.
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Luminosity /G 6 0 R \
+                     /BC [0.5 0.5 0.5 0.5 0.5] >> >> >>";
+    build_pdf(content, resources, &[&obj_5, &obj_6])
+}
+
+/// `/SMask /BC` with n=5 (DeviceN) per §11.6.5.2 Table 144 + §8.6.6.5.
+/// The five-component backdrop runs through the group's tint transform
+/// (here a Type 4 PostScript calculator that always emits CMYK(0, 0,
+/// 0, 0.25)). The alternate-space CMYK projects to RGB via §10.3.5
+/// additive-clamp, yielding a uniform grey-75% mask pre-fill.
+#[test]
+fn smask_bc_devicen_5_components_evaluates_tint_transform() {
+    let rgba = render_rgba(fixture_smask_with_bc_devicen_5_components());
+    let (r, g, b, _) = pixel_at(&rgba, 50, 50);
+    // Tint transform emits CMYK(0, 0, 0, 0.25). additive-clamp →
+    // RGB(191.25, 191.25, 191.25) → byte (191, 191, 191). BT.601 Y =
+    // (0.30 + 0.59 + 0.11) · 191/255 = 191/255 ≈ 0.7490. m = 0.7490.
+    // inv_m = 0.2510. dest = m · painted + inv_m · snapshot.
+    //  R: 0.7490 · 255 + 0.2510 · 255 = 255
+    //  G: 0.7490 · 0   + 0.2510 · 255 = 64.0  → byte 64
+    //  B: 0.7490 · 0   + 0.2510 · 255 = 64.0  → byte 64
+    // Reference (255, 64, 64). Distinguishable from Identity /BC
+    // fallback to black (255, 255, 255 — no backdrop fill, paint
+    // visible) and from n=1/3/4 device-family cases.
+    assert_eq!(
+        (r, g, b),
+        (255, 64, 64),
+        "ISO 32000-1 §11.6.5.2 + §8.6.6.5 /SMask /BC n=5 DeviceN: tint \
+         transform must run and project to RGB via the alternate CMYK; \
+         expected byte-exact (255, 64, 64); got ({r}, {g}, {b})"
+    );
 }
 
 /// `/SMask /TR` Type-0 sampled function per §7.10.2. The 256-byte

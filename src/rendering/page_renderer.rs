@@ -5887,46 +5887,10 @@ impl PageRenderer {
             },
         };
 
-        // For /S /Luminosity, pre-fill with the /BC backdrop if
-        // present. The backdrop is in the Group colour space; we
-        // assume DeviceGray / DeviceRGB / DeviceCMYK based on the
-        // backdrop array length. (The audit fixture uses /BC [0.5]
-        // which maps to DeviceGray = (128, 128, 128).)
-        if smask.subtype == crate::content::graphics_state::SoftMaskSubtype::Luminosity {
-            if let Some(ref bc) = smask.backdrop {
-                let (r, g, b) = match bc.len() {
-                    1 => {
-                        let v = (bc[0].clamp(0.0, 1.0) * 255.0).round() as u8;
-                        (v, v, v)
-                    },
-                    3 => (
-                        (bc[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-                        (bc[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-                        (bc[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    ),
-                    4 => {
-                        let (rf, gf, bf) = cmyk_to_rgb(bc[0], bc[1], bc[2], bc[3]);
-                        (
-                            (rf * 255.0).round() as u8,
-                            (gf * 255.0).round() as u8,
-                            (bf * 255.0).round() as u8,
-                        )
-                    },
-                    _ => (0, 0, 0),
-                };
-                let data = mask_pixmap.data_mut();
-                for px in 0..(w * h) as usize {
-                    let off = px * 4;
-                    data[off] = r;
-                    data[off + 1] = g;
-                    data[off + 2] = b;
-                    data[off + 3] = 255;
-                }
-            }
-        }
-
-        // Resolve the Form XObject and render it into the mask
-        // pixmap.
+        // Resolve the Form XObject. We load it before the /BC pre-fill
+        // so the pre-fill can consult the Form's /Group /CS for
+        // 5+ component DeviceN backdrops (the n=1/3/4 device-family
+        // cases don't need the Group CS — array length disambiguates).
         let form_obj = match doc.load_object(smask.form_ref) {
             Ok(o) => o,
             Err(_) => {
@@ -5948,6 +5912,61 @@ impl PageRenderer {
                 return Ok(());
             },
         };
+
+        // For /S /Luminosity, pre-fill with the /BC backdrop if
+        // present. The backdrop is in the Group colour space:
+        //  - n=1   → /DeviceGray
+        //  - n=3   → /DeviceRGB
+        //  - n=4   → /DeviceCMYK
+        //  - n>=5  → /DeviceN (or /NChannel) declared on the Form's
+        //           /Group /CS. Evaluating an /DeviceN backdrop
+        //           requires walking the Group /CS tint transform
+        //           and projecting the alternate-space colour through
+        //           the same path the renderer uses for /Separation /
+        //           /DeviceN paints. The helper below handles that.
+        if smask.subtype == crate::content::graphics_state::SoftMaskSubtype::Luminosity {
+            if let Some(ref bc) = smask.backdrop {
+                let (r, g, b) = match bc.len() {
+                    1 => {
+                        let v = (bc[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                        (v, v, v)
+                    },
+                    3 => (
+                        (bc[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (bc[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (bc[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ),
+                    4 => {
+                        let (rf, gf, bf) = cmyk_to_rgb(bc[0], bc[1], bc[2], bc[3]);
+                        (
+                            (rf * 255.0).round() as u8,
+                            (gf * 255.0).round() as u8,
+                            (bf * 255.0).round() as u8,
+                        )
+                    },
+                    n if n >= 5 => {
+                        // §11.6.5.2 Table 144 + §8.6.6.5: when the
+                        // Form group declares DeviceN / NChannel as
+                        // its /CS, /BC carries n tints. Evaluate the
+                        // group's tint transform on the BC tints and
+                        // project the resulting alternate-space colour
+                        // to RGB. Falls to (0, 0, 0) (the spec's
+                        // black-point default) if the group's CS is
+                        // not a recognised DeviceN.
+                        evaluate_devicen_bc_to_rgb(&form_dict, bc, doc).unwrap_or((0, 0, 0))
+                    },
+                    _ => (0, 0, 0),
+                };
+                let data = mask_pixmap.data_mut();
+                for px in 0..(w * h) as usize {
+                    let off = px * 4;
+                    data[off] = r;
+                    data[off + 1] = g;
+                    data[off + 2] = b;
+                    data[off + 3] = 255;
+                }
+            }
+        }
 
         let form_resources_obj = form_dict
             .get("Resources")
@@ -6949,6 +6968,121 @@ fn obj_to_f32(o: &Object) -> Option<f32> {
     o.as_real()
         .map(|r| r as f32)
         .or_else(|| o.as_integer().map(|i| i as f32))
+}
+
+/// Evaluate a /BC backdrop colour whose component count is 5 or more,
+/// against the Form XObject's /Group /CS = /DeviceN (or /NChannel).
+/// Returns the RGB byte triple after the DeviceN tint transform runs
+/// and the alternate-space result projects to RGB.
+///
+/// Per ISO 32000-1:2008 §11.6.5.2 Table 144 + §8.6.6.5 (DeviceN colour
+/// spaces): the BC entry consists of `n` numbers (one per group CS
+/// component), and the renderer must evaluate the group's tint
+/// transform to project the BC tints into the alternate colour space
+/// before any further conversion.
+///
+/// Returns `None` when:
+///  - the Form has no /Group dict, or
+///  - the Group has no /CS entry, or
+///  - the CS is not a /DeviceN array, or
+///  - the tint transform evaluator fails to produce a result.
+fn evaluate_devicen_bc_to_rgb(
+    form_dict: &std::collections::HashMap<String, Object>,
+    bc: &[f32],
+    doc: &PdfDocument,
+) -> Option<(u8, u8, u8)> {
+    let group_obj = form_dict.get("Group")?;
+    let group_resolved = doc.resolve_object(group_obj).ok()?;
+    let group_dict = group_resolved.as_dict()?;
+    let cs_obj = group_dict.get("CS")?;
+    let cs_resolved = doc.resolve_object(cs_obj).ok()?;
+    let cs_arr = match &cs_resolved {
+        Object::Array(arr) => arr,
+        _ => return None,
+    };
+    let type_name = cs_arr.first().and_then(|o| o.as_name())?;
+    if type_name != "DeviceN" && type_name != "NChannel" {
+        return None;
+    }
+    let alt_cs_obj = cs_arr.get(2)?;
+    let func_obj = cs_arr.get(3)?;
+    let func_resolved = doc.resolve_object(func_obj).ok()?;
+    let func_dict = func_resolved.as_dict()?;
+    let func_type = func_dict.get("FunctionType").and_then(Object::as_integer)?;
+
+    let altspace_values: Vec<f32> = match func_type {
+        2 => {
+            // Type 2 is single-input; for a multi-component DeviceN
+            // /BC against a Type 2 tint transform, only bc[0] reaches
+            // the function — that's a malformed PDF (Type 2 inputs
+            // are single-component) but we can still produce a
+            // reasonable backdrop.
+            let n_pow = func_dict
+                .get("N")
+                .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
+                .unwrap_or(1.0) as f32;
+            let c0 = func_dict.get("C0").and_then(|o| o.as_array());
+            let c1 = func_dict.get("C1").and_then(|o| o.as_array());
+            let len = c0.map(|a| a.len()).max(c1.map(|a| a.len())).unwrap_or(1);
+            let x = bc.first().copied().unwrap_or(0.0);
+            let x_pow = if n_pow == 1.0 { x } else { x.powf(n_pow) };
+            let mut out = Vec::with_capacity(len);
+            for j in 0..len {
+                let c0j = c0
+                    .and_then(|a| a.get(j))
+                    .map(|o| obj_to_f32(o).unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                let c1j = c1
+                    .and_then(|a| a.get(j))
+                    .map(|o| obj_to_f32(o).unwrap_or(1.0))
+                    .unwrap_or(1.0);
+                out.push(c0j + x_pow * (c1j - c0j));
+            }
+            out
+        },
+        4 => {
+            // Type 4 PostScript calculator. Evaluate the program
+            // with the BC tints as inputs.
+            let bytes = match &func_resolved {
+                Object::Stream { .. } => func_resolved.decode_stream_data().ok()?,
+                _ => return None,
+            };
+            let program = crate::functions::Program::compile(&bytes).ok()?;
+            let inputs: Vec<f64> = bc.iter().map(|&v| v as f64).collect();
+            let result = program.evaluate(&inputs).ok()?;
+            result.into_iter().map(|v| v as f32).collect()
+        },
+        _ => return None,
+    };
+
+    // Project alternate-space values to RGB. Mirrors the dispatch in
+    // `resolve_separation_or_devicen` at src/rendering/resolution/color.rs.
+    let alt_cs_name = alt_cs_obj.as_name();
+    let (r, g, b) = match alt_cs_name {
+        Some("DeviceCMYK") | Some("CMYK") if altspace_values.len() >= 4 => {
+            let (rf, gf, bf) = cmyk_to_rgb(
+                altspace_values[0],
+                altspace_values[1],
+                altspace_values[2],
+                altspace_values[3],
+            );
+            (rf, gf, bf)
+        },
+        Some("DeviceRGB") | Some("RGB") if altspace_values.len() >= 3 => {
+            (altspace_values[0], altspace_values[1], altspace_values[2])
+        },
+        Some("DeviceGray") | Some("G") if !altspace_values.is_empty() => {
+            let v = altspace_values[0];
+            (v, v, v)
+        },
+        _ => return None,
+    };
+
+    Some((
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ))
 }
 
 /// Returns `true` when the operator paints pixels into the pixmap.
