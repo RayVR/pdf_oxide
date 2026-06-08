@@ -78,7 +78,9 @@ pub trait IccBackend {
     /// handle. Used by the transparency sidecar to mirror RGB-source
     /// paints into the CMYK plane so subsequent transparent CMYK
     /// paints composite against the converted backdrop rather than
-    /// paper-white per §11.3.4.
+    /// paper-white per §11.3.4 + §11.4.5.1 (§11.4.5.1 defines the
+    /// group's /CS as the single blend colour space; §11.3.4 is the
+    /// per-pixel computation that runs inside it).
     type SrgbToCmykTransform;
 
     /// Build a source-profile → sRGB transform honouring `intent`.
@@ -350,10 +352,12 @@ mod lcms2_impl {
     /// composite pixmap's actual colour space — every RGB-source paint
     /// has been resolved to sRGB by the rasteriser), and the
     /// destination is the document's OutputIntent CMYK profile. The
-    /// transform flows sRGB → Lab PCS → destination CMYK so the §11.3.4
-    /// blend-space conversion happens through the same canonical PCS
-    /// path the press uses. Like the `CmykRetarget` above, we quantise
-    /// at the 8-bit boundary because press hardware ultimately consumes
+    /// transform flows sRGB → Lab PCS → destination CMYK so the
+    /// §11.3.4 / §11.4.5.1 blend-space conversion happens through the
+    /// same canonical PCS path the press uses (§11.4.5.1 is the "ONE
+    /// blend space" mandate; §11.3.4 is the per-pixel computation that
+    /// runs inside it). Like the `CmykRetarget` above, we quantise at
+    /// the 8-bit boundary because press hardware ultimately consumes
     /// 8-bit plates.
     pub struct SrgbToCmykTransform {
         pub(super) inner:

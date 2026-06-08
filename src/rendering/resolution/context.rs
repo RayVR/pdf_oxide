@@ -92,8 +92,11 @@ pub(crate) struct IccTransformCache {
     /// RGB-paint mirror path consults this cache to convert RGB-source
     /// paints into the OutputIntent CMYK space so subsequent
     /// transparent CMYK paints over an RGB backdrop composite against
-    /// the converted backdrop per §11.3.4. Built on miss (lcms2 builds
-    /// only — qcms returns `None`); cached for the page lifetime.
+    /// the converted backdrop per §11.3.4 + §11.4.5.1 (§11.4.5.1
+    /// defines the group's /CS as the single blend colour space;
+    /// §11.3.4 is the per-pixel computation that runs inside it).
+    /// Built on miss (lcms2 builds only — qcms returns `None`); cached
+    /// for the page lifetime.
     srgb_to_cmyk_entries:
         RefCell<HashMap<(u64, RenderingIntent), Option<Arc<SrgbToCmykTransform>>>>,
     /// Test-support counter: every cache miss (i.e. every call that

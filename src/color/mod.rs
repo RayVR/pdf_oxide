@@ -459,8 +459,10 @@ pub const fn active_backend_supports_cmyk_retarget() -> bool {
 /// Used by the transparency sidecar's RGB-paint mirror path to convert
 /// the rasterised sRGB composite into the document's OutputIntent CMYK
 /// space so subsequent transparent CMYK paints over an RGB backdrop
-/// composite against the converted backdrop per ISO 32000-1 §11.3.4
-/// (compositing happens in ONE blend space — the group's CS).
+/// composite against the converted backdrop per ISO 32000-1 §11.3.4 +
+/// §11.4.5.1 (§11.4.5.1 defines the group's /CS as the single blend
+/// colour space; §11.3.4 is the per-pixel compositing computation that
+/// runs inside it).
 ///
 /// Only `icc-lcms2` builds construct a real CMM transform. Under
 /// `icc-qcms` or no-CMM builds the constructor returns `None`; the
