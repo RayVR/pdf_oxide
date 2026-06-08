@@ -1174,6 +1174,14 @@ fn output_intent_render_pixel_is_byte_exact_against_qcms_reference() {
 /// no out-of-gamut excursion to compress. If qcms ever starts producing
 /// different values per intent on a constant CLUT that's a CMM bug
 /// worth surfacing.
+///
+/// This assertion holds for qcms 0.3.0 (which ignores the intent
+/// parameter for CMYK inputs altogether) but NOT for lcms2 with BPC
+/// on — BPC adjusts the black-point mapping per intent even on a
+/// constant CLUT, so the four intents legitimately produce different
+/// shadow-region bytes.  Gated to qcms-only so the probe stays
+/// meaningful when the icc-lcms2 backend is also linked in.
+#[cfg(not(feature = "icc-lcms2"))]
 #[test]
 fn output_intent_constant_clut_is_invariant_across_rendering_intents() {
     use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
@@ -2145,6 +2153,14 @@ fn qa_round4_thousand_rgb_paints_through_default_rgb_build_one_transform() {
 /// IF qcms honoured them. Synthesising such a fixture requires a real
 /// CMM toolchain (curves + matrices + a true 4D CLUT) — deferred as
 /// HONEST_GAP_INTENT_SENSITIVE_FIXTURE.
+///
+/// Gated to qcms-only: under `icc-lcms2` the intent IS externally
+/// observable (lcms2 honours rendering intent + BPC for CMYK
+/// inputs), which is the round-7 closure path.  Running this probe
+/// under the lcms2 backend would correctly flip it RED — that's
+/// the gap closure documented at
+/// `HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH_R7`.
+#[cfg(not(feature = "icc-lcms2"))]
 #[test]
 fn qa_round3_qcms_030_treats_cmyk_intent_as_informational() {
     use pdf_oxide::color::{IccProfile, RenderingIntent, Transform};
