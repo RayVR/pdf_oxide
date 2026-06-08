@@ -1217,6 +1217,33 @@ pub(crate) fn extract_process_paint_cmyk(
                     if proc_tints.len() < 4 {
                         return None;
                     }
+                    // Round 7 ICC retargeting: when the active CMM
+                    // backend supports CMYK→CMYK retargeting AND the
+                    // embedded profile is genuinely different from the
+                    // document OutputIntent profile, retarget the
+                    // source tints through the destination profile's
+                    // BToA. The result is the same colour the press
+                    // (the OutputIntent's modelled press) would produce
+                    // for the source paint, with BPC applied for the
+                    // relative-colorimetric press default.
+                    //
+                    // Falls through to the round-5 "natural form"
+                    // reading when:
+                    //   - the backend can't do CMYK→CMYK (qcms 0.3),
+                    //   - no OutputIntent CMYK profile is declared,
+                    //   - the embedded profile parses but the
+                    //     destination profile parses,
+                    //   - the two profiles compile to byte-identical
+                    //     bytes (same press, same paint — no
+                    //     conversion needed).
+                    //
+                    // See HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH
+                    // for the three-state matrix.
+                    if let Some(retargeted) =
+                        try_retarget_cmyk_via_embedded_profile(cs_arr, &proc_tints, doc)
+                    {
+                        return Some(retargeted);
+                    }
                     Some((proc_tints[0], proc_tints[1], proc_tints[2], proc_tints[3]))
                 },
                 3 => {
@@ -1245,6 +1272,103 @@ pub(crate) fn extract_process_paint_cmyk(
     // proper colour transform is out of scope. The call site falls
     // back to the §10.3.5 inverse from the rasterised RGB.
     None
+}
+
+/// Closes `HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH` for the
+/// embedded /Process /ColorSpace [/ICCBased N=4] case.
+///
+/// Parses both the embedded process profile (from the /ICCBased
+/// stream in `cs_arr`) and the document OutputIntent CMYK profile,
+/// then runs the source tints through a `CmykRetargetTransform`
+/// (which lcms2 builds as CMYK → Lab PCS → CMYK with BPC on for the
+/// press default). The returned tuple is the destination-CMYK colour
+/// the press would produce.
+///
+/// Returns `None` (so the caller falls back to the round-5 natural-
+/// form reading) when:
+///   - the active backend can't compile a CMYK→CMYK transform
+///     (qcms 0.3 baseline — no CMYK output path),
+///   - the document declares no OutputIntent CMYK profile,
+///   - either profile fails to parse / cross-check the /N entry,
+///   - the embedded profile's bytes match the OutputIntent profile's
+///     bytes (identity retarget — no conversion needed).
+///
+/// The three-state HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH
+/// matrix in `tests/test_46_round5_devicen_process_polish.rs`
+/// documents which state each (backend, profile-mismatch) tuple
+/// resolves to.
+fn try_retarget_cmyk_via_embedded_profile(
+    cs_arr: &[Object],
+    proc_tints: &[f32],
+    doc: &PdfDocument,
+) -> Option<(f32, f32, f32, f32)> {
+    if !crate::color::active_backend_supports_cmyk_retarget() {
+        return None;
+    }
+    if proc_tints.len() < 4 {
+        return None;
+    }
+
+    // The destination profile MUST come from the document
+    // OutputIntents. Without it there's no defined target gamut to
+    // retarget into, and the natural-form reading is the only
+    // sensible fallback. `doc.output_intent_cmyk_profile()` already
+    // performs the §14.11.5 lookup (first /GTS_PDFX or /GTS_PDFA
+    // entry with a /N=4 /DestOutputProfile) and parses it through
+    // IccProfile::parse, so we get a vetted Arc back.
+    let dst_profile = doc.output_intent_cmyk_profile()?;
+
+    // The embedded /Process /ColorSpace [/ICCBased N 0 R] stream
+    // is at index 1 of cs_arr. Resolve the indirect reference,
+    // decode the stream bytes, parse through IccProfile::parse
+    // (which cross-checks N=4 against the ICC header CMYK
+    // signature).
+    let stream_obj = cs_arr.get(1)?;
+    let resolved_stream = doc.resolve_object(stream_obj).ok()?;
+    let dict = resolved_stream.as_dict()?;
+    let declared_n: u8 = dict
+        .get("N")
+        .and_then(Object::as_integer)
+        .filter(|n| *n == 4)
+        .map(|n| n as u8)?;
+    let bytes = resolved_stream.decode_stream_data().ok()?;
+    let src_profile = std::sync::Arc::new(crate::color::IccProfile::parse(bytes, declared_n)?);
+
+    // Identity retarget — both profiles are byte-identical, so any
+    // transform we built would round-trip the input through Lab and
+    // produce essentially the same bytes back (the natural-form
+    // reading IS the identity retarget on byte-identical profiles).
+    // Skip the transform-build cost and emit the natural form.
+    if src_profile.content_hash() == dst_profile.content_hash() {
+        return None;
+    }
+
+    // The PDF spec doesn't pin a per-paint rendering intent for the
+    // /Process retarget; the document-level §10.7.3 intent governs.
+    // We default to `RelativeColorimetric` (the press default —
+    // and what §8.6.5.8 falls back to for unrecognised intents)
+    // with BPC on. A future refinement could thread the live gs
+    // intent through, but the operator dispatcher doesn't currently
+    // hand `extract_process_paint_cmyk` a graphics state, and the
+    // common-case correctness gain of "retarget at all" dwarfs the
+    // intent-precision gain on top.
+    let transform = crate::color::CmykRetargetTransform::new(
+        src_profile,
+        dst_profile,
+        crate::color::RenderingIntent::RelativeColorimetric,
+    )?;
+    let out = transform.retarget_pixel([
+        proc_tints[0].clamp(0.0, 1.0),
+        proc_tints[1].clamp(0.0, 1.0),
+        proc_tints[2].clamp(0.0, 1.0),
+        proc_tints[3].clamp(0.0, 1.0),
+    ]);
+    Some((
+        out[0].clamp(0.0, 1.0),
+        out[1].clamp(0.0, 1.0),
+        out[2].clamp(0.0, 1.0),
+        out[3].clamp(0.0, 1.0),
+    ))
 }
 
 /// Initial colour values for a colour space per ISO 32000-1 §8.6.8
