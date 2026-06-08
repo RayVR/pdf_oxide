@@ -245,7 +245,7 @@ fn build_pdf_with_output_intent(
     content: &str,
     resources_inner: &str,
     icc_profile: &[u8],
-    extra_objs: &[&str],
+    extra_objs: &[&[u8]],
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"%PDF-1.4\n");
@@ -275,7 +275,7 @@ fn build_pdf_with_output_intent(
     let mut extra_offs: Vec<usize> = Vec::new();
     for obj in extra_objs {
         extra_offs.push(buf.len());
-        buf.extend_from_slice(obj.as_bytes());
+        buf.extend_from_slice(obj);
     }
 
     let xref_off = buf.len();
@@ -332,12 +332,15 @@ fn build_devicen_iccbased_fixture(icc: &[u8], process_icc: &[u8]) -> Vec<u8> {
          ] >>",
         psfunc
     );
-    let process_icc_obj = format!("6 0 obj\n<< /N 4 /Length {} >>\nstream\n", process_icc.len());
-    let mut process_icc_obj_bytes = Vec::from(process_icc_obj.as_bytes());
+    let process_icc_obj_hdr =
+        format!("6 0 obj\n<< /N 4 /Length {} >>\nstream\n", process_icc.len());
+    let mut process_icc_obj_bytes = Vec::from(process_icc_obj_hdr.as_bytes());
     process_icc_obj_bytes.extend_from_slice(process_icc);
     process_icc_obj_bytes.extend_from_slice(b"\nendstream\nendobj\n");
-    let process_icc_obj_str = unsafe { String::from_utf8_unchecked(process_icc_obj_bytes) };
-    build_pdf_with_output_intent(content, &resources, icc, &[process_icc_obj_str.as_str()])
+    // Pass the raw bytes through — the ICC profile body is binary and
+    // would violate `String`'s UTF-8 invariant if forced through a
+    // `&str` boundary. `build_pdf_with_output_intent` accepts &[&[u8]].
+    build_pdf_with_output_intent(content, &resources, icc, &[&process_icc_obj_bytes])
 }
 
 // ===========================================================================
