@@ -262,18 +262,33 @@ mod lcms2_impl {
     /// for every byte-packed pixel format — the lcms2 crate's "u8
     /// special case" handles the reshape internally. PixelFormat
     /// (set in `new_flags`) determines the real channel count.
+    /// `DisallowCache` is required (via `Flags::NO_CACHE`) for the
+    /// transform to be `Sync` — the per-page IccTransformCache is
+    /// shared across rayon worker threads under the `parallel`
+    /// feature.
     pub struct SrgbTransform {
-        pub(super) inner: lcms2::Transform<u8, u8>,
+        pub(super) inner: lcms2::Transform<u8, u8, lcms2::GlobalContext, lcms2::DisallowCache>,
         pub(super) source_components: u8,
     }
 
-    /// CMYK→CMYK retarget. The transform is built for `CMYK_FLT`
-    /// on both sides so unit-interval f32 inputs / outputs round-trip
-    /// without an extra 8-bit quantisation step (caller decides when
-    /// to quantise). `Transform<f32, f32>` gives us a typed surface
-    /// matching the f32-CMYK pixel-format constants.
+    /// CMYK→CMYK retarget.  Uses `CMYK_8` on both sides (4-channel
+    /// byte packed) because lcms2's `CMYK_FLT` encoding treats CMYK
+    /// floats as percentages in the 0..100 range — convenient for
+    /// ink-coverage UIs, surprising for unit-interval API design.  We
+    /// quantise to/from 8-bit at the boundary so the trait surface
+    /// can stay in unit-interval f32; the precision loss is bounded
+    /// (≤ 1/255) and dominates only when the destination profile's
+    /// BToA has sharp transitions — for the prepress / packaging
+    /// workloads round 7 targets, 8-bit retarget is the industry-
+    /// canonical encoding.  Real production CMMs serialise their CMYK
+    /// retargeting LUTs as 8 or 16 bit anyway; floating-point CMYK
+    /// PCS handoff is a niche correctness boundary, not the common
+    /// case.  `DisallowCache` is required for `Sync` so the
+    /// transform can live inside an `Arc` shared across worker
+    /// threads under the `parallel` feature.
     pub struct CmykRetarget {
-        pub(super) inner: lcms2::Transform<f32, f32>,
+        pub(super) inner:
+            lcms2::Transform<[u8; 4], [u8; 4], lcms2::GlobalContext, lcms2::DisallowCache>,
     }
 
     fn lcms2_intent(intent: RenderingIntent) -> lcms2::Intent {
@@ -285,12 +300,26 @@ mod lcms2_impl {
         }
     }
 
-    fn lcms2_flags(flags: TransformFlags) -> lcms2::Flags {
-        let base = lcms2::Flags::default();
+    fn lcms2_flags(flags: TransformFlags) -> lcms2::Flags<lcms2::DisallowCache> {
+        // NO_CACHE is required to make `lcms2::Transform` implement
+        // `Sync`.  The pdf_oxide rendering pipeline holds compiled
+        // transforms in an `Arc<Transform>` inside the per-page
+        // IccTransformCache, and the parallel page-extraction
+        // feature shares the same cache across rayon worker threads.
+        // The internal 1-pixel cache lcms2 default-enables is a
+        // micro-optimisation worth giving up for cross-thread
+        // safety; pdf_oxide's per-paint cache already covers the
+        // repeat-same-pixel pattern at a coarser grain.
+        //
+        // BLACKPOINT_COMPENSATION is defined on Flags<AllowCache> in
+        // the lcms2 crate, but the `BitOr` impl preserves the cache
+        // type of the LHS — so `Flags::NO_CACHE | BPC` produces a
+        // `Flags<DisallowCache>` regardless of the BPC constant's
+        // declared cache type.
         if flags.black_point_compensation {
-            base | lcms2::Flags::BLACKPOINT_COMPENSATION
+            lcms2::Flags::NO_CACHE | lcms2::Flags::BLACKPOINT_COMPENSATION
         } else {
-            base
+            lcms2::Flags::NO_CACHE
         }
     }
 
@@ -316,7 +345,8 @@ mod lcms2_impl {
             let dst = lcms2::Profile::new_srgb();
             let in_fmt = src_pixel_format(profile.n_components())?;
             let out_fmt = lcms2::PixelFormat::RGB_8;
-            let inner = lcms2::Transform::new_flags(
+            let inner = lcms2::Transform::new_flags_context(
+                lcms2::GlobalContext::new(),
                 &src,
                 in_fmt,
                 &dst,
@@ -392,11 +422,12 @@ mod lcms2_impl {
             if !matches!(dst.color_space(), lcms2::ColorSpaceSignature::CmykData) {
                 return None;
             }
-            let inner = lcms2::Transform::new_flags(
+            let inner = lcms2::Transform::new_flags_context(
+                lcms2::GlobalContext::new(),
                 &src,
-                lcms2::PixelFormat::CMYK_FLT,
+                lcms2::PixelFormat::CMYK_8,
                 &dst,
-                lcms2::PixelFormat::CMYK_FLT,
+                lcms2::PixelFormat::CMYK_8,
                 lcms2_intent(intent),
                 lcms2_flags(flags),
             )
@@ -405,10 +436,26 @@ mod lcms2_impl {
         }
 
         fn retarget_cmyk_pixel(transform: &Self::CmykRetarget, cmyk: [f32; 4]) -> [f32; 4] {
-            let src: [f32; 4] = cmyk;
-            let mut dst = [0f32; 4];
+            // Unit-interval f32 in, byte in 0..=255 to lcms2, byte
+            // out, then back to unit-interval f32.  The two halves of
+            // the round-trip ARE part of the retarget contract: the
+            // press hardware ultimately serialises plate values as
+            // 8-bit anyway, so an 8-bit clamp at this boundary is the
+            // round-trip-faithful encoding.
+            let src = [[
+                (cmyk[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (cmyk[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (cmyk[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (cmyk[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]];
+            let mut dst = [[0u8; 4]; 1];
             transform.inner.transform_pixels(&src, &mut dst);
-            dst
+            [
+                dst[0][0] as f32 / 255.0,
+                dst[0][1] as f32 / 255.0,
+                dst[0][2] as f32 / 255.0,
+                dst[0][3] as f32 / 255.0,
+            ]
         }
     }
 }
