@@ -830,3 +830,476 @@ fn r7_backend_name_matches_active_features() {
     #[cfg(not(any(feature = "icc-qcms", feature = "icc-lcms2")))]
     assert_eq!(name, "noop");
 }
+
+// ===========================================================================
+// Intent-threading probes — close the round-7 P2 gap.
+//
+// Round-7 baseline hard-coded `RelativeColorimetric` inside
+// `try_retarget_cmyk_via_embedded_profile`. Per ISO 32000-1 §10.7.3
+// the `ri` operator (and ExtGState /RI) declares the rendering intent
+// for the operator that follows; a `/Perceptual ri` before a DeviceN
+// /Process /ICCBased paint must retarget through the destination
+// profile's perceptual BToA tag (`BToA0`), not the relative-
+// colorimetric one (`BToA1`).
+//
+// These probes pin byte-exact behaviour using a multi-intent profile
+// (distinct `BToA0` / `BToA1` / `BToA2` constants) so the destination
+// CMYK depends on which BToA tag lcms2 picks for the requested intent.
+// ===========================================================================
+
+/// Tunable parameters for a multi-intent CMYK destination profile.
+/// Three distinct `BToAN` constant CLUTs let intent dispatch surface
+/// at the byte level: lcms2 picks `BToA0` for Perceptual, `BToA1` for
+/// RelativeColorimetric (and AbsoluteColorimetric, with chromatic
+/// adaptation), and `BToA2` for Saturation. Pinning a different
+/// destination CMYK per tag means the per-pixel byte output depends
+/// on which intent the renderer threaded into the transform builder.
+#[cfg(feature = "icc-lcms2")]
+#[derive(Clone, Copy)]
+struct MultiIntentCmykProfileParams {
+    /// `A2B0` constant Lab output L channel.
+    l_byte: u8,
+    /// `B2A0` constant destination CMYK (perceptual tag).
+    dest_perceptual: (u8, u8, u8, u8),
+    /// `B2A1` constant destination CMYK (relative-colorimetric tag).
+    dest_relative: (u8, u8, u8, u8),
+    /// `B2A2` constant destination CMYK (saturation tag).
+    dest_saturation: (u8, u8, u8, u8),
+}
+
+/// Build a multi-intent CMYK ICC profile carrying `A2B0`, `B2A0`,
+/// `B2A1`, and `B2A2` tags. Each `B2A` tag carries a constant CMYK
+/// CLUT pinned by `params`, so intent dispatch produces three
+/// distinct byte references.
+///
+/// Layout per ICC.1:2004-10 §10.8:
+///   - 128-byte header.
+///   - 4-byte tag count = 4.
+///   - 48-byte tag table (4 entries × 12 bytes).
+///   - Tag bodies, each padded to 4-byte alignment.
+#[cfg(feature = "icc-lcms2")]
+fn build_multi_intent_cmyk_icc(params: MultiIntentCmykProfileParams) -> Vec<u8> {
+    let mut a2b0 = build_mft1_constant(4, 3, &[params.l_byte, 128, 128]);
+    let mut b2a0 = build_mft1_constant(
+        3,
+        4,
+        &[
+            params.dest_perceptual.0,
+            params.dest_perceptual.1,
+            params.dest_perceptual.2,
+            params.dest_perceptual.3,
+        ],
+    );
+    let mut b2a1 = build_mft1_constant(
+        3,
+        4,
+        &[
+            params.dest_relative.0,
+            params.dest_relative.1,
+            params.dest_relative.2,
+            params.dest_relative.3,
+        ],
+    );
+    let mut b2a2 = build_mft1_constant(
+        3,
+        4,
+        &[
+            params.dest_saturation.0,
+            params.dest_saturation.1,
+            params.dest_saturation.2,
+            params.dest_saturation.3,
+        ],
+    );
+
+    for tag in [&mut a2b0, &mut b2a0, &mut b2a1, &mut b2a2] {
+        while !tag.len().is_multiple_of(4) {
+            tag.push(0);
+        }
+    }
+
+    let header_size: u32 = 128;
+    let tag_count: u32 = 4;
+    let tag_table_size: u32 = 4 + tag_count * 12;
+    let a2b0_offset: u32 = header_size + tag_table_size;
+    let a2b0_size: u32 = a2b0.len() as u32;
+    let b2a0_offset: u32 = a2b0_offset + a2b0_size;
+    let b2a0_size: u32 = b2a0.len() as u32;
+    let b2a1_offset: u32 = b2a0_offset + b2a0_size;
+    let b2a1_size: u32 = b2a1.len() as u32;
+    let b2a2_offset: u32 = b2a1_offset + b2a1_size;
+    let b2a2_size: u32 = b2a2.len() as u32;
+    let total_size: u32 = b2a2_offset + b2a2_size;
+
+    let mut profile = vec![0u8; 128];
+    profile[0..4].copy_from_slice(&total_size.to_be_bytes());
+    profile[8..12].copy_from_slice(&0x0240_0000u32.to_be_bytes()); // version 2.4
+    profile[12..16].copy_from_slice(b"prtr");
+    profile[16..20].copy_from_slice(b"CMYK");
+    profile[20..24].copy_from_slice(b"Lab ");
+    profile[36..40].copy_from_slice(b"acsp");
+    profile[64..68].copy_from_slice(&0u32.to_be_bytes());
+    profile[68..72].copy_from_slice(&0x0000_F6D6u32.to_be_bytes());
+    profile[72..76].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    profile[76..80].copy_from_slice(&0x0000_D32Du32.to_be_bytes());
+
+    profile.extend_from_slice(&tag_count.to_be_bytes());
+    profile.extend_from_slice(&0x4132_4230u32.to_be_bytes()); // 'A2B0'
+    profile.extend_from_slice(&a2b0_offset.to_be_bytes());
+    profile.extend_from_slice(&a2b0_size.to_be_bytes());
+    profile.extend_from_slice(&0x4232_4130u32.to_be_bytes()); // 'B2A0' (perceptual)
+    profile.extend_from_slice(&b2a0_offset.to_be_bytes());
+    profile.extend_from_slice(&b2a0_size.to_be_bytes());
+    profile.extend_from_slice(&0x4232_4131u32.to_be_bytes()); // 'B2A1' (rel-colorimetric)
+    profile.extend_from_slice(&b2a1_offset.to_be_bytes());
+    profile.extend_from_slice(&b2a1_size.to_be_bytes());
+    profile.extend_from_slice(&0x4232_4132u32.to_be_bytes()); // 'B2A2' (saturation)
+    profile.extend_from_slice(&b2a2_offset.to_be_bytes());
+    profile.extend_from_slice(&b2a2_size.to_be_bytes());
+
+    profile.extend_from_slice(&a2b0);
+    profile.extend_from_slice(&b2a0);
+    profile.extend_from_slice(&b2a1);
+    profile.extend_from_slice(&b2a2);
+    profile
+}
+
+/// Compute the byte-exact destination CMYK lcms2 produces for a given
+/// (src, dst, src_cmyk, intent) tuple under the press-default
+/// `BLACKPOINT_COMPENSATION | NO_CACHE` flags — the same flags
+/// `CmykRetargetTransform::new` uses via `TransformFlags::press_default`.
+#[cfg(feature = "icc-lcms2")]
+fn compute_retarget_reference_with_intent(
+    src_icc: &[u8],
+    dst_icc: &[u8],
+    src_cmyk: [f32; 4],
+    intent: lcms2::Intent,
+) -> [u8; 4] {
+    let src = lcms2::Profile::new_icc(src_icc).expect("lcms2 parses source");
+    let dst = lcms2::Profile::new_icc(dst_icc).expect("lcms2 parses dest");
+    let flags = lcms2::Flags::NO_CACHE | lcms2::Flags::BLACKPOINT_COMPENSATION;
+    let t: lcms2::Transform<[u8; 4], [u8; 4]> = lcms2::Transform::new_flags(
+        &src,
+        lcms2::PixelFormat::CMYK_8,
+        &dst,
+        lcms2::PixelFormat::CMYK_8,
+        intent,
+        flags,
+    )
+    .expect("lcms2 builds CMYK→CMYK retarget");
+    let src_arr = [[
+        (src_cmyk[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (src_cmyk[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (src_cmyk[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (src_cmyk[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]];
+    let mut dst_arr = [[0u8; 4]; 1];
+    t.transform_pixels(&src_arr, &mut dst_arr);
+    dst_arr[0]
+}
+
+/// Compose a single retarget reference at α=0.5 over backdrop
+/// (0.4, 0, 0, 0) — the per-lane fixture composite used by every
+/// intent probe below.
+#[cfg(feature = "icc-lcms2")]
+fn compose_reference(retarget_u8: [u8; 4]) -> [u8; 4] {
+    let alpha = 0.5_f32;
+    let bd = [0.4_f32, 0.0, 0.0, 0.0];
+    let r = [
+        retarget_u8[0] as f32 / 255.0,
+        retarget_u8[1] as f32 / 255.0,
+        retarget_u8[2] as f32 / 255.0,
+        retarget_u8[3] as f32 / 255.0,
+    ];
+    [
+        ((alpha * r[0] + (1.0 - alpha) * bd[0]).clamp(0.0, 1.0) * 255.0).round() as u8,
+        ((alpha * r[1] + (1.0 - alpha) * bd[1]).clamp(0.0, 1.0) * 255.0).round() as u8,
+        ((alpha * r[2] + (1.0 - alpha) * bd[2]).clamp(0.0, 1.0) * 255.0).round() as u8,
+        ((alpha * r[3] + (1.0 - alpha) * bd[3]).clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+/// Build a DeviceN /Process /ICCBased fixture parameterised by the
+/// `/RI` declaration inside the content stream. `intent_decl` is the
+/// raw operator-stream snippet preceding the `scn` — pass
+/// `"/Perceptual ri\n"` for a perceptual paint, `""` for none.
+fn build_devicen_iccbased_fixture_with_intent(
+    icc: &[u8],
+    process_icc: &[u8],
+    intent_decl: &str,
+) -> Vec<u8> {
+    let psfunc = "<< /FunctionType 2 /Domain [0 1 0 1 0 1 0 1] \
+                  /Range [0 1 0 1 0 1 0 1] \
+                  /C0 [0 0 0 0] /C1 [1 1 1 1] /N 1 >>";
+    let content = format!(
+        "0.4 0 0 0 k\n0 0 100 100 re\nf\n\
+         /CS_N cs\n/Ov gs\n{}0.5 0.2 0.7 0.1 scn\n0 0 100 100 re\nf\n",
+        intent_decl
+    );
+    let resources = format!(
+        "/ExtGState << /Ov << /Type /ExtGState /OP true /ca 0.5 >> >> \
+         /ColorSpace << /CS_N [/DeviceN [/Cyan /Magenta /Yellow /Black] \
+            /DeviceCMYK {} \
+            << /Process << /ColorSpace [/ICCBased 6 0 R] \
+                          /Components [/Cyan /Magenta /Yellow /Black] >> >> \
+         ] >>",
+        psfunc
+    );
+    let process_icc_obj_hdr =
+        format!("6 0 obj\n<< /N 4 /Length {} >>\nstream\n", process_icc.len());
+    let mut process_icc_obj_bytes = Vec::from(process_icc_obj_hdr.as_bytes());
+    process_icc_obj_bytes.extend_from_slice(process_icc);
+    process_icc_obj_bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    build_pdf_with_output_intent(&content, &resources, icc, &[&process_icc_obj_bytes])
+}
+
+// Pin three distinct destination CMYK constants per intent tag. The
+// values are arbitrary but chosen to be visibly distinct so a stash-
+// fail diff is unambiguous.
+#[cfg(feature = "icc-lcms2")]
+const PROBE_DEST_PARAMS: MultiIntentCmykProfileParams = MultiIntentCmykProfileParams {
+    l_byte: 135,
+    dest_perceptual: (240, 60, 20, 30),  // BToA0 — perceptual
+    dest_relative: (200, 50, 20, 30),    // BToA1 — rel-colorimetric (also abs)
+    dest_saturation: (160, 100, 80, 60), // BToA2 — saturation
+};
+
+/// Source profile carries a single B2A0 — the round-7 single-tag shape.
+/// Only the dst profile multi-tags matter for intent dispatch on the
+/// dst.BToA leg of the retarget pipeline.
+#[cfg(feature = "icc-lcms2")]
+fn probe_src_profile_bytes() -> Vec<u8> {
+    build_bidirectional_cmyk_icc(SyntheticCmykProfileParams {
+        l_byte: 200,
+        dest_cmyk: (10, 20, 30, 40),
+    })
+}
+
+#[cfg(feature = "icc-lcms2")]
+fn probe_dst_profile_bytes() -> Vec<u8> {
+    build_multi_intent_cmyk_icc(PROBE_DEST_PARAMS)
+}
+
+// ---------------------------------------------------------------------------
+// P9 — `/Perceptual ri` retargets through BToA0 (perceptual constants).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "icc-lcms2")]
+#[test]
+fn r7_intent_perceptual_retargets_through_b2a0_byte_exact() {
+    let dst = probe_dst_profile_bytes();
+    let src = probe_src_profile_bytes();
+
+    let retarget = compute_retarget_reference_with_intent(
+        &src,
+        &dst,
+        [0.5, 0.2, 0.7, 0.1],
+        lcms2::Intent::Perceptual,
+    );
+    let expected = compose_reference(retarget);
+
+    let pdf = build_devicen_iccbased_fixture_with_intent(&dst, &src, "/Perceptual ri\n");
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let got = [
+        centre(plate(&plates, "Cyan")),
+        centre(plate(&plates, "Magenta")),
+        centre(plate(&plates, "Yellow")),
+        centre(plate(&plates, "Black")),
+    ];
+
+    assert_eq!(
+        got, expected,
+        "ISO 32000-1 §10.7.3 / §8.6.5.5: `/Perceptual ri` before a \
+         DeviceN /Process /ICCBased paint must retarget through the \
+         destination profile's BToA0 (perceptual) tag. Independent \
+         lcms2 reference: {:?}; got {:?}. A regression where got == \
+         the rel-colorimetric reference {:?} indicates the live gs \
+         intent is being ignored and the hard-coded \
+         RelativeColorimetric path is still active.",
+        expected,
+        got,
+        compose_reference(compute_retarget_reference_with_intent(
+            &src,
+            &dst,
+            [0.5, 0.2, 0.7, 0.1],
+            lcms2::Intent::RelativeColorimetric,
+        )),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P10 — `/Saturation ri` retargets through BToA2 (saturation constants).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "icc-lcms2")]
+#[test]
+fn r7_intent_saturation_retargets_through_b2a2_byte_exact() {
+    let dst = probe_dst_profile_bytes();
+    let src = probe_src_profile_bytes();
+
+    let retarget = compute_retarget_reference_with_intent(
+        &src,
+        &dst,
+        [0.5, 0.2, 0.7, 0.1],
+        lcms2::Intent::Saturation,
+    );
+    let expected = compose_reference(retarget);
+
+    let pdf = build_devicen_iccbased_fixture_with_intent(&dst, &src, "/Saturation ri\n");
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let got = [
+        centre(plate(&plates, "Cyan")),
+        centre(plate(&plates, "Magenta")),
+        centre(plate(&plates, "Yellow")),
+        centre(plate(&plates, "Black")),
+    ];
+
+    // Reference for the wrong-intent (rel-colorimetric) path — used in
+    // the assertion message so a regression's failure mode is obvious.
+    let rel_reference = compose_reference(compute_retarget_reference_with_intent(
+        &src,
+        &dst,
+        [0.5, 0.2, 0.7, 0.1],
+        lcms2::Intent::RelativeColorimetric,
+    ));
+    let perc_reference = compose_reference(compute_retarget_reference_with_intent(
+        &src,
+        &dst,
+        [0.5, 0.2, 0.7, 0.1],
+        lcms2::Intent::Perceptual,
+    ));
+
+    assert_eq!(
+        got, expected,
+        "ISO 32000-1 §10.7.3: `/Saturation ri` must retarget through \
+         BToA2 (saturation). Expected {:?}; got {:?}. Wrong-intent \
+         references: rel-colorimetric {:?}, perceptual {:?}. A match \
+         against either of those would indicate the live intent is \
+         not being threaded.",
+        expected, got, rel_reference, perc_reference,
+    );
+    assert_ne!(
+        got, rel_reference,
+        "round-7 P2 closure: saturation result must DIFFER from \
+         rel-colorimetric. Equal output proves intent threading is \
+         dropped between the dispatcher and \
+         try_retarget_cmyk_via_embedded_profile."
+    );
+    assert_ne!(
+        got, perc_reference,
+        "saturation result must DIFFER from perceptual — distinct \
+         BToA2 vs BToA0 CLUTs ensure that at the profile level."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P11 — no `ri` declaration: §8.6.5.8 default of RelativeColorimetric
+//        fires and produces the BToA1 reference. Also pins the existing
+//        round-7 cross-profile fixture reference is preserved when the
+//        new threading runs with gs.rendering_intent empty.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "icc-lcms2")]
+#[test]
+fn r7_intent_default_no_ri_falls_to_rel_colorimetric_byte_exact() {
+    let dst = probe_dst_profile_bytes();
+    let src = probe_src_profile_bytes();
+
+    let retarget = compute_retarget_reference_with_intent(
+        &src,
+        &dst,
+        [0.5, 0.2, 0.7, 0.1],
+        lcms2::Intent::RelativeColorimetric,
+    );
+    let expected = compose_reference(retarget);
+
+    // No `ri` operator in the content stream — gs.rendering_intent
+    // stays empty, RenderingIntent::from_pdf_name maps empty to
+    // RelativeColorimetric (§8.6.5.8).
+    let pdf = build_devicen_iccbased_fixture_with_intent(&dst, &src, "");
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let got = [
+        centre(plate(&plates, "Cyan")),
+        centre(plate(&plates, "Magenta")),
+        centre(plate(&plates, "Yellow")),
+        centre(plate(&plates, "Black")),
+    ];
+
+    assert_eq!(
+        got, expected,
+        "ISO 32000-1 §8.6.5.8: when no rendering intent is declared, \
+         the default RelativeColorimetric applies. Expected (BToA1 \
+         path) {:?}; got {:?}.",
+        expected, got
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P12 — `/Perceptual ri` on the qcms-only build: intent has no effect
+//        on the round-5 natural-form fallback (qcms 0.3 has no CMYK
+//        output path, so retargeting is bypassed regardless of intent).
+//        The qcms backend's intent dispatch covers RGB-out transforms,
+//        not the CMYK→CMYK retarget the round-7 wiring touches.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "icc-qcms", not(feature = "icc-lcms2")))]
+#[test]
+fn r7_intent_under_qcms_only_falls_to_natural_form_byte_exact() {
+    let dst = build_bidirectional_cmyk_icc(SyntheticCmykProfileParams {
+        l_byte: 135,
+        dest_cmyk: (200, 50, 20, 30),
+    });
+    let src = build_bidirectional_cmyk_icc(SyntheticCmykProfileParams {
+        l_byte: 200,
+        dest_cmyk: (10, 20, 30, 40),
+    });
+
+    // Natural-form bytes — same as r7_icc_qcms_only_preserves_round5
+    // _natural_form_byte_exact. Threading /Perceptual ri must NOT
+    // change the byte values because qcms 0.3 bypasses the retarget
+    // entirely (active_backend_supports_cmyk_retarget returns false
+    // and try_retarget_cmyk_via_embedded_profile returns None at the
+    // capability check).
+    let pdf = build_devicen_iccbased_fixture_with_intent(&dst, &src, "/Perceptual ri\n");
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let c = centre(plate(&plates, "Cyan"));
+    let m = centre(plate(&plates, "Magenta"));
+    let y = centre(plate(&plates, "Yellow"));
+    let k = centre(plate(&plates, "Black"));
+
+    assert_eq!(c, 115, "qcms-only + /Perceptual ri: C lane natural-form preserved. Got {}", c);
+    assert_eq!(m, 26, "qcms-only + /Perceptual ri: M lane natural-form preserved. Got {}", m);
+    assert_eq!(y, 89, "qcms-only + /Perceptual ri: Y lane natural-form preserved. Got {}", y);
+    assert_eq!(k, 13, "qcms-only + /Perceptual ri: K lane natural-form preserved. Got {}", k);
+}
+
+// Same probe under no-CMM build — the §10.3.5 fallback fires at the
+// consumer, the process-paint extractor returns natural form unchanged.
+#[cfg(not(any(feature = "icc-qcms", feature = "icc-lcms2")))]
+#[test]
+fn r7_intent_under_no_cmm_falls_to_natural_form_byte_exact() {
+    let dst = build_bidirectional_cmyk_icc(SyntheticCmykProfileParams {
+        l_byte: 135,
+        dest_cmyk: (200, 50, 20, 30),
+    });
+    let src = build_bidirectional_cmyk_icc(SyntheticCmykProfileParams {
+        l_byte: 200,
+        dest_cmyk: (10, 20, 30, 40),
+    });
+
+    let pdf = build_devicen_iccbased_fixture_with_intent(&dst, &src, "/Perceptual ri\n");
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+    let plates = render_separations(&doc, 0, 72).expect("render");
+    let c = centre(plate(&plates, "Cyan"));
+    let m = centre(plate(&plates, "Magenta"));
+    let y = centre(plate(&plates, "Yellow"));
+    let k = centre(plate(&plates, "Black"));
+
+    assert_eq!(c, 115, "no-CMM + /Perceptual ri: C lane natural-form. Got {}", c);
+    assert_eq!(m, 26, "no-CMM + /Perceptual ri: M lane natural-form. Got {}", m);
+    assert_eq!(y, 89, "no-CMM + /Perceptual ri: Y lane natural-form. Got {}", y);
+    assert_eq!(k, 13, "no-CMM + /Perceptual ri: K lane natural-form. Got {}", k);
+}
