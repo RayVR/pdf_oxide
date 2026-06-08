@@ -73,6 +73,13 @@ use pdf_oxide::rendering::render_separations;
 /// the /Process /ColorSpace altogether) — the divergent-profiles case
 /// is rare. The alternate reading would round-trip through sRGB and
 /// recover CMYK via §10.3.5, which destroys the K channel.
+///
+/// See `HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH_R7` in
+/// `tests/test_46_round7_icc_retargeting.rs` for the `icc-lcms2`
+/// closure path — the `CmykRetargetTransform` pipeline (CMYK → Lab PCS
+/// → CMYK with BPC on, intent threaded from `gs.rendering_intent`)
+/// runs the §8.6.5.5 retarget end-to-end. The qcms-only state below
+/// remains documented as the no-closure baseline.
 pub const HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH: &str =
     "HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH: when a DeviceN \
      /Process /ColorSpace [/ICCBased <N=4 stream>] declaration uses an \
