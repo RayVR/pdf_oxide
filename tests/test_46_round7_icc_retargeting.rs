@@ -1108,7 +1108,8 @@ fn r7_intent_perceptual_retargets_through_b2a0_byte_exact() {
     ];
 
     assert_eq!(
-        got, expected,
+        got,
+        expected,
         "ISO 32000-1 §10.7.3 / §8.6.5.5: `/Perceptual ri` before a \
          DeviceN /Process /ICCBased paint must retarget through the \
          destination profile's BToA0 (perceptual) tag. Independent \
