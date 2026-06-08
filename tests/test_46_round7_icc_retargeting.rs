@@ -42,7 +42,16 @@ use pdf_oxide::rendering::render_separations;
 // ===========================================================================
 
 /// `HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH` —
-/// three-state matrix after round 7:
+/// three-state matrix after round 7.
+///
+/// **Companion narrative:** `HONEST_GAP_DEVICEN_PROCESS_ICC_PROFILE_MISMATCH`
+/// in `tests/test_46_round5_devicen_process_polish.rs` documents the
+/// original qcms-only "natural form" reading that this constant's three-
+/// state matrix supersedes. The round-5 constant is preserved (not
+/// collapsed) because it carries the historical rationale for why the
+/// natural-form reading remains the qcms / no-CMM fallback. Read this
+/// constant for the current truth-table; read the round-5 constant for
+/// the rationale on the non-lcms2 rows.
 ///
 ///  - **`icc-lcms2` enabled (round 7 closure)**: when a DeviceN
 ///    /Process /ColorSpace [/ICCBased N=4] declaration carries an
