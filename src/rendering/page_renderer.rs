@@ -317,6 +317,21 @@ impl PageRenderer {
         self.icc_transform_cache.build_count()
     }
 
+    /// Total `IccTransformCache::get_or_build` calls (hits + misses)
+    /// observed since the last `render_page_with_options` call. Test-
+    /// support only. Distinguishes a properly-hoisted per-paint
+    /// lookup from a per-pixel regression: the cache returns a cached
+    /// `Arc<Transform>` on every hit so `build_count` stays at 1
+    /// either way, but the `content_hash` SipHash over the whole
+    /// profile blob runs on every call, hit or miss. A correctly
+    /// hoisted hot loop therefore yields lookup_count ≈ paint count;
+    /// a per-pixel regression yields lookup_count proportional to
+    /// painted pixels.
+    #[cfg(feature = "test-support")]
+    pub fn icc_transform_cache_lookup_count(&self) -> usize {
+        self.icc_transform_cache.lookup_count()
+    }
+
     /// Pixmap dimensions of the per-page compositing sidecar, or
     /// `None` when the sidecar was not allocated for the most recent
     /// `render_page_with_options` call (detection-OFF).
@@ -4764,6 +4779,13 @@ impl PageRenderer {
         };
         let intent = crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent);
         let coverage = coverage.expect("checked above");
+        // Hoist the ICC transform out of the per-pixel loop. The cache key
+        // includes `profile.content_hash()`, which hashes every byte of the
+        // ICC profile blob — a per-pixel lookup on a full-page transparency
+        // fill ran tens of GB of hash work for the same (profile, intent)
+        // tuple every paint. The sibling diff-driven path
+        // (`apply_cmyk_compose_after_paint`) hoists the same way.
+        let transform = self.icc_transform_cache.get_or_build(&profile, intent);
         let dest = pixmap.data_mut();
 
         for px in 0..(dest.len() / 4) {
@@ -4792,7 +4814,6 @@ impl PageRenderer {
             let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
             let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
 
-            let transform = self.icc_transform_cache.get_or_build(&profile, intent);
             let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
 
             dest[off] = rgb[0];
@@ -4841,9 +4862,13 @@ impl PageRenderer {
         // Build a single ICC transform for this call. The renderer's
         // per-page IccTransformCache holds the compiled qcms transform
         // across the many paint operators on the page; we look it up
-        // through the same cache so we never rebuild the 17⁴ CLUT for
-        // the same `(profile, intent)` tuple twice.
+        // ONCE here and reuse the Arc<Transform> for every pixel in the
+        // loop below. The cache key includes `profile.content_hash()`,
+        // which hashes every byte of the profile blob (SipHash over
+        // hundreds of KB on a typical CMYK profile); a per-pixel lookup
+        // would re-hash the same blob on every paint.
         let intent = crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent);
+        let transform = self.icc_transform_cache.get_or_build(&profile, intent);
 
         // Compute the convert-first source RGB the rasteriser actually
         // wrote into the pixmap. We need this to recover the effective
@@ -4857,7 +4882,6 @@ impl PageRenderer {
             let m_u8 = (sm.clamp(0.0, 1.0) * 255.0).round() as u8;
             let y_u8 = (sy.clamp(0.0, 1.0) * 255.0).round() as u8;
             let k_u8 = (sk.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let transform = self.icc_transform_cache.get_or_build(&profile, intent);
             let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
             [
                 rgb[0] as f32 / 255.0,
@@ -4955,12 +4979,12 @@ impl PageRenderer {
             let my = c_alpha * sy + (1.0 - c_alpha) * dy;
             let mk = c_alpha * sk + (1.0 - c_alpha) * dk;
 
-            // Convert the composed CMYK through the OutputIntent ICC.
+            // Convert the composed CMYK through the OutputIntent ICC,
+            // reusing the loop-hoisted `transform`.
             let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
             let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
             let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
             let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let transform = self.icc_transform_cache.get_or_build(&profile, intent);
             let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
 
             dest[off] = rgb[0];
@@ -5067,6 +5091,18 @@ impl PageRenderer {
         } else {
             None
         };
+        // Hoist the ICC transform once per call rather than once per pixel:
+        // the cache key includes `profile.content_hash()` (a SipHash over
+        // every byte of the profile blob), so a per-pixel lookup on a
+        // full-page overprint fill ran tens of GB of hash work for the
+        // same (profile, intent). The sibling diff-driven path hoists the
+        // same way.
+        let icc_transform = match (icc_profile.as_ref(), icc_intent) {
+            (Some(profile), Some(intent)) => {
+                Some(self.icc_transform_cache.get_or_build(profile, intent))
+            },
+            _ => None,
+        };
 
         let dest = pixmap.data_mut();
         for px in 0..(dest.len() / 4) {
@@ -5101,23 +5137,21 @@ impl PageRenderer {
                 c_alpha,
             );
 
-            let (r_byte, g_byte, b_byte) =
-                if let (Some(profile), Some(intent)) = (icc_profile.as_ref(), icc_intent) {
-                    let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let transform = self.icc_transform_cache.get_or_build(profile, intent);
-                    let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
-                    (rgb[0], rgb[1], rgb[2])
-                } else {
-                    let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
-                    (
-                        (rr * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (rg * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (rb * 255.0).round().clamp(0.0, 255.0) as u8,
-                    )
-                };
+            let (r_byte, g_byte, b_byte) = if let Some(transform) = icc_transform.as_ref() {
+                let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
+                (rgb[0], rgb[1], rgb[2])
+            } else {
+                let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
+                (
+                    (rr * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (rg * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (rb * 255.0).round().clamp(0.0, 255.0) as u8,
+                )
+            };
 
             dest[off] = r_byte;
             dest[off + 1] = g_byte;
@@ -5687,18 +5721,27 @@ impl PageRenderer {
         } else {
             None
         };
+        // Hoist the ICC transform out of the per-pixel loop. The cache
+        // key includes `profile.content_hash()` (SipHash over every
+        // byte of the ICC profile blob); a per-pixel lookup re-hashed
+        // hundreds of KB on every painted pixel.
+        let icc_transform = match (icc_profile.as_ref(), icc_intent) {
+            (Some(profile), Some(intent)) => {
+                Some(self.icc_transform_cache.get_or_build(profile, intent))
+            },
+            _ => None,
+        };
 
         // Pre-compute the convert-first source RGB the rasteriser
         // actually wrote. Used to invert the source-over alpha blend
         // and recover effective coverage·alpha per pixel. Mirrors the
         // `apply_cmyk_compose_after_paint` recovery for byte-identity
         // with the compose-first path.
-        let src_rgb_ic = if let (Some(profile), Some(intent)) = (icc_profile.as_ref(), icc_intent) {
+        let src_rgb_ic = if let Some(transform) = icc_transform.as_ref() {
             let c_u8 = (sc.clamp(0.0, 1.0) * 255.0).round() as u8;
             let m_u8 = (sm.clamp(0.0, 1.0) * 255.0).round() as u8;
             let y_u8 = (sy.clamp(0.0, 1.0) * 255.0).round() as u8;
             let k_u8 = (sk.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let transform = self.icc_transform_cache.get_or_build(profile, intent);
             let rgb = transform.convert_cmyk_pixel(c_u8, m_u8, y_u8, k_u8);
             [
                 rgb[0] as f32 / 255.0,
@@ -5794,23 +5837,21 @@ impl PageRenderer {
 
             // CMYK → RGB conversion. ICC path for the press-accurate
             // case; additive-clamp `cmyk_to_rgb` for the fallback.
-            let (r_byte, g_byte, b_byte) =
-                if let (Some(profile), Some(intent)) = (icc_profile.as_ref(), icc_intent) {
-                    let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let transform = self.icc_transform_cache.get_or_build(profile, intent);
-                    let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
-                    (rgb[0], rgb[1], rgb[2])
-                } else {
-                    let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
-                    (
-                        (rr * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (rg * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (rb * 255.0).round().clamp(0.0, 255.0) as u8,
-                    )
-                };
+            let (r_byte, g_byte, b_byte) = if let Some(transform) = icc_transform.as_ref() {
+                let mc_u8 = (mc.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mm_u8 = (mm.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let my_u8 = (my.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mk_u8 = (mk.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let rgb = transform.convert_cmyk_pixel(mc_u8, mm_u8, my_u8, mk_u8);
+                (rgb[0], rgb[1], rgb[2])
+            } else {
+                let (rr, rg, rb) = cmyk_to_rgb(mc, mm, my, mk);
+                (
+                    (rr * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (rg * 255.0).round().clamp(0.0, 255.0) as u8,
+                    (rb * 255.0).round().clamp(0.0, 255.0) as u8,
+                )
+            };
 
             // Preserve the painted pixel's alpha (post-paint alpha
             // already accounts for the paint's contribution); just

@@ -107,6 +107,15 @@ pub(crate) struct IccTransformCache {
     /// might also build transforms.
     #[cfg(feature = "test-support")]
     pub(crate) build_count: std::cell::Cell<usize>,
+    /// Test-support counter: every `get_or_build` CALL — hit or miss —
+    /// increments this counter. Hoist-correctness probes use it to
+    /// distinguish "called once per paint" (hoisted) from "called once
+    /// per pixel" (regressed): `build_count` alone cannot, because the
+    /// per-page CMYK cache returns the same `Arc<Transform>` on every
+    /// hit and the cost we're guarding against is the `content_hash`
+    /// call needed to PROBE the cache, not the build itself.
+    #[cfg(feature = "test-support")]
+    pub(crate) lookup_count: std::cell::Cell<usize>,
 }
 
 impl IccTransformCache {
@@ -116,6 +125,8 @@ impl IccTransformCache {
             srgb_to_cmyk_entries: RefCell::new(HashMap::new()),
             #[cfg(feature = "test-support")]
             build_count: std::cell::Cell::new(0),
+            #[cfg(feature = "test-support")]
+            lookup_count: std::cell::Cell::new(0),
         }
     }
 
@@ -130,6 +141,8 @@ impl IccTransformCache {
         profile: &Arc<IccProfile>,
         intent: RenderingIntent,
     ) -> Arc<Transform> {
+        #[cfg(feature = "test-support")]
+        self.lookup_count.set(self.lookup_count.get() + 1);
         let key = (profile.content_hash(), intent);
         if let Some(t) = self.entries.borrow().get(&key).cloned() {
             return t;
@@ -168,6 +181,8 @@ impl IccTransformCache {
         self.srgb_to_cmyk_entries.borrow_mut().clear();
         #[cfg(feature = "test-support")]
         self.build_count.set(0);
+        #[cfg(feature = "test-support")]
+        self.lookup_count.set(0);
     }
 
     /// Number of cache misses observed in the cache's lifetime since
@@ -176,6 +191,17 @@ impl IccTransformCache {
     #[cfg(feature = "test-support")]
     pub(crate) fn build_count(&self) -> usize {
         self.build_count.get()
+    }
+
+    /// Total `get_or_build` calls (hits + misses) observed since the
+    /// last `clear()`. Test-only. Used by the hot-loop hoist probes:
+    /// a single paint may legitimately CALL `get_or_build` once
+    /// (cache hit on every pixel), but the `content_hash` cost we are
+    /// guarding against runs on every call regardless of hit/miss, so
+    /// the only correct steady-state is "one call per paint".
+    #[cfg(feature = "test-support")]
+    pub(crate) fn lookup_count(&self) -> usize {
+        self.lookup_count.get()
     }
 }
 

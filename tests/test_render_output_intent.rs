@@ -3879,3 +3879,219 @@ fn output_intent_malformed_iccbased_stream_falls_through() {
          panicking; got ({r},{g},{b},{a})"
     );
 }
+
+// ===========================================================================
+// ICC transform cache MUST be hoisted out of the per-pixel transparency loop
+// ===========================================================================
+//
+// `apply_cmyk_compose_after_paint_with_coverage` and
+// `apply_overprint_after_paint_with_coverage` previously called
+// `IccTransformCache::get_or_build` inside their per-pixel coverage loops.
+// The cache key hashes every byte of the ICC profile blob (SipHash via
+// `IccProfile::content_hash`), so a full-page transparency fill on a
+// 1000×1000-pixel page meant ~1M hashes of the same profile per paint.
+// The fix hoists the lookup once per call. These probes pin the hoist
+// via the test-support `build_count`: a single paint can only build the
+// transform once.
+
+/// Build a single-page PDF that declares one ExtGState with `/ca 0.5`,
+/// references it once via `gs`, then emits N opaque CMYK fills covering
+/// the whole page. Every fill routes through the
+/// `apply_cmyk_compose_after_paint_with_coverage` helper (transparency
+/// active → sidecar allocated → coverage path active). With the hoist,
+/// the cache must record exactly one build for the single (profile,
+/// intent) tuple in play.
+fn build_pdf_cmyk_with_transparency_and_repeated_paints(
+    icc_profile_bytes: &[u8],
+    paints: usize,
+) -> Vec<u8> {
+    let mut ops = String::new();
+    ops.push_str("/T gs\n");
+    for _ in 0..paints {
+        ops.push_str("0.25 0 0 0 k\n0 0 100 100 re\nf\n");
+    }
+    let catalog_entries =
+        "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (S) /DestOutputProfile 5 0 R >>]";
+
+    // Re-implement the catalog-entries builder so the page can carry
+    // ExtGState in its /Resources. The shared helper hard-codes
+    // `<< >>` for resources.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    let catalog =
+        format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R {} >>\nendobj\n", catalog_entries);
+    buf.extend_from_slice(catalog.as_bytes());
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /ExtGState << /T << /Type /ExtGState /ca 0.5 >> >> >> \
+         /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_off = buf.len();
+    let icc_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", icc_profile_bytes.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(icc_profile_bytes);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+/// Pin that `apply_cmyk_compose_after_paint_with_coverage` builds the
+/// ICC transform exactly once per (profile, intent), even across many
+/// paints touching the full page under transparency. Before the hoist
+/// fix the cache was queried per pixel — for a 100×100 page rendered
+/// at 72 DPI that meant one hash of the entire ICC blob for every
+/// pixel covered. The counter is exact: 1 = hoisted, > paint count
+/// = per-pixel regression.
+#[cfg(feature = "test-support")]
+#[test]
+fn cmyk_transparency_compose_hoists_icc_transform_cache_lookup() {
+    use pdf_oxide::rendering::{PageRenderer, RenderOptions};
+
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let paints: usize = 8;
+    let pdf = build_pdf_cmyk_with_transparency_and_repeated_paints(&icc, paints);
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+
+    let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72));
+    let _ = renderer.render_page(&doc, 0).expect("render");
+
+    let built = renderer.icc_transform_cache_build_count();
+    assert_eq!(
+        built, 1,
+        "Many full-page transparency CMYK paints under one OutputIntent \
+         profile and one rendering intent must build the qcms Transform \
+         exactly once. Built {built} times — the per-paint transform \
+         cache regressed or is missing."
+    );
+
+    // The hoist guards against per-pixel `get_or_build` calls. The
+    // cache returns the same `Arc<Transform>` on every hit so
+    // `build_count` cannot distinguish "hoisted" from "per-pixel"; the
+    // `lookup_count` counter increments on every CALL regardless of
+    // hit/miss, so it cleanly does. On a 100×100 page with 8 paints
+    // covering the full canvas, the per-pixel regression would record
+    // ≈ 8 × 10_000 = 80_000 lookups; the hoisted path records at most
+    // a small constant per paint (one for the with_coverage helper).
+    let looked_up = renderer.icc_transform_cache_lookup_count();
+    assert!(
+        looked_up <= paints * 4,
+        "Per-pixel `get_or_build` regression detected in \
+         `apply_cmyk_compose_after_paint_with_coverage`: {paints} \
+         full-page CMYK paints recorded {looked_up} ICC-transform \
+         lookups. The hoist caps lookups at a small constant per paint \
+         (one call per `get_or_build` site reached); a per-pixel \
+         lookup scales with painted-pixel count (100×100 = 10_000 per \
+         paint here)."
+    );
+}
+
+/// Pin the same hoist for the overprint helper. The fixture toggles
+/// `/OP true` on the ExtGState so process-colour overprint composition
+/// routes through `apply_overprint_after_paint_with_coverage`. The
+/// build count must remain at 1 across many overprint paints.
+fn build_pdf_cmyk_with_overprint_and_repeated_paints(
+    icc_profile_bytes: &[u8],
+    paints: usize,
+) -> Vec<u8> {
+    let mut ops = String::new();
+    ops.push_str("/T gs\n");
+    for _ in 0..paints {
+        ops.push_str("0.25 0 0 0 k\n0 0 100 100 re\nf\n");
+    }
+    let catalog_entries =
+        "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (S) /DestOutputProfile 5 0 R >>]";
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+
+    let cat_off = buf.len();
+    let catalog =
+        format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R {} >>\nendobj\n", catalog_entries);
+    buf.extend_from_slice(catalog.as_bytes());
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /ExtGState << /T << /Type /ExtGState /OP true /op true >> >> >> \
+         /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_off = buf.len();
+    let icc_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", icc_profile_bytes.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(icc_profile_bytes);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cmyk_overprint_with_coverage_hoists_icc_transform_cache_lookup() {
+    use pdf_oxide::rendering::{PageRenderer, RenderOptions};
+
+    let icc = build_minimal_cmyk_to_rgb_lut8_profile(135);
+    let paints: usize = 8;
+    let pdf = build_pdf_cmyk_with_overprint_and_repeated_paints(&icc, paints);
+    let doc = PdfDocument::from_bytes(pdf).expect("open");
+
+    let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72));
+    let _ = renderer.render_page(&doc, 0).expect("render");
+
+    let built = renderer.icc_transform_cache_build_count();
+    assert_eq!(
+        built, 1,
+        "Many full-page CMYK overprint paints under one OutputIntent \
+         profile and one rendering intent must build the qcms Transform \
+         exactly once."
+    );
+
+    let looked_up = renderer.icc_transform_cache_lookup_count();
+    assert!(
+        looked_up <= paints * 4,
+        "Per-pixel `get_or_build` regression detected in \
+         `apply_overprint_after_paint_with_coverage`: {paints} \
+         full-page CMYK overprint paints recorded {looked_up} ICC- \
+         transform lookups. Hoist caps lookups at a small constant \
+         per paint."
+    );
+}
