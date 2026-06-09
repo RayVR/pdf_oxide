@@ -2176,3 +2176,119 @@ fn outputintent_then_transparency_composite_before_convert() {
          (192, 255, 191); got ({r2}, {g2}, {b2})"
     );
 }
+
+// ===========================================================================
+// §11.6.5.2 SMask Form rendered in the device space in effect at host paint
+// ===========================================================================
+//
+// The mask Form XObject must be rasterised under the SAME transform as the
+// host paint (the page's `base_transform` — PDF→device y-flip + DPI scale),
+// not under `Transform::identity()`. Using identity leaves the mask at PDF
+// user-space (72 dpi, y-up): at any DPI ≠ 72 the mask shrinks toward the
+// pixmap origin, and at any DPI the mask is sampled upside-down relative
+// to the host paint.
+//
+// The fixture below makes the bug observable in two independent dimensions
+// at a single DPI by choosing an asymmetric mask region:
+//
+//   - Form BBox [0 0 100 100], its content paints alpha=1 only in the
+//     PDF-coordinate region [50, 50, 100, 100] (top-right quadrant in PDF
+//     y-up).
+//   - SMask /S /Alpha so mask-alpha == form-alpha.
+//   - Host paint: full-page red fill on a white backdrop.
+//
+// At DPI=144 (scale=2 → 200×200 pixmap):
+//   - Identity-bug path: mask alpha=255 inside pixel rect [50..100, 50..100]
+//     of the 200×200 pixmap (top-left quadrant); elsewhere alpha=0.
+//   - Correct base_transform path: PDF (50..100, 50..100) y-flips and
+//     scales to pixel rows [0..100], pixel cols [100..200] → top-right
+//     quadrant of the 200×200 pixmap.
+//
+// Probe pixel (75, 75) (centre of the identity-bug active region — TOP-LEFT
+// quadrant in image coords) and pixel (150, 50) (centre of the correct
+// active region — TOP-RIGHT quadrant). The discrimination is byte-exact and
+// independent of any DPI-dependent rounding because both sample pixels are
+// well inside their respective active rects.
+
+fn fixture_smask_form_alpha_offcentre_144dpi() -> Vec<u8> {
+    // Form's content stream paints an opaque rect over the upper-right
+    // quadrant of its own user space — PDF coordinates [50, 50, 100, 100],
+    // expressed as `re` operands `x y w h` = `50 50 50 50`.
+    let form_content = "1 1 1 rg\n50 50 50 50 re\nf\n";
+    let obj_5 = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+         /Resources << >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        form_content.len(),
+        form_content
+    );
+    // Host paint: white backdrop, then SMask gs, then full-page red fill.
+    // Under the mask, red survives where mask α=1 and the white backdrop
+    // shows through where mask α=0.
+    let content = "1 1 1 rg\n0 0 100 100 re\nf\n\
+                   /Sm gs\n\
+                   1 0 0 rg\n\
+                   0 0 100 100 re\nf\n";
+    let resources = "/ExtGState << /Sm << /Type /ExtGState \
+                     /SMask << /Type /Mask /S /Alpha /G 5 0 R >> >> >>";
+    build_pdf(content, resources, &[&obj_5])
+}
+
+/// Render the synthetic PDF at a chosen DPI and assert the raster is the
+/// expected `(width, height)`. Used by the SMask base_transform probe to
+/// pin the 200×200 raster at DPI=144 on the 100×100 MediaBox fixture.
+fn render_rgba_at_dpi(pdf_bytes: Vec<u8>, dpi: u32, width: u32, height: u32) -> Vec<u8> {
+    let doc = PdfDocument::from_bytes(pdf_bytes).expect("synthetic PDF parses");
+    let opts = RenderOptions::with_dpi(dpi).as_raw();
+    let img = render_page(&doc, 0, &opts).expect("render_page succeeds");
+    assert_eq!(img.format, ImageFormat::RawRgba8);
+    assert_eq!(img.width, width, "raster width at DPI={dpi}");
+    assert_eq!(img.height, height, "raster height at DPI={dpi}");
+    img.data
+}
+
+/// Sample a single pixel from a raster of given dimensions. Mirrors
+/// [`pixel_at`] but parameterises on the raster width/height so callers
+/// rendering at DPI ≠ 72 don't trip the 100×100 invariant.
+fn pixel_at_sized(rgba: &[u8], width: u32, height: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {
+    assert_eq!(rgba.len() as u32, width * height * 4);
+    assert!(x < width && y < height);
+    let off = ((y * width + x) * 4) as usize;
+    (rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3])
+}
+
+/// Regression sentry — `/SMask /S /Alpha` Form must be rasterised under
+/// the host's `base_transform` (§11.6.5.2: the mask is evaluated in the
+/// device space in effect at the host paint), not under
+/// `Transform::identity()`. The bug is observable at DPI≠72 as a
+/// scale-down toward the pixmap origin AND a y-flip; the fixture's
+/// asymmetric mask region surfaces both at DPI=144.
+#[test]
+fn smask_form_honours_base_transform_at_144_dpi() {
+    let rgba = render_rgba_at_dpi(fixture_smask_form_alpha_offcentre_144dpi(), 144, 200, 200);
+
+    // Sample (150, 50) — centre of the correct (top-right) active region.
+    // With base_transform, mask α=255 here → red paint shows through.
+    let (r_tr, g_tr, b_tr, _) = pixel_at_sized(&rgba, 200, 200, 150, 50);
+    assert_eq!(
+        (r_tr, g_tr, b_tr),
+        (255, 0, 0),
+        "§11.6.5.2: SMask form rendered under base_transform must place \
+         the mask in the y-flipped, DPI-scaled device-space region of the \
+         host paint. Pixel (150, 50) is the centre of that region at \
+         DPI=144 and must be byte-exact red (255, 0, 0); got \
+         ({r_tr}, {g_tr}, {b_tr})."
+    );
+
+    // Sample (75, 75) — centre of the identity-bug active region.
+    // With base_transform, mask α=0 here → white backdrop survives.
+    let (r_tl, g_tl, b_tl, _) = pixel_at_sized(&rgba, 200, 200, 75, 75);
+    assert_eq!(
+        (r_tl, g_tl, b_tl),
+        (255, 255, 255),
+        "§11.6.5.2: outside the mask's device-space region the host paint \
+         must be fully masked out. Pixel (75, 75) is the centre of the \
+         old identity-transformed mask region; if it survives non-white \
+         the mask is being rendered at PDF user-space (the bug). Got \
+         ({r_tl}, {g_tl}, {b_tl})."
+    );
+}

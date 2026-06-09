@@ -1547,6 +1547,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
                         }
@@ -1662,6 +1663,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
                         }
@@ -1779,6 +1781,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
 
@@ -1824,6 +1827,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
                         }
@@ -1917,6 +1921,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
 
@@ -1963,6 +1968,7 @@ impl PageRenderer {
                                         doc,
                                         page_num,
                                         resources,
+                                        base_transform,
                                     )?;
                                 }
                             }
@@ -2112,6 +2118,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
                             adv
@@ -2212,6 +2219,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
                             adv
@@ -2308,6 +2316,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
                             adv
@@ -2417,6 +2426,7 @@ impl PageRenderer {
                                     doc,
                                     page_num,
                                     resources,
+                                    base_transform,
                                 )?;
                             }
                             adv
@@ -2536,6 +2546,7 @@ impl PageRenderer {
                                 doc,
                                 page_num,
                                 resources,
+                                base_transform,
                             )?;
                         }
                     }
@@ -2727,6 +2738,7 @@ impl PageRenderer {
                                 doc,
                                 page_num,
                                 resources,
+                                base_transform,
                             )?;
                         }
                     }
@@ -5844,6 +5856,7 @@ impl PageRenderer {
         doc: &PdfDocument,
         page_num: usize,
         resources: &Object,
+        base_transform: Transform,
     ) -> Result<()> {
         let smask = match gs.smask.as_ref() {
             Some(s) => s.clone(),
@@ -5874,6 +5887,7 @@ impl PageRenderer {
             doc,
             page_num,
             resources,
+            base_transform,
         );
         self.smask_depth -= 1;
         result
@@ -5888,6 +5902,7 @@ impl PageRenderer {
         doc: &PdfDocument,
         page_num: usize,
         resources: &Object,
+        base_transform: Transform,
     ) -> Result<()> {
         // Render the Form XObject into a fresh pixmap. The pixmap
         // starts fully transparent for /S /Alpha (the spec default
@@ -5993,16 +6008,20 @@ impl PageRenderer {
             .and_then(|r| doc.resolve_object(r).ok())
             .unwrap_or_else(|| resources.clone());
 
-        // Render the form. We pass a Transform::identity so the form's
-        // /Matrix and /BBox define its pixel footprint within the
-        // pixmap. The audit fixture uses a 100×100 page and a Form
-        // with /BBox [0 0 50 50] — the form's content paints into
-        // (10..40, 10..40) of the mask pixmap.
+        // Render the form using the page's base transform: §11.6.5.2
+        // mandates the mask be evaluated in the device space in effect
+        // at the host paint, which carries both the DPI scale and the
+        // PDF→device y-flip. Using `Transform::identity()` here would
+        // leave the mask at PDF user-space (72 dpi, y-up) — mis-scaled
+        // and y-flipped relative to the pixmap whenever DPI ≠ 72.
+        // The form's /Matrix is still composed on top of `base_transform`
+        // by `render_form_xobject`, so the mask remains positioned by
+        // its own matrix within the page-aligned device frame.
         let _ = self.render_form_xobject(
             &mut mask_pixmap,
             &form_dict,
             &form_data,
-            Transform::identity(),
+            base_transform,
             doc,
             page_num,
             &form_resources_obj,
