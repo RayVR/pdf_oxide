@@ -42,16 +42,21 @@ impl NonSeparableBlend {
 
 /// Compose `source` over `dest` in-place using the §11.3.5.3 algorithm.
 ///
-/// Both buffers are RGBA8 row-major, identical dimensions. The source
-/// alpha defines a coverage mask: where `source.alpha == 0` the dest
-/// pixel is unchanged; elsewhere the blend rule is applied to the
-/// `(source.rgb, dest.rgb)` triple, with the result composited into
-/// dest via SourceOver against `source.alpha`.
+/// Both buffers are RGBA8 row-major, identical dimensions, and — per
+/// tiny_skia's storage contract on `Pixmap::data()` / `data_mut()` —
+/// hold **premultiplied** RGBA samples. The §11.3.5.3 non-separable
+/// blend formulas (and the §11.3.4 compositing equation that consumes
+/// their result) operate on **straight** colour values. Each pixel is
+/// therefore un-premultiplied on the way in, blended/composited as
+/// straight RGB, and re-premultiplied on the way out.
 ///
-/// This is the spec algorithm for an opaque backdrop (no group alpha
-/// considerations). The current composite path renders into RGBA
-/// pixmaps with dest alpha already at 255 (page background was filled),
-/// so the simplified composition is correct for the audit fixtures.
+/// The composition implements the full §11.3.4 form for a non-isolated
+/// non-knockout group:
+///   αo = αs + αb · (1 − αs)
+///   Co = ((1 − αs) · αb · Cb + αs · ((1 − αb) · Cs + αb · B(Cb, Cs))) / αo
+/// (When αo = 0 the output pixel is fully transparent and `Co` is
+/// undefined; the buffer is zeroed there.) The opaque-backdrop
+/// reduction (αb = 1) drops out of this as a special case.
 pub(crate) fn compose_in_place(dest: &mut [u8], source: &[u8], mode: NonSeparableBlend) {
     debug_assert_eq!(dest.len(), source.len());
     debug_assert_eq!(dest.len() % 4, 0);
@@ -60,21 +65,20 @@ pub(crate) fn compose_in_place(dest: &mut [u8], source: &[u8], mode: NonSeparabl
         let off = px * 4;
         let src_a = source[off + 3];
         if src_a == 0 {
+            // Source fully transparent → dest unchanged (αo = αb,
+            // Co = Cb is the §11.3.4 reduction; nothing to write).
             continue;
         }
 
-        // Read source and dest as f32 in [0, 1].
-        let sr = source[off] as f32 / 255.0;
-        let sg = source[off + 1] as f32 / 255.0;
-        let sb = source[off + 2] as f32 / 255.0;
+        // Read source/dest as premultiplied f32 in [0, 1], then
+        // un-premultiply to straight colour for the §11.3.5.3 math.
         let sa = src_a as f32 / 255.0;
+        let (sr, sg, sb) = unpremultiply(source[off], source[off + 1], source[off + 2], sa);
 
-        let dr = dest[off] as f32 / 255.0;
-        let dg = dest[off + 1] as f32 / 255.0;
-        let db = dest[off + 2] as f32 / 255.0;
         let da = dest[off + 3] as f32 / 255.0;
+        let (dr, dg, db) = unpremultiply(dest[off], dest[off + 1], dest[off + 2], da);
 
-        // Apply the blend rule to (Cs, Cb).
+        // §11.3.5.3 blend B(Cb, Cs) on STRAIGHT colour.
         let (br, bg, bb) = match mode {
             NonSeparableBlend::Hue => {
                 // SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb))
@@ -98,20 +102,51 @@ pub(crate) fn compose_in_place(dest: &mut [u8], source: &[u8], mode: NonSeparabl
             },
         };
 
-        // Composite the blended result over dest with source alpha
-        // (SourceOver): out = sa * B + (1 - sa) * Cb.
-        // Per §11.3.4 the alpha out is sa + da * (1 - sa).
+        // §11.3.4 general (non-isolated, non-knockout) composition with
+        // arbitrary backdrop alpha, on STRAIGHT colour:
+        //   αo = αs + αb · (1 − αs)
+        //   Co = ((1 − αs) · αb · Cb + αs · ((1 − αb) · Cs + αb · B)) / αo
         let inv_sa = 1.0 - sa;
-        let out_r = sa * br + inv_sa * dr;
-        let out_g = sa * bg + inv_sa * dg;
-        let out_b = sa * bb + inv_sa * db;
+        let inv_da = 1.0 - da;
         let out_a = sa + da * inv_sa;
 
-        dest[off] = (out_r.clamp(0.0, 1.0) * 255.0).round() as u8;
-        dest[off + 1] = (out_g.clamp(0.0, 1.0) * 255.0).round() as u8;
-        dest[off + 2] = (out_b.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let (out_r, out_g, out_b) = if out_a <= 0.0 {
+            (0.0, 0.0, 0.0)
+        } else {
+            let blend_r = inv_sa * da * dr + sa * (inv_da * sr + da * br);
+            let blend_g = inv_sa * da * dg + sa * (inv_da * sg + da * bg);
+            let blend_b = inv_sa * da * db + sa * (inv_da * sb + da * bb);
+            (blend_r / out_a, blend_g / out_a, blend_b / out_a)
+        };
+
+        // Re-premultiply for tiny_skia storage.
+        let out_r_premul = (out_r.clamp(0.0, 1.0) * out_a).clamp(0.0, 1.0);
+        let out_g_premul = (out_g.clamp(0.0, 1.0) * out_a).clamp(0.0, 1.0);
+        let out_b_premul = (out_b.clamp(0.0, 1.0) * out_a).clamp(0.0, 1.0);
+
+        dest[off] = (out_r_premul * 255.0).round() as u8;
+        dest[off + 1] = (out_g_premul * 255.0).round() as u8;
+        dest[off + 2] = (out_b_premul * 255.0).round() as u8;
         dest[off + 3] = (out_a.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
+}
+
+/// Convert one premultiplied RGB byte triple at the given (straight)
+/// alpha back to straight RGB in [0, 1]. Returns `(0, 0, 0)` when
+/// `alpha == 0` — the spec leaves `Co` undefined in that case and the
+/// caller has already short-circuited the source-α==0 branch, but the
+/// destination side calls in unconditionally and a 0 backdrop alpha
+/// must not produce a divide-by-zero.
+fn unpremultiply(r: u8, g: u8, b: u8, alpha: f32) -> (f32, f32, f32) {
+    if alpha <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let inv = 1.0 / alpha;
+    (
+        (r as f32 / 255.0 * inv).clamp(0.0, 1.0),
+        (g as f32 / 255.0 * inv).clamp(0.0, 1.0),
+        (b as f32 / 255.0 * inv).clamp(0.0, 1.0),
+    )
 }
 
 /// §11.3.5.3 `Lum(C) = 0.30 R + 0.59 G + 0.11 B`.
@@ -274,5 +309,108 @@ mod tests {
             .max((dest[0] as i32 - dest[2] as i32).abs())
             .max((dest[1] as i32 - dest[2] as i32).abs());
         assert!(max_diff < 30, "Saturation grey-over-red should desaturate; got {:?}", dest);
+    }
+
+    // ============================================================
+    // Partial-alpha byte-exact probes — §11.3.4 + §11.3.5.3
+    // ============================================================
+    //
+    // tiny_skia's `Pixmap::data` is premultiplied RGBA; the §11.3.5.3
+    // non-separable formulas + the §11.3.4 compositing equation
+    // operate on STRAIGHT colour. The probes below pin the byte-exact
+    // result for each of the four non-separable modes at a partial
+    // source and partial backdrop alpha. They fail when the function
+    // reads premultiplied bytes as if they were straight colour
+    // (the bug before the un-premultiply/re-premultiply fix landed)
+    // or when the compositing reduces to the αb = 1 special case.
+    //
+    // Fixture inputs (all stored as premultiplied bytes):
+    //   - Backdrop: red at αb_byte = 128 → straight Cb = (1, 0, 0),
+    //     stored as (128, 0, 0, 128).
+    //   - Source:   blue at αs_byte = 179 → straight Cs = (0, 0, 1),
+    //     stored as (0, 0, 179, 179).
+    //
+    // Output α: αo = αs + αb·(1−αs) ≈ 0.852 → byte 217 (shared by
+    // every mode at these inputs).
+    //
+    // Expected straight-colour blend results B(Cb, Cs):
+    //   - Hue        = SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb))
+    //   - Saturation = SetLum(SetSat(Cb, Sat(Cs)), Lum(Cb))
+    //   - Color      = SetLum(Cs, Lum(Cb))
+    //   - Luminosity = SetLum(Cb, Lum(Cs))
+    // The hand-derived expected bytes below are reproduced from the
+    // §11.3.5.3 + §11.3.4 walk in this test's module docstring; see
+    // also the bug write-up for the per-channel arithmetic.
+
+    /// Backdrop pixel — straight red at α≈0.502, premultiplied.
+    const PA_BACKDROP: [u8; 4] = [128, 0, 0, 128];
+    /// Source pixel — straight blue at α≈0.702, premultiplied.
+    const PA_SOURCE: [u8; 4] = [0, 0, 179, 179];
+
+    #[test]
+    fn hue_blend_partial_alpha_is_byte_exact() {
+        // Hue B = (0.2135, 0.2135, 1.0); composite per §11.3.4 with
+        // αs=179/255, αb=128/255 and re-premultiply → (57, 19, 179, 217).
+        let mut dest = PA_BACKDROP;
+        compose_in_place(&mut dest, &PA_SOURCE, NonSeparableBlend::Hue);
+        assert_eq!(
+            dest,
+            [57, 19, 179, 217],
+            "Hue blend partial-alpha: §11.3.4 + §11.3.5.3 produce \
+             byte-exact (57, 19, 179, 217); got {:?}",
+            dest
+        );
+    }
+
+    #[test]
+    fn saturation_blend_partial_alpha_is_byte_exact() {
+        // Saturation B = (1.0, 0, 0); composite per §11.3.4 →
+        // (128, 0, 89, 217). The R-channel passes through the backdrop's
+        // (1 − αs)·αb·Cb + αs·αb·B_r term unchanged because Cb=Cs_sat-
+        // applied=red coincides; B_blue picks up the source-only term.
+        let mut dest = PA_BACKDROP;
+        compose_in_place(&mut dest, &PA_SOURCE, NonSeparableBlend::Saturation);
+        assert_eq!(
+            dest,
+            [128, 0, 89, 217],
+            "Saturation blend partial-alpha: §11.3.4 + §11.3.5.3 \
+             produce byte-exact (128, 0, 89, 217); got {:?}",
+            dest
+        );
+    }
+
+    #[test]
+    fn color_blend_partial_alpha_is_byte_exact() {
+        // Color B = (0.2135, 0.2135, 1.0); composite per §11.3.4 →
+        // (57, 19, 179, 217). Identical to Hue at this input because
+        // both Cs and Cb sit at saturation 1; B(Cb, Cs) reduces to the
+        // SetLum(Cs, Lum(Cb)) form for both modes.
+        let mut dest = PA_BACKDROP;
+        compose_in_place(&mut dest, &PA_SOURCE, NonSeparableBlend::Color);
+        assert_eq!(
+            dest,
+            [57, 19, 179, 217],
+            "Color blend partial-alpha: §11.3.4 + §11.3.5.3 produce \
+             byte-exact (57, 19, 179, 217); got {:?}",
+            dest
+        );
+    }
+
+    #[test]
+    fn luminosity_blend_partial_alpha_is_byte_exact() {
+        // Luminosity B = (0.367, 0, 0); composite per §11.3.4 →
+        // (71, 0, 89, 217). The B-channel survives via the source-only
+        // (1 − αb)·αs·Cs term — αb < 1 means the source contributes
+        // even outside its blended region; without the un-premultiply
+        // fix the backdrop would dominate.
+        let mut dest = PA_BACKDROP;
+        compose_in_place(&mut dest, &PA_SOURCE, NonSeparableBlend::Luminosity);
+        assert_eq!(
+            dest,
+            [71, 0, 89, 217],
+            "Luminosity blend partial-alpha: §11.3.4 + §11.3.5.3 \
+             produce byte-exact (71, 0, 89, 217); got {:?}",
+            dest
+        );
     }
 }
