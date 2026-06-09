@@ -691,8 +691,9 @@ fn extract_inks_from_color_space_dict(
     doc: Option<&PdfDocument>,
     out: &mut Vec<String>,
 ) {
+    let mut visited: std::collections::HashSet<ObjectRef> = std::collections::HashSet::new();
     for cs_def in cs_dict.values() {
-        collect_inks_from_color_space(cs_def, doc, out);
+        collect_inks_from_color_space(cs_def, doc, out, &mut visited, 0);
     }
 }
 
@@ -700,11 +701,23 @@ fn extract_inks_from_color_space_dict(
 /// Factored out of [`extract_inks_from_color_space_dict`] so the
 /// Pattern arm can recurse into its underlying colour space without
 /// requiring a synthetic single-entry dict.
+///
+/// **Cycle handling:** the Pattern arm recurses into the underlying
+/// colour space (§8.7.3.1). A self-referential array such as
+/// `5 0 obj [/Pattern 5 0 R]` would otherwise blow the stack, so
+/// indirect references are de-duplicated via `visited` (keyed on
+/// `ObjectRef`) and total depth is capped at `MAX_RECURSION_DEPTH`
+/// — the same backstop used by [`PdfDocument::walk_form_xobject_tree_for_inks`].
 fn collect_inks_from_color_space(
     cs_def: &Object,
     doc: Option<&PdfDocument>,
     out: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<ObjectRef>,
+    depth: u32,
 ) {
+    if depth >= MAX_RECURSION_DEPTH {
+        return;
+    }
     let deref = |obj: &Object| -> Object {
         match (obj.as_reference(), doc) {
             (Some(r), Some(d)) => d.load_object(r).unwrap_or_else(|_| obj.clone()),
@@ -731,8 +744,18 @@ fn collect_inks_from_color_space(
             // underlying space's tints). Recurse so a Pattern
             // with /Separation or /DeviceN underlying surfaces
             // the spot colorants for plate allocation.
+            //
+            // Guard against self-referential cycles (e.g.
+            // `5 0 obj [/Pattern 5 0 R]`): an indirect underlying
+            // ref is recorded in `visited`; a repeat hit terminates
+            // the recursion silently.
+            if let Some(r) = arr[1].as_reference() {
+                if !visited.insert(r) {
+                    return;
+                }
+            }
             let underlying = deref(&arr[1]);
-            collect_inks_from_color_space(&underlying, doc, out);
+            collect_inks_from_color_space(&underlying, doc, out, visited, depth + 1);
         },
         "Separation" => {
             // §8.6.6.2: [/Separation /InkName /AlternateCS /TintTransform].
@@ -23722,5 +23745,91 @@ mod ink_dict_extractor_tests {
         let mut out = Vec::new();
         extract_inks_from_color_space_dict(&cs_dict, None, &mut out);
         assert!(out.is_empty());
+    }
+
+    /// Build a minimal PDF that embeds a single colour-space object with a
+    /// self-referential Pattern array `5 0 obj [/Pattern 5 0 R]`. Used by the
+    /// cycle-handling regression below — the array as stored on disk is the
+    /// minimal shape that triggers unbounded recursion in the inks walker
+    /// before the depth/visited-set guard was added.
+    fn build_pdf_with_self_referential_pattern_cs() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /ColorSpace << /CS0 5 0 R >> >> >>\nendobj\n",
+        );
+
+        let off4 = pdf.len();
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n");
+
+        // Object 5: a Pattern colour-space array whose underlying space is a
+        // reference back to itself — the cycle the regression guards against.
+        let off5 = pdf.len();
+        pdf.extend_from_slice(b"5 0 obj\n[/Pattern 5 0 R]\nendobj\n");
+
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n");
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off1).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off2).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off3).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off4).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off5).as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off)
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn self_referential_pattern_cs_does_not_stack_overflow() {
+        // Regression: prior to the depth-bound + visited-set guard, a
+        // self-referential Pattern colour space (§8.7.3.1) recursed through
+        // `collect_inks_from_color_space` without termination and aborted
+        // the process with a stack overflow. The fix records each indirect
+        // underlying ref in a visited set and caps total walk depth at
+        // `MAX_RECURSION_DEPTH`, mirroring `walk_form_xobject_tree_for_inks`.
+        //
+        // The call must return without panicking; the inks vector is left
+        // empty because no concrete colorant ever surfaces on a self-cycle.
+        let pdf = build_pdf_with_self_referential_pattern_cs();
+        let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF should parse");
+
+        // Resolve `5 0 R` to the on-disk Pattern array; this matches how the
+        // page-level walker enters the helper after dereferencing a /ColorSpace
+        // resource entry.
+        let cs_def = doc
+            .load_object(ObjectRef { id: 5, gen: 0 })
+            .expect("object 5 should load");
+
+        let mut out = Vec::new();
+        let mut visited: std::collections::HashSet<ObjectRef> = std::collections::HashSet::new();
+        // The bug is a stack overflow, so the assertion is simply that this
+        // call returns. The visited-set must dedupe the self-reference on
+        // first encounter; without the guard, the recursion is unbounded.
+        super::collect_inks_from_color_space(&cs_def, Some(&doc), &mut out, &mut visited, 0);
+        assert!(
+            out.is_empty(),
+            "self-referential Pattern colour space surfaces no concrete colorants"
+        );
+    }
+
+    #[test]
+    fn get_page_inks_handles_self_referential_pattern_cs() {
+        // End-to-end shape of the same regression: the public
+        // `get_page_inks` entry point walks the resource dictionary and
+        // hits the cycle through the same helper. Must not stack-overflow.
+        let pdf = build_pdf_with_self_referential_pattern_cs();
+        let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF should parse");
+        let inks = doc.get_page_inks(0).expect("page-inks walk must not panic");
+        assert!(inks.is_empty(), "self-cycle yields no plates");
     }
 }
