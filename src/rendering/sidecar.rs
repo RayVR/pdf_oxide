@@ -95,6 +95,7 @@
 //! filtered out per §8.6.6.4).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::document::PdfDocument;
 use crate::object::Object;
@@ -1070,6 +1071,7 @@ pub(crate) fn extract_process_paint_cmyk(
     components: &[f32],
     doc: &PdfDocument,
     rendering_intent: crate::color::RenderingIntent,
+    retarget_cache: Option<&crate::rendering::resolution::context::IccTransformCache>,
 ) -> Option<(f32, f32, f32, f32)> {
     let arr = space.as_array()?;
     if arr.first().and_then(Object::as_name)? != "DeviceN" {
@@ -1245,6 +1247,7 @@ pub(crate) fn extract_process_paint_cmyk(
                         &proc_tints,
                         doc,
                         rendering_intent,
+                        retarget_cache,
                     ) {
                         return Some(retargeted);
                     }
@@ -1306,6 +1309,7 @@ fn try_retarget_cmyk_via_embedded_profile(
     proc_tints: &[f32],
     doc: &PdfDocument,
     rendering_intent: crate::color::RenderingIntent,
+    retarget_cache: Option<&crate::rendering::resolution::context::IccTransformCache>,
 ) -> Option<(f32, f32, f32, f32)> {
     if !crate::color::active_backend_supports_cmyk_retarget() {
         return None;
@@ -1359,8 +1363,25 @@ fn try_retarget_cmyk_via_embedded_profile(
     // `RenderingIntent::from_pdf_name`, applied at the call site
     // before threading into here. BPC stays on for the press
     // default `TransformFlags::press_default()`.
-    let transform =
-        crate::color::CmykRetargetTransform::new(src_profile, dst_profile, rendering_intent)?;
+    // Look up (or build, on miss) the compiled CMYK→CMYK retarget
+    // transform through the per-renderer cache when available. Without
+    // the cache, every paint re-parses both ICC profiles AND rebuilds
+    // the lcms2 CLUT — for a page with thousands of process-attributed
+    // DeviceN paints this is the dominant render cost. With the cache
+    // the build runs once per unique (src, dst, intent) tuple and
+    // every subsequent paint is a single `Arc<…>` clone. The
+    // no-cache path stays around for non-rendering callers (e.g.
+    // initial-colour evaluation in colour-space setup).
+    let transform: Arc<crate::color::CmykRetargetTransform> = match retarget_cache {
+        Some(cache) => {
+            cache.get_or_build_cmyk_retarget(&src_profile, &dst_profile, rendering_intent)?
+        },
+        None => Arc::new(crate::color::CmykRetargetTransform::new(
+            src_profile,
+            dst_profile,
+            rendering_intent,
+        )?),
+    };
     let out = transform.retarget_pixel([
         proc_tints[0].clamp(0.0, 1.0),
         proc_tints[1].clamp(0.0, 1.0),
@@ -1424,6 +1445,7 @@ pub(crate) fn initial_colour_for_space(
     resolved_space: Option<&Object>,
     doc: &PdfDocument,
     rendering_intent: crate::color::RenderingIntent,
+    retarget_cache: Option<&crate::rendering::resolution::context::IccTransformCache>,
 ) -> InitialColour {
     let deref =
         |obj: &Object| -> Object { doc.resolve_object(obj).unwrap_or_else(|_| obj.clone()) };
@@ -1605,6 +1627,7 @@ pub(crate) fn initial_colour_for_space(
                 &components,
                 doc,
                 rendering_intent,
+                retarget_cache,
             );
             InitialColour {
                 components,

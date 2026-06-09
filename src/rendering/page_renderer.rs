@@ -332,6 +332,17 @@ impl PageRenderer {
         self.icc_transform_cache.lookup_count()
     }
 
+    /// Number of CMYK→CMYK retarget cache misses observed since the
+    /// last `render_page_with_options` call. Test-support only. Pins
+    /// the M2 retarget cache: a page with many DeviceN /Process
+    /// /ICCBased N=4 paints under one OutputIntent must build the
+    /// retarget transform exactly once per unique `(src_profile,
+    /// dst_profile, intent)` tuple, not once per paint.
+    #[cfg(feature = "test-support")]
+    pub fn icc_transform_cache_cmyk_retarget_build_count(&self) -> usize {
+        self.icc_transform_cache.cmyk_retarget_build_count()
+    }
+
     /// Pixmap dimensions of the per-page compositing sidecar, or
     /// `None` when the sidecar was not allocated for the most recent
     /// `render_page_with_options` call (detection-OFF).
@@ -867,6 +878,7 @@ impl PageRenderer {
                         resolved.as_ref(),
                         doc,
                         intent_for_initial,
+                        Some(&self.icc_transform_cache),
                     );
                     let gs = gs_stack.current_mut();
                     gs.fill_color_space = name.clone();
@@ -888,6 +900,7 @@ impl PageRenderer {
                         resolved.as_ref(),
                         doc,
                         intent_for_initial,
+                        Some(&self.icc_transform_cache),
                     );
                     let gs = gs_stack.current_mut();
                     gs.stroke_color_space = name.clone();
@@ -1216,6 +1229,7 @@ impl PageRenderer {
                                                             components,
                                                             doc,
                                                             intent_for_extract,
+                                                            Some(&self.icc_transform_cache),
                                                         )
                                                     {
                                                         gs.fill_color_cmyk = Some(cmyk);
@@ -1345,6 +1359,7 @@ impl PageRenderer {
                                                             components,
                                                             doc,
                                                             intent_for_extract,
+                                                            Some(&self.icc_transform_cache),
                                                         )
                                                     {
                                                         gs.stroke_color_cmyk = Some(cmyk);

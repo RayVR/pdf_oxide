@@ -1313,3 +1313,86 @@ fn r7_intent_under_no_cmm_falls_to_natural_form_byte_exact() {
     assert_eq!(y, 89, "no-CMM + /Perceptual ri: Y lane natural-form. Got {}", y);
     assert_eq!(k, 13, "no-CMM + /Perceptual ri: K lane natural-form. Got {}", k);
 }
+
+/// Build a single-page PDF whose content stream emits N successive
+/// DeviceN /Process /ICCBased N=4 paints. Mirrors
+/// `build_devicen_iccbased_fixture` but parametrised on paint count
+/// so the M2 retarget-cache probe can drive many paints through one
+/// declared profile pair.
+#[cfg(feature = "icc-lcms2")]
+fn build_devicen_iccbased_fixture_repeated(
+    icc: &[u8],
+    process_icc: &[u8],
+    paints: usize,
+) -> Vec<u8> {
+    let psfunc = "<< /FunctionType 2 /Domain [0 1 0 1 0 1 0 1] \
+                  /Range [0 1 0 1 0 1 0 1] \
+                  /C0 [0 0 0 0] /C1 [1 1 1 1] /N 1 >>";
+    let mut content = String::from("0.4 0 0 0 k\n0 0 100 100 re\nf\n/CS_N cs\n/Ov gs\n");
+    for _ in 0..paints {
+        content.push_str("0.5 0.2 0.7 0.1 scn\n0 0 100 100 re\nf\n");
+    }
+    let resources = format!(
+        "/ExtGState << /Ov << /Type /ExtGState /OP true /ca 0.5 >> >> \
+         /ColorSpace << /CS_N [/DeviceN [/Cyan /Magenta /Yellow /Black] \
+            /DeviceCMYK {} \
+            << /Process << /ColorSpace [/ICCBased 6 0 R] \
+                          /Components [/Cyan /Magenta /Yellow /Black] >> >> \
+         ] >>",
+        psfunc
+    );
+    let process_icc_obj_hdr =
+        format!("6 0 obj\n<< /N 4 /Length {} >>\nstream\n", process_icc.len());
+    let mut process_icc_obj_bytes = Vec::from(process_icc_obj_hdr.as_bytes());
+    process_icc_obj_bytes.extend_from_slice(process_icc);
+    process_icc_obj_bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    build_pdf_with_output_intent(&content, &resources, icc, &[&process_icc_obj_bytes])
+}
+
+/// Pin that many DeviceN /Process /ICCBased N=4 paints under one
+/// embedded source profile and one OutputIntent destination profile
+/// build the CMYK→CMYK retarget transform exactly once across the
+/// whole page. Before the cache landed, each `scn` re-parsed both
+/// profiles and rebuilt the lcms2 CLUT.
+///
+/// The (src, dst, intent) fingerprint key uses
+/// `(n_components, byte_len, content_hash)` per profile so a
+/// theoretical SipHash collision can't route a wrong-profile
+/// transform — the n_components and byte_len agreement adds two
+/// extra independent constraints.
+#[cfg(feature = "icc-lcms2")]
+#[test]
+fn r7_icc_lcms2_retarget_transform_caches_per_profile_pair() {
+    use pdf_oxide::rendering::{PageRenderer, RenderOptions};
+
+    let icc = build_bidirectional_cmyk_icc(SyntheticCmykProfileParams {
+        l_byte: 135,
+        dest_cmyk: (200, 50, 20, 30),
+    });
+    let process_icc = build_bidirectional_cmyk_icc(SyntheticCmykProfileParams {
+        l_byte: 200,
+        dest_cmyk: (10, 20, 30, 40),
+    });
+    let paints: usize = 6;
+    let pdf = build_devicen_iccbased_fixture_repeated(&icc, &process_icc, paints);
+    let doc = PdfDocument::from_bytes(pdf).expect("parse");
+
+    // The fixture's ExtGState carries /ca 0.5, so
+    // `page_declares_transparency_or_overprint` returns true and the
+    // sidecar is allocated under the OutputIntent gate; the renderer
+    // takes the with-coverage compose path that calls the retarget
+    // through the cache for every DeviceN /Process /ICCBased N=4 scn.
+    let mut renderer = PageRenderer::new(RenderOptions::with_dpi(72).as_raw());
+    let _ = renderer.render_page(&doc, 0).expect("render");
+
+    let built = renderer.icc_transform_cache_cmyk_retarget_build_count();
+    assert_eq!(
+        built, 1,
+        "Many DeviceN /Process /ICCBased N=4 paints under one embedded \
+         source profile and one OutputIntent destination profile must \
+         build the CMYK→CMYK retarget transform exactly once \
+         (`CmykRetargetTransform::new` runs the lcms2 CLUT compile, \
+         not free). Built {built} times — the per-renderer retarget \
+         cache regressed."
+    );
+}

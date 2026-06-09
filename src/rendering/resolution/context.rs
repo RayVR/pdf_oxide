@@ -29,7 +29,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::color::{IccProfile, RenderingIntent, SrgbToCmykTransform, Transform};
+use crate::color::{
+    CmykRetargetTransform, IccProfile, RenderingIntent, SrgbToCmykTransform, Transform,
+};
 use crate::document::PdfDocument;
 use crate::object::Object;
 
@@ -99,6 +101,25 @@ pub(crate) struct IccTransformCache {
     /// for the page lifetime.
     srgb_to_cmyk_entries:
         RefCell<HashMap<(u64, RenderingIntent), Option<Arc<SrgbToCmykTransform>>>>,
+    /// CMYK → CMYK retarget transforms keyed by `(src_fingerprint,
+    /// dst_fingerprint, intent)` where each fingerprint is
+    /// `(n_components, byte_len, content_hash)`. The wider key (vs the
+    /// scalar `content_hash` used elsewhere) is the same hardening the
+    /// font-identity cache uses — `content_hash` alone is SipHash u64,
+    /// so a same-byte-length / same-hash collision would route a
+    /// wrong-profile transform; including `n_components` and
+    /// `byte_len` makes a collision strictly stronger to fabricate.
+    /// Built on miss; cached for the page lifetime. The retarget path
+    /// is on the DeviceN /Process /ICCBased N=4 hot path (called once
+    /// per paint by `try_retarget_cmyk_via_embedded_profile`); without
+    /// the cache, each paint re-parses the OutputIntent + embedded
+    /// profile and rebuilds the lcms2 CLUT.
+    cmyk_retarget_entries: RefCell<
+        HashMap<
+            ((u8, usize, u64), (u8, usize, u64), RenderingIntent),
+            Option<Arc<CmykRetargetTransform>>,
+        >,
+    >,
     /// Test-support counter: every cache miss (i.e. every call that
     /// actually constructs a fresh `Transform`) increments this
     /// instance-local counter. Distinct from the global
@@ -116,6 +137,13 @@ pub(crate) struct IccTransformCache {
     /// call needed to PROBE the cache, not the build itself.
     #[cfg(feature = "test-support")]
     pub(crate) lookup_count: std::cell::Cell<usize>,
+    /// Test-support counter: every CMYK→CMYK retarget cache miss
+    /// (i.e. every actual `CmykRetargetTransform::new` call) increments
+    /// this counter. Used by the M2 perf-bound probe to pin "the
+    /// retarget transform builds exactly once per unique profile
+    /// pair, even across many paints".
+    #[cfg(feature = "test-support")]
+    pub(crate) cmyk_retarget_build_count: std::cell::Cell<usize>,
 }
 
 impl IccTransformCache {
@@ -123,10 +151,13 @@ impl IccTransformCache {
         Self {
             entries: RefCell::new(HashMap::new()),
             srgb_to_cmyk_entries: RefCell::new(HashMap::new()),
+            cmyk_retarget_entries: RefCell::new(HashMap::new()),
             #[cfg(feature = "test-support")]
             build_count: std::cell::Cell::new(0),
             #[cfg(feature = "test-support")]
             lookup_count: std::cell::Cell::new(0),
+            #[cfg(feature = "test-support")]
+            cmyk_retarget_build_count: std::cell::Cell::new(0),
         }
     }
 
@@ -174,15 +205,57 @@ impl IccTransformCache {
         built
     }
 
+    /// Look up or build the compiled CMYK→CMYK retarget transform for
+    /// `(src_profile, dst_profile, intent)`. `None` (cached) is
+    /// returned when the active backend can't compile the transform
+    /// (qcms — no CMYK output path). The key uses
+    /// `(n_components, byte_len, content_hash)` per profile rather than
+    /// the bare `content_hash` to harden against collisions; mirrors
+    /// the font-identity-cache shape.
+    pub(crate) fn get_or_build_cmyk_retarget(
+        &self,
+        src_profile: &Arc<IccProfile>,
+        dst_profile: &Arc<IccProfile>,
+        intent: RenderingIntent,
+    ) -> Option<Arc<CmykRetargetTransform>> {
+        let src_key = (
+            src_profile.n_components(),
+            src_profile.bytes().len(),
+            src_profile.content_hash(),
+        );
+        let dst_key = (
+            dst_profile.n_components(),
+            dst_profile.bytes().len(),
+            dst_profile.content_hash(),
+        );
+        let key = (src_key, dst_key, intent);
+        if let Some(slot) = self.cmyk_retarget_entries.borrow().get(&key) {
+            return slot.clone();
+        }
+        let built =
+            CmykRetargetTransform::new(Arc::clone(src_profile), Arc::clone(dst_profile), intent)
+                .map(Arc::new);
+        self.cmyk_retarget_entries
+            .borrow_mut()
+            .insert(key, built.clone());
+        #[cfg(feature = "test-support")]
+        self.cmyk_retarget_build_count
+            .set(self.cmyk_retarget_build_count.get() + 1);
+        built
+    }
+
     /// Drop every entry. Called per page so the cache doesn't leak
     /// transforms across renders when `PageRenderer` is reused.
     pub(crate) fn clear(&self) {
         self.entries.borrow_mut().clear();
         self.srgb_to_cmyk_entries.borrow_mut().clear();
+        self.cmyk_retarget_entries.borrow_mut().clear();
         #[cfg(feature = "test-support")]
         self.build_count.set(0);
         #[cfg(feature = "test-support")]
         self.lookup_count.set(0);
+        #[cfg(feature = "test-support")]
+        self.cmyk_retarget_build_count.set(0);
     }
 
     /// Number of cache misses observed in the cache's lifetime since
@@ -202,6 +275,14 @@ impl IccTransformCache {
     #[cfg(feature = "test-support")]
     pub(crate) fn lookup_count(&self) -> usize {
         self.lookup_count.get()
+    }
+
+    /// Number of CMYK→CMYK retarget cache misses observed since the
+    /// last `clear()`. Test-only. M2 probe pins "exactly one build
+    /// per unique (src, dst, intent) tuple, even across many paints".
+    #[cfg(feature = "test-support")]
+    pub(crate) fn cmyk_retarget_build_count(&self) -> usize {
+        self.cmyk_retarget_build_count.get()
     }
 }
 

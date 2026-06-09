@@ -474,6 +474,17 @@ pub struct PdfDocument {
     /// happens to echo into the header band on every page (B3: pdfa_010
     /// would otherwise drop "University of Oklahoma 2009").
     running_artifact_signatures: Mutex<Option<std::collections::HashMap<String, usize>>>,
+    /// Memoised result of [`PdfDocument::output_intent_cmyk_profile`].
+    ///
+    /// The accessor walks `/OutputIntents` and decodes + parses the ICC
+    /// stream every call. The hot transparency / overprint paths invoke
+    /// it once per paint and the parse is non-trivial (qcms / lcms2
+    /// header validation + LUT decode on a profile blob that can be
+    /// hundreds of KB), so the result is cached for the document
+    /// lifetime here. `Some(None)` means "checked once, no usable CMYK
+    /// OutputIntent" — distinct from `None` (not yet checked).
+    output_intent_cmyk_profile_cache:
+        Mutex<Option<Option<std::sync::Arc<crate::color::IccProfile>>>>,
     /// Accumulated extraction warnings for programmatic inspection.
     /// Populated when silent fallbacks occur (font not found, CMap absent, etc.).
     /// Retrieve with [`PdfDocument::warnings`]; drain with [`PdfDocument::take_warnings`].
@@ -1065,6 +1076,7 @@ impl PdfDocument {
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
             page_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
             running_artifact_signatures: Mutex::new(None),
+            output_intent_cmyk_profile_cache: Mutex::new(None),
             accumulated_warnings: Mutex::new(Vec::new()),
             warning_sink: crate::extractors::warnings::WarningSink::new(),
         };
@@ -3790,6 +3802,26 @@ impl PdfDocument {
     /// Returns `None` when no output intent exists, no CMYK entry is
     /// present, or the profile stream can't be parsed as ICC.
     pub fn output_intent_cmyk_profile(&self) -> Option<std::sync::Arc<crate::color::IccProfile>> {
+        // Memoise the (potentially expensive) decode + parse: hot rendering
+        // paths consult this accessor once per paint, and qcms / lcms2
+        // header validation + LUT decode on a hundreds-of-KB profile is
+        // not free. `Some(None)` means "checked once, no usable CMYK
+        // OutputIntent"; a subsequent call must NOT re-walk the catalog.
+        if let Some(cached) = self
+            .output_intent_cmyk_profile_cache
+            .lock_or_recover()
+            .as_ref()
+        {
+            return cached.clone();
+        }
+        let resolved = self.compute_output_intent_cmyk_profile();
+        *self.output_intent_cmyk_profile_cache.lock_or_recover() = Some(resolved.clone());
+        resolved
+    }
+
+    fn compute_output_intent_cmyk_profile(
+        &self,
+    ) -> Option<std::sync::Arc<crate::color::IccProfile>> {
         let catalog = self.catalog().ok()?;
         let cat_dict = catalog.as_dict()?;
 
