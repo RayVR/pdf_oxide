@@ -93,19 +93,30 @@ pub(crate) fn parse_ext_g_state_inner(
         None => return Ok(out),
     };
 
-    if let Some(ca) = state_dict.get("ca") {
+    // ISO 32000-1 §7.3.10: ANY direct object can be replaced by an indirect
+    // reference. Reading `/ca 3 0 R` as-is yields a `Reference` whose typed
+    // accessors all return None; the field would silently drop to its
+    // default. Resolve every value once before classifying. `/SMask` has
+    // its own resolve below because its dict entries need the same
+    // treatment.
+    let read = |key: &str| -> Option<Object> {
+        let raw = state_dict.get(key)?;
+        doc.resolve_object(raw).ok()
+    };
+
+    if let Some(ca) = read("ca") {
         out.fill_alpha = ca
             .as_real()
             .map(|v| v as f32)
             .or_else(|| ca.as_integer().map(|v| v as f32));
     }
-    if let Some(ca_upper) = state_dict.get("CA") {
+    if let Some(ca_upper) = read("CA") {
         out.stroke_alpha = ca_upper
             .as_real()
             .map(|v| v as f32)
             .or_else(|| ca_upper.as_integer().map(|v| v as f32));
     }
-    if let Some(bm) = state_dict.get("BM") {
+    if let Some(bm) = read("BM") {
         // ISO 32000-1 §11.3.5 + §11.6.3: `/BM` may be a name OR an array of
         // names. For an array, "the first name that names a blend mode
         // supported by the conforming reader shall be used". Unrecognised
@@ -113,14 +124,17 @@ pub(crate) fn parse_ext_g_state_inner(
         // `crate::rendering::sidecar::is_recognised_mode` enumerates every
         // standard mode from §11.3.5.2 + §11.3.5.3; we share that list so
         // detection and dispatch stay in lockstep.
-        let mode = match bm {
+        //
+        // Array elements may themselves be indirect refs (§7.3.10), so
+        // each is resolved before pattern-matching its name.
+        let mode = match &bm {
             Object::Name(n) => n.clone(),
             Object::Array(arr) => arr
                 .iter()
-                .filter_map(Object::as_name)
+                .filter_map(|elem| doc.resolve_object(elem).ok())
+                .filter_map(|elem| elem.as_name().map(str::to_string))
                 .find(|name| crate::rendering::sidecar::is_recognised_mode(name))
-                .unwrap_or("Normal")
-                .to_string(),
+                .unwrap_or_else(|| "Normal".to_string()),
             _ => "Normal".to_string(),
         };
         out.blend_mode = Some(mode);
@@ -129,12 +143,12 @@ pub(crate) fn parse_ext_g_state_inner(
     // ISO 32000-1 §11.7.4 / Table 128. `/OP` is the stroking overprint;
     // `/op` (lowercase) is the non-stroking overprint. When `/OP` is
     // present without `/op`, the spec says it sets both.
-    let op_stroke = state_dict.get("OP").and_then(Object::as_bool);
-    let op_fill = state_dict.get("op").and_then(Object::as_bool);
+    let op_stroke = read("OP").and_then(|v| v.as_bool());
+    let op_fill = read("op").and_then(|v| v.as_bool());
     out.stroke_overprint = op_stroke;
     out.fill_overprint = op_fill.or(op_stroke);
 
-    if let Some(opm) = state_dict.get("OPM").and_then(Object::as_integer) {
+    if let Some(opm) = read("OPM").and_then(|v| v.as_integer()) {
         // Spec defines only 0 (standard) and 1 (nonzero). Any other
         // value is undefined; clamp to 0 so a malformed PDF doesn't
         // accidentally enable nonzero-overprint mode.
@@ -155,16 +169,29 @@ pub(crate) fn parse_ext_g_state_inner(
                 out.smask = Some(SoftMaskValue::None);
             },
             Object::Dictionary(mask_dict) => {
+                // §7.3.10: sub-entries of a SMask dict may themselves be
+                // indirect refs. The /G entry is always a Reference by
+                // design (it's the Form XObject id, used as a key into
+                // the xref) so it stays an explicit Reference-match. The
+                // /S, /BC, and /TR entries are values that the spec
+                // allows to be direct OR indirect — resolve before
+                // reading.
+                let resolve_in_smask = |key: &str| -> Option<Object> {
+                    let raw = mask_dict.get(key)?;
+                    doc.resolve_object(raw).ok()
+                };
+
                 // Subtype: /S /Alpha or /S /Luminosity (default Alpha
                 // per spec). Anything else falls through to None — a
                 // malformed mask must not silently mis-render.
-                let subtype = match mask_dict.get("S").and_then(Object::as_name) {
+                let subtype = match resolve_in_smask("S").as_ref().and_then(Object::as_name) {
                     Some("Alpha") => SoftMaskSubtype::Alpha,
                     Some("Luminosity") => SoftMaskSubtype::Luminosity,
                     _ => SoftMaskSubtype::Alpha,
                 };
 
-                // /G — required Form XObject reference.
+                // /G — required Form XObject reference. Stays as a raw
+                // Reference; the renderer loads the form via xref.
                 let form_ref = mask_dict.get("G").and_then(|o| match o {
                     Object::Reference(r) => Some(*r),
                     _ => None,
@@ -173,25 +200,33 @@ pub(crate) fn parse_ext_g_state_inner(
                 if let Some(form_ref) = form_ref {
                     // /BC backdrop colour — array of N reals. Only
                     // honoured for /S /Luminosity per §11.4.7; for
-                    // /S /Alpha the spec ignores /BC.
+                    // /S /Alpha the spec ignores /BC. Each array
+                    // element may itself be an indirect ref (§7.3.10).
                     let backdrop = if subtype == SoftMaskSubtype::Luminosity {
-                        mask_dict.get("BC").and_then(|o| o.as_array()).map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| {
-                                    v.as_real()
-                                        .map(|r| r as f32)
-                                        .or_else(|| v.as_integer().map(|i| i as f32))
-                                })
-                                .collect::<Vec<f32>>()
+                        resolve_in_smask("BC").and_then(|o| {
+                            o.as_array().map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| doc.resolve_object(v).ok())
+                                    .filter_map(|v| {
+                                        v.as_real()
+                                            .map(|r| r as f32)
+                                            .or_else(|| v.as_integer().map(|i| i as f32))
+                                    })
+                                    .collect::<Vec<f32>>()
+                            })
                         })
                     } else {
                         None
                     };
 
-                    // /TR transfer function — stored raw; the
-                    // renderer evaluates per-pixel via the Function
-                    // evaluator already used for tint transforms.
-                    let transfer = mask_dict.get("TR").cloned();
+                    // /TR transfer function — stored as the resolved
+                    // value; the renderer evaluates per-pixel via the
+                    // Function evaluator already used for tint
+                    // transforms. Indirect-ref TR (very common — `/TR
+                    // 12 0 R` pointing at a Function dict) is now
+                    // resolved at parse time rather than at every
+                    // per-pixel call.
+                    let transfer = resolve_in_smask("TR");
 
                     out.smask = Some(SoftMaskValue::Form(SoftMaskForm {
                         form_ref,
@@ -302,5 +337,121 @@ mod tests {
         assert_eq!(parsed.stroke_overprint, None);
         assert_eq!(parsed.fill_overprint, None);
         assert_eq!(parsed.overprint_mode, None);
+    }
+
+    /// PDF whose xref carries primitive indirect objects we can reference
+    /// from a synthetic ExtGState dict.
+    ///
+    ///   3 0 obj  0.5            (real)
+    ///   4 0 obj  true           (bool)
+    ///   5 0 obj  1              (integer)
+    ///   6 0 obj  /Multiply      (name)
+    ///   7 0 obj  [/Multiply]    (array of names)
+    fn fixture_doc_with_indirect_values() -> PdfDocument {
+        use crate::object::ObjectRef;
+        let _ = ObjectRef::new(0, 0); // ensure the type is in scope for callers
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets: Vec<usize> = Vec::new();
+        let mut emit = |buf: &mut Vec<u8>, body: &str| {
+            let off = buf.len();
+            buf.extend_from_slice(body.as_bytes());
+            offsets.push(off);
+        };
+        emit(&mut buf, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        emit(&mut buf, "2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        emit(&mut buf, "3 0 obj\n0.5\nendobj\n");
+        emit(&mut buf, "4 0 obj\ntrue\nendobj\n");
+        emit(&mut buf, "5 0 obj\n1\nendobj\n");
+        emit(&mut buf, "6 0 obj\n/Multiply\nendobj\n");
+        emit(&mut buf, "7 0 obj\n[/Multiply]\nendobj\n");
+        let xref_off = buf.len();
+        buf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off)
+                .as_bytes(),
+        );
+        PdfDocument::from_bytes(buf).expect("fixture PDF parses")
+    }
+
+    fn obj_ref(num: u32) -> Object {
+        use crate::object::ObjectRef;
+        Object::Reference(ObjectRef::new(num, 0))
+    }
+
+    // ISO 32000-1 §7.3.10 — any direct object value may be replaced by an
+    // indirect reference. The ExtGState parser MUST resolve indirect
+    // references for every value before reading the typed accessor, or
+    // PDFs that emit e.g. `/ca 3 0 R` silently fall back to defaults.
+    //
+    // These probes pin that resolution for every value the parser reads.
+    // Sensitivity-verify by reverting the resolved_value() call inside the
+    // parser to a bare `state_dict.get(...)`: every probe below fails
+    // because the typed accessor (.as_real / .as_bool / .as_integer /
+    // .as_name / .as_array) returns None on an unresolved Reference.
+
+    #[test]
+    fn resolves_indirect_fill_alpha() {
+        let obj = dict(&[("ca", obj_ref(3))]); // 3 0 R → 0.5
+        let doc = fixture_doc_with_indirect_values();
+        let parsed = parse_ext_g_state_inner(&obj, &doc).expect("parses");
+        assert_eq!(parsed.fill_alpha, Some(0.5_f32));
+    }
+
+    #[test]
+    fn resolves_indirect_stroke_alpha() {
+        let obj = dict(&[("CA", obj_ref(3))]); // 3 0 R → 0.5
+        let doc = fixture_doc_with_indirect_values();
+        let parsed = parse_ext_g_state_inner(&obj, &doc).expect("parses");
+        assert_eq!(parsed.stroke_alpha, Some(0.5_f32));
+    }
+
+    #[test]
+    fn resolves_indirect_blend_mode_name() {
+        let obj = dict(&[("BM", obj_ref(6))]); // 6 0 R → /Multiply
+        let doc = fixture_doc_with_indirect_values();
+        let parsed = parse_ext_g_state_inner(&obj, &doc).expect("parses");
+        assert_eq!(parsed.blend_mode.as_deref(), Some("Multiply"));
+    }
+
+    #[test]
+    fn resolves_indirect_blend_mode_array() {
+        let obj = dict(&[("BM", obj_ref(7))]); // 7 0 R → [/Multiply]
+        let doc = fixture_doc_with_indirect_values();
+        let parsed = parse_ext_g_state_inner(&obj, &doc).expect("parses");
+        assert_eq!(parsed.blend_mode.as_deref(), Some("Multiply"));
+    }
+
+    #[test]
+    fn resolves_indirect_op_op_opm() {
+        let obj = dict(&[
+            ("OP", obj_ref(4)),  // 4 0 R → true
+            ("op", obj_ref(4)),  // 4 0 R → true
+            ("OPM", obj_ref(5)), // 5 0 R → 1
+        ]);
+        let doc = fixture_doc_with_indirect_values();
+        let parsed = parse_ext_g_state_inner(&obj, &doc).expect("parses");
+        assert_eq!(parsed.stroke_overprint, Some(true));
+        assert_eq!(parsed.fill_overprint, Some(true));
+        assert_eq!(parsed.overprint_mode, Some(1));
+    }
+
+    #[test]
+    fn resolves_indirect_blend_mode_array_with_indirect_elements() {
+        // PDFs in the wild emit `/BM [5 0 R 6 0 R]` where each element is
+        // itself an indirect reference to a name object. §7.3.10 lets any
+        // direct value be an indirect ref, including inside an array.
+        // The parser must resolve each element before classifying.
+        use crate::object::ObjectRef;
+        let array_with_indirect_name = Object::Array(vec![
+            Object::Reference(ObjectRef::new(6, 0)), // → /Multiply
+        ]);
+        let obj = dict(&[("BM", array_with_indirect_name)]);
+        let doc = fixture_doc_with_indirect_values();
+        let parsed = parse_ext_g_state_inner(&obj, &doc).expect("parses");
+        assert_eq!(parsed.blend_mode.as_deref(), Some("Multiply"));
     }
 }
