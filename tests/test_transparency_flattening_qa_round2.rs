@@ -13,13 +13,15 @@
 //!    `ICC(A) + ICC(B)` differs from `ICC(A+B)`) and writes the probe
 //!    that proves the gap real.
 //!
-//!  - **SMask + overprint paint-arm coverage matrix**. The round-2 fix
-//!    wires `smask_snapshot` / `overprint_snapshot` only on
-//!    `Operator::Fill` and `Operator::Stroke`. The agent explicitly
-//!    noted FillStroke combos (`B`, `B*`, `b`, `b*`), FillEvenOdd
-//!    (`f*`), PaintShading (`sh`), Do (`Do`), and text-showing (`Tj`,
-//!    `TJ`, `'`, `"`) all keep the existing direct-paint path. Each
-//!    probe documents one such arm with a tracking constant.
+//!  - **SMask + overprint paint-arm coverage matrix**. Subsequent
+//!    rounds wired `smask_snapshot` / `overprint_snapshot` through
+//!    every paint operator the round-2 audit flagged — the FillStroke
+//!    combos (`B`, `B*`, `b`, `b*`), FillEvenOdd (`f*`), PaintShading
+//!    (`sh`), `Do`, and the text-showing operators (`Tj`, `TJ`, `'`,
+//!    `"`). The tracking constants below are preserved as historical
+//!    markers; each probe pins the post-fix byte-exact behaviour and
+//!    guards against a regression that would re-introduce the
+//!    direct-paint path.
 //!
 //!  - **SMask scope through q/Q**. The agent flagged this as "rides on
 //!    GraphicsState clone behaviour, correct but unprobed."
@@ -882,9 +884,12 @@ fn fixture_smask_for_do_form_xobject() -> Vec<u8> {
 }
 
 /// SMask must modulate the painted Form XObject invoked through `Do`.
-/// At HEAD the `Operator::Do` arm bypasses the smask_snapshot /
-/// apply_smask_after_paint cycle, so the Form's opaque red paints
-/// through the soft mask unmodulated.
+/// The `Operator::Do` arm now snapshots before invoking the Form and
+/// runs `apply_smask_after_paint` against that snapshot, so the
+/// painted Form goes through the active soft mask. This probe pins
+/// the byte-exact post-modulation pixel and guards against a
+/// regression that re-introduces the pre-fix path where `Do` painted
+/// opaquely through the mask.
 #[test]
 fn qa_round3_smask_modulates_do_form_xobject() {
     let rgba = render_rgba(fixture_smask_for_do_form_xobject());

@@ -293,19 +293,11 @@ fn round6_qa_b1_shading_fill_spot_inks_does_not_leak_to_next_path_fill() {
 // per pixel rule applies to ALL components (process + spot). The
 // natural reading: no visible mark → no spot lane write.
 //
-// Fix candidates (impl agent):
-//  (a) Drop the `cov.render_mode = 0` override. The text rasteriser
-//      will then paint fully transparent for render_mode == 3 → alpha
-//      channel collapses to 0 → coverage 0 → no lane write. Round 6
-//      probes (p1-p5) do not exercise render_mode != 0, so they
-//      continue to pass.
-//  (b) Add an explicit early-return in
-//      `rasterise_text_coverage_render_text` and `..._render_tj_array`:
-//      `if gs.render_mode == 3 { return Some(vec![0; w·h]); }`.
-//      Equivalent to (a) but more explicit.
-//
-// This probe is `#[ignore]`'d pending the fix; the fix agent should
-// flip it on.
+// Resolution: option (b) landed — the coverage rasterisers early-return
+// an all-zero coverage plane when `gs.render_mode == 3`, so the spot
+// mirror's diff branch sees no change and the lane stays unwritten.
+// The probe now runs live and asserts the byte-exact zero plate; it
+// is no longer `#[ignore]`-gated.
 #[test]
 fn round6_qa_invisible_text_must_not_write_spot_lane() {
     let icc = build_constant_cmyk_icc(135);

@@ -1287,7 +1287,7 @@ pub(crate) fn extract_process_paint_cmyk(
                     //   - the backend can't do CMYK→CMYK (qcms 0.3),
                     //   - no OutputIntent CMYK profile is declared,
                     //   - the embedded profile parses but the
-                    //     destination profile parses,
+                    //     destination profile fails to parse,
                     //   - the two profiles compile to byte-identical
                     //     bytes (same press, same paint — no
                     //     conversion needed).

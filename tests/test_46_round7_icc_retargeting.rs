@@ -420,18 +420,32 @@ fn r7_icc_qcms_only_preserves_round5_natural_form_byte_exact() {
 //
 // If pdf_oxide ever stops using lcms2 OR uses lcms2 differently
 // (different intent, BPC, or pixel format), the assertion fires.
-// The reference values below were computed by lcms2 6.1.1 on macOS
-// arm64 and pinned by running the helper `compute_retarget_reference`
-// once during development.
+// The reference values below come from a SAME-ENGINE self-check
+// (`compute_retarget_self_check`) — both sides go through lcms2,
+// so the path catches pdf_oxide-wiring drift but NOT lcms2 drift.
+// To localise an independent oracle the probe additionally pins the
+// dst profile's constant B2A0 CLUT bytes by hand (the synthetic
+// `dest_cmyk` parameter), so an lcms2 regression that changed the
+// constant-CLUT round-trip would surface as a mismatch between the
+// self-check and the hand-derived anchor in the same probe.
 // ===========================================================================
 
+/// Same-engine round-trip self-check: runs lcms2 with the same
+/// profile bytes, intent, and TransformFlags pdf_oxide's
+/// `CmykRetargetTransform::new` uses, so a discrepancy with the
+/// production render localises a bug to pdf_oxide's wiring (not to
+/// lcms2 itself).
+///
+/// This is NOT an independent oracle — both sides go through lcms2,
+/// so an lcms2 regression or a TransformFlags drift inside
+/// `CmykRetargetTransform::new` would be masked by both producing
+/// the same wrong number. Tests that need a TRUE independent
+/// reference must hand-derive the expected bytes from the synthetic
+/// profiles' constant CLUTs (see
+/// `r7_icc_lcms2_cross_profile_retarget_hand_derived_byte_exact`
+/// below for an example anchor).
 #[cfg(feature = "icc-lcms2")]
-fn compute_retarget_reference(src_icc: &[u8], dst_icc: &[u8], src_cmyk: [f32; 4]) -> [f32; 4] {
-    // Mirror the backend's encoding: 8-bit CMYK round-trip so the
-    // reference matches what `CmykRetargetTransform::retarget_pixel`
-    // produces internally.  lcms2's CMYK_FLT uses the legacy "ink
-    // percentage" 0..100 encoding; CMYK_8 stays in 0..255 byte space
-    // which matches pdf_oxide's unit-interval API more directly.
+fn compute_retarget_self_check(src_icc: &[u8], dst_icc: &[u8], src_cmyk: [f32; 4]) -> [f32; 4] {
     let src = lcms2::Profile::new_icc(src_icc).expect("lcms2 parses source");
     let dst = lcms2::Profile::new_icc(dst_icc).expect("lcms2 parses dest");
     let flags = lcms2::Flags::NO_CACHE | lcms2::Flags::BLACKPOINT_COMPENSATION;
@@ -476,8 +490,28 @@ fn r7_icc_lcms2_cross_profile_retarget_byte_exact() {
     // The lcms2 retarget pipeline is process_icc.AToB (CMYK→Lab) then
     // icc.BToA (Lab→CMYK).  With both LUTs constant, the destination
     // CMYK is the OutputIntent profile's (200/255, 50/255, 20/255,
-    // 30/255).
-    let retargeted = compute_retarget_reference(&process_icc, &icc, [0.5, 0.2, 0.7, 0.1]);
+    // 30/255). This call is a SAME-ENGINE self-check (both sides use
+    // lcms2 with the same flags); the hand-derived anchor immediately
+    // below it independently pins those constant bytes from the
+    // profile's CLUT.
+    let retargeted = compute_retarget_self_check(&process_icc, &icc, [0.5, 0.2, 0.7, 0.1]);
+    let hand_derived_dst_cmyk: [f32; 4] = [200.0 / 255.0, 50.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0];
+    for (i, (lcms2_val, hand_val)) in retargeted
+        .iter()
+        .zip(hand_derived_dst_cmyk.iter())
+        .enumerate()
+    {
+        let lcms2_byte = (lcms2_val.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let hand_byte = (hand_val.clamp(0.0, 1.0) * 255.0).round() as u8;
+        assert_eq!(
+            lcms2_byte, hand_byte,
+            "channel {i}: lcms2 self-check produced byte {lcms2_byte}; \
+             hand-derived anchor from the dst profile's constant B2A0 \
+             CLUT is {hand_byte}. A mismatch means lcms2's tetrahedral \
+             interpolation has drifted off the constant CLUT value — \
+             tells us the test loses its independence guarantee."
+        );
+    }
     // §11.3.3 composite at α=0.5 over (0.4, 0, 0, 0):
     let alpha = 0.5_f32;
     let bd = [0.4_f32, 0.0, 0.0, 0.0];
@@ -783,7 +817,7 @@ fn r7_diag_print_retarget_outputs() {
     eprintln!("dst.pcs = {:?}", dst.pcs());
     eprintln!("dst has B2A0 = {}", dst.has_tag(lcms2::TagSignature::BToA0Tag));
 
-    let out = compute_retarget_reference(&src_bytes, &dst_bytes, [0.5, 0.2, 0.7, 0.1]);
+    let out = compute_retarget_self_check(&src_bytes, &dst_bytes, [0.5, 0.2, 0.7, 0.1]);
     eprintln!("retarget output (BPC on, rel): {:?}", out);
 
     // Without BPC, same intent.

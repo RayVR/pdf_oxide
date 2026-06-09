@@ -2,15 +2,13 @@
 //!
 //! These probes pin behaviours the round-1 design+impl probes do not
 //! cover. They are intentionally additive — every probe pins the
-//! *correct* spec behaviour as a byte-exact assertion, and tests
-//! marked `#[ignore]` document KNOWN BUGS the fix agent should
-//! address before round 1 is sealed.
-//!
-//! Each `#[ignore]` test carries a `QA_BUG_*` constant explaining
-//! exactly which behaviour it pins, what the impl currently does
-//! wrong, and the spec citation that grounds the correct behaviour.
-//! When the fix agent lands the fix, the `#[ignore]` must come off
-//! and the assertion must pass byte-exact.
+//! *correct* spec behaviour as a byte-exact assertion. Every probe
+//! now runs live; the round-1 fix agent landed each of the bugs the
+//! `QA_BUG_*` constants below describe, and the assertions hold
+//! byte-exact at HEAD. The constants are preserved as historical
+//! markers and as load-bearing references inside the probes that
+//! pin the matching spec rule, so a regression that re-introduces
+//! the bug surfaces with the original citation in scope.
 //!
 //! Methodology references:
 //!  - `docs/research/2026-06-06-nonsep-blends-in-devicen.md` —
