@@ -506,42 +506,9 @@ pub(crate) fn discover_page_spot_inks(doc: &PdfDocument, page_index: usize) -> V
 /// through composite-then-decompose where the §11.4 model evaluates
 /// against the composite buffer.
 pub(crate) fn page_declares_transparency(doc: &PdfDocument, resources: &Object) -> bool {
-    let res_dict = match resources {
-        Object::Dictionary(d) => d,
-        _ => return false,
-    };
-
-    if let Some(ext_gs_obj) = res_dict.get("ExtGState") {
-        if let Ok(ext_gs_resolved) = doc.resolve_object(ext_gs_obj) {
-            if let Some(ext_g_states) = ext_gs_resolved.as_dict() {
-                if ext_g_states_signal_transparency_only(doc, ext_g_states) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    if let Some(xobj_obj) = res_dict.get("XObject") {
-        if let Ok(xobj_resolved) = doc.resolve_object(xobj_obj) {
-            if let Some(xobj_dict) = xobj_resolved.as_dict() {
-                for obj in xobj_dict.values() {
-                    if let Ok(resolved) = doc.resolve_object(obj) {
-                        let dict = match &resolved {
-                            Object::Stream { dict, .. } => Some(dict),
-                            _ => None,
-                        };
-                        if let Some(dict) = dict {
-                            if dict.contains_key("Group") || dict.contains_key("SMask") {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    false
+    let mut visited: std::collections::HashSet<crate::object::ObjectRef> =
+        std::collections::HashSet::new();
+    resources_declare_transparency_or_overprint(doc, resources, &mut visited, 0, false)
 }
 
 fn ext_g_states_signal_transparency_only(
@@ -557,10 +524,11 @@ fn ext_g_states_signal_transparency_only(
             continue;
         };
         for key in ["CA", "ca"] {
-            if let Some(v) = state_dict.get(key) {
+            if let Some(v_raw) = state_dict.get(key) {
+                let v = doc.resolve_object(v_raw).unwrap_or_else(|_| v_raw.clone());
                 let alpha = match v {
-                    Object::Real(r) => *r as f32,
-                    Object::Integer(i) => *i as f32,
+                    Object::Real(r) => r as f32,
+                    Object::Integer(i) => i as f32,
                     _ => 1.0,
                 };
                 if alpha < 1.0 {
@@ -568,13 +536,19 @@ fn ext_g_states_signal_transparency_only(
                 }
             }
         }
-        if let Some(smask) = state_dict.get("SMask") {
-            if !matches!(smask, Object::Name(n) if n == "None") {
+        if let Some(smask_raw) = state_dict.get("SMask") {
+            let smask = doc
+                .resolve_object(smask_raw)
+                .unwrap_or_else(|_| smask_raw.clone());
+            if !matches!(&smask, Object::Name(n) if n == "None") {
                 return true;
             }
         }
-        if let Some(bm) = state_dict.get("BM") {
-            if bm_is_non_normal(bm) {
+        if let Some(bm_raw) = state_dict.get("BM") {
+            let bm = doc
+                .resolve_object(bm_raw)
+                .unwrap_or_else(|_| bm_raw.clone());
+            if bm_is_non_normal(&bm) {
                 return true;
             }
         }
@@ -603,6 +577,28 @@ pub(crate) fn page_declares_transparency_or_overprint(
     doc: &PdfDocument,
     resources: &Object,
 ) -> bool {
+    let mut visited: std::collections::HashSet<crate::object::ObjectRef> =
+        std::collections::HashSet::new();
+    resources_declare_transparency_or_overprint(doc, resources, &mut visited, 0, true)
+}
+
+/// Maximum form-XObject resource recursion depth used by the detection
+/// helpers. Mirrors `MAX_FORM_XOBJECT_DEPTH` over in the renderer's
+/// content-walker; bounds at well above any realistic legitimate
+/// nesting so the depth cap is purely a backstop against adversarial
+/// /Resources cycles that escape the `visited` set.
+const MAX_DETECTION_RECURSION: u32 = 32;
+
+fn resources_declare_transparency_or_overprint(
+    doc: &PdfDocument,
+    resources: &Object,
+    visited: &mut std::collections::HashSet<crate::object::ObjectRef>,
+    depth: u32,
+    include_overprint: bool,
+) -> bool {
+    if depth >= MAX_DETECTION_RECURSION {
+        return false;
+    }
     let res_dict = match resources {
         Object::Dictionary(d) => d,
         _ => return false,
@@ -611,7 +607,12 @@ pub(crate) fn page_declares_transparency_or_overprint(
     if let Some(ext_gs_obj) = res_dict.get("ExtGState") {
         if let Ok(ext_gs_resolved) = doc.resolve_object(ext_gs_obj) {
             if let Some(ext_g_states) = ext_gs_resolved.as_dict() {
-                if ext_g_states_signal_transparency(doc, ext_g_states) {
+                let hit = if include_overprint {
+                    ext_g_states_signal_transparency(doc, ext_g_states)
+                } else {
+                    ext_g_states_signal_transparency_only(doc, ext_g_states)
+                };
+                if hit {
                     return true;
                 }
             }
@@ -621,17 +622,54 @@ pub(crate) fn page_declares_transparency_or_overprint(
     if let Some(xobj_obj) = res_dict.get("XObject") {
         if let Ok(xobj_resolved) = doc.resolve_object(xobj_obj) {
             if let Some(xobj_dict) = xobj_resolved.as_dict() {
-                for obj in xobj_dict.values() {
-                    if let Ok(resolved) = doc.resolve_object(obj) {
-                        let dict = match &resolved {
-                            Object::Stream { dict, .. } => Some(dict),
-                            _ => None,
-                        };
-                        if let Some(dict) = dict {
-                            if dict.contains_key("Group") || dict.contains_key("SMask") {
-                                return true;
-                            }
+                for raw in xobj_dict.values() {
+                    // Skip XObjects we've already inspected at this
+                    // scope: indirect refs are deduplicated by
+                    // ObjectRef. Inline streams cannot self-reference,
+                    // so the visited set only meaningfully tracks
+                    // refs.
+                    if let Some(r) = raw.as_reference() {
+                        if !visited.insert(r) {
+                            continue;
                         }
+                    }
+                    let resolved = match doc.resolve_object(raw) {
+                        Ok(o) => o,
+                        Err(_) => continue,
+                    };
+                    let dict = match &resolved {
+                        Object::Stream { dict, .. } => Some(dict),
+                        _ => None,
+                    };
+                    let Some(dict) = dict else { continue };
+
+                    // §11.4.5 Form XObject: declaring its own /Group
+                    // dict — or carrying an /SMask entry — is a
+                    // direct transparency trigger.
+                    if dict.contains_key("Group") || dict.contains_key("SMask") {
+                        return true;
+                    }
+                    // §11.4.5 + §11.6.5.2: a Form XObject may also
+                    // declare its own /Resources/ExtGState whose
+                    // entries drive transparency from inside the
+                    // form. The renderer evaluates the form's content
+                    // under those state entries (§8.10.1), so they
+                    // must count toward sidecar allocation the same
+                    // way the page-level ExtGState does. Recurse on
+                    // the form's resources (or fall through to the
+                    // parent's when /Resources is absent).
+                    let form_res = match dict.get("Resources").map(|r| doc.resolve_object(r)) {
+                        Some(Ok(o)) => o,
+                        _ => continue,
+                    };
+                    if resources_declare_transparency_or_overprint(
+                        doc,
+                        &form_res,
+                        visited,
+                        depth + 1,
+                        include_overprint,
+                    ) {
+                        return true;
                     }
                 }
             }
@@ -653,22 +691,29 @@ fn ext_g_states_signal_transparency(
         let Some(state_dict) = state_resolved.as_dict() else {
             continue;
         };
-        if state_dict
+        let op_true = state_dict
             .get("OP")
-            .map(|o| matches!(o, Object::Boolean(true)))
-            .unwrap_or(false)
-            || state_dict
-                .get("op")
-                .map(|o| matches!(o, Object::Boolean(true)))
-                .unwrap_or(false)
-        {
+            .map(|o| {
+                let resolved = doc.resolve_object(o).unwrap_or_else(|_| o.clone());
+                matches!(resolved, Object::Boolean(true))
+            })
+            .unwrap_or(false);
+        let op_lower_true = state_dict
+            .get("op")
+            .map(|o| {
+                let resolved = doc.resolve_object(o).unwrap_or_else(|_| o.clone());
+                matches!(resolved, Object::Boolean(true))
+            })
+            .unwrap_or(false);
+        if op_true || op_lower_true {
             return true;
         }
         for key in ["CA", "ca"] {
-            if let Some(v) = state_dict.get(key) {
+            if let Some(v_raw) = state_dict.get(key) {
+                let v = doc.resolve_object(v_raw).unwrap_or_else(|_| v_raw.clone());
                 let alpha = match v {
-                    Object::Real(r) => *r as f32,
-                    Object::Integer(i) => *i as f32,
+                    Object::Real(r) => r as f32,
+                    Object::Integer(i) => i as f32,
                     _ => 1.0,
                 };
                 if alpha < 1.0 {
@@ -676,8 +721,11 @@ fn ext_g_states_signal_transparency(
                 }
             }
         }
-        if let Some(smask) = state_dict.get("SMask") {
-            if !matches!(smask, Object::Name(n) if n == "None") {
+        if let Some(smask_raw) = state_dict.get("SMask") {
+            let smask = doc
+                .resolve_object(smask_raw)
+                .unwrap_or_else(|_| smask_raw.clone());
+            if !matches!(&smask, Object::Name(n) if n == "None") {
                 return true;
             }
         }
@@ -686,9 +734,13 @@ fn ext_g_states_signal_transparency(
         // blend mode supported by the conforming reader shall be used".
         // An unrecognised name maps to /Normal per §11.6.3. Walk both
         // shapes; fire the detection trigger only when the resolved
-        // mode is non-/Normal.
-        if let Some(bm) = state_dict.get("BM") {
-            if bm_is_non_normal(bm) {
+        // mode is non-/Normal. The raw `/BM` may itself be an indirect
+        // ref to a name / array, so resolve before classifying.
+        if let Some(bm_raw) = state_dict.get("BM") {
+            let bm = doc
+                .resolve_object(bm_raw)
+                .unwrap_or_else(|_| bm_raw.clone());
+            if bm_is_non_normal(&bm) {
                 return true;
             }
         }
@@ -2076,6 +2128,186 @@ mod tests {
              must return empty per HONEST_GAP_DEVICEN_PROCESS_MISMATCHED\
              _NAMES. Got {:?}.",
             result
+        );
+    }
+
+    // ============================================================
+    // Detection-helper indirect-ref + nested-form regressions (M3).
+    // ============================================================
+    //
+    // `page_declares_transparency_or_overprint` /
+    // `page_declares_transparency` previously read `/CA /ca /SMask /BM`
+    // straight off the ExtGState dict and only inspected the page-
+    // level resource scope. Two PDF shapes silently routed through
+    // the per-plate walker:
+    //
+    //   1. ExtGState whose `/CA /ca /BM` value is an indirect
+    //      reference (the resolved name / number triggers transparency
+    //      but the raw Reference variant fell through the `match` to
+    //      `_ => 1.0` / unrecognised mode).
+    //   2. Form XObject whose own `/Resources/ExtGState` declares a
+    //      transparent entry, with the page-level ExtGState empty.
+    //
+    // The probes below construct minimal synthetic PDFs that
+    // surface each case and assert the detection helper now returns
+    // `true`. Sensitivity verification: stash the corresponding fix
+    // → assertion flips to false.
+
+    /// Build a single-page PDF whose page-level Resources dict carries
+    /// the literal text in `resources_inner` (e.g.
+    /// `"/ExtGState << /T << /Type /ExtGState /ca 6 0 R >> >>"`) and
+    /// whose object table includes the verbatim `extra_objs` after the
+    /// page-content stream. Returns the parsed `PdfDocument` and the
+    /// page's `/Resources` dictionary so callers can hand both to
+    /// `page_declares_transparency_*`.
+    fn build_doc_with_resources_and_objs(
+        resources_inner: &str,
+        extra_objs: &[&str],
+    ) -> (PdfDocument, Object) {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        let cat_off = buf.len();
+        buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages_off = buf.len();
+        buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let page_off = buf.len();
+        let page = format!(
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+             /Resources << {} >> /Contents 4 0 R >>\nendobj\n",
+            resources_inner
+        );
+        buf.extend_from_slice(page.as_bytes());
+        let stream_off = buf.len();
+        let body = b"% no content\n";
+        let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", body.len());
+        buf.extend_from_slice(stream_hdr.as_bytes());
+        buf.extend_from_slice(body);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let mut extra_offs: Vec<usize> = Vec::new();
+        for obj in extra_objs {
+            extra_offs.push(buf.len());
+            buf.extend_from_slice(obj.as_bytes());
+        }
+
+        let xref_off = buf.len();
+        let total_objs = 4 + extra_objs.len();
+        buf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", total_objs + 1).as_bytes(),
+        );
+        for off in [cat_off, pages_off, page_off, stream_off] {
+            buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        for off in extra_offs {
+            buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        buf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                total_objs + 1,
+                xref_off
+            )
+            .as_bytes(),
+        );
+
+        let doc = PdfDocument::from_bytes(buf).expect("synthetic PDF parses");
+        let resources = doc.get_page_resources(0).expect("page resources");
+        (doc, resources)
+    }
+
+    #[test]
+    fn detection_resolves_indirect_ca() {
+        // `/ca 6 0 R` where 6 0 obj is `Real(0.6)`. Pre-fix: the
+        // `match v` arm on `Object::Reference` fell to `_ => 1.0`,
+        // alpha stayed 1.0, the helper missed the trigger.
+        let resources_inner = "/ExtGState << /T << /Type /ExtGState /ca 6 0 R >> >>";
+        let extras = ["6 0 obj\n0.6\nendobj\n"];
+        let (doc, resources) = build_doc_with_resources_and_objs(resources_inner, &extras);
+        assert!(
+            page_declares_transparency_or_overprint(&doc, &resources),
+            "page_declares_transparency_or_overprint must dereference \
+             `/ca 6 0 R` and recognise the resolved Real(0.6) < 1.0 \
+             as transparent."
+        );
+        assert!(
+            page_declares_transparency(&doc, &resources),
+            "page_declares_transparency must dereference `/ca 6 0 R` \
+             and recognise the resolved Real(0.6) < 1.0 as transparent."
+        );
+    }
+
+    #[test]
+    fn detection_resolves_indirect_ca_upper() {
+        // /CA mirror of /ca.
+        let resources_inner = "/ExtGState << /T << /Type /ExtGState /CA 6 0 R >> >>";
+        let extras = ["6 0 obj\n0.7\nendobj\n"];
+        let (doc, resources) = build_doc_with_resources_and_objs(resources_inner, &extras);
+        assert!(
+            page_declares_transparency_or_overprint(&doc, &resources),
+            "page_declares_transparency_or_overprint must dereference \
+             `/CA 6 0 R` and recognise the resolved Real(0.7) < 1.0 \
+             as transparent."
+        );
+    }
+
+    #[test]
+    fn detection_resolves_indirect_bm() {
+        // `/BM 6 0 R` where 6 0 obj is `Name("Multiply")`. Pre-fix:
+        // `bm_is_non_normal` matched against `Object::Reference` and
+        // returned `false`, missing the trigger.
+        let resources_inner = "/ExtGState << /T << /Type /ExtGState /BM 6 0 R >> >>";
+        let extras = ["6 0 obj\n/Multiply\nendobj\n"];
+        let (doc, resources) = build_doc_with_resources_and_objs(resources_inner, &extras);
+        assert!(
+            page_declares_transparency_or_overprint(&doc, &resources),
+            "page_declares_transparency_or_overprint must dereference \
+             `/BM 6 0 R` and recognise the resolved /Multiply name as \
+             non-/Normal."
+        );
+    }
+
+    #[test]
+    fn detection_recurses_into_form_xobject_extgstate() {
+        // Form XObject (object 6) whose own /Resources/ExtGState
+        // declares a transparent state (/ca 0.6). Page-level
+        // ExtGState is empty. Pre-fix: the XObject loop checked only
+        // /Group and /SMask on the form dict, missing the nested
+        // transparency entirely.
+        let form_obj = "6 0 obj\n\
+            << /Type /XObject /Subtype /Form /FormType 1 \
+               /BBox [0 0 100 100] \
+               /Resources << /ExtGState << /Half << /Type /ExtGState /ca 0.6 >> >> >> \
+               /Length 14 >>\n\
+            stream\n% no paint\n\nendstream\nendobj\n";
+        let resources_inner = "/XObject << /F 6 0 R >>";
+        let (doc, resources) = build_doc_with_resources_and_objs(resources_inner, &[form_obj]);
+        assert!(
+            page_declares_transparency_or_overprint(&doc, &resources),
+            "page_declares_transparency_or_overprint must recurse into \
+             Form-XObject /Resources/ExtGState. The form's /Half \
+             ExtGState declares /ca 0.6; the page must route through \
+             composite-then-decompose."
+        );
+        assert!(
+            page_declares_transparency(&doc, &resources),
+            "narrower page_declares_transparency must also recurse \
+             into nested-form ExtGState."
+        );
+    }
+
+    #[test]
+    fn detection_no_trigger_returns_false() {
+        // Sanity: a page with neither ExtGState nor XObject still
+        // reports false (no regressions from the recursion shape).
+        let resources_inner = "/ColorSpace << /CS [/Separation /InkA /DeviceCMYK << >>] >>";
+        let (doc, resources) = build_doc_with_resources_and_objs(resources_inner, &[]);
+        assert!(
+            !page_declares_transparency_or_overprint(&doc, &resources),
+            "no ExtGState or XObject → no transparency / overprint trigger."
+        );
+        assert!(
+            !page_declares_transparency(&doc, &resources),
+            "no ExtGState or XObject → no transparency-only trigger."
         );
     }
 }
