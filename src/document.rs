@@ -3819,6 +3819,35 @@ impl PdfDocument {
         resolved
     }
 
+    /// True when the document catalog declares an `/OutputIntents`
+    /// array, regardless of whether the contained profile bytes
+    /// successfully parse. Coupled with
+    /// [`Self::output_intent_cmyk_profile`] returning `None`, this
+    /// distinguishes "no OutputIntent requested" (acceptable silent
+    /// fallback) from "OutputIntent requested but unusable" (degraded
+    /// press output that callers should warn about). Tracks upstream
+    /// issue yfedoseev/pdf_oxide#712 on swallowed profile-parse
+    /// diagnostics.
+    pub fn has_output_intents_declaration(&self) -> bool {
+        let Ok(catalog) = self.catalog() else {
+            return false;
+        };
+        let Some(cat_dict) = catalog.as_dict() else {
+            return false;
+        };
+        let Some(intents_obj) = cat_dict.get("OutputIntents") else {
+            return false;
+        };
+        let intents_obj = match intents_obj {
+            Object::Reference(r) => match self.load_object(*r) {
+                Ok(o) => o,
+                Err(_) => return false,
+            },
+            other => other.clone(),
+        };
+        matches!(intents_obj, Object::Array(_))
+    }
+
     fn compute_output_intent_cmyk_profile(
         &self,
     ) -> Option<std::sync::Arc<crate::color::IccProfile>> {

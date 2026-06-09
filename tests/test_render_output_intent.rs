@@ -4095,3 +4095,145 @@ fn cmyk_overprint_with_coverage_hoists_icc_transform_cache_lookup() {
          per paint."
     );
 }
+
+// ===========================================================================
+// H3b — silent K=0 RGB→CMYK fallback under declared /OutputIntents.
+//
+// `resolve_rgb_paint_to_cmyk` falls back to the §10.3.5 inverse
+// (C, M, Y) = (1−R, 1−G, 1−B), K = 0 whenever it can't get a CMYK
+// profile out of the document. That's the correct behaviour when no
+// /OutputIntents declaration was made at all (the producer didn't ask
+// for press conversion). When the catalog DOES declare /OutputIntents
+// but the profile bytes don't parse, the fallback silently degrades
+// press output — the K plane goes empty. This probe pins a one-shot
+// `log::warn!` on that surface so the silent degradation is
+// observable until upstream yfedoseev/pdf_oxide#712 (swallowed
+// profile-parse diagnostic) lands.
+// ===========================================================================
+
+/// Capture warn-level log records into an in-test buffer so the probe
+/// can grep for the H3b diagnostic. Mirrors `CapturingLogger` in
+/// `src/rendering/sidecar.rs::tests` — duplicated here because the
+/// integration test crate can't reach in-crate test types.
+struct WarnCaptureLogger {
+    buf: std::sync::Mutex<Vec<String>>,
+}
+impl log::Log for WarnCaptureLogger {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            let mut g = self.buf.lock().unwrap();
+            g.push(format!("{}", record.args()));
+        }
+    }
+    fn flush(&self) {}
+}
+static WARN_CAPTURE_LOGGER: std::sync::OnceLock<&'static WarnCaptureLogger> =
+    std::sync::OnceLock::new();
+fn install_warn_capture_logger() -> &'static WarnCaptureLogger {
+    WARN_CAPTURE_LOGGER.get_or_init(|| {
+        let leaked: &'static WarnCaptureLogger = Box::leak(Box::new(WarnCaptureLogger {
+            buf: std::sync::Mutex::new(Vec::new()),
+        }));
+        let _ = log::set_logger(leaked);
+        log::set_max_level(log::LevelFilter::Warn);
+        leaked
+    })
+}
+
+/// Build a single-page PDF that declares `/OutputIntents` with a
+/// malformed /DestOutputProfile stream (64 bytes of garbage — below
+/// the 128-byte ICC header minimum) and an ExtGState with `/ca 0.5`
+/// to force the sidecar / RGB-to-CMYK mirror path. The page paints a
+/// non-trivial RGB rect so `resolve_rgb_paint_to_cmyk` runs.
+fn build_pdf_rgb_with_unparseable_output_intent() -> Vec<u8> {
+    let garbage: Vec<u8> = (0u8..=63u8).collect();
+    let ops = "/T gs\n0.4 0.6 0.8 rg\n0 0 100 100 re\nf\n";
+    let catalog_entries =
+        "/OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (S) /DestOutputProfile 5 0 R >>]";
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    let cat_off = buf.len();
+    let catalog =
+        format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R {} >>\nendobj\n", catalog_entries);
+    buf.extend_from_slice(catalog.as_bytes());
+
+    let pages_off = buf.len();
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let page_off = buf.len();
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /ExtGState << /T << /Type /ExtGState /ca 0.5 >> >> >> \
+         /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let stream_off = buf.len();
+    let stream_hdr = format!("4 0 obj\n<< /Length {} >>\nstream\n", ops.len());
+    buf.extend_from_slice(stream_hdr.as_bytes());
+    buf.extend_from_slice(ops.as_bytes());
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let icc_off = buf.len();
+    let icc_hdr = format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", garbage.len());
+    buf.extend_from_slice(icc_hdr.as_bytes());
+    buf.extend_from_slice(&garbage);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for off in [cat_off, pages_off, page_off, stream_off, icc_off] {
+        buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes(),
+    );
+    buf
+}
+
+#[test]
+fn h3b_rgb_paint_under_unparseable_output_intent_logs_k_zero_warning() {
+    use pdf_oxide::rendering::render_separations;
+
+    let logger = install_warn_capture_logger();
+    let start_len = logger.buf.lock().unwrap().len();
+
+    let pdf = build_pdf_rgb_with_unparseable_output_intent();
+    let doc = PdfDocument::from_bytes(pdf).expect("open synthetic PDF");
+
+    // Pre-condition: the catalog declares /OutputIntents and the
+    // accessor can't extract a usable CMYK profile.
+    assert!(doc.has_output_intents_declaration(), "fixture must declare /OutputIntents");
+    assert!(
+        doc.output_intent_cmyk_profile().is_none(),
+        "fixture's /DestOutputProfile is 64 bytes of garbage; \
+         IccProfile::parse must reject it and the accessor must \
+         surface None"
+    );
+
+    // Render through the separation entry point: that route flips
+    // `force_cmyk_sidecar` so the sidecar lives even when no usable
+    // OutputIntent profile is in scope. The /ca 0.5 ExtGState
+    // satisfies the transparency-detection gate so the RGB-paint
+    // mirror path fires; that path calls `resolve_rgb_paint_to_cmyk`
+    // and hits the K=0 fallback.
+    let _plates = render_separations(&doc, 0, 72).expect("render separations");
+
+    let records: Vec<String> = {
+        let guard = logger.buf.lock().unwrap();
+        guard[start_len..].to_vec()
+    };
+    let saw_warning = records
+        .iter()
+        .any(|m| m.contains("K=0") && m.contains("/OutputIntents") && m.contains("712"));
+    assert!(
+        saw_warning,
+        "H3b: an RGB paint under a malformed /OutputIntents declaration \
+         must emit a `log::warn!` naming the K=0 fallback and upstream \
+         issue #712. Captured records since start: {:?}",
+        records
+    );
+}

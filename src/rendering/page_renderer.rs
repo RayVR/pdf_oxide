@@ -265,6 +265,13 @@ pub struct PageRenderer {
     /// gate ([`page_declares_transparency_or_overprint`]) is still
     /// honoured; detection-OFF pages never allocate a sidecar.
     pub(crate) force_cmyk_sidecar: bool,
+    /// Latch on the H3b silent-K=0 warning: when the document declares
+    /// `/OutputIntents` but no usable CMYK profile parses out, the
+    /// RGB→CMYK fallback emits K=0 (losing the K plane). The first
+    /// fallback hit logs once; subsequent paints stay silent so the
+    /// log doesn't spam on a degenerate document. Reset on each
+    /// `render_page_with_options` entry.
+    k_zero_warning_emitted: bool,
 }
 
 /// Maximum SMask materialisation recursion depth. A cyclic
@@ -289,6 +296,7 @@ impl PageRenderer {
             smask_depth: 0,
             cmyk_sidecar: None,
             force_cmyk_sidecar: false,
+            k_zero_warning_emitted: false,
         }
     }
 
@@ -398,6 +406,12 @@ impl PageRenderer {
         // amortising transform construction across paints within a
         // single page.
         self.icc_transform_cache.clear();
+        // Reset the H3b silent-K=0 warning latch so a new page's first
+        // RGB-to-CMYK fallback under a declared-but-unparseable
+        // /OutputIntents profile logs once on the new page (instead
+        // of staying suppressed across all subsequent renders on this
+        // long-lived PageRenderer).
+        self.k_zero_warning_emitted = false;
 
         // Refresh the excluded-layers snapshot once per page. The effective
         // set combines (a) the PDF's default-off OCGs per /OCProperties/D
@@ -5223,7 +5237,7 @@ impl PageRenderer {
     /// documented behaviour, observable only when the destination
     /// press carries non-zero K under the converted RGB region.
     fn resolve_rgb_paint_to_cmyk(
-        &self,
+        &mut self,
         gs: &GraphicsState,
         doc: &PdfDocument,
         fill_side: bool,
@@ -5249,6 +5263,29 @@ impl PageRenderer {
         // §10.3.5 inverse for the qcms / no-CMM backends. K stays at 0
         // because the additive-clamp form `(C, M, Y) = (1-R, 1-G, 1-B)`
         // does not encode ink-coverage in K.
+        //
+        // When the document catalog DECLARES an /OutputIntents array
+        // but `output_intent_cmyk_profile()` returns `None`, the
+        // producer asked for a press conversion that we couldn't honour
+        // (e.g. profile bytes failed to parse, or no entry carried a
+        // /N=4 /DestOutputProfile). Falling through to the K=0 inverse
+        // silently degrades press output — the K plane goes empty
+        // where the OutputIntent profile would have allocated black
+        // ink. Log a one-shot warning so this is observable until
+        // upstream issue yfedoseev/pdf_oxide#712 lands the proper
+        // profile-parse-error diagnostic. When no /OutputIntents
+        // declaration is present the K=0 fallback is the documented
+        // device-RGB behaviour and stays silent.
+        if doc.has_output_intents_declaration() && !self.k_zero_warning_emitted {
+            log::warn!(
+                "rgb→cmyk fallback fired with K=0 while document declares \
+                 /OutputIntents. Profile lookup returned None (likely an \
+                 unparseable /DestOutputProfile stream); press output \
+                 will degrade in the K plane. Tracked upstream as \
+                 yfedoseev/pdf_oxide#712."
+            );
+            self.k_zero_warning_emitted = true;
+        }
         (1.0 - r, 1.0 - g, 1.0 - b, 0.0)
     }
 
