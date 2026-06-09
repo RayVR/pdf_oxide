@@ -5071,10 +5071,10 @@ impl PdfDocument {
     /// assembled exactly as [`extract_text_with_options`](Self::extract_text_with_options)
     /// would, so the native text is byte-for-byte preserved; the extra spans
     /// only add content, sorted in by their bounding box.
-    // Callers live behind the `ocr` feature (the Auto extractor) and in tests;
-    // without `ocr` a plain `--lib` build sees no caller, so silence dead_code
-    // only in that configuration (CI builds with `-D warnings`).
-    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
+    // Only the Auto extractor (behind the `ocr` feature) and the unit test that
+    // pins span placement call this, so it is compiled only in those configs —
+    // a plain non-`ocr` `--lib` build omits it entirely (no dead code).
+    #[cfg(any(feature = "ocr", test))]
     pub(crate) fn extract_text_with_extra_spans(
         &self,
         page_index: usize,
@@ -15587,7 +15587,9 @@ impl PdfDocument {
     /// [`extract_text_with_extra_spans`](Self::extract_text_with_extra_spans).
     /// The Auto extractor uses this to drop OCR'd image text into its figure's
     /// reading-order slot for Markdown, so auto markdown is a superset of native.
-    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
+    // Only the (ocr-gated) Auto extractor calls this, so compile it only with
+    // the `ocr` feature — a non-`ocr` build omits it (no dead code).
+    #[cfg(feature = "ocr")]
     pub(crate) fn to_markdown_with_extra_spans(
         &self,
         page_index: usize,
@@ -16107,7 +16109,9 @@ impl PdfDocument {
     /// Convert a page to HTML with caller-supplied extra spans merged into the
     /// converter's reading-order pass — the HTML companion to
     /// [`to_markdown_with_extra_spans`](Self::to_markdown_with_extra_spans).
-    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
+    // Only the (ocr-gated) Auto extractor calls this, so compile it only with
+    // the `ocr` feature — a non-`ocr` build omits it (no dead code).
+    #[cfg(feature = "ocr")]
     pub(crate) fn to_html_with_extra_spans(
         &self,
         page_index: usize,
