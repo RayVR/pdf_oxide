@@ -132,8 +132,8 @@ fn synthetic_adobe_japan1_pdf_renders_non_blank() {
 
 #[test]
 fn jo_pdf_vertical_japanese_renders_non_blank() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/vertical_cjk/jo.pdf");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vertical_cjk/jo.pdf");
     let doc = PdfDocument::open(&path).expect("open jo.pdf fixture");
     let opts = RenderOptions::with_dpi(150);
     let img = render_page(&doc, 0, &opts).expect("render jo.pdf page 0");
