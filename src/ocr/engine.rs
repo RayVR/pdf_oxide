@@ -78,6 +78,7 @@ impl OcrSpan {
             char_widths: Vec::new(),
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 
@@ -409,7 +410,7 @@ mod tests {
         }
         // The original symptom: sorting must not panic.
         let mut v = pts.to_vec();
-        v.sort_by(|a, b| OcrOutput::reading_order_cmp(a, b));
+        v.sort_by(OcrOutput::reading_order_cmp);
         assert_eq!(v.len(), pts.len());
     }
 

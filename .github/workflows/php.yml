@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up PHP ${{ matrix.php-version }}
-        uses: shivammathur/setup-php@7c071dfe9dc99bdf297fa79cb49ea005b9fcadbc # v2.37.1
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
         with:
           php-version: ${{ matrix.php-version }}
           extensions: ffi, mbstring, json
@@ -59,7 +59,7 @@ jobs:
           tools: composer:v2
 
       - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           cache: false
           rustflags: ''
@@ -149,6 +149,20 @@ jobs:
           PDF_OXIDE_CDYLIB_PATH: ${{ env.PDF_OXIDE_CDYLIB_PATH }}
         run: vendor/bin/phpunit --testsuite=Integration
 
+      # Core example (01-extract-text) runs on Linux/macOS/Windows with an
+      # output assertion — the cross-language cross-OS guard.
+      - name: Run PHP example (01-extract-text, with assertion)
+        shell: bash
+        env:
+          PDF_OXIDE_CDYLIB_PATH: ${{ env.PDF_OXIDE_CDYLIB_PATH }}
+        run: |
+          set -uo pipefail
+          PDF="$GITHUB_WORKSPACE/tests/fixtures/simple.pdf"
+          out="$(php "$GITHUB_WORKSPACE/examples/php/01-extract-text/main.php" "$PDF" 2>&1)" \
+            || { echo "$out"; echo "ASSERT FAILED (exit)"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -q "Pages:" || { echo "ASSERT FAILED: missing 'Pages:'"; exit 1; }
+
       - name: Upload test artifacts on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -170,7 +184,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up PHP 8.4
-        uses: shivammathur/setup-php@7c071dfe9dc99bdf297fa79cb49ea005b9fcadbc # v2.37.1
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
         with:
           php-version: '8.4'
           extensions: ffi, mbstring, json
@@ -207,7 +221,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up PHP 8.4
-        uses: shivammathur/setup-php@7c071dfe9dc99bdf297fa79cb49ea005b9fcadbc # v2.37.1
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
         with:
           php-version: '8.4'
           extensions: ffi, mbstring, json

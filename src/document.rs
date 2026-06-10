@@ -5050,8 +5050,175 @@ impl PdfDocument {
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
         let base_spans = self.extract_spans(page_index)?;
+        // Vertical CJK (tategaki, ISO 32000-1 §9.7.4.3 vertical writing mode):
+        // glyphs run top-to-bottom in columns that progress right-to-left, so
+        // the horizontal row-major assembler shreds the reading order. When the
+        // page is geometrically vertical, read it column-major instead.
+        if let Some(vertical) = Self::try_assemble_vertical_cjk(&base_spans) {
+            return Ok(vertical);
+        }
         let text = self.assemble_text_from_spans(page_index, base_spans, options)?;
         Ok(Self::apply_mixed_rtl_line_pass(text))
+    }
+
+    /// Assemble page text from the page's native spans **plus** caller-supplied
+    /// extra spans, positioned together in a single reading-order pass.
+    ///
+    /// The Auto extractor uses this to drop text recovered from an image region
+    /// (via OCR) into the page at the image's spatial location — so a chart
+    /// caption embedded in a figure reads in its correct place rather than being
+    /// appended after the whole page. The native spans are extracted and
+    /// assembled exactly as [`extract_text_with_options`](Self::extract_text_with_options)
+    /// would, so the native text is byte-for-byte preserved; the extra spans
+    /// only add content, sorted in by their bounding box.
+    // Only the Auto extractor (behind the `ocr` feature) and the unit test that
+    // pins span placement call this, so it is compiled only in those configs —
+    // a plain non-`ocr` `--lib` build omits it entirely (no dead code).
+    #[cfg(any(feature = "ocr", test))]
+    pub(crate) fn extract_text_with_extra_spans(
+        &self,
+        page_index: usize,
+        extra: Vec<crate::layout::TextSpan>,
+        options: &crate::converters::ConversionOptions,
+    ) -> Result<String> {
+        let mut base_spans = self.extract_spans(page_index)?;
+        base_spans.extend(extra);
+        let text = self.assemble_text_from_spans(page_index, base_spans, options)?;
+        Ok(Self::apply_mixed_rtl_line_pass(text))
+    }
+
+    /// Returns column-major text when the page is a vertical-CJK (tategaki)
+    /// layout, or `None` for every other page (so horizontal documents are
+    /// byte-for-byte unchanged).
+    ///
+    /// Detection is purely geometric: among CJK glyph spans, count how many
+    /// neighbour pairs are stacked *vertically* (same column, one glyph-height
+    /// apart) versus *horizontally* (same row, one glyph-width apart). Vertical
+    /// writing is declared only when CJK is the clear majority of the page and
+    /// vertical adjacencies dominate horizontal ones — so horizontal CJK
+    /// (Chinese/Japanese prose set left-to-right) never triggers it. Assembly
+    /// then orders spans by column right-to-left (X descending, banded to the
+    /// glyph width) and top-to-bottom within a column (Y descending), matching
+    /// how the script is read.
+    fn try_assemble_vertical_cjk(spans: &[TextSpan]) -> Option<String> {
+        fn is_cjk(c: char) -> bool {
+            matches!(
+                c as u32,
+                0x3040..=0x30FF      // Hiragana + Katakana
+                | 0x3400..=0x4DBF    // CJK Ext A
+                | 0x4E00..=0x9FFF    // CJK Unified
+                | 0xF900..=0xFAFF    // CJK Compatibility
+                | 0xFF66..=0xFF9F    // Halfwidth Katakana
+            )
+        }
+        let cjk: Vec<&TextSpan> = spans
+            .iter()
+            .filter(|s| s.text.chars().any(is_cjk))
+            .collect();
+        if cjk.len() < 8 {
+            return None;
+        }
+        // Tategaki signature: vertical writing positions each glyph on its own
+        // origin, so a genuine vertical-CJK page is composed of SINGLE-glyph
+        // spans. Horizontal CJK is emitted as multi-character runs (a whole
+        // word/line per show op). The column-major geometry below assumes glyph
+        // cells; on run-level spans the nearest neighbour of a run is the run on
+        // the line above/below (vertical), so a horizontal page is mis-detected
+        // as vertical and its reading order is shredded. Require single-glyph
+        // CJK spans to be the majority before treating the page as vertical;
+        // otherwise fall back to the horizontal assembler (the pre-vertical-CJK
+        // behaviour, so a missed detection never regresses against it).
+        let single_glyph_cjk = cjk
+            .iter()
+            .filter(|s| {
+                let t = s.text.trim();
+                t.chars().count() == 1 && t.chars().all(is_cjk)
+            })
+            .count();
+        if single_glyph_cjk * 2 < cjk.len() {
+            return None;
+        }
+        // CJK must be the clear majority of the page's non-space glyphs.
+        let total_chars: usize = spans
+            .iter()
+            .map(|s| s.text.chars().filter(|c| !c.is_whitespace()).count())
+            .sum();
+        let cjk_chars: usize = cjk
+            .iter()
+            .map(|s| s.text.chars().filter(|c| is_cjk(*c)).count())
+            .sum();
+        if total_chars == 0 || cjk_chars * 2 < total_chars {
+            return None;
+        }
+
+        // Glyph cell width from the median-ish span box (CJK glyphs are square);
+        // used to band columns when sorting column-major below.
+        let mut widths: Vec<f32> = cjk
+            .iter()
+            .map(|s| s.bbox.width)
+            .filter(|w| *w > 0.0)
+            .collect();
+        if widths.is_empty() {
+            return None;
+        }
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let gw = widths[widths.len() / 2];
+
+        // Discriminate vertical (tategaki) from horizontal CJK by each glyph's
+        // NEAREST-neighbour direction (capped for O(n²) cost). The earlier
+        // all-pairs `vert > horiz` count mis-classified grid-aligned HORIZONTAL
+        // CJK — genkō-yōshi regulatory/academic text aligns glyphs in both rows
+        // and columns, so vertical and horizontal adjacencies are about equal
+        // and noise tipped the page to "vertical", scrambling its reading order
+        // and collapsing line breaks. A glyph's single closest neighbour is the
+        // next glyph in its own line: horizontally adjacent for horizontal text
+        // (intra-row pitch < inter-row leading), vertically adjacent for
+        // tategaki (intra-column pitch < inter-column gutter). Only assemble
+        // column-major when vertical nearest-neighbours clearly dominate
+        // (> 2×). Otherwise fall back to the normal horizontal path — which is
+        // also the pre-vertical-CJK (≤ 0.3.61) behaviour, so a missed detection
+        // never regresses against that baseline.
+        let sample = &cjk[..cjk.len().min(250)];
+        let (mut vert, mut horiz) = (0usize, 0usize);
+        for (i, a) in sample.iter().enumerate() {
+            let (mut best, mut bdx, mut bdy) = (f32::MAX, 0.0f32, 0.0f32);
+            for (j, b) in sample.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let dx = a.bbox.x - b.bbox.x;
+                let dy = a.bbox.y - b.bbox.y;
+                let d2 = dx * dx + dy * dy;
+                if d2 < best {
+                    best = d2;
+                    bdx = dx.abs();
+                    bdy = dy.abs();
+                }
+            }
+            // Classify the nearest neighbour's dominant axis (ties → neither).
+            if bdy > bdx {
+                vert += 1;
+            } else if bdx > bdy {
+                horiz += 1;
+            }
+        }
+        // Require a clear vertical majority; ambiguous or horizontal → None.
+        if vert == 0 || vert <= horiz * 2 {
+            return None;
+        }
+
+        // Column-major order: X descending (right-to-left), banded to the glyph
+        // width so a column's sub-pixel X jitter does not split it, then Y
+        // descending (top-to-bottom) within the column.
+        let band = (gw * 0.5).max(1.0);
+        let mut ordered: Vec<&TextSpan> = spans.iter().collect();
+        ordered.sort_by(|a, b| {
+            let ca = (a.bbox.x / band).round() as i32;
+            let cb = (b.bbox.x / band).round() as i32;
+            cb.cmp(&ca)
+                .then(crate::utils::safe_float_cmp(b.bbox.y, a.bbox.y))
+        });
+        Some(ordered.iter().map(|s| s.text.as_str()).collect())
     }
 
     /// Per-line UAX #9 pass for mixed-direction lines (bidi item 4): for each
@@ -5077,7 +5244,7 @@ impl PdfDocument {
     /// inside `include_region` if one is set. Exclusion runs first so it takes
     /// precedence. Shared by the plain-text, markdown, and HTML conversion paths
     /// so `ConversionOptions` region filtering behaves identically across every
-    /// text surface (#609). A no-op when neither field is set.
+    /// text surface. A no-op when neither field is set.
     fn apply_region_filters(
         base_spans: Vec<crate::layout::TextSpan>,
         options: &crate::converters::ConversionOptions,
@@ -5645,6 +5812,10 @@ impl PdfDocument {
         } else {
             cleaned_text
         };
+
+        // Drop stray spaces a producer inserted between a CJK ideograph and an
+        // embedded ASCII number (e.g. "公元前 1000 年" → "公元前1000年").
+        let cleaned_text = crate::extractors::text::strip_cjk_digit_boundary_spaces(&cleaned_text);
 
         Ok(cleaned_text)
     }
@@ -6663,6 +6834,30 @@ impl PdfDocument {
             return false;
         }
 
+        // Complex Brahmic / South-East-Asian scripts (Devanagari, Bengali,
+        // Tamil, Telugu, …, Thai, Khmer): an inter-glyph gap *inside* a word is
+        // not a word break. These scripts render dependent vowel signs
+        // (matras), conjuncts, and reordered glyphs with their own positional
+        // advances, so the Latin-tuned proportional-gap test below fires inside
+        // a syllable cluster (e.g. a Bengali consonant following a wide matra
+        // sits ~0.7em from it). Word boundaries in conforming text are carried
+        // by an explicit SPACE glyph — ISO 32000-1 §14.8.2.5 requires the
+        // spacing characters that separate words to be present — so a heuristic
+        // space here only double-counts a boundary the explicit space already
+        // marks. Suppress it when both sides are the *same* complex script;
+        // this mirrors the CJK guard above (CJK uses no inter-word space at
+        // all, these scripts carry it explicitly).
+        {
+            use crate::text::complex_script_detector::detect_complex_script;
+            let prev_script = prev_tail.and_then(|c| detect_complex_script(c as u32));
+            let curr_script = curr_head.and_then(|c| detect_complex_script(c as u32));
+            if let (Some(p), Some(c)) = (prev_script, curr_script) {
+                if p == c {
+                    return false;
+                }
+            }
+        }
+
         // Emoji / pictographic → letter boundary: a wide pictographic glyph
         // (e.g. 📄) abuts the next token, so the proportional-gap test below
         // would drop the inter-token space (`📄README` instead of `📄 README`).
@@ -7058,7 +7253,7 @@ impl PdfDocument {
     /// so visually-stored RTL (e.g. issue10301 Hebrew "גבא") otherwise leaked
     /// out reversed. A single-direction run's logical order is just its reverse,
     /// so no glyph geometry is needed for the pure-RTL case.
-    fn push_span_text_bidi(out: &mut String, span: &TextSpan) {
+    fn push_span_text_bidi(out: &mut String, span: &TextSpan, rtl_run: bool) {
         use crate::text::rtl_detector::is_rtl_text;
         let mut rtl = 0usize;
         let mut has_latin = false;
@@ -7075,13 +7270,202 @@ impl PdfDocument {
             }
         }
         if rtl >= 2 && !has_latin {
-            let reversed: String = span.text.chars().rev().collect();
             let mut tmp = span.clone();
-            tmp.text = reversed;
+            // Strip producer-inserted SPACEs that fall *between two Arabic
+            // letters* inside a single show string. ISO 32000-1 §14.8.2.3.3
+            // states a reverse-order show string "shall not contain interior
+            // SPACEs" — a word break is signalled by a SPACE at the string
+            // boundary (here, a separate span), never inside it. Arabic is
+            // cursive, so an interior space splits letters that the script
+            // joins; it is never a word boundary in the pure-text
+            // representation (§14.8.2.5). Restricted to Arabic (cursive): a
+            // non-cursive script such as Hebrew can legitimately carry a
+            // space-separated pair in one show string, so it is left alone.
+            tmp.text =
+                Self::reverse_rtl_keeping_marks(&Self::strip_interior_arabic_spaces(&span.text));
+            Self::push_span_text(out, &tmp);
+        } else if rtl_run && Self::is_reversible_rtl_neutral_span(&span.text) {
+            // A neutral-only span (separator / terminator punctuation plus
+            // spaces — no strong letters and no digits) embedded in a pure-RTL
+            // run carries its glyphs in *visual* (content-stream draw) order.
+            // Per UAX #9 the neutrals inherit the surrounding right-to-left
+            // direction (rules N1/N2), so their logical order is the reverse of
+            // the visual sequence: a visual "<space><comma>" drawn between two
+            // Hebrew words becomes "<comma><space>", re-attaching the comma to
+            // the preceding word. The pure-RTL words around it are reversed by
+            // the branch above; without this the punctuation stayed stranded on
+            // the wrong side of the inter-word space.
+            let mut tmp = span.clone();
+            tmp.text = span.text.chars().rev().collect();
             Self::push_span_text(out, &tmp);
         } else {
             Self::push_span_text(out, span);
         }
+    }
+
+    /// Remove ASCII SPACE (U+0020) characters that sit *between two Arabic
+    /// letters* within a single show string — producer-inserted spurious
+    /// spaces that split a cursive word (e.g. `قِ ل` inside `القِطّ`).
+    ///
+    /// Per ISO 32000-1 §14.8.2.3.3 a show string "shall not contain interior
+    /// SPACEs"; a genuine word break is a SPACE at a string boundary (a
+    /// separate span in this pipeline). Combining marks between the space and
+    /// its neighbouring base letter are seen through, so a mark sitting next to
+    /// the space does not hide the Arabic letter on that side. Leading and
+    /// trailing spaces (real word-break candidates) and spaces flanked by
+    /// anything other than two Arabic letters are preserved verbatim, so the
+    /// fast path returns the input unchanged when there is nothing to strip.
+    fn strip_interior_arabic_spaces(text: &str) -> String {
+        use crate::text::rtl_detector::{is_arabic_letter, is_rtl_diacritic};
+        if !text.contains(' ') {
+            return text.to_string();
+        }
+        // First non-mark char in `it` is an Arabic letter? (marks are seen
+        // through so a diacritic next to the space does not hide its base.)
+        fn arabic_letter_past_marks<'a>(it: impl Iterator<Item = &'a char>) -> bool {
+            for &c in it {
+                if is_rtl_diacritic(c as u32) {
+                    continue;
+                }
+                return is_arabic_letter(c as u32);
+            }
+            false
+        }
+        let chars: Vec<char> = text.chars().collect();
+        // Interior spaces flanked by Arabic letters on both sides. A producer's
+        // spurious cursive-join space splits ONE word, so a genuine spurious run
+        // carries exactly one such space. A span with several Arabic-flanked
+        // spaces is ordinary multi-word text whose spaces are real word breaks —
+        // stripping them all would concatenate every word into one token
+        // (the right_to_left_01 class). §14.8.2.3.3 governs word-break detection,
+        // not deletion of every interior space, so strip only the lone case and
+        // leave multi-word runs (and their real spaces) intact.
+        let qualifying: Vec<usize> = (0..chars.len())
+            .filter(|&i| {
+                chars[i] == ' '
+                    && arabic_letter_past_marks(chars[..i].iter().rev())
+                    && arabic_letter_past_marks(chars[i + 1..].iter())
+            })
+            .collect();
+        if qualifying.len() != 1 {
+            return text.to_string();
+        }
+        let drop = qualifying[0];
+        chars
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &c)| (i != drop).then_some(c))
+            .collect()
+    }
+
+    /// Emit the inter-line newline(s) between two vertically separated spans in
+    /// the struct-order assembler. A normal line gap maps to one to three
+    /// newlines proportional to the vertical distance (`y_diff / line_height`,
+    /// clamped) so multi-line paragraph spacing survives. When `single_break`
+    /// is set — two consecutive cells of a tagged table on different rows — a
+    /// single newline is emitted instead: table rows are stacked block rows,
+    /// not free-leading paragraphs (ISO 32000-1 §14.8.4.3.4), and the geometric
+    /// row pitch (~1.7× leading) would otherwise insert a spurious blank line
+    /// between every row.
+    fn push_line_breaks(
+        text: &mut String,
+        prev: &TextSpan,
+        span: &TextSpan,
+        y_diff: f32,
+        single_break: bool,
+    ) {
+        if single_break {
+            text.push('\n');
+            return;
+        }
+        let font_size = prev.font_size.max(span.font_size).max(10.0);
+        let line_height = font_size * 1.2;
+        let num_breaks = (y_diff / line_height).round() as usize;
+        for _ in 0..num_breaks.clamp(1, 3) {
+            text.push('\n');
+        }
+    }
+
+    /// Whether every span in this marked-content element is part of a *pure*
+    /// right-to-left run: at least one Arabic/Hebrew letter is present and no
+    /// Latin letter is. Mirrors the gating in [`order_mcid_spans`] (the branch
+    /// that sorts pure-RTL spans right-to-left). Used to decide whether
+    /// neutral-only punctuation spans inside the run must be reversed from
+    /// visual to logical order by [`push_span_text_bidi`].
+    fn mcid_run_is_pure_rtl(spans: &[crate::layout::TextSpan]) -> bool {
+        use crate::text::rtl_detector::is_rtl_text;
+        let has_rtl = spans
+            .iter()
+            .any(|s| s.text.chars().any(|c| is_rtl_text(c as u32)));
+        let has_latin = spans
+            .iter()
+            .any(|s| s.text.chars().any(|c| c.is_ascii_alphabetic()));
+        has_rtl && !has_latin
+    }
+
+    /// Is `c` a direction-neutral punctuation mark whose order inside an RTL
+    /// run is a pure transposition — safe to reverse with the surrounding RTL
+    /// neutrals? Restricted to separators and terminators (comma, full stop,
+    /// semicolon, colon, exclamation, question, and their Arabic/Hebrew
+    /// equivalents). Deliberately excludes paired brackets and quotation marks
+    /// (which need UAX #9 L4 mirroring, handled elsewhere), digits, and any
+    /// character that anchors an embedded left-to-right sub-run.
+    fn is_rtl_reorderable_neutral(c: char) -> bool {
+        matches!(
+            c,
+            ',' | '.' | ';' | ':' | '!' | '?'
+                | '\u{05BE}' // Hebrew maqaf
+                | '\u{05C3}' // Hebrew sof pasuq
+                | '\u{060C}' // Arabic comma
+                | '\u{061B}' // Arabic semicolon
+                | '\u{061F}' // Arabic question mark
+                | '\u{06D4}' // Arabic full stop
+        )
+    }
+
+    /// Whether `text` is a neutral-only span eligible for the RTL visual→logical
+    /// reversal in [`push_span_text_bidi`]: every character is whitespace or a
+    /// [reorderable neutral](Self::is_rtl_reorderable_neutral), it contains at
+    /// least one such punctuation mark, and it is at least two characters long
+    /// (so there is an order to fix). A lone punctuation glyph or a bare space
+    /// run reverses to itself and is left untouched.
+    fn is_reversible_rtl_neutral_span(text: &str) -> bool {
+        let mut has_punct = false;
+        let mut count = 0usize;
+        for c in text.chars() {
+            count += 1;
+            if c.is_whitespace() {
+                continue;
+            }
+            if Self::is_rtl_reorderable_neutral(c) {
+                has_punct = true;
+                continue;
+            }
+            return false; // letter, digit, bracket, quote, or other → not eligible
+        }
+        has_punct && count >= 2
+    }
+
+    /// Reverse a pure-RTL run from visual to logical order while keeping each
+    /// Arabic/Hebrew combining mark attached to its base letter.
+    ///
+    /// A naive `chars().rev()` reverses by Unicode scalar value, so a base
+    /// letter's diacritics (which follow it in logical order — kasra/shadda
+    /// U+0650/U+0651, Hebrew points U+05B0..) jump *in front* of the base and
+    /// float off as standalone marks. Grouping each base char with the
+    /// combining marks that trail it, then reversing the group order (each
+    /// group's internal order preserved), keeps marks bound to their base.
+    fn reverse_rtl_keeping_marks(text: &str) -> String {
+        use crate::text::rtl_detector::is_rtl_diacritic;
+        let mut groups: Vec<Vec<char>> = Vec::new();
+        for c in text.chars() {
+            if is_rtl_diacritic(c as u32) && !groups.is_empty() {
+                groups.last_mut().unwrap().push(c);
+            } else {
+                groups.push(vec![c]);
+            }
+        }
+        groups.iter().rev().flatten().collect()
     }
 
     /// Parse font size from a /DA (Default Appearance) string.
@@ -7438,6 +7822,7 @@ impl PdfDocument {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             });
         }
 
@@ -7604,6 +7989,7 @@ impl PdfDocument {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             });
         }
 
@@ -8489,6 +8875,9 @@ impl PdfDocument {
         // Step 4: Assemble text in structure order
         let mut text = String::with_capacity(mcid_map.len() * 50); // estimate
         let mut prev_span: Option<&TextSpan> = None;
+        // Whether the content element that emitted `prev_span` sat inside a
+        // table — used to collapse a table row boundary to a single newline.
+        let mut prev_in_table = false;
         let mut consumed_mcids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         for content in &ordered_content {
@@ -8530,24 +8919,27 @@ impl PdfDocument {
 
             if let Some(spans) = mcid_map.get(&mcid) {
                 consumed_mcids.insert(mcid);
+                let rtl_run = Self::mcid_run_is_pure_rtl(spans);
                 for span in Self::order_mcid_spans(spans) {
                     if let Some(prev) = prev_span {
                         let y_diff = (prev.bbox.y - span.bbox.y).abs();
 
                         if y_diff > Self::same_line_threshold(prev, span) {
-                            let font_size = prev.font_size.max(span.font_size).max(10.0);
-                            let line_height = font_size * 1.2;
-                            let num_breaks = (y_diff / line_height).round() as usize;
-                            for _ in 0..num_breaks.clamp(1, 3) {
-                                text.push('\n');
-                            }
+                            Self::push_line_breaks(
+                                &mut text,
+                                prev,
+                                span,
+                                y_diff,
+                                content.in_table && prev_in_table,
+                            );
                         } else if Self::should_insert_space(prev, span) {
                             text.push(' ');
                         }
                     }
 
-                    Self::push_span_text_bidi(&mut text, span);
+                    Self::push_span_text_bidi(&mut text, span, rtl_run);
                     prev_span = Some(span);
+                    prev_in_table = content.in_table;
                 }
             } else {
                 log::warn!(
@@ -8575,6 +8967,7 @@ impl PdfDocument {
                 unconsumed.len()
             );
             for (_mcid, spans) in &unconsumed {
+                let rtl_run = Self::mcid_run_is_pure_rtl(spans);
                 for span in *spans {
                     if let Some(prev) = prev_span {
                         let y_diff = (prev.bbox.y - span.bbox.y).abs();
@@ -8584,7 +8977,7 @@ impl PdfDocument {
                             text.push(' ');
                         }
                     }
-                    Self::push_span_text_bidi(&mut text, span);
+                    Self::push_span_text_bidi(&mut text, span, rtl_run);
                     prev_span = Some(span);
                 }
             }
@@ -8605,7 +8998,7 @@ impl PdfDocument {
                         text.push(' ');
                     }
                 }
-                Self::push_span_text_bidi(&mut text, span);
+                Self::push_span_text_bidi(&mut text, span, false);
                 prev_span = Some(span);
             }
         }
@@ -8618,24 +9011,218 @@ impl PdfDocument {
     }
 
     /// Order one MCID's spans for emission in the structure-order assemblers
-    /// (#608). A single marked-content element can carry spans across several
+    ///. A single marked-content element can carry spans across several
     /// visual lines; emitting them in raw extraction order can mis-order them,
     /// so sort by the canonical reading-order comparator. Skipped for single-
     /// span MCIDs and for any MCID containing RTL text (whose span order is
     /// handled by the bidi passes) — both stay byte-identical.
     fn order_mcid_spans(spans: &[crate::layout::TextSpan]) -> Vec<&crate::layout::TextSpan> {
+        use crate::text::rtl_detector::is_rtl_text;
         let mut ordered: Vec<&crate::layout::TextSpan> = spans.iter().collect();
-        let has_rtl = |s: &crate::layout::TextSpan| {
-            s.text
-                .chars()
-                .any(|c| crate::text::rtl_detector::is_rtl_text(c as u32))
-        };
-        if spans.len() > 1 && !spans.iter().any(has_rtl) {
+        if spans.len() <= 1 {
+            return ordered;
+        }
+        let has_rtl = spans
+            .iter()
+            .any(|s| s.text.chars().any(|c| is_rtl_text(c as u32)));
+        let has_latin = spans
+            .iter()
+            .any(|s| s.text.chars().any(|c| c.is_ascii_alphabetic()));
+        if !has_rtl {
+            // LTR multi-span MCID: left-to-right row-aware reading order.
             ordered.sort_by(|a, b| {
                 crate::utils::row_aware_span_cmp(a.bbox.y, a.bbox.x, b.bbox.y, b.bbox.x)
             });
+        } else if !has_latin {
+            // #656/#657: pure-RTL MCID. The tagged struct-tree path never
+            // reaches `reverse_rtl_visual_order_runs`, so without an explicit
+            // span-order pass the words emerge in visual (reversed) sequence.
+            // Emitting each row right-to-left (X descending) reconstructs
+            // logical reading order from geometry, independent of whether the
+            // producer stored the run visually or logically. Per-span glyph
+            // order is corrected separately by `push_span_text_bidi`.
+            ordered = Self::order_pure_rtl_spans(spans);
         }
+        // Mixed RTL+Latin MCIDs keep raw order (full UAX #9 bidi deferred).
         ordered
+    }
+
+    /// Order a pure-RTL MCID's spans into logical reading order: group spans
+    /// into visual lines using a **font-relative** vertical tolerance, then
+    /// emit each line right-to-left (X descending).
+    ///
+    /// A fixed quantized row band (`row_aware_span_cmp_rtl` with the global
+    /// `ROW_BAND_TOLERANCE_PT`) over-segments Arabic lines. Producers routinely
+    /// draw zero-advance glyphs — hamza seats, shadda/kasra marks, and even
+    /// whole consonants positioned by a separate zero-width show — 1–3 pt off
+    /// the baseline. A coarse fixed band rounds those into adjacent rows, which
+    /// then emit before or after the body of the line and scatter the run (the
+    /// telltale leading run of stray alef/hamza glyphs). Banding by a tolerance
+    /// proportional to the glyph size keeps one jittery line intact while still
+    /// separating genuinely distinct lines, whose leading is ~1.2× the font
+    /// size — comfortably beyond the tolerance. Per-span glyph order is fixed
+    /// separately by [`push_span_text_bidi`]; this function only fixes the order
+    /// in which spans are emitted.
+    fn order_pure_rtl_spans(spans: &[crate::layout::TextSpan]) -> Vec<&crate::layout::TextSpan> {
+        use crate::utils::safe_float_cmp;
+        let mut by_y: Vec<&crate::layout::TextSpan> = spans.iter().collect();
+        // Stable sort, Y descending (top of page first). Ties keep extraction
+        // (content-stream) order; the X-descending pass below refines each line.
+        by_y.sort_by(|a, b| safe_float_cmp(b.bbox.y, a.bbox.y));
+
+        let mut out: Vec<&crate::layout::TextSpan> = Vec::with_capacity(spans.len());
+        let mut line: Vec<&crate::layout::TextSpan> = Vec::new();
+        let mut anchor_y = f32::NAN;
+        let mut tol = 0.0f32;
+        for s in by_y {
+            let fs = if s.font_size.is_finite() && s.font_size > 1.0 {
+                s.font_size
+            } else {
+                10.0
+            };
+            let starts_new_line =
+                anchor_y.is_finite() && (!s.bbox.y.is_finite() || anchor_y - s.bbox.y > tol);
+            if anchor_y.is_nan() || starts_new_line {
+                if !line.is_empty() {
+                    line.sort_by(|a, b| safe_float_cmp(b.bbox.x, a.bbox.x));
+                    out.append(&mut line);
+                }
+                anchor_y = s.bbox.y;
+                tol = 0.5 * fs;
+            }
+            line.push(s);
+        }
+        if !line.is_empty() {
+            line.sort_by(|a, b| safe_float_cmp(b.bbox.x, a.bbox.x));
+            out.append(&mut line);
+        }
+        out
+    }
+
+    /// Port of the plain-text RTL reading-order correction to the converter
+    /// pipeline's [`crate::pipeline::OrderedTextSpan`] sequence, so `to_markdown`
+    /// and `to_html` produce logical-order Arabic/Hebrew.
+    ///
+    /// The plain-text path fixes RTL during structure assembly
+    /// ([`order_pure_rtl_spans`] for span order, [`push_span_text_bidi`] for
+    /// per-glyph order). The converter pipeline never reaches those — it orders
+    /// spans by MCID/geometry and the converters emit each span's text verbatim
+    /// — so visual-order Arabic leaked through reversed and scrambled. This pass
+    /// groups the reading-order sequence into visual lines by a font-relative Y
+    /// tolerance (matching the converters' own line-break test) and, for each
+    /// line that is purely right-to-left, emits the spans rightmost-first and
+    /// rewrites each span's text to logical order:
+    /// - a pure-RTL span: strip interior cursive-join spaces (§14.8.2.3.3) then
+    ///   reverse keeping combining marks attached ([`reverse_rtl_keeping_marks`]);
+    /// - a neutral-only span: reverse so trailing punctuation re-attaches to the
+    ///   preceding word (UAX #9 N1/N2, [`is_reversible_rtl_neutral_span`]).
+    ///
+    /// Mixed RTL+Latin lines are left untouched (full UAX #9 deferred), and the
+    /// whole pass is skipped when the page has no RTL characters.
+    fn apply_rtl_logical_order_to_ordered_spans(spans: &mut [crate::pipeline::OrderedTextSpan]) {
+        use crate::text::rtl_detector::is_rtl_text;
+        use crate::utils::safe_float_cmp;
+
+        let has_any_rtl = |s: &crate::pipeline::OrderedTextSpan| {
+            s.span.text.chars().any(|c| is_rtl_text(c as u32))
+        };
+        if !spans.iter().any(has_any_rtl) {
+            return; // fast path: pure-LTR page is byte-identical
+        }
+
+        // The converter pipeline's reading order can interleave the spans of a
+        // single RTL line (the MCID/XYCut order is not strictly top-to-bottom),
+        // which would break the consecutive line-grouping below — a display
+        // heading then scatters into one `#` per fragment. On a page that is
+        // dominantly right-to-left, re-sort by Y first so each visual line is
+        // contiguous; Y-descending IS the reading order there. Mixed / LTR-
+        // dominant pages keep the pipeline order so LTR runs are not disturbed.
+        let rtl_letters = spans
+            .iter()
+            .flat_map(|s| s.span.text.chars())
+            .filter(|c| is_rtl_text(*c as u32))
+            .count();
+        let latin_letters = spans
+            .iter()
+            .flat_map(|s| s.span.text.chars())
+            .filter(|c| c.is_ascii_alphabetic())
+            .count();
+        if rtl_letters > latin_letters.max(1) * 2 {
+            spans.sort_by(|a, b| safe_float_cmp(b.span.bbox.y, a.span.bbox.y));
+        }
+
+        let n = spans.len();
+        let mut i = 0;
+        while i < n {
+            // Group the maximal run of spans on the same visual line, using the
+            // same font-relative tolerance the converters use for line breaks.
+            let anchor_y = spans[i].span.bbox.y;
+            let mut j = i + 1;
+            while j < n {
+                let fs = spans[i]
+                    .span
+                    .font_size
+                    .max(spans[j].span.font_size)
+                    .max(1.0);
+                if !spans[j].span.bbox.y.is_finite()
+                    || (spans[j].span.bbox.y - anchor_y).abs() > 0.5 * fs
+                {
+                    break;
+                }
+                j += 1;
+            }
+            let line = &mut spans[i..j];
+
+            let has_rtl = line.iter().any(has_any_rtl);
+            let has_latin = line
+                .iter()
+                .any(|s| s.span.text.chars().any(|c| c.is_ascii_alphabetic()));
+            if has_rtl && !has_latin {
+                // Logical RTL order is rightmost glyph first.
+                line.sort_by(|a, b| safe_float_cmp(b.span.bbox.x, a.span.bbox.x));
+                // Snap every span on this line to a single baseline. RTL
+                // producers jitter glyphs a few points off the baseline (hamza
+                // seats, marks), and the converters break a line whenever the
+                // Y delta between consecutive spans exceeds ~0.5em — which,
+                // after the X-descending reorder, would shatter one line into
+                // many spurious one-word "lines" (each then mis-promoted to a
+                // heading). Collapsing the jitter keeps the line intact.
+                for s in line.iter_mut() {
+                    s.span.bbox.y = anchor_y;
+                }
+                for s in line.iter_mut() {
+                    let mut rtl = 0usize;
+                    let mut latin = false;
+                    for c in s.span.text.chars() {
+                        if c.is_whitespace() {
+                            continue;
+                        }
+                        if c.is_ascii_alphabetic() {
+                            latin = true;
+                            break;
+                        }
+                        if is_rtl_text(c as u32) {
+                            rtl += 1;
+                        }
+                    }
+                    if rtl >= 2 && !latin {
+                        s.span.text = Self::reverse_rtl_keeping_marks(
+                            &Self::strip_interior_arabic_spaces(&s.span.text),
+                        );
+                    } else if Self::is_reversible_rtl_neutral_span(&s.span.text) {
+                        s.span.text = s.span.text.chars().rev().collect();
+                    }
+                }
+            }
+            i = j;
+        }
+
+        // The converters re-sort by `reading_order` before emitting, so the
+        // span-order changes above (the Y pre-sort and the per-line X-descending
+        // reorder) only take effect once that field reflects the new sequence.
+        for (idx, s) in spans.iter_mut().enumerate() {
+            s.reading_order = idx;
+        }
     }
 
     ///
@@ -8727,6 +9314,65 @@ impl PdfDocument {
     /// over the converters' [`crate::pipeline::OrderedTextSpan`]
     /// shape; renumbers `reading_order` after dropping suppressed
     /// spans so downstream converters see a contiguous sequence.
+    /// Tag ordered spans that fall within a `/Link` annotation's rectangle
+    /// with its resolved URI, so the markdown/HTML converters can emit
+    /// hyperlinks (ISO 32000-1 §12.5.6.5 Link annotations + §12.6.4.7 URI
+    /// actions). Spans and link rectangles share PDF user-space coordinates,
+    /// so a span is linked when its bbox centre lies inside the rectangle.
+    pub(crate) fn apply_link_annotations_to_ordered_spans(
+        &self,
+        page_index: usize,
+        ordered: &mut [crate::pipeline::OrderedTextSpan],
+    ) {
+        use crate::annotation_types::AnnotationSubtype;
+        use crate::annotations::LinkAction;
+
+        let annots = match self.get_annotations(page_index) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let mut links: Vec<([f32; 4], std::sync::Arc<str>)> = Vec::new();
+        for a in &annots {
+            if a.subtype_enum != AnnotationSubtype::Link {
+                continue;
+            }
+            let uri = match &a.action {
+                Some(LinkAction::Uri(u)) if !u.is_empty() => {
+                    std::sync::Arc::<str>::from(u.as_str())
+                },
+                _ => continue,
+            };
+            if let Some(r) = a.rect {
+                links.push((
+                    [
+                        r[0].min(r[2]) as f32,
+                        r[1].min(r[3]) as f32,
+                        r[0].max(r[2]) as f32,
+                        r[1].max(r[3]) as f32,
+                    ],
+                    uri,
+                ));
+            }
+        }
+        if links.is_empty() {
+            return;
+        }
+        for s in ordered.iter_mut() {
+            let b = &s.span.bbox;
+            let (sx0, sy0, sx1, sy1) = (b.x, b.y, b.x + b.width, b.y + b.height);
+            // A span is linked when its bbox overlaps the annotation rectangle.
+            // Overlap (rather than centre-in-rect) keeps the link when adjacent
+            // runs are merged into one wide span the small link rect only
+            // partially covers — the URL is preserved rather than lost.
+            if let Some((_, uri)) = links
+                .iter()
+                .find(|(r, _)| sx0 < r[2] && sx1 > r[0] && sy0 < r[3] && sy1 > r[1])
+            {
+                s.link_uri = Some(uri.clone());
+            }
+        }
+    }
+
     pub(crate) fn apply_actualtext_to_ordered_spans(
         &self,
         page_index: usize,
@@ -9041,6 +9687,7 @@ impl PdfDocument {
         // Step 4: Assemble text in structure order
         let mut text = String::with_capacity(mcid_map.len() * 50);
         let mut prev_span: Option<&TextSpan> = None;
+        let mut prev_in_table = false;
         let mut consumed_mcids: HashSet<u32> = HashSet::new();
 
         for content in ordered_content {
@@ -9074,23 +9721,26 @@ impl PdfDocument {
 
             if let Some(spans) = mcid_map.get(&mcid) {
                 consumed_mcids.insert(mcid);
+                let rtl_run = Self::mcid_run_is_pure_rtl(spans);
                 for span in Self::order_mcid_spans(spans) {
                     if let Some(prev) = prev_span {
                         let y_diff = (prev.bbox.y - span.bbox.y).abs();
                         if y_diff > Self::same_line_threshold(prev, span) {
-                            let font_size = prev.font_size.max(span.font_size).max(10.0);
-                            let line_height = font_size * 1.2;
-                            let num_breaks = (y_diff / line_height).round() as usize;
-                            for _ in 0..num_breaks.clamp(1, 3) {
-                                text.push('\n');
-                            }
+                            Self::push_line_breaks(
+                                &mut text,
+                                prev,
+                                span,
+                                y_diff,
+                                content.in_table && prev_in_table,
+                            );
                         } else if Self::should_insert_space(prev, span) {
                             text.push(' ');
                         }
                     }
 
-                    Self::push_span_text_bidi(&mut text, span);
+                    Self::push_span_text_bidi(&mut text, span, rtl_run);
                     prev_span = Some(span);
+                    prev_in_table = content.in_table;
                 }
             }
         }
@@ -9107,6 +9757,7 @@ impl PdfDocument {
                 unconsumed.len()
             );
             for (_mcid, spans) in &unconsumed {
+                let rtl_run = Self::mcid_run_is_pure_rtl(spans);
                 for span in *spans {
                     if let Some(prev) = prev_span {
                         let y_diff = (prev.bbox.y - span.bbox.y).abs();
@@ -9116,7 +9767,7 @@ impl PdfDocument {
                             text.push(' ');
                         }
                     }
-                    Self::push_span_text_bidi(&mut text, span);
+                    Self::push_span_text_bidi(&mut text, span, rtl_run);
                     prev_span = Some(span);
                 }
             }
@@ -9139,7 +9790,7 @@ impl PdfDocument {
                         text.push(' ');
                     }
                 }
-                Self::push_span_text_bidi(&mut text, span);
+                Self::push_span_text_bidi(&mut text, span, false);
                 prev_span = Some(span);
             }
         }
@@ -9413,22 +10064,41 @@ impl PdfDocument {
         lower.starts_with("cm") || lower.contains("symbol")
     }
 
-    /// Replace a `¬` (U+00AC) that sits directly between two ASCII digits with
-    /// `.` (the decimal point a math subset drew from its `logicalnot` slot).
-    /// Leaves every other `¬` untouched.
+    /// Replace a `¬` (U+00AC) that a math subset drew from its `logicalnot`
+    /// slot as a decimal point. Two shapes are recovered:
+    ///
+    ///   - `digit ¬ digit`         → `digit.digit` (e.g. `1¬00` → `1.00`)
+    ///   - `digit ¬ <space> digit` → `digit.digit` (e.g. `1¬ 00` → `1.00`)
+    ///
+    /// The second form covers subsets that emit a single space between the
+    /// decimal glyph and the fractional digits; the lone separating space is
+    /// dropped so the number reads as one token. The leading digit must abut
+    /// `¬` directly in both shapes, so a genuinely spaced negation (`5 ¬ 3`,
+    /// `A ¬ B`) is left untouched. Every other `¬` is preserved.
     fn fix_digit_logicalnot_decimal(text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
         let mut out = String::with_capacity(text.len());
-        for (i, &c) in chars.iter().enumerate() {
-            if c == '\u{00AC}'
-                && i > 0
-                && chars[i - 1].is_ascii_digit()
-                && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit())
-            {
-                out.push('.');
-            } else {
-                out.push(c);
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\u{00AC}' && i > 0 && chars[i - 1].is_ascii_digit() {
+                // Unspaced: digit ¬ digit.
+                if chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
+                    out.push('.');
+                    i += 1;
+                    continue;
+                }
+                // Spaced: digit ¬ <single space> digit — drop the lone space.
+                if chars.get(i + 1) == Some(&' ')
+                    && chars.get(i + 2).is_some_and(|n| n.is_ascii_digit())
+                {
+                    out.push('.');
+                    i += 2; // skip the ¬ and the single separating space
+                    continue;
+                }
             }
+            out.push(c);
+            i += 1;
         }
         out
     }
@@ -9513,14 +10183,41 @@ impl PdfDocument {
             }
         }
 
-        // Reading order: XY-cut when the page has multiple columns (B4);
-        // otherwise the cheap row-aware sort. XY-cut is spatial recursion
-        // that correctly orders multi-column layouts (newspapers, academic
-        // papers, dashboards) but is overkill for single-column pages
-        // doesn't handle tabular rowspan labels specifically. Heuristic:
-        // count distinct X-center clusters with vertical overlap; ≥2
-        // clusters → multi-column.
-        if Self::is_multi_column_page(&spans) {
+        // Tategaki (vertical writing) intercept. Pages whose majority of
+        // spans were emitted under WMode 1 (font /Encoding ends in -V or
+        // the CMap declares /WMode 1) need right-to-left, top-to-bottom
+        // ordering. Row-aware / XY-cut sorts assume horizontal flow and
+        // scramble vertical text; per-span wmode lets us route just those
+        // pages through a tategaki comparator while leaving every existing
+        // horizontal corpus untouched.
+        let vertical_count = spans.iter().filter(|s| s.wmode == 1).count();
+        if !spans.is_empty() && vertical_count * 2 >= spans.len() {
+            // Cluster tolerance: median span width. Wide enough to keep one
+            // vertical column together, narrow enough to separate adjacent
+            // columns. Robust to single rotated outliers.
+            //
+            // Assumption (M7): tategaki CJK body text is functionally
+            // monospaced (full-width kanji/kana, half-width digits all
+            // advance by similar widths), so the median span width
+            // approximates the column pitch. Mixed-pitch tategaki (rare —
+            // typically only ruby annotations) may overcluster; that
+            // would be an explicit follow-up if it shows up in real
+            // corpora.
+            let mut widths: Vec<f32> = spans.iter().map(|s| s.bbox.width.max(1.0)).collect();
+            widths.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
+            let tol = widths[widths.len() / 2].max(1.0);
+            spans.sort_by(|a, b| {
+                let ax = a.bbox.x + a.bbox.width * 0.5;
+                let bx = b.bbox.x + b.bbox.width * 0.5;
+                if (ax - bx).abs() <= tol {
+                    // Same column: top first (descending y in PDF user space).
+                    crate::utils::safe_float_cmp(b.bbox.y, a.bbox.y)
+                } else {
+                    // Different column: rightmost first.
+                    crate::utils::safe_float_cmp(bx, ax)
+                }
+            });
+        } else if Self::is_multi_column_page(&spans) {
             use crate::pipeline::reading_order::{
                 ReadingOrderContext as ROContext, ReadingOrderStrategy, XYCutStrategy,
             };
@@ -10145,7 +10842,142 @@ impl PdfDocument {
     /// old reading order. False positives (single column routed through
     /// XY-cut) cost a bit of CPU but produce the same or better result.
     /// Both sides degrade gracefully.
+    /// True when the page splits into side-by-side columns separated by a clean
+    /// vertical gutter that no text span crosses.
+    ///
+    /// This is the small-page companion to the histogram detector in
+    /// [`Self::is_multi_column_page`]: a two-column page with only a handful of
+    /// wrapped lines per column (a short article, a synthetic fixture) carries
+    /// too few spans for a projection histogram to classify, yet the gutter is
+    /// perfectly unambiguous. We recover it directly:
+    ///
+    /// 1. Drop spans whose width exceeds 60 % of the content width — full-bleed
+    ///    headings/footers legitimately straddle the gutter and must not veto it
+    ///    (the recursive XY-Cut handles them with a horizontal cut first).
+    /// 2. Sweep the remaining boxes left-to-right merging their X extents; a
+    ///    forward jump of ≥ `MIN_GUTTER_PT` between the running right edge and
+    ///    the next box's left edge is an empty channel that no span crosses.
+    /// 3. Accept only when ≥ 2 spans sit on each side (genuine columns, not a
+    ///    stray indent or page number) and the two sides' vertical ranges
+    ///    overlap (columns sit beside each other, ruling out stacked blocks).
+    fn has_clean_column_gutter(spans: &[crate::layout::TextSpan]) -> bool {
+        /// Minimum empty-channel width. Real column gutters run ≥ 18pt; ordinary
+        /// inter-word/inter-cell gaps are both narrower and crossed by spans on
+        /// other lines, so they never survive the sweep.
+        const MIN_GUTTER_PT: f32 = 18.0;
+
+        // (x0, x1, y0, y1) for every non-empty, finite span.
+        let mut boxes: Vec<(f32, f32, f32, f32)> = spans
+            .iter()
+            .filter(|s| {
+                !s.text.trim().is_empty()
+                    && s.bbox.x.is_finite()
+                    && s.bbox.y.is_finite()
+                    && s.bbox.width.is_finite()
+                    && s.bbox.height.is_finite()
+                    && s.bbox.width > 0.0
+            })
+            .map(|s| (s.bbox.x, s.bbox.x + s.bbox.width, s.bbox.y, s.bbox.y + s.bbox.height))
+            .collect();
+        if boxes.len() < 4 {
+            return false;
+        }
+
+        let content_min_x = boxes.iter().map(|b| b.0).fold(f32::INFINITY, f32::min);
+        let content_max_x = boxes.iter().map(|b| b.1).fold(f32::NEG_INFINITY, f32::max);
+        let content_w = content_max_x - content_min_x;
+        if content_w < 100.0 {
+            return false; // a single narrow column cannot hold a gutter
+        }
+
+        // Exclude full-width headings/footers from the gutter sweep.
+        boxes.retain(|b| (b.1 - b.0) <= 0.6 * content_w);
+        if boxes.len() < 4 {
+            return false;
+        }
+        boxes.sort_by(|a, b| crate::utils::safe_float_cmp(a.0, b.0));
+
+        // Grid-row guard. A two-column body has exactly one text run per column
+        // on a line, so a row carries at most one wide internal gap (the
+        // gutter). A table / form row instead has several cells, i.e. two or
+        // more wide internal gaps. Group the (heading-excluded) boxes into rows
+        // by baseline and, when the majority of multi-box rows carry ≥ 2
+        // significant internal gaps, treat the page as a grid and bail — a
+        // single wide middle gap on a 2×N cell grid would otherwise read as a
+        // lone gutter. Mirrors the grid-row discriminator on the histogram path.
+        const MIN_GAP_PT: f32 = 6.0;
+        let mut rows: std::collections::BTreeMap<i32, Vec<(f32, f32)>> =
+            std::collections::BTreeMap::new();
+        for &(x0, x1, _y0, y1) in &boxes {
+            rows.entry(y1.round() as i32).or_default().push((x0, x1));
+        }
+        let (mut multi_gap_rows, mut counted_rows) = (0usize, 0usize);
+        for cells in rows.values() {
+            if cells.len() < 2 {
+                continue;
+            }
+            let mut s = cells.clone();
+            s.sort_by(|a, b| crate::utils::safe_float_cmp(a.0, b.0));
+            let gaps = s
+                .windows(2)
+                .filter(|w| w[1].0 - w[0].1 >= MIN_GAP_PT)
+                .count();
+            counted_rows += 1;
+            if gaps >= 2 {
+                multi_gap_rows += 1;
+            }
+        }
+        if counted_rows > 0 && multi_gap_rows * 2 >= counted_rows {
+            return false; // grid / form, not a two-column body
+        }
+
+        // Sweep-merge X extents and collect EVERY ≥ MIN_GUTTER_PT forward jump
+        // (a vertical channel no span crosses). A genuine two-column body has
+        // exactly ONE such corridor — the gutter; the lines inside each column
+        // overlap horizontally, so a column's own extents merge into a single
+        // contiguous run. A short-cell table (numeric grid, form) instead leaves
+        // a corridor between every cell column, so two or more qualifying gaps
+        // means a grid / multi-region layout, not two columns — reject it
+        // (matching the grid-row discriminator on the histogram path).
+        let mut cover_right = boxes[0].1;
+        let mut gutter_splits: Vec<usize> = Vec::new();
+        for i in 1..boxes.len() {
+            if boxes[i].0 - cover_right >= MIN_GUTTER_PT {
+                gutter_splits.push(i);
+            }
+            cover_right = cover_right.max(boxes[i].1);
+        }
+        if gutter_splits.len() != 1 {
+            return false; // 0 = single column; ≥ 2 = grid / multi-region
+        }
+
+        let (left, right) = boxes.split_at(gutter_splits[0]);
+        if left.len() < 2 || right.len() < 2 {
+            return false;
+        }
+        // Vertical ranges of the two sides must overlap — otherwise the
+        // "columns" are vertically stacked blocks (e.g. a body block above a
+        // sidebar), which read fine row-aware.
+        let l_y0 = left.iter().map(|b| b.2).fold(f32::INFINITY, f32::min);
+        let l_y1 = left.iter().map(|b| b.3).fold(f32::NEG_INFINITY, f32::max);
+        let r_y0 = right.iter().map(|b| b.2).fold(f32::INFINITY, f32::min);
+        let r_y1 = right.iter().map(|b| b.3).fold(f32::NEG_INFINITY, f32::max);
+        let overlap = l_y1.min(r_y1) - l_y0.max(r_y0);
+        let min_height = (l_y1 - l_y0).min(r_y1 - r_y0);
+        min_height > 0.0 && overlap > 0.5 * min_height
+    }
+
     fn is_multi_column_page(spans: &[crate::layout::TextSpan]) -> bool {
+        // Clean-gutter detector (handles short pages the histogram gates below
+        // reject for lack of spans). A genuine empty vertical channel that no
+        // span crosses, with multi-line content of overlapping vertical extent
+        // on both sides, is the unambiguous geometric signature of side-by-side
+        // columns — recoverable for untagged pages only from layout (XY-Cut,
+        // ISO 32000-1 §9.4, since there is no logical-structure hint).
+        if Self::has_clean_column_gutter(spans) {
+            return true;
+        }
+
         if spans.len() < 12 {
             return false; // too few to confidently split into columns
         }
@@ -12919,6 +13751,7 @@ impl PdfDocument {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             })
             .collect();
 
@@ -13704,11 +14537,175 @@ impl PdfDocument {
             return Some(h);
         }
         let font = self.load_object(font_ref).ok()?;
-        let h = Self::font_identity_hash_cheap(&font);
+        let h = self.font_identity_hash_with_descendants(&font);
         self.font_id_hash_cache
             .lock_or_recover()
             .insert(font_ref, h);
         Some(h)
+    }
+
+    /// Document-aware extension of `font_identity_hash_cheap` that resolves
+    /// `/DescendantFonts` references on Type0 fonts and folds the descendant
+    /// CIDFont's width metrics (`/DW`, `/DW2`, `/W`, `/W2`) into the hash.
+    ///
+    /// Without this, two Type0 fonts whose Type0 dicts have identical inline
+    /// shape (same BaseFont, Encoding, ToUnicode/DescendantFonts refs) but
+    /// whose referenced CIDFonts carry different vertical metrics collide on
+    /// the Layer 5/6 caches — the second document silently inherits the
+    /// first's `w1y` and renders vertical text at the wrong advance. This is
+    /// the same bug class as the ToUnicode-stream poisoning fixed in
+    /// `a327bcd` and the `/Widths` poisoning fixed in #598, applied to the
+    /// descendant CIDFont's horizontal AND vertical width arrays.
+    ///
+    /// Cost: one `load_object` per descendant CIDFont (typically one) on the
+    /// first call; subsequent calls hit `font_id_hash_cache`. The descendant
+    /// load is the same work `FontInfo::from_dict` will do later, so the
+    /// marginal cost when a font actually needs parsing is zero; the only
+    /// new work is on cache *hits* that previously skipped descendant
+    /// resolution entirely. In return we trade off one indirect-ref load per
+    /// unique Type0 font per process for correctness on /W2 + /DW2.
+    fn font_identity_hash_with_descendants(&self, font_obj: &Object) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Seed with the cheap inline hash so existing identity coverage is
+        // preserved bit-for-bit when there are no descendants to fold in.
+        let base = Self::font_identity_hash_cheap(font_obj);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        base.hash(&mut hasher);
+
+        if let Some(d) = font_obj.as_dict() {
+            if let Some(Object::Array(arr)) = d.get("DescendantFonts") {
+                // Domain separator for the descendant section.
+                11u8.hash(&mut hasher);
+                for item in arr {
+                    let resolved = match item {
+                        Object::Reference(r) => self.load_object(*r).ok(),
+                        Object::Dictionary(_) => Some(item.clone()),
+                        _ => None,
+                    };
+                    let desc = match resolved {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    let dd = match desc.as_dict() {
+                        Some(dd) => dd,
+                        None => continue,
+                    };
+
+                    // /DW — default horizontal width on the CIDFont. Always
+                    // int in well-formed PDFs; we accept Real defensively.
+                    if let Some(dw) = dd.get("DW") {
+                        12u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(dw, &mut hasher);
+                    }
+                    // /DW2 — default vertical metrics [v_y w1y]. Two-element
+                    // numeric array per ISO 32000-1 §9.7.4.3.
+                    if let Some(dw2) = dd.get("DW2") {
+                        13u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(dw2, &mut hasher);
+                    }
+                    // /W — per-CID horizontal widths, may use form-a
+                    // (c [w1 w2 …]) or form-b (c_first c_last w).
+                    if let Some(w) = dd.get("W") {
+                        14u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(w, &mut hasher);
+                    }
+                    // /W2 — per-CID vertical metrics, analogous to /W.
+                    if let Some(w2) = dd.get("W2") {
+                        15u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(w2, &mut hasher);
+                    }
+                    // /CIDSystemInfo — folded so otherwise-identical dicts
+                    // targeting different registries don't collide.
+                    if let Some(csi) = dd.get("CIDSystemInfo") {
+                        16u8.hash(&mut hasher);
+                        Self::hash_pdf_object_deterministic(csi, &mut hasher);
+                    }
+                }
+            }
+        }
+
+        hasher.finish()
+    }
+
+    /// Hash a PDF `Object` deterministically. Used by the descendant-aware
+    /// font identity hash to fold raw width-array content into the key.
+    ///
+    /// Cycles are not possible for /W, /W2, /DW2 or /CIDSystemInfo content
+    /// in any conformant PDF: these are pure data subtrees (numbers,
+    /// arrays of numbers, occasional name/integer dicts), never indirect
+    /// references back to a font dict. We still avoid recursing into
+    /// streams (whose data we deliberately exclude from the cheap hash)
+    /// and into unresolved references (we hash the ref's id/gen, not the
+    /// pointed-to bytes — the per-font cache key already covers the
+    /// referenced descendant CIDFont).
+    fn hash_pdf_object_deterministic<H: std::hash::Hasher>(obj: &Object, hasher: &mut H) {
+        use std::hash::Hash;
+        match obj {
+            Object::Null => 0u8.hash(hasher),
+            Object::Boolean(b) => {
+                1u8.hash(hasher);
+                b.hash(hasher);
+            },
+            Object::Integer(i) => {
+                2u8.hash(hasher);
+                i.hash(hasher);
+            },
+            // Bit-pattern hash so two equal values hash identically without
+            // tripping over f64's missing `Hash` impl. NaN is not produced
+            // by PDF parsers from numeric tokens.
+            Object::Real(r) => {
+                3u8.hash(hasher);
+                r.to_bits().hash(hasher);
+            },
+            Object::String(s) => {
+                4u8.hash(hasher);
+                s.hash(hasher);
+            },
+            Object::Name(n) => {
+                5u8.hash(hasher);
+                n.hash(hasher);
+            },
+            Object::Array(arr) => {
+                6u8.hash(hasher);
+                (arr.len() as u64).hash(hasher);
+                for item in arr {
+                    Self::hash_pdf_object_deterministic(item, hasher);
+                }
+            },
+            Object::Dictionary(d) => {
+                7u8.hash(hasher);
+                // Sort keys for deterministic ordering — HashMap iteration
+                // is randomized per process.
+                let mut keys: Vec<&str> = d.keys().map(|k| k.as_str()).collect();
+                keys.sort_unstable();
+                (keys.len() as u64).hash(hasher);
+                for k in keys {
+                    k.hash(hasher);
+                    if let Some(v) = d.get(k) {
+                        Self::hash_pdf_object_deterministic(v, hasher);
+                    }
+                }
+            },
+            Object::Reference(r) => {
+                8u8.hash(hasher);
+                r.id.hash(hasher);
+                r.gen.hash(hasher);
+            },
+            // Streams: dict shape only; we do not pull stream data into
+            // the font identity hash (kept consistent with the cheap path).
+            Object::Stream { dict, .. } => {
+                9u8.hash(hasher);
+                let mut keys: Vec<&str> = dict.keys().map(|k| k.as_str()).collect();
+                keys.sort_unstable();
+                (keys.len() as u64).hash(hasher);
+                for k in keys {
+                    k.hash(hasher);
+                    if let Some(v) = dict.get(k) {
+                        Self::hash_pdf_object_deterministic(v, hasher);
+                    }
+                }
+            },
+        }
     }
 
     fn font_identity_hash_cheap(font_obj: &Object) -> u64 {
@@ -14021,8 +15018,14 @@ impl PdfDocument {
                         all_from_cache = false;
                         let font = self.load_object(font_ref)?;
 
-                        // Compute identity hash (cheap: 3-6 dict lookups, ~200ns)
-                        let id_hash = Self::font_identity_hash_cheap(&font);
+                        // Compute identity hash. For Type0 fonts this also
+                        // resolves the descendant CIDFont and folds its
+                        // /DW, /DW2, /W, /W2 into the key — otherwise two
+                        // Type0 fonts whose top-level dicts have identical
+                        // inline shape but whose CIDFonts ship different
+                        // horizontal or vertical metrics would collide on
+                        // the Layer 5/6 caches.
+                        let id_hash = self.font_identity_hash_with_descendants(&font);
 
                         // Type 3 fonts and subset fonts must not cross
                         // PdfDocument boundaries via the global cache — their
@@ -14362,6 +15365,7 @@ impl PdfDocument {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             })
             .collect();
 
@@ -14613,6 +15617,32 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        self.to_markdown_inner(page_index, options, &[])
+    }
+
+    /// Convert a page to Markdown with caller-supplied extra spans merged into
+    /// the converter's reading-order pass — the structured-output companion to
+    /// [`extract_text_with_extra_spans`](Self::extract_text_with_extra_spans).
+    /// The Auto extractor uses this to drop OCR'd image text into its figure's
+    /// reading-order slot for Markdown, so auto markdown is a superset of native.
+    // Only the (ocr-gated) Auto extractor calls this, so compile it only with
+    // the `ocr` feature — a non-`ocr` build omits it (no dead code).
+    #[cfg(feature = "ocr")]
+    pub(crate) fn to_markdown_with_extra_spans(
+        &self,
+        page_index: usize,
+        extra_spans: &[crate::layout::TextSpan],
+        options: &crate::converters::ConversionOptions,
+    ) -> Result<String> {
+        self.to_markdown_inner(page_index, options, extra_spans)
+    }
+
+    fn to_markdown_inner(
+        &self,
+        page_index: usize,
+        options: &crate::converters::ConversionOptions,
+        extra_spans: &[crate::layout::TextSpan],
+    ) -> Result<String> {
         if self.is_encrypted_unreadable() {
             log::warn!("PDF is encrypted and could not be decrypted; returning empty markdown");
             return Ok(String::new());
@@ -14622,6 +15652,14 @@ impl PdfDocument {
         // (#609: markdown previously ignored `exclude_regions`/`include_region`,
         // which were only honoured by the plain-text path).
         let base_spans = Self::apply_region_filters(self.extract_spans(page_index)?, options);
+
+        // Vertical CJK (tategaki, ISO 32000-1 §9.7.4.3): the column-major text is
+        // a single flowing paragraph. The horizontal converter pipeline would
+        // mis-read its columns (and the spatial table fallback mis-fires on
+        // them), so mirror the plain-text path and emit the column-major text.
+        if let Some(vertical) = Self::try_assemble_vertical_cjk(&base_spans) {
+            return Ok(vertical);
+        }
 
         let tables = if options.extract_tables {
             // text_fallback=true: to_markdown explicitly targets structured output,
@@ -14636,10 +15674,13 @@ impl PdfDocument {
         if options.include_form_fields {
             spans.extend(self.extract_widget_spans(page_index));
         }
+        // Caller-supplied spans (e.g. OCR'd image text from the Auto extractor),
+        // each carrying the MCID/position that drops it into reading order.
+        spans.extend_from_slice(extra_spans);
 
         let pipeline_config = TextPipelineConfig::from_conversion_options(options);
 
-        let (mcid_order, mcid_to_role, mcid_to_block_id) = {
+        let (mcid_order, mcid_to_role, mcid_to_block_id, mcid_preformatted) = {
             // Use structure-tree reading order only when trustworthy (§14.8.2.3.1):
             // honours /MarkInfo /Suspects so markdown stays consistent with
             // extract_text / to_plain_text. (The /Table-element table path in
@@ -14671,9 +15712,14 @@ impl PdfDocument {
                     std::collections::HashMap::new();
                 let mut block_map: std::collections::HashMap<u32, u32> =
                     std::collections::HashMap::new();
+                let mut preformatted_set: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
                 if let Some(content) = cached_page {
                     for item in content {
                         if let Some(mcid) = item.mcid {
+                            if item.preformatted {
+                                preformatted_set.insert(mcid);
+                            }
                             // Heading takes precedence over list role on the
                             // same MCR (a heading-marked-content doesn't
                             // also play a list role in any sane PDF).
@@ -14739,6 +15785,11 @@ impl PdfDocument {
                 } else {
                     Some(block_map)
                 };
+                let preformatted_opt = if preformatted_set.is_empty() {
+                    None
+                } else {
+                    Some(preformatted_set)
+                };
 
                 if !order.is_empty() {
                     log::debug!(
@@ -14748,19 +15799,19 @@ impl PdfDocument {
                         block_map_opt.as_ref().map(|m| m.len()).unwrap_or(0),
                         page_index
                     );
-                    (Some(order), role_map_opt, block_map_opt)
+                    (Some(order), role_map_opt, block_map_opt, preformatted_opt)
                 } else {
                     log::debug!(
                         "No MCIDs found for page {}, reading order strategy will use geometric fallback",
                         page_index
                     );
-                    (None, role_map_opt, block_map_opt)
+                    (None, role_map_opt, block_map_opt, preformatted_opt)
                 }
             } else {
                 log::debug!(
                     "No structure tree found, reading order strategy will use geometric fallback"
                 );
-                (None, None, None)
+                (None, None, None, None)
             }
         };
 
@@ -14782,7 +15833,7 @@ impl PdfDocument {
         // and respect tagged paragraph boundaries even when the
         // geometric inter-paragraph gap is too small for the heuristic
         // (issue #377 D1 + D5 unlock).
-        if mcid_to_role.is_some() || mcid_to_block_id.is_some() {
+        if mcid_to_role.is_some() || mcid_to_block_id.is_some() || mcid_preformatted.is_some() {
             for s in ordered_spans.iter_mut() {
                 if let Some(mcid) = s.span.mcid {
                     if let Some(role) = mcid_to_role.as_ref().and_then(|m| m.get(&mcid)) {
@@ -14790,6 +15841,12 @@ impl PdfDocument {
                     }
                     if let Some(bid) = mcid_to_block_id.as_ref().and_then(|m| m.get(&mcid)) {
                         s.block_id = Some(*bid);
+                    }
+                    if mcid_preformatted
+                        .as_ref()
+                        .is_some_and(|m| m.contains(&mcid))
+                    {
+                        s.preformatted = true;
                     }
                 }
             }
@@ -14800,6 +15857,14 @@ impl PdfDocument {
         // suppress non-anchor spans of multi-MCID subtrees. Untagged
         // documents are no-ops.
         self.apply_actualtext_to_ordered_spans(page_index, &mut ordered_spans);
+
+        // Tag spans inside /Link annotations with their URI.
+        self.apply_link_annotations_to_ordered_spans(page_index, &mut ordered_spans);
+
+        // Correct right-to-left reading order (Arabic/Hebrew) before the
+        // converter emits spans verbatim — the converter pipeline does not
+        // reach the plain-text path's RTL passes.
+        Self::apply_rtl_logical_order_to_ordered_spans(&mut ordered_spans);
 
         // Step 8: Use pipeline converter with tables
         let converter = MarkdownOutputConverter::new();
@@ -15076,6 +16141,31 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        self.to_html_inner(page_index, options, &[])
+    }
+
+    /// Convert a page to HTML with caller-supplied extra spans merged into the
+    /// converter's reading-order pass — the HTML companion to
+    /// [`to_markdown_with_extra_spans`](Self::to_markdown_with_extra_spans).
+    // Only the (ocr-gated) Auto extractor calls this, so compile it only with
+    // the `ocr` feature — a non-`ocr` build omits it (no dead code).
+    #[cfg(feature = "ocr")]
+    pub(crate) fn to_html_with_extra_spans(
+        &self,
+        page_index: usize,
+        extra_spans: &[crate::layout::TextSpan],
+        options: &crate::converters::ConversionOptions,
+    ) -> Result<String> {
+        self.to_html_inner(page_index, options, extra_spans)
+    }
+
+    #[allow(clippy::wrong_self_convention)] // Needs mutable access for caching
+    fn to_html_inner(
+        &self,
+        page_index: usize,
+        options: &crate::converters::ConversionOptions,
+        extra_spans: &[crate::layout::TextSpan],
+    ) -> Result<String> {
         if self.is_encrypted_unreadable() {
             log::warn!("PDF is encrypted and could not be decrypted; returning empty HTML");
             return Ok(String::new());
@@ -15083,6 +16173,18 @@ impl PdfDocument {
         // Region filters applied up front so excluded content is gone from every
         // downstream path (#609), matching the markdown and plain-text surfaces.
         let base_spans = Self::apply_region_filters(self.extract_spans(page_index)?, options);
+
+        // Vertical CJK (tategaki, ISO 32000-1 §9.7.4.3): emit the column-major
+        // text as a single paragraph, mirroring the plain-text and markdown
+        // paths (the horizontal pipeline mis-reads vertical columns and the
+        // spatial table fallback mis-fires on them).
+        if let Some(vertical) = Self::try_assemble_vertical_cjk(&base_spans) {
+            let escaped = vertical
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            return Ok(format!("<p>{}</p>", escaped.trim()));
+        }
 
         let tables = if options.extract_tables {
             // text_fallback=true: to_html explicitly targets structured output,
@@ -15097,6 +16199,9 @@ impl PdfDocument {
         if options.include_form_fields {
             spans.extend(self.extract_widget_spans(page_index));
         }
+        // Caller-supplied spans (e.g. OCR'd image text from the Auto extractor),
+        // each carrying the MCID/position that drops it into reading order.
+        spans.extend_from_slice(extra_spans);
 
         let pipeline_config = TextPipelineConfig::from_conversion_options(options);
 
@@ -15121,6 +16226,14 @@ impl PdfDocument {
         // Apply struct-tree-scope /ActualText; see `to_markdown` for
         // the rationale.
         self.apply_actualtext_to_ordered_spans(page_index, &mut ordered_spans);
+
+        // Tag spans inside /Link annotations with their URI.
+        self.apply_link_annotations_to_ordered_spans(page_index, &mut ordered_spans);
+
+        // Correct right-to-left reading order (Arabic/Hebrew) before the
+        // converter emits spans verbatim — the converter pipeline does not
+        // reach the plain-text path's RTL passes.
+        Self::apply_rtl_logical_order_to_ordered_spans(&mut ordered_spans);
 
         // Step 7: Use pipeline converter with tables
         let converter = HtmlOutputConverter::new();
@@ -15245,6 +16358,16 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        // Encrypted-and-undecryptable parity: extract_text / to_markdown / to_html
+        // all short-circuit to an empty string here (ISO 32000-1:2008 §7.6); the
+        // geometric plain-text path below would also yield empty (no decryptable
+        // content) but went through the full pipeline first. Guard explicitly so
+        // every text surface returns the same empty result on the same input.
+        if self.is_encrypted_unreadable() {
+            log::warn!("PDF is encrypted and could not be decrypted; returning empty text");
+            return Ok(String::new());
+        }
+
         // #608: for a trustworthy tagged PDF, read in logical structure order
         // (§14.8.2.3.1) by assembling directly from the structure tree — the
         // same path `extract_text` uses. The geometric plain-text converter
@@ -15298,6 +16421,14 @@ impl PdfDocument {
         // Apply struct-tree-scope /ActualText; see `to_markdown` for
         // the rationale.
         self.apply_actualtext_to_ordered_spans(page_index, &mut ordered_spans);
+
+        // Tag spans inside /Link annotations with their URI.
+        self.apply_link_annotations_to_ordered_spans(page_index, &mut ordered_spans);
+
+        // Correct right-to-left reading order (Arabic/Hebrew) before the
+        // converter emits spans verbatim — the converter pipeline does not
+        // reach the plain-text path's RTL passes.
+        Self::apply_rtl_logical_order_to_ordered_spans(&mut ordered_spans);
 
         // Step 7: Use pipeline converter with tables
         let converter = PlainTextConverter::new();
@@ -17791,6 +18922,112 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// A span injected into a tagged page via `extract_text_with_extra_spans`
+    /// and carrying the MCID of a middle block must be emitted at that block's
+    /// position in structure order — not appended after the page. This is the
+    /// primitive the Auto extractor uses to drop OCR'd image text into the
+    /// figure's reading-order slot instead of after the whole page.
+    #[test]
+    fn extra_span_with_borrowed_mcid_lands_in_structure_order() {
+        // Three tagged paragraphs (MCID 0/1/2) drawn top-to-bottom.
+        let content = b"BT /F1 12 Tf\n\
+            /P <</MCID 0>> BDC 1 0 0 1 72 700 Tm (ALPHA) Tj EMC\n\
+            /P <</MCID 1>> BDC 1 0 0 1 72 600 Tm (BRAVO) Tj EMC\n\
+            /P <</MCID 2>> BDC 1 0 0 1 72 500 Tm (CHARLIE) Tj EMC\n\
+            ET\n";
+        let mut buf: Vec<u8> = Vec::new();
+        let mut off = vec![0usize; 9];
+        let obj = |buf: &mut Vec<u8>, off: &mut Vec<usize>, id: usize, body: &str| {
+            off[id] = buf.len();
+            buf.extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        let stream = |buf: &mut Vec<u8>, off: &mut Vec<usize>, id: usize, data: &[u8]| {
+            off[id] = buf.len();
+            buf.extend_from_slice(
+                format!("{id} 0 obj\n<< /Length {} >>\nstream\n", data.len()).as_bytes(),
+            );
+            buf.extend_from_slice(data);
+            buf.extend_from_slice(b"\nendstream\nendobj\n");
+        };
+        buf.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+        obj(
+            &mut buf,
+            &mut off,
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /MarkInfo << /Marked true >> /StructTreeRoot 7 0 R >>",
+        );
+        obj(&mut buf, &mut off, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        obj(
+            &mut buf,
+            &mut off,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /StructParents 0 >>",
+        );
+        stream(&mut buf, &mut off, 4, content);
+        obj(
+            &mut buf,
+            &mut off,
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        // Minimal struct tree: three /P kids referencing MCID 0/1/2.
+        obj(&mut buf, &mut off, 7, "<< /Type /StructTreeRoot /K [8 0 R] >>");
+        obj(
+            &mut buf,
+            &mut off,
+            8,
+            "<< /Type /StructElem /S /Document /K [<< /Type /StructElem /S /P /Pg 3 0 R /K 0 >> \
+             << /Type /StructElem /S /P /Pg 3 0 R /K 1 >> \
+             << /Type /StructElem /S /P /Pg 3 0 R /K 2 >>] >>",
+        );
+        let xref = buf.len();
+        buf.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+        for id in 1..=8 {
+            if id == 6 {
+                buf.extend_from_slice(b"0000000000 65535 f \n");
+                continue;
+            }
+            buf.extend_from_slice(format!("{:010} 00000 n \n", off[id]).as_bytes());
+        }
+        buf.extend_from_slice(b"trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n");
+        buf.extend_from_slice(format!("{xref}\n%%EOF\n").as_bytes());
+
+        let doc = PdfDocument::from_bytes(buf).unwrap();
+        // Plain extraction reads ALPHA, BRAVO, CHARLIE in order.
+        let plain = doc.extract_text(0).unwrap();
+        assert!(
+            plain.find("ALPHA") < plain.find("BRAVO")
+                && plain.find("BRAVO") < plain.find("CHARLIE"),
+            "baseline structure order wrong: {plain:?}"
+        );
+
+        // Inject a span carrying MCID 1 (BRAVO's block) positioned at BRAVO's
+        // y. It must land within BRAVO's group — after BRAVO, before CHARLIE —
+        // NOT appended after CHARLIE.
+        let extra = crate::layout::TextSpan {
+            text: "INSERTED".to_string(),
+            bbox: crate::geometry::Rect::new(72.0, 590.0, 50.0, 12.0),
+            font_size: 12.0,
+            mcid: Some(1),
+            ..Default::default()
+        };
+        let opts = crate::converters::ConversionOptions {
+            extract_tables: true,
+            ..Default::default()
+        };
+        let out = doc
+            .extract_text_with_extra_spans(0, vec![extra], &opts)
+            .unwrap();
+        let (a, b, ins, c) =
+            (out.find("ALPHA"), out.find("BRAVO"), out.find("INSERTED"), out.find("CHARLIE"));
+        assert!(ins.is_some(), "injected span dropped: {out:?}");
+        assert!(
+            a < b && b < ins && ins < c,
+            "injected span not placed in MCID-1 slot (expected ALPHA<BRAVO<INSERTED<CHARLIE): {out:?}"
+        );
+    }
+
     #[test]
     fn test_rotate_span_bbox_identity_and_180() {
         let r = crate::geometry::Rect::new(10.0, 20.0, 30.0, 5.0);
@@ -18664,6 +19901,97 @@ mod tests {
     // ========================================================================
 
     /// Helper to create a TextSpan with minimal required fields for testing.
+    #[test]
+    fn test_try_assemble_vertical_cjk_orders_columns_right_to_left() {
+        // Three columns of CJK glyphs; the right column (x=116) is read first,
+        // top-to-bottom, then the next column to the left, etc.
+        let mk = |t: &str, x: f32, y: f32| make_test_span(t, x, y, 18.0, 18.0);
+        let spans = vec![
+            mk("\u{4E00}", 116.0, 719.0),
+            mk("\u{4E8C}", 116.0, 701.0),
+            mk("\u{4E09}", 116.0, 683.0),
+            mk("\u{56DB}", 89.0, 719.0),
+            mk("\u{4E94}", 89.0, 701.0),
+            mk("\u{516D}", 89.0, 683.0),
+            mk("\u{4E03}", 62.0, 719.0),
+            mk("\u{516B}", 62.0, 701.0),
+            mk("\u{4E5D}", 62.0, 683.0),
+        ];
+        assert_eq!(
+            PdfDocument::try_assemble_vertical_cjk(&spans).as_deref(),
+            Some("\u{4E00}\u{4E8C}\u{4E09}\u{56DB}\u{4E94}\u{516D}\u{4E03}\u{516B}\u{4E5D}")
+        );
+    }
+
+    #[test]
+    fn test_try_assemble_vertical_cjk_horizontal_returns_none() {
+        // A horizontal CJK row (glyphs advance in X at a fixed Y) must NOT be
+        // detected as vertical — horizontal documents stay on the normal path.
+        let mk = |t: &str, x: f32| make_test_span(t, x, 700.0, 18.0, 18.0);
+        let spans = vec![
+            mk("\u{4E00}", 62.0),
+            mk("\u{4E8C}", 80.0),
+            mk("\u{4E09}", 98.0),
+            mk("\u{56DB}", 116.0),
+            mk("\u{4E94}", 134.0),
+            mk("\u{516D}", 152.0),
+            mk("\u{4E03}", 170.0),
+            mk("\u{516B}", 188.0),
+        ];
+        assert!(PdfDocument::try_assemble_vertical_cjk(&spans).is_none());
+    }
+
+    #[test]
+    fn test_try_assemble_vertical_cjk_multichar_runs_returns_none() {
+        // Horizontal CJK emitted as multi-character RUNS (a whole line per show
+        // op), stacked top-to-bottom. Each run's nearest neighbour is the run on
+        // the line above/below (vertical) — but these are horizontal lines, not
+        // tategaki columns. The single-glyph-span gate must keep this on the
+        // horizontal path so the reading order is not shredded.
+        let mk = |t: &str, y: f32| make_test_span(t, 60.0, y, 200.0, 18.0);
+        let spans = vec![
+            mk("標準マーケットモデルは", 700.0),
+            mk("次元で説明することは", 680.0),
+            mk("取引できない商品がマ", 660.0),
+            mk("クロ経済変数などである", 640.0),
+            mk("モデルを考えることは", 620.0),
+            mk("可能で非完備の場合は", 600.0),
+            mk("リスク中立確率は一意", 580.0),
+            mk("ではなく価格も一意でない", 560.0),
+        ];
+        assert!(PdfDocument::try_assemble_vertical_cjk(&spans).is_none());
+    }
+
+    #[test]
+    fn test_try_assemble_vertical_cjk_latin_returns_none() {
+        // A Latin page is not CJK-majority → None (never vertical).
+        let spans: Vec<TextSpan> = "the quick brown fox jumps over a lazy dog today"
+            .split(' ')
+            .enumerate()
+            .map(|(i, w)| make_test_span(w, 60.0 + i as f32 * 40.0, 700.0, 30.0, 12.0))
+            .collect();
+        assert!(PdfDocument::try_assemble_vertical_cjk(&spans).is_none());
+    }
+
+    #[test]
+    fn test_push_line_breaks_table_row_single_newline() {
+        // A table-row boundary (single_break = true) emits exactly one newline
+        // regardless of the geometric row pitch.
+        let prev = make_test_span("North", 72.0, 700.0, 30.0, 12.0);
+        let span = make_test_span("South", 72.0, 676.0, 30.0, 12.0); // 24pt gap ≈ 1.7em
+        let mut out = String::new();
+        PdfDocument::push_line_breaks(&mut out, &prev, &span, 24.0, true);
+        assert_eq!(out, "\n", "table row boundary must be a single newline");
+        // The same gap WITHOUT the table flag rounds to a blank line (2).
+        let mut out2 = String::new();
+        PdfDocument::push_line_breaks(&mut out2, &prev, &span, 24.0, false);
+        assert_eq!(out2, "\n\n", "non-table ~1.7em gap keeps the geometric blank line");
+        // A single-line gap stays one newline either way.
+        let mut out3 = String::new();
+        PdfDocument::push_line_breaks(&mut out3, &prev, &span, 14.0, false);
+        assert_eq!(out3, "\n");
+    }
+
     fn make_test_span(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextSpan {
         TextSpan {
             artifact_type: None,
@@ -18692,6 +20020,7 @@ mod tests {
             char_widths: vec![],
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 
@@ -18865,6 +20194,40 @@ mod tests {
         assert!(PdfDocument::should_insert_space(&prev, &current));
     }
 
+    /// Two glyphs of the same complex Brahmic script with an intra-word
+    /// gap (a Bengali matra-cluster `ছো` followed by `ট`, ~9pt apart at 13pt)
+    /// must NOT get a heuristic space — word breaks in these scripts are
+    /// carried by explicit SPACE glyphs (§14.8.2.5), and the Latin-tuned gap
+    /// test otherwise splits syllables (`ছো ট`). Mirrors the CJK guard.
+    #[test]
+    fn test_should_insert_space_suppressed_within_complex_script() {
+        // Bengali: prev ends in matra ো (U+09CB), next is consonant ট (U+09AF…
+        // here U+099F) — same script, ~9pt gap.
+        let prev = make_test_span("\u{099B}\u{09CB}", 0.0, 100.0, 7.0, 13.0);
+        let current = make_test_span("\u{099F}", 16.0, 100.0, 5.0, 13.0);
+        assert!(
+            !PdfDocument::should_insert_space(&prev, &current),
+            "intra-word complex-script gap must not insert a space"
+        );
+        // Tamil likewise (prev ends in vowel sign ை U+0BC8, next consonant).
+        let p2 = make_test_span("\u{0B87}\u{0BA9}\u{0BC8}", 0.0, 100.0, 20.0, 13.0);
+        let c2 = make_test_span("\u{0B9A}\u{0BCD}", 30.0, 100.0, 8.0, 13.0);
+        assert!(!PdfDocument::should_insert_space(&p2, &c2));
+    }
+
+    /// The guard is script-specific: a complex-script glyph meeting a Latin
+    /// glyph across a real gap still gets its boundary space (only *same*-script
+    /// intra-word gaps are suppressed).
+    #[test]
+    fn test_should_insert_space_kept_across_script_boundary() {
+        let prev = make_test_span("\u{0B95}", 0.0, 100.0, 12.0, 13.0); // Tamil க
+        let current = make_test_span("A", 18.0, 100.0, 8.0, 13.0); // Latin
+        assert!(
+            PdfDocument::should_insert_space(&prev, &current),
+            "complex↔Latin boundary gap must keep its space"
+        );
+    }
+
     // ========================================================================
     // is_column_spanning_decimal / push_span_text tests (nougat_018 fix)
     // ========================================================================
@@ -18902,6 +20265,7 @@ mod tests {
             char_widths,
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 
@@ -19254,6 +20618,253 @@ mod tests {
             "#557: per-word RTL spans must be reordered into logical word order \
              without char-flipping (got {texts:?})"
         );
+    }
+
+    // #656/#657: the tagged struct-tree path collapses a page into one MCID
+    // whose pure-RTL word-spans are laid out left-to-right (visual, X
+    // ascending). `order_mcid_spans` must emit them right-to-left (logical)
+    // using geometry, since the tagged path never reaches the untagged
+    // `reverse_rtl_visual_order_runs`. (Per-span glyph order is handled
+    // separately by `push_span_text_bidi`; this test asserts span ORDER.)
+    #[test]
+    fn test_order_mcid_spans_pure_rtl_emitted_right_to_left() {
+        // One Hebrew row, three words placed left-to-right by X.
+        let spans = vec![
+            make_rtl_test_span("שלוש", 100.0, 700.0), // leftmost  → logically last
+            make_rtl_test_span("שתיים", 200.0, 700.0),
+            make_rtl_test_span("אחת", 300.0, 700.0), // rightmost → logically first
+        ];
+        let ordered = PdfDocument::order_mcid_spans(&spans);
+        let texts: Vec<&str> = ordered.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["אחת", "שתיים", "שלוש"],
+            "pure-RTL MCID spans must emit rightmost-first (logical RTL order), got {texts:?}"
+        );
+    }
+
+    /// A pure-RTL line whose zero-advance glyphs (hamza seats, marks,
+    /// producer-positioned consonants) are drawn a couple of points off the
+    /// baseline must NOT be scattered into separate rows. The fixed quantized
+    /// row band split them out and emitted them first (the leading stray-alef
+    /// cluster); font-relative line grouping keeps the whole line together and
+    /// in rightmost-first order.
+    #[test]
+    fn test_order_pure_rtl_spans_keeps_jittery_baseline_in_one_line() {
+        // Five Arabic letters on ONE visual line at X = 300..100 (rightmost
+        // first is logical), but with ±2pt baseline jitter — two of them drawn
+        // above the baseline as a zero-width producer would. Font size 12 →
+        // tolerance 6pt, so the 4pt spread stays a single line.
+        let spans = vec![
+            make_rtl_test_span("\u{0627}", 300.0, 701.0), // ا  rightmost, +1
+            make_rtl_test_span("\u{0644}", 250.0, 703.0), // ل  above baseline
+            make_rtl_test_span("\u{0642}", 200.0, 700.0), // ق  baseline
+            make_rtl_test_span("\u{0637}", 150.0, 702.0), // ط
+            make_rtl_test_span("\u{0645}", 100.0, 699.0), // م  leftmost, -1
+        ];
+        let ordered = PdfDocument::order_pure_rtl_spans(&spans);
+        let texts: Vec<&str> = ordered.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["\u{0627}", "\u{0644}", "\u{0642}", "\u{0637}", "\u{0645}"],
+            "jittery-baseline RTL line must stay in one rightmost-first run, got {texts:?}"
+        );
+    }
+
+    /// Genuinely separate RTL lines (leading ~1.2x font size) must still break:
+    /// the font-relative tolerance groups jitter, not whole lines.
+    #[test]
+    fn test_order_pure_rtl_spans_breaks_distinct_lines() {
+        // Two lines, 14pt apart (font size 12 → tol 6pt, so they split). Each
+        // line emits rightmost-first; the top line precedes the bottom line.
+        let spans = vec![
+            make_rtl_test_span("\u{0628}", 200.0, 714.0), // top-left
+            make_rtl_test_span("\u{0627}", 300.0, 714.0), // top-right
+            make_rtl_test_span("\u{062F}", 200.0, 700.0), // bottom-left
+            make_rtl_test_span("\u{062C}", 300.0, 700.0), // bottom-right
+        ];
+        let ordered = PdfDocument::order_pure_rtl_spans(&spans);
+        let texts: Vec<&str> = ordered.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["\u{0627}", "\u{0628}", "\u{062C}", "\u{062F}"],
+            "distinct RTL lines must break (top first, each rightmost-first), got {texts:?}"
+        );
+    }
+
+    /// The converter-pipeline RTL pass must reorder a pure-RTL line
+    /// rightmost-first and reverse each span's glyphs to logical order, so the
+    /// markdown/HTML converters (which emit spans verbatim) get logical Arabic
+    /// /Hebrew. Mirrors the plain-text path on `OrderedTextSpan`.
+    #[test]
+    fn test_apply_rtl_logical_order_to_ordered_spans() {
+        use crate::pipeline::OrderedTextSpan;
+        let mk = |t: &str, x: f32| OrderedTextSpan::new(make_rtl_test_span(t, x, 700.0), 0);
+        // Two Hebrew word-spans drawn left-to-right (visual), each with its
+        // glyphs in visual (reversed) order. Logical: rightmost span first,
+        // glyphs un-reversed.
+        let mut spans = vec![
+            mk("\u{05D2}\u{05D1}\u{05D0}", 100.0), // visual גבא  → logical אבג
+            mk("\u{05D5}\u{05D4}", 200.0),         // visual וה   → logical הו
+        ];
+        PdfDocument::apply_rtl_logical_order_to_ordered_spans(&mut spans);
+        assert_eq!(spans[0].span.text, "\u{05D4}\u{05D5}", "rightmost-first + glyphs logical");
+        assert_eq!(spans[1].span.text, "\u{05D0}\u{05D1}\u{05D2}");
+    }
+
+    /// Pure-LTR ordered spans are byte-identical after the pass (fast path).
+    #[test]
+    fn test_apply_rtl_logical_order_leaves_ltr_untouched() {
+        use crate::pipeline::OrderedTextSpan;
+        let mut spans = vec![
+            OrderedTextSpan::new(make_rtl_test_span("Hello", 100.0, 700.0), 0),
+            OrderedTextSpan::new(make_rtl_test_span("World", 200.0, 700.0), 1),
+        ];
+        PdfDocument::apply_rtl_logical_order_to_ordered_spans(&mut spans);
+        assert_eq!(spans[0].span.text, "Hello");
+        assert_eq!(spans[1].span.text, "World");
+    }
+
+    // #656: grapheme-aware RTL reversal keeps Arabic combining marks bound to
+    // their base letter (vs. a naive chars().rev() that floats them off).
+    #[test]
+    fn test_reverse_rtl_keeping_marks_keeps_diacritics_attached() {
+        // قِطّ = QAF + KASRA(U+0650) + TAH + SHADDA(U+0651). Reversing must
+        // keep each mark immediately after its base, not lead the string.
+        let src = "\u{0642}\u{0650}\u{0637}\u{0651}"; // قِطّ
+        let out = PdfDocument::reverse_rtl_keeping_marks(src);
+        // Expected: base order reversed (TAH+SHADDA group, then QAF+KASRA group).
+        assert_eq!(out, "\u{0637}\u{0651}\u{0642}\u{0650}");
+        // No combining mark ever leads a base it doesn't belong to: every
+        // diacritic is immediately preceded by a non-diacritic.
+        let chars: Vec<char> = out.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if crate::text::rtl_detector::is_rtl_diacritic(*c as u32) {
+                assert!(
+                    i > 0 && !crate::text::rtl_detector::is_rtl_diacritic(chars[i - 1] as u32),
+                    "diacritic at {i} is detached from its base"
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // RTL neutral-punctuation reversal (push_span_text_bidi)
+    // ========================================================================
+
+    /// A neutral-only span ("<space><comma>") inside a pure-RTL run carries its
+    /// glyphs in visual draw order; emitting it under an RTL run must reverse it
+    /// to logical order ("<comma><space>") so the comma re-attaches to the word
+    /// it follows. Reproduces the wiki-cat-he `הטורפים, ממשפחת` case.
+    #[test]
+    fn test_push_span_text_bidi_reverses_neutral_span_in_rtl_run() {
+        let span = make_rtl_test_span(" ,", 270.0, 700.0);
+        let mut out = String::from("\u{05D4}\u{05D8}\u{05D5}\u{05E8}"); // a Hebrew word
+        PdfDocument::push_span_text_bidi(&mut out, &span, true);
+        assert!(out.ends_with(", "), "neutral span not reversed to logical: {out:?}");
+        assert!(!out.ends_with(" ,"), "visual order leaked into output: {out:?}");
+    }
+
+    /// The same neutral-only span in a non-RTL run (rtl_run = false) is emitted
+    /// verbatim — LTR text keeps visual == logical order, so reversal would be
+    /// wrong. Pins the no-regression contract for LTR documents.
+    #[test]
+    fn test_push_span_text_bidi_keeps_neutral_span_in_ltr_run() {
+        let span = make_rtl_test_span(" ,", 270.0, 700.0);
+        let mut out = String::from("word");
+        PdfDocument::push_span_text_bidi(&mut out, &span, false);
+        assert_eq!(out, "word ,", "LTR neutral span must be emitted verbatim");
+    }
+
+    /// A neutral span that embeds a digit (a left-to-right sub-run) must NOT be
+    /// reversed even inside an RTL run — reversing `2009` would corrupt the year
+    /// to `9002`. Guards the digit-exclusion in `is_reversible_rtl_neutral_span`.
+    #[test]
+    fn test_push_span_text_bidi_does_not_reverse_digit_bearing_span() {
+        let span = make_rtl_test_span("2009,", 270.0, 700.0);
+        let mut out = String::new();
+        PdfDocument::push_span_text_bidi(&mut out, &span, true);
+        assert_eq!(out, "2009,", "digit-bearing span must not be reversed");
+    }
+
+    #[test]
+    fn test_is_reversible_rtl_neutral_span_classification() {
+        // Reversible: at least one reorderable punctuation mark + ≥2 chars.
+        assert!(PdfDocument::is_reversible_rtl_neutral_span(" ,"));
+        assert!(PdfDocument::is_reversible_rtl_neutral_span(" ."));
+        assert!(PdfDocument::is_reversible_rtl_neutral_span(". "));
+        assert!(PdfDocument::is_reversible_rtl_neutral_span(" \u{060C}")); // Arabic comma
+                                                                           // Not reversible: single char (reverses to itself), bare spaces, or
+                                                                           // anything carrying a letter / digit / bracket / quote.
+        assert!(!PdfDocument::is_reversible_rtl_neutral_span(","));
+        assert!(!PdfDocument::is_reversible_rtl_neutral_span("  "));
+        assert!(!PdfDocument::is_reversible_rtl_neutral_span(" 9"));
+        assert!(!PdfDocument::is_reversible_rtl_neutral_span(" )"));
+        assert!(!PdfDocument::is_reversible_rtl_neutral_span(" \""));
+        assert!(!PdfDocument::is_reversible_rtl_neutral_span("a,"));
+    }
+
+    #[test]
+    fn test_strip_interior_arabic_spaces() {
+        // Spurious space between two Arabic letters (cursive join) is dropped.
+        // قِ ل ا  →  قِلا  (space between kasra-marked qaf and lam removed).
+        assert_eq!(
+            PdfDocument::strip_interior_arabic_spaces("\u{0642}\u{0650} \u{0644}\u{0627}"),
+            "\u{0642}\u{0650}\u{0644}\u{0627}"
+        );
+        // A combining mark adjacent to the space does not hide the base letter.
+        assert_eq!(
+            PdfDocument::strip_interior_arabic_spaces("\u{0642} \u{0650}\u{0644}"),
+            "\u{0642}\u{0650}\u{0644}"
+        );
+        // Leading / trailing spaces (real word-break candidates) are preserved.
+        assert_eq!(
+            PdfDocument::strip_interior_arabic_spaces(" \u{0642}\u{0644} "),
+            " \u{0642}\u{0644} "
+        );
+        // Non-Arabic flanks are left alone: Hebrew (non-cursive) keeps its space.
+        assert_eq!(
+            PdfDocument::strip_interior_arabic_spaces("\u{05E9} \u{05DC}"),
+            "\u{05E9} \u{05DC}"
+        );
+        // Space between an Arabic letter and a digit is a real boundary — kept.
+        assert_eq!(PdfDocument::strip_interior_arabic_spaces("\u{0642} 5"), "\u{0642} 5");
+        // No spaces → fast path returns the input unchanged.
+        assert_eq!(
+            PdfDocument::strip_interior_arabic_spaces("\u{0642}\u{0644}"),
+            "\u{0642}\u{0644}"
+        );
+    }
+
+    #[test]
+    fn test_mcid_run_is_pure_rtl() {
+        let pure_rtl = vec![
+            make_rtl_test_span("\u{05E9}\u{05DC}\u{05D5}\u{05DD}", 100.0, 700.0),
+            make_rtl_test_span(" ,", 90.0, 700.0),
+        ];
+        assert!(PdfDocument::mcid_run_is_pure_rtl(&pure_rtl));
+        // RTL + Latin → not pure-RTL (full UAX #9 deferred).
+        let mixed = vec![
+            make_rtl_test_span("\u{05E9}\u{05DC}\u{05D5}\u{05DD}", 100.0, 700.0),
+            make_rtl_test_span("World", 200.0, 700.0),
+        ];
+        assert!(!PdfDocument::mcid_run_is_pure_rtl(&mixed));
+        // No RTL at all → not pure-RTL.
+        let ltr = vec![make_rtl_test_span("Hello", 100.0, 700.0)];
+        assert!(!PdfDocument::mcid_run_is_pure_rtl(&ltr));
+    }
+
+    // Mixed RTL+Latin MCIDs are left in raw order (full UAX #9 deferred) —
+    // guards against the pure-RTL reorder accidentally firing on mixed runs.
+    #[test]
+    fn test_order_mcid_spans_mixed_rtl_latin_kept_raw() {
+        let spans = vec![
+            make_rtl_test_span("שלום", 100.0, 700.0),
+            make_rtl_test_span("World", 200.0, 700.0),
+        ];
+        let ordered = PdfDocument::order_mcid_spans(&spans);
+        let texts: Vec<&str> = ordered.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["שלום", "World"], "mixed RTL+Latin must stay in raw order");
     }
 
     // #553: bare page-number detection (applied only inside the margin band).
@@ -22126,6 +23737,7 @@ mod tests {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             }
         }
 
@@ -22190,6 +23802,7 @@ mod tests {
             char_widths: vec![],
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 
@@ -22464,6 +24077,20 @@ mod tests {
         assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("5 \u{00AC} 3"), "5 \u{00AC} 3");
         // Leading/trailing `¬` with only one digit neighbour: untouched.
         assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("\u{00AC}5"), "\u{00AC}5");
+        // Spaced decimal: a subset that emits a single space between the decimal
+        // glyph and the fractional digits → drop the lone space, recover `.`.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("1\u{00AC} 00"), "1.00");
+        assert_eq!(
+            PdfDocument::fix_digit_logicalnot_decimal("0\u{00AC} 75 1\u{00AC} 00"),
+            "0.75 1.00"
+        );
+        // Still NOT a decimal when the leading digit does not abut `¬`
+        // (genuine spaced negation): `5 ¬ 3` stays untouched even though a
+        // digit follows the space.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("5 \u{00AC} 3"), "5 \u{00AC} 3");
+        // Only a single separating space is absorbed; two spaces is not a
+        // decimal rendering and is left alone.
+        assert_eq!(PdfDocument::fix_digit_logicalnot_decimal("1\u{00AC}  00"), "1\u{00AC}  00");
     }
 
     #[test]
@@ -22563,6 +24190,7 @@ mod tests {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             }
         }
 
@@ -22633,6 +24261,7 @@ mod tests {
                 char_widths: vec![],
                 heading_level: None,
                 rotation_degrees: 0.0,
+                wmode: 0,
             }
         }
 

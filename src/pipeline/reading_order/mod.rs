@@ -10,12 +10,15 @@
 //! - [`XYCutStrategy`]: Recursive XY-Cut spatial partitioning (newspapers, academic papers)
 //! - [`SimpleStrategy`]: Simple top-to-bottom, left-to-right ordering
 
+pub mod article_thread;
 pub mod detectors;
 pub mod geometric;
 pub mod simple;
 pub mod structure_tree;
+pub mod tategaki;
 pub mod xycut;
 
+pub use article_thread::ArticleThreadStrategy;
 pub use detectors::{
     classify_region, detect_dense_single_line, detect_dramatic_script, detect_narrow_tracked,
     detect_sub_super_glyphs, DetectorGlyph, ReadingOrderClass,
@@ -23,6 +26,7 @@ pub use detectors::{
 pub use geometric::GeometricStrategy;
 pub use simple::SimpleStrategy;
 pub use structure_tree::StructureTreeStrategy;
+pub use tategaki::TategakiStrategy;
 pub use xycut::XYCutStrategy;
 
 use crate::error::Result;
@@ -75,6 +79,15 @@ pub struct ReadingOrderContext {
     /// MCID to reading order mapping (if structure tree available).
     pub mcid_order: Option<Vec<u32>>,
 
+    /// Ordered article-thread bead rectangles for this page, in `/N` order
+    /// (ISO 32000-1:2008 §12.4.3). Set only when the document declares
+    /// `/Threads`, no trustworthy structure tree governs the page, and the
+    /// beads cover enough of the page text to be trusted. When present, the
+    /// reading-order strategy threads spans through these regions instead of
+    /// using pure geometric inference. `None` ⇒ the geometric path is unchanged
+    /// (fails closed).
+    pub bead_rects: Option<Vec<Rect>>,
+
     /// Whether the structure tree contains suspect (unreliable) content.
     ///
     /// Per ISO 32000-1:2008 Section 14.7.1, when this is true, the structure
@@ -114,6 +127,12 @@ impl ReadingOrderContext {
     /// ordering instead of trusting the potentially unreliable structure tree.
     pub fn with_suspects(mut self, suspects: bool) -> Self {
         self.suspects = suspects;
+        self
+    }
+
+    /// Set the ordered article-thread bead rectangles for this page.
+    pub fn with_bead_rects(mut self, bead_rects: Vec<Rect>) -> Self {
+        self.bead_rects = Some(bead_rects);
         self
     }
 }

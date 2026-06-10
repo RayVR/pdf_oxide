@@ -20,6 +20,11 @@ pub enum ReadingOrderSource {
     ///
     /// Confidence: 0.90 (robust for multi-column layouts).
     XYCut,
+    /// Order from article threads (`/Threads`, ISO 32000-1:2008 §12.4.3).
+    ///
+    /// Confidence: 0.95 (author-supplied explicit reading order; ranks below
+    /// the structure tree but above geometric inference).
+    ArticleThread,
     /// Order from geometric column analysis.
     ///
     /// Confidence: 0.85 (good for standard column layouts).
@@ -44,6 +49,7 @@ impl ReadingOrderSource {
     pub fn default_confidence(&self) -> f32 {
         match self {
             ReadingOrderSource::StructureTree => 1.0,
+            ReadingOrderSource::ArticleThread => 0.95,
             ReadingOrderSource::XYCut => 0.90,
             ReadingOrderSource::Geometric => 0.85,
             ReadingOrderSource::Simple => 0.75,
@@ -56,6 +62,7 @@ impl ReadingOrderSource {
     pub fn name(&self) -> &'static str {
         match self {
             ReadingOrderSource::StructureTree => "StructureTree",
+            ReadingOrderSource::ArticleThread => "ArticleThread",
             ReadingOrderSource::XYCut => "XYCut",
             ReadingOrderSource::Geometric => "Geometric",
             ReadingOrderSource::Simple => "Simple",
@@ -102,6 +109,11 @@ impl ReadingOrderInfo {
     /// Create for XY-Cut source.
     pub fn xycut() -> Self {
         Self::from_source(ReadingOrderSource::XYCut)
+    }
+
+    /// Create for article-thread source (`/Threads`, §12.4.3).
+    pub fn article_thread() -> Self {
+        Self::from_source(ReadingOrderSource::ArticleThread)
     }
 
     /// Create for geometric source.
@@ -187,6 +199,17 @@ pub struct OrderedTextSpan {
     /// drop the non-anchor spans of a multi-MCID subtree without
     /// disturbing the reading-order vector's indexing.
     pub actualtext_replacement: Option<Arc<str>>,
+
+    /// Hyperlink target for this span, if its bbox falls within a `/Link`
+    /// annotation whose action resolves to a URI (ISO 32000-1 §12.5.6.5 +
+    /// §12.6.4.7). Output converters emit `[text](uri)` / `<a href>` for runs
+    /// of spans that share a URI. None when the span carries no link.
+    pub link_uri: Option<Arc<str>>,
+
+    /// True when this span is preformatted (nested under a `Code` element in
+    /// the structure tree). Converters must preserve its line breaks and never
+    /// reflow it into a paragraph.
+    pub preformatted: bool,
 }
 
 impl OrderedTextSpan {
@@ -201,6 +224,8 @@ impl OrderedTextSpan {
             struct_role: None,
             block_id: None,
             actualtext_replacement: None,
+            link_uri: None,
+            preformatted: false,
         }
     }
 
@@ -214,6 +239,8 @@ impl OrderedTextSpan {
             struct_role: None,
             block_id: None,
             actualtext_replacement: None,
+            link_uri: None,
+            preformatted: false,
         }
     }
 
@@ -379,6 +406,7 @@ mod tests {
             char_widths: vec![],
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 

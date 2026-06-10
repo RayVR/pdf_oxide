@@ -324,6 +324,82 @@ fn looks_like_prose_paragraph(table: &Table) -> bool {
     false
 }
 
+/// Reject a spatial (no-rulings) "table" that is actually CJK prose split into
+/// columns by the wrap geometry of an unspaced script. CJK (Chinese, Japanese,
+/// Korean Han/kana) writes without inter-word spaces, so wrapped prose lines
+/// align into a grid the column detector mistakes for a table. A genuine CJK
+/// data cell is short (a label or a number); a prose fragment is a long run of
+/// ideographs/kana. Reject when any cell holds a run of `MIN_CJK_RUN` or more
+/// consecutive CJK characters. Ruled / author-marked tables never reach here.
+fn looks_like_cjk_prose(table: &Table) -> bool {
+    const MIN_CJK_RUN: usize = 12;
+    fn is_cjk(c: char) -> bool {
+        matches!(
+            c as u32,
+            0x3040..=0x30FF      // Hiragana + Katakana
+            | 0x3400..=0x4DBF    // CJK Ext A
+            | 0x4E00..=0x9FFF    // CJK Unified
+            | 0xF900..=0xFAFF    // CJK Compatibility
+            | 0xFF66..=0xFF9F    // Halfwidth Katakana
+            | 0xAC00..=0xD7AF    // Hangul Syllables
+        )
+    }
+    table.rows.iter().flat_map(|r| &r.cells).any(|c| {
+        let mut run = 0usize;
+        for ch in c.text.chars() {
+            if is_cjk(ch) {
+                run += 1;
+                if run >= MIN_CJK_RUN {
+                    return true;
+                }
+            } else if !ch.is_whitespace() {
+                run = 0;
+            }
+        }
+        false
+    })
+}
+
+/// Reject a spatial (no-rulings) "table" that is actually a bulleted list whose
+/// markers and bodies aligned into columns. A genuine data table never carries
+/// a cell that is *only* a bullet glyph; an untagged list rendered into two
+/// columns (`• | Ship the API.`) does. Catches the structured-document
+/// false-positive where a heading + bulleted list + prose are mis-fused into a
+/// grid. Ruled / author-marked tables never reach this path.
+fn looks_like_bulleted_list(table: &Table) -> bool {
+    /// An unambiguous bullet glyph (never a legitimate data value).
+    fn is_bullet_glyph(c: char) -> bool {
+        matches!(
+            c,
+            '\u{2022}'
+                | '\u{2023}'
+                | '\u{2043}'
+                | '\u{2219}'
+                | '\u{25AA}'
+                | '\u{25CF}'
+                | '\u{25E6}'
+                | '\u{00B7}'
+                | '\u{2024}'
+        )
+    }
+    fn is_list_item(t: &str) -> bool {
+        let mut chars = t.chars();
+        match chars.next() {
+            // Leads with a bullet glyph (lone "•" or "• item") → a list item.
+            Some(c) if is_bullet_glyph(c) => true,
+            // A lone "*" cell is also a marker (but "*5" footnote-data is not).
+            Some('*') => chars.next().is_none(),
+            _ => false,
+        }
+    }
+    table
+        .rows
+        .iter()
+        .flat_map(|r| &r.cells)
+        .filter(|c| !c.text.trim().is_empty())
+        .any(|c| is_list_item(c.text.trim()))
+}
+
 /// Detect page column regions from an X-projection histogram of text spans.
 ///
 /// Builds a histogram of horizontal coverage (2pt buckets), then identifies
@@ -674,6 +750,8 @@ pub fn detect_tables_from_spans(spans: &[TextSpan], config: &TableDetectionConfi
     if !is_valid_table(&orig_table)
         || !passes_spatial_quality_gate(&orig_table)
         || looks_like_prose_paragraph(&orig_table)
+        || looks_like_bulleted_list(&orig_table)
+        || looks_like_cjk_prose(&orig_table)
     {
         return Vec::new();
     }
@@ -703,6 +781,8 @@ pub fn detect_tables_from_spans(spans: &[TextSpan], config: &TableDetectionConfi
     if !is_valid_table(&table)
         || !passes_spatial_quality_gate(&table)
         || looks_like_prose_paragraph(&table)
+        || looks_like_bulleted_list(&table)
+        || looks_like_cjk_prose(&table)
     {
         return Vec::new();
     }
@@ -1503,7 +1583,12 @@ fn group_lines_into_clusters(
     // Post-processing: split clusters whose vertical lines occupy distinct Y-ranges.
     // This prevents a small bordered table (e.g. an invoice header) from merging
     // with a large main table that happens to be nearby vertically.
-    let raw_clusters: Vec<LineCluster> = cluster_map.into_values().collect();
+    // Deterministic order: `cluster_map` is a HashMap (per-process-randomized
+    // iteration), so sort clusters by their first (smallest) line index — each
+    // cluster's `lines` Vec is already ascending — to keep downstream table
+    // boundary order stable across runs.
+    let mut raw_clusters: Vec<LineCluster> = cluster_map.into_values().collect();
+    raw_clusters.sort_by_key(|c| c.lines.first().copied().unwrap_or(usize::MAX));
     let mut result: Vec<LineCluster> = Vec::with_capacity(raw_clusters.len());
     const LINE_AXIS_TOL: f32 = 2.0;
     let v_split_gap = config.v_split_gap;
@@ -2014,7 +2099,15 @@ fn reconstitute_dotted_lines(edges: &mut Vec<Edge>) {
         }
     }
 
-    for segments in dotted_groups.values() {
+    // Iterate in sorted key order: `dotted_groups` is a HashMap (per-process-
+    // randomized), and the reconstituted edges are appended to `long_edges`
+    // (which becomes `*edges`), so HashMap order would leak into edge order and,
+    // downstream, table-cell/region order. Sorting the snapped-coordinate keys
+    // makes it deterministic.
+    let mut dotted_keys: Vec<i32> = dotted_groups.keys().copied().collect();
+    dotted_keys.sort_unstable();
+    for key in dotted_keys {
+        let segments = &dotted_groups[&key];
         if segments.len() >= DOTTED_MIN_SEGMENTS {
             let min_start = segments
                 .iter()
@@ -2215,11 +2308,27 @@ fn group_cells_into_tables(cells: &[IntersectionCell]) -> Vec<Vec<usize>> {
     let n = cells.len();
     let mut uf = UnionFind::new(n);
 
-    // Two cells share an edge if they share two corners.
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let ci = &cells[i];
+    // Sweep-line prune for the O(n²) edge-adjacency scan (the hot loop on dense
+    // ruled pages — CFR regulatory megafiles, #26). BOTH adjacency tests below
+    // require the cells' y-extents to touch within SNAP_TOL: horizontal
+    // adjacency needs y1≈y1 (so cj.y1 ≤ ci.y2 + SNAP_TOL), and vertical
+    // adjacency needs cj.y1 ≈ ci.y2 (also ≤ ci.y2 + SNAP_TOL). Iterating cells
+    // in ascending-y1 order lets us `break` the inner loop once a candidate's
+    // y1 clears ci.y2 + SNAP_TOL — every later candidate has an even larger y1
+    // and cannot share an edge. We `union` by ORIGINAL index, and union is
+    // order-independent, so the resulting partition is byte-identical to the
+    // full O(n²) scan; only provably-non-adjacent pairs are skipped.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| crate::utils::safe_float_cmp(cells[a].y1, cells[b].y1));
+    for a in 0..n {
+        let i = order[a];
+        let ci = &cells[i];
+        let y_limit = ci.y2 + SNAP_TOL;
+        for &j in order.iter().skip(a + 1) {
             let cj = &cells[j];
+            if cj.y1 > y_limit {
+                break; // sorted by y1 → no later cell can touch ci's y-extent
+            }
             let shares_edge = // Horizontal adjacency (share a vertical edge)
                 (((ci.x2 - cj.x1).abs() <= SNAP_TOL || (ci.x1 - cj.x2).abs() <= SNAP_TOL)
                     && (ci.y1 - cj.y1).abs() <= SNAP_TOL
@@ -2234,8 +2343,16 @@ fn group_cells_into_tables(cells: &[IntersectionCell]) -> Vec<Vec<usize>> {
         }
     }
 
-    // Collect groups.
-    uf.groups().into_values().collect()
+    // Collect groups in a DETERMINISTIC order. `groups()` returns a HashMap
+    // whose iteration order is randomized per-process (Rust `RandomState`), so
+    // `into_values().collect()` would yield table clusters in a different order
+    // each run — leaking non-deterministic reading order on multi-table / figure
+    // pages (e.g. matrix-figure pages with several detected regions). Each
+    // group's `Vec` is already ascending (built `for i in 0..n`); sort the outer
+    // list by each group's first (smallest) cell index so table order is stable.
+    let mut groups: Vec<Vec<usize>> = uf.groups().into_values().collect();
+    groups.sort_by_key(|g| g.first().copied().unwrap_or(usize::MAX));
+    groups
 }
 
 /// Split table rows that contain text spans at multiple distinct Y positions into sub-rows.
@@ -3875,6 +3992,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_looks_like_cjk_prose() {
+        let row = |cells: &[&str]| TableRow {
+            cells: cells.iter().map(|c| prose_cell(c)).collect(),
+            is_header: false,
+        };
+        // CJK prose mis-split into columns: a long ideograph/kana run in a cell.
+        let mut prose = Table::new();
+        prose.col_count = 2;
+        prose.rows.push(row(&[
+            "\u{30CD}\u{30B3}",
+            "\u{72ED}\u{7FA9}\u{306B}\u{306F}\u{98DF}\u{8089}\u{76EE}\u{30CD}\u{30B3}\u{79D1}\u{30CD}\u{30B3}\u{5C5E}",
+        ]));
+        assert!(looks_like_cjk_prose(&prose));
+
+        // A genuine CJK data table — short label + number cells — is NOT prose.
+        let mut table = Table::new();
+        table.col_count = 2;
+        table.rows.push(row(&["\u{58F2}\u{4E0A}", "1,234"]));
+        table.rows.push(row(&["\u{5229}\u{76CA}", "567"]));
+        assert!(!looks_like_cjk_prose(&table));
+
+        // Latin prose has no long CJK run.
+        let mut latin = Table::new();
+        latin.col_count = 2;
+        latin.rows.push(row(&["Region", "North"]));
+        assert!(!looks_like_cjk_prose(&latin));
+    }
+
+    #[test]
+    fn test_looks_like_bulleted_list_rejects_bullet_cells() {
+        let row = |cells: &[&str]| TableRow {
+            cells: cells.iter().map(|c| prose_cell(c)).collect(),
+            is_header: false,
+        };
+        // A bulleted list mis-fused into two columns: lone bullet markers in
+        // the first column → recognise as a list, not a table.
+        let mut list = Table::new();
+        list.col_count = 2;
+        list.rows.push(row(&["\u{2022}", "Ship the API."]));
+        list.rows.push(row(&["\u{2022}", "Write the docs."]));
+        assert!(looks_like_bulleted_list(&list));
+
+        // A genuine two-column data table has no lone-bullet cell.
+        let mut table = Table::new();
+        table.col_count = 2;
+        table.rows.push(row(&["Region", "Q1"]));
+        table.rows.push(row(&["North", "120"]));
+        assert!(!looks_like_bulleted_list(&table));
+
+        // A cell that merely *starts* with a dash but carries text (a value or
+        // a negative number) is not a bullet marker.
+        let mut dash = Table::new();
+        dash.col_count = 2;
+        dash.rows.push(row(&["Delta", "-12"]));
+        assert!(!looks_like_bulleted_list(&dash));
+    }
+
     /// #09 prose gate: a wrapped paragraph mis-split into a table — a row
     /// crossing a sentence boundary ("...to 23,500. Stockout rate...") must
     /// be recognised as prose and rejected.
@@ -3966,6 +4141,7 @@ mod tests {
             char_widths: vec![],
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
     fn make_h_line(x: f32, y: f32, width: f32) -> crate::elements::PathContent {
@@ -6313,6 +6489,7 @@ mod tests {
             char_widths: vec![],
             heading_level: None,
             rotation_degrees: 0.0,
+            wmode: 0,
         }
     }
 
