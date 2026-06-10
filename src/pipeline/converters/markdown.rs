@@ -235,6 +235,54 @@ fn dedup_identical_header_cells(s: &str) -> String {
 /// logical heading. See `looks_like_heading_wrap` for the 2-fragment
 /// wrapped-heading rule; otherwise require 3+ fragments each <= 2
 /// words (canonical PowerPoint word-per-heading pattern).
+/// Is `line` a Markdown list-item marker line (`- `, `* `, `+ `, or an ordered
+/// `N.`/`N)` marker)? Used to tighten lists.
+fn is_md_list_item_line(line: &str) -> bool {
+    let t = line.trim_start();
+    if let Some(rest) = t
+        .strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("+ "))
+    {
+        return !rest.trim().is_empty() || rest.is_empty();
+    }
+    // Ordered marker: leading ASCII digits then '.' or ')' then a space.
+    let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0
+        && matches!(t.as_bytes().get(digits), Some(b'.') | Some(b')'))
+        && t.as_bytes().get(digits + 1) == Some(&b' ')
+}
+
+/// Collapse blank lines that sit between two consecutive list-item marker lines
+/// so the list renders tight (CommonMark §5.3) rather than loose. The span
+/// flush in [`MarkdownOutputConverter::convert`] always appends a blank line
+/// after each item, which would otherwise wrap every item in its own `<p>` and
+/// fragment the document's list structure. Blank lines that separate a list
+/// item from non-list content (the end of the list) are preserved.
+fn tighten_list_items(s: &str) -> String {
+    let lines: Vec<&str> = s.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        out.push(lines[i].to_string());
+        if is_md_list_item_line(lines[i]) {
+            // Look past blank lines to the next content line.
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
+            // Only collapse when the next content line is also a list item AND
+            // at least one blank line separated them (so we actually tighten).
+            if j > i + 1 && j < lines.len() && is_md_list_item_line(lines[j]) {
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.join("\n")
+}
+
 fn merge_consecutive_same_level_headings(s: &str) -> String {
     let lines: Vec<&str> = s.split('\n').collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -737,58 +785,7 @@ impl MarkdownOutputConverter {
     /// like "1.1 Foo" and years like "1986" are not falsely promoted
     /// to numbered lists. See issue #377 D3.
     fn is_ordered_list_marker(text: &str) -> Option<u32> {
-        let t = text.trim_start();
-        let bytes = t.as_bytes();
-        if bytes.is_empty() {
-            return None;
-        }
-        // Find the marker token (digits, single ASCII letter, or short
-        // roman numeral) and the trailing punctuation `.` or `)`.
-        let mut idx = 0;
-        // Numeric form: `\d{1,3}`.
-        while idx < bytes.len() && bytes[idx].is_ascii_digit() && idx < 3 {
-            idx += 1;
-        }
-        let numeric_n = if idx > 0 {
-            std::str::from_utf8(&bytes[..idx])
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-        } else {
-            None
-        };
-        // Single ASCII letter form (a) / b. / I.).
-        if idx == 0 && bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() {
-            // Roman numerals up to 4 chars (i, ii, iii, iv).
-            let mut roman_end = 0;
-            while roman_end < bytes.len().min(4)
-                && matches!(bytes[roman_end], b'i' | b'v' | b'x' | b'I' | b'V' | b'X')
-            {
-                roman_end += 1;
-            }
-            if roman_end >= 1 && bytes.len() > roman_end {
-                let punct = bytes[roman_end];
-                if matches!(punct, b'.' | b')') && bytes.get(roman_end + 1).copied() == Some(b' ') {
-                    return Some(1); // unknown roman position
-                }
-            }
-            // Single letter: a) Foo, A. Bar.
-            if bytes.len() >= 3
-                && matches!(bytes[1], b'.' | b')')
-                && bytes[2] == b' '
-                && bytes[0].is_ascii_alphabetic()
-            {
-                return Some(1);
-            }
-            return None;
-        }
-        // For the numeric branch, check trailing `.` / `)` and a space.
-        if idx > 0 && bytes.len() > idx {
-            let punct = bytes[idx];
-            if matches!(punct, b'.' | b')') && bytes.get(idx + 1).copied() == Some(b' ') {
-                return numeric_n;
-            }
-        }
-        None
+        super::is_ordered_list_marker(text)
     }
 
     /// Check if a span consists of a single bullet character.
@@ -796,50 +793,12 @@ impl MarkdownOutputConverter {
     /// Common bullet characters used in PDF documents:
     /// ► • ▪ ▸ ‣ ◦ ● ■ ◆ ○ □ ❍ ❖ ✓ ✔ ➢ ➤ 
     fn is_bullet_span(text: &str) -> bool {
-        let t = text.trim();
-        matches!(
-            t,
-            "►" | "•"
-                | "▪"
-                | "▸"
-                | "‣"
-                | "◦"
-                | "●"
-                | "■"
-                | "◆"
-                | "○"
-                | "□"
-                | "❍"
-                | "❖"
-                | "✓"
-                | "✔"
-                | "➢"
-                | "➤"
-                | "\x7f"
-        )
+        super::is_bullet_span(text)
     }
 
     /// Check if text starts with a bullet character (for inline bullets).
     fn starts_with_bullet(text: &str) -> bool {
-        let t = text.trim_start();
-        t.starts_with('►')
-            || t.starts_with('•')
-            || t.starts_with('▪')
-            || t.starts_with('▸')
-            || t.starts_with('‣')
-            || t.starts_with('◦')
-            || t.starts_with('●')
-            || t.starts_with('■')
-            || t.starts_with('◆')
-            || t.starts_with('○')
-            || t.starts_with('□')
-            || t.starts_with('❍')
-            || t.starts_with('❖')
-            || t.starts_with('✓')
-            || t.starts_with('✔')
-            || t.starts_with('➢')
-            || t.starts_with('➤')
-            || t.starts_with('\x7f')
+        super::starts_with_bullet(text)
     }
 
     /// Validate that a string looks like a heading (not a paragraph or noise).
@@ -1148,27 +1107,31 @@ impl MarkdownOutputConverter {
         // mode bucketed to 0.5pt, with smaller-bucket tiebreak so body
         // text wins over headings when counts are close. Capped at 12pt
         // so that heading-only documents still produce sensible ratios.
-        let base_font_size = if config.output.detect_headings {
-            // Exclude sub-9pt spans (bullet glyphs, subscripts, footnotes)
-            // that would skew the mode downward.
-            let mut size_counts: std::collections::HashMap<u32, usize> =
-                std::collections::HashMap::new();
-            for s in sorted.iter() {
-                let sz = s.span.font_size;
-                if sz < 9.0 {
-                    continue;
+        let base_font_size = super::base_heading_font_size(&sorted, config.output.detect_headings);
+
+        // Per-block margins: the rightmost edge and the leftmost edge any span
+        // sharing a paragraph `block_id` reaches. A *wrapped* prose line runs to
+        // the column margin (the right edge for left-to-right text, the LEFT
+        // edge for right-to-left text); a deliberately short line (a shell
+        // command, a record row, a paragraph's last line) stops well short of
+        // it. Used to gate the structure-authoritative paragraph reflow below.
+        let mut block_right_max: std::collections::HashMap<u32, f32> =
+            std::collections::HashMap::new();
+        let mut block_left_min: std::collections::HashMap<u32, f32> =
+            std::collections::HashMap::new();
+        for s in &sorted {
+            if let Some(b) = s.block_id {
+                let right = s.span.bbox.x + s.span.bbox.width;
+                let e = block_right_max.entry(b).or_insert(f32::MIN);
+                if right > *e {
+                    *e = right;
                 }
-                *size_counts.entry((sz * 2.0).round() as u32).or_insert(0) += 1;
+                let l = block_left_min.entry(b).or_insert(f32::MAX);
+                if s.span.bbox.x < *l {
+                    *l = s.span.bbox.x;
+                }
             }
-            let mode = size_counts
-                .into_iter()
-                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-                .map(|(bucket, _)| bucket as f32 / 2.0)
-                .unwrap_or(12.0);
-            mode.min(12.0)
-        } else {
-            12.0
-        };
+        }
 
         // Track which tables have been rendered
         let mut tables_rendered = vec![false; tables.len()];
@@ -1191,6 +1154,11 @@ impl MarkdownOutputConverter {
         let mut active_bold = false;
         let mut active_italic = false;
         let mut current_heading_level: Option<u8> = None;
+        // Whether every non-blank span accumulated into `current_line` so far is
+        // monospace (a fixed-pitch / code font). A plain paragraph that is all
+        // monospace is a code line; consecutive ones are fused into a fenced
+        // block by `fence_monospace_blocks` after rendering.
+        let mut current_line_all_mono = true;
 
         /// Close any open bold/italic markers on `line`.
         ///
@@ -1271,8 +1239,11 @@ impl MarkdownOutputConverter {
                         // Flush current line
                         close_formatting(&mut current_line, &mut active_bold, &mut active_italic);
                         if !current_line.is_empty() {
-                            result.push_str(current_line.trim());
-                            result.push_str("\n\n");
+                            push_plain_paragraph(
+                                &mut result,
+                                current_line.trim(),
+                                current_line_all_mono,
+                            );
                             current_line.clear();
                         }
 
@@ -1312,6 +1283,31 @@ impl MarkdownOutputConverter {
                     | Some(StructRole::ListItem)
                     | Some(StructRole::ListItemLabel)
             );
+
+            // Whether this span's own text already carries an ordered marker
+            // (`1.`, `a)`). Ordered items must not also get a `- ` prefix.
+            let span_is_ordered =
+                Self::is_ordered_list_marker(span.span.text.trim_start()).is_some();
+
+            // Force-flush an open heading before a list item begins, so a bullet
+            // or ordered marker never glues onto the heading line.
+            let span_starts_list = is_list_item_role
+                || Self::is_bullet_span(&span.span.text)
+                || Self::starts_with_bullet(&span.span.text)
+                || span_is_ordered;
+            if span_starts_list && !current_line.trim().is_empty() {
+                if let Some(level) = current_heading_level {
+                    close_formatting(&mut current_line, &mut active_bold, &mut active_italic);
+                    let prefix = "#".repeat(level as usize);
+                    result.push_str(&format!(
+                        "{} {}\n\n",
+                        prefix,
+                        strip_emphasis(current_line.trim())
+                    ));
+                    current_line.clear();
+                    current_heading_level = None;
+                }
+            }
 
             // Check for paragraph break or line break
             let same_line = prev_span
@@ -1377,13 +1373,84 @@ impl MarkdownOutputConverter {
                 // inline with a leading caption.
                 let heading_changed_break = heading_changed && !line_truly_continuous;
 
-                if group_flush
+                // Structure-authoritative paragraph reflow (ISO 32000-1 §14.8.3:
+                // one `<P>` BLSE is a single paragraph that "can be split
+                // between lines of text"). When two spans share a paragraph
+                // block, the *geometric* gap heuristic must not split a wrapped
+                // line — but only when this is genuinely a mid-sentence wrap.
+                // The continuation signals (cheap, language-neutral) keep
+                // intentional same-block line breaks intact: form fields and
+                // record rows start with a capitalised label, code is tagged
+                // preformatted, and a sentence end is a hard boundary.
+                let same_block = matches!(
+                    (span.block_id, prev.block_id),
+                    (Some(a), Some(b)) if a == b
+                );
+                let plain_para = current_heading_level.is_none()
+                    && span_heading_level.is_none()
+                    && !is_list_item_role
+                    && !prev_was_list_item
+                    && !span.preformatted
+                    && !prev.preformatted;
+                // The next line continues the sentence when it starts lowercase
+                // (`…downtown by\nnine…`), with a caseless-script letter
+                // (Hebrew/Arabic/CJK/Indic have no capitalisation, so a letter
+                // at the line start is always a continuation, never a new
+                // sentence/field), or with a number that is not an ordered-list
+                // marker (`…downtown by\n2028`). An ordered marker (`2.` / `3)`)
+                // is a deliberate new item and must not merge.
+                let next_trim = span.span.text.trim_start();
+                let next_continues_lowercase = next_trim.chars().next().is_some_and(|c| {
+                    c.is_lowercase()
+                        || (c.is_alphabetic() && !c.is_uppercase())
+                        || (c.is_ascii_digit()
+                            && super::is_ordered_list_marker(next_trim).is_none())
+                });
+                let prev_trimmed = current_line.trim_end();
+                let prev_unterminated = prev_trimmed
+                    .chars()
+                    .last()
+                    .is_none_or(|c| !matches!(c, '.' | '!' | '?' | ':' | ';'));
+                // A line broken mid-word at a hyphen (`…three sub-\nNeptune…`)
+                // is always a wrap, even when the continuation is capitalised (a
+                // proper noun) — the trailing hyphen is the continuation signal.
+                let next_continues_lowercase =
+                    next_continues_lowercase || prev_trimmed.ends_with('-');
+                // The previous line must have run to the column margin — a
+                // genuine wrap. A short ragged line (shell command, mis-tagged
+                // code, a record value) is a deliberate break and is preserved.
+                // Left-to-right lines fill toward the RIGHT margin; right-to-left
+                // lines (Arabic/Hebrew) start at the right and fill toward the
+                // LEFT margin, so the test is mirrored for them.
+                let tol = prev.span.font_size.max(8.0) * 1.5;
+                let prev_is_rtl = crate::text::bidi::looks_rtl(&prev.span.text);
+                let prev_fills_column = prev.block_id.is_some_and(|b| {
+                    if prev_is_rtl {
+                        block_left_min
+                            .get(&b)
+                            .is_some_and(|&lo| prev.span.bbox.x <= lo + tol)
+                    } else {
+                        block_right_max
+                            .get(&b)
+                            .is_some_and(|&hi| prev.span.bbox.x + prev.span.bbox.width >= hi - tol)
+                    }
+                });
+                let merge_wrapped_line = same_block
+                    && plain_para
+                    && next_continues_lowercase
+                    && prev_unterminated
+                    && prev_fills_column;
+                // A genuine intra-paragraph wrap (same block, plain body text,
+                // previous line filled the column margin, next line continues)
+                // is one paragraph, so it suppresses every *soft* break — the
+                // geometric gap, a reading-order group change, and a structure
+                // block change (the same `<P>` re-entered). It does NOT override
+                // a list-item transition or a real column gutter.
+                let soft_break = group_flush
                     || self.is_paragraph_break(span, prev)
                     || heading_changed_break
-                    || list_item_changed
-                    || block_changed
-                    || column_gap
-                {
+                    || block_changed;
+                if (soft_break && !merge_wrapped_line) || list_item_changed || column_gap {
                     close_formatting(&mut current_line, &mut active_bold, &mut active_italic);
                     if !current_line.is_empty() {
                         if let Some(level) = current_heading_level {
@@ -1394,13 +1461,16 @@ impl MarkdownOutputConverter {
                                 strip_emphasis(current_line.trim())
                             ));
                         } else {
-                            result.push_str(current_line.trim());
-                            result.push_str("\n\n");
+                            push_plain_paragraph(
+                                &mut result,
+                                current_line.trim(),
+                                current_line_all_mono,
+                            );
                         }
                         current_line.clear();
                     }
                     current_heading_level = span_heading_level;
-                    if is_list_item_role {
+                    if is_list_item_role && !span_is_ordered {
                         current_line.push_str("- ");
                     }
                 } else if !same_line {
@@ -1451,7 +1521,7 @@ impl MarkdownOutputConverter {
                             current_line.clear();
                         }
                         current_heading_level = span_heading_level;
-                        if starts_new_list_item {
+                        if starts_new_list_item && !span_is_ordered {
                             current_line.push_str("- ");
                         }
                     } else {
@@ -1471,7 +1541,7 @@ impl MarkdownOutputConverter {
                 }
             } else {
                 current_heading_level = span_heading_level;
-                if is_list_item_role {
+                if is_list_item_role && !span_is_ordered {
                     current_line.push_str("- ");
                 }
             }
@@ -1568,7 +1638,16 @@ impl MarkdownOutputConverter {
                 text = &normalized;
             }
 
-            let linkified = self.linkify(text);
+            // A span inside a /Link annotation becomes a markdown link
+            // `[text](uri)` — but only for safe schemes (reject javascript:,
+            // data:, … to avoid injecting active content). Otherwise fall back
+            // to autolinking bare URLs in the text.
+            let linkified = match span.link_uri.as_deref() {
+                Some(uri) if super::is_safe_link_uri(uri) => {
+                    format!("[{}]({})", text.trim(), uri.replace(' ', "%20").replace(')', "%29"))
+                },
+                _ => self.linkify(text),
+            };
 
             let is_bold = self.is_bold(span, config);
             let is_italic = self.is_italic(span);
@@ -1628,6 +1707,17 @@ impl MarkdownOutputConverter {
                 }
             }
 
+            // Track whether the line being built is entirely monospace. At this
+            // point `current_line` reflects the post-flush state (a break above
+            // cleared it), so an empty / bullet-only line re-arms the flag before
+            // this span's content lands; each non-blank span then narrows it.
+            if current_line.trim_start_matches("- ").trim().is_empty() {
+                current_line_all_mono = true;
+            }
+            if span.span.text.chars().any(|c| !c.is_whitespace()) {
+                current_line_all_mono &= span.span.is_monospace;
+            }
+
             current_line.push_str(&linkified);
 
             prev_span = Some(span);
@@ -1678,8 +1768,11 @@ impl MarkdownOutputConverter {
                             strip_emphasis(current_line.trim())
                         ));
                     } else {
-                        result.push_str(current_line.trim());
-                        result.push_str("\n\n");
+                        push_plain_paragraph(
+                            &mut result,
+                            current_line.trim(),
+                            current_line_all_mono,
+                        );
                     }
                     current_line.clear();
                 }
@@ -1693,6 +1786,13 @@ impl MarkdownOutputConverter {
             if let Some(level) = current_heading_level {
                 let prefix = "#".repeat(level as usize);
                 result.push_str(&format!("{} {}\n", prefix, strip_emphasis(current_line.trim())));
+            } else if current_line_all_mono {
+                // Trailing monospace paragraph — sentinel-wrap so the fence pass
+                // fuses it with any preceding code lines.
+                result.push(MONO_SENTINEL);
+                result.push_str(current_line.trim());
+                result.push(MONO_SENTINEL);
+                result.push('\n');
             } else {
                 result.push_str(current_line.trim());
                 result.push('\n');
@@ -1759,6 +1859,15 @@ impl MarkdownOutputConverter {
         // and untagged documents.
         final_result = escape_stray_leading_pipes(&final_result);
         final_result = coalesce_camelcase_bold_fragments(&final_result);
+        // Fuse consecutive monospace (fixed-pitch / code-font) paragraphs into a
+        // fenced code block. A `Code` element renders its lines monospace even
+        // when the producer left the block untagged.
+        final_result = fence_monospace_blocks(&final_result);
+        // Tight lists: drop blank lines between consecutive list-item markers.
+        // The span flush always appends a blank line, which turns every list
+        // into a Markdown "loose" list (each item wrapped in <p>); the golden
+        // corpus and most renderers expect a "tight" list. CommonMark §5.3.
+        final_result = tighten_list_items(&final_result);
 
         // Structure-recovery heuristics — UNTAGGED documents only.
         // For tagged PDFs the structure tree is authoritative (§14.8.4)
@@ -2030,15 +2139,121 @@ fn find_matching(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 ///    starts the next, both at the same baseline. Without the
 ///    backward-wrap detection the converter joins them into the
 ///    nonsense token `constitutionAssailing`.
+///
+/// Marker wrapped around a fully-monospace plain paragraph at flush time so
+/// `fence_monospace_blocks` can recognise and fuse consecutive ones. NUL never
+/// occurs in extracted text, so it is unambiguous and is always removed.
+const MONO_SENTINEL: char = '\u{0}';
+
+/// Emit a plain (non-heading, non-list) paragraph, wrapping it in
+/// [`MONO_SENTINEL`] markers when it is entirely monospace so the fence pass
+/// can fuse a run of them into one code block.
+fn push_plain_paragraph(result: &mut String, line: &str, mono: bool) {
+    if mono && !line.is_empty() {
+        result.push(MONO_SENTINEL);
+        result.push_str(line);
+        result.push(MONO_SENTINEL);
+    } else {
+        result.push_str(line);
+    }
+    result.push_str("\n\n");
+}
+
+/// Fuse consecutive monospace paragraphs (each flagged with [`MONO_SENTINEL`])
+/// into a single fenced code block, preserving their internal line breaks.
+/// A run of one or more sentinel-marked paragraphs becomes:
+/// ```text
+/// ```
+/// line 1
+/// line 2
+/// ```
+/// ```
+/// Non-marked paragraphs pass through unchanged; the markers are always
+/// stripped (so even a lone inline NUL, which never occurs anyway, is removed).
+fn fence_monospace_blocks(s: &str) -> String {
+    if !s.contains(MONO_SENTINEL) {
+        return s.to_string();
+    }
+    let paras: Vec<&str> = s.split("\n\n").collect();
+    let mut out: Vec<String> = Vec::with_capacity(paras.len());
+    let mut code: Vec<String> = Vec::new();
+    let flush_code = |code: &mut Vec<String>, out: &mut Vec<String>| {
+        if !code.is_empty() {
+            let body = code.join("\n");
+            // A fence around whitespace-only content carries no information and,
+            // on a scanned / blank page (whose only spans are stray whitespace),
+            // it would make the page's Markdown non-empty — masking the empty
+            // state and suppressing the `[OCR REQUIRED]` annotation. Drop it.
+            if body.trim().is_empty() {
+                code.clear();
+                return;
+            }
+            out.push(format!("```\n{body}\n```"));
+            code.clear();
+        }
+    };
+    for p in paras {
+        let trimmed = p.trim();
+        if let Some(inner) = trimmed
+            .strip_prefix(MONO_SENTINEL)
+            .and_then(|t| t.strip_suffix(MONO_SENTINEL))
+        {
+            code.push(inner.to_string());
+        } else {
+            flush_code(&mut code, &mut out);
+            // Defensive: strip any stray sentinel from a normal paragraph.
+            if p.contains(MONO_SENTINEL) {
+                out.push(p.replace(MONO_SENTINEL, ""));
+            } else {
+                out.push(p.to_string());
+            }
+        }
+    }
+    flush_code(&mut code, &mut out);
+    out.join("\n\n")
+}
+
 fn is_column_gap(prev: &OrderedTextSpan, current: &OrderedTextSpan) -> bool {
     let prev_right = prev.span.bbox.x + prev.span.bbox.width;
     let cur_left = current.span.bbox.x;
     let font_size = current.span.font_size.max(prev.span.font_size).max(1.0);
 
-    // Backward wrap: x went meaningfully backwards on the same y
-    // baseline. Strongest possible signal of a column-major reading
-    // order transition.
-    if cur_left + font_size * 2.0 < prev.span.bbox.x {
+    // Right-to-left text reads with *decreasing* X, so the backward-X "column
+    // wrap" heuristic below (which assumes left-to-right flow) is inverted for
+    // it: an RTL line's spans, ordered into logical reading order, step left on
+    // every word. Treating that as a column boundary splits the line into one
+    // paragraph/heading per word (Arabic/Hebrew titles and prose). The RTL
+    // reading-order pass has already placed these spans correctly, so skip the
+    // backward-X branch when both sides are RTL.
+    // A whitespace / neutral span between two RTL words is part of the RTL
+    // flow (it has no direction of its own), so it must not break the RTL
+    // context — otherwise every word→space→word step inside a right-to-left
+    // line reads as a same-baseline column gap and the line shatters into one
+    // paragraph per word.
+    let rtl_friendly = |t: &str| crate::text::bidi::looks_rtl(t) || t.trim().is_empty();
+    let both_rtl = rtl_friendly(&prev.span.text)
+        && rtl_friendly(&current.span.text)
+        && (crate::text::bidi::looks_rtl(&prev.span.text)
+            || crate::text::bidi::looks_rtl(&current.span.text));
+
+    // Backward wrap: x went meaningfully backwards. This is the signature of
+    // BOTH a within-column line wrap (X resets to the column's left margin) and
+    // a genuine column transition (X jumps to the next column). They are told
+    // apart by Y: a normal line wrap steps DOWN by about one line, whereas a
+    // column transition jumps back UP to the next column's top (Y increases) or
+    // drops far more than a line. Only the latter is a column boundary —
+    // treating a plain wrap as one splits every wrapped line in a narrow column
+    // into its own paragraph (multi-column newspaper / journal bodies).
+    if !both_rtl && cur_left + font_size * 2.0 < prev.span.bbox.x {
+        // A within-column line wrap drops by about ONE line; a column
+        // transition either jumps back UP (Y increases), drops far more than a
+        // line, or stays on roughly the SAME baseline (a balanced column whose
+        // next column resumes at the same height). Only a ~one-line downward
+        // step is an ordinary wrap.
+        let y_drop = prev.span.bbox.y - current.span.bbox.y;
+        if y_drop > font_size * 0.5 && y_drop < font_size * 2.0 {
+            return false; // ordinary line wrap, not a column boundary
+        }
         return true;
     }
 
@@ -2088,6 +2303,72 @@ mod tests {
     use crate::pipeline::converters::span_in_table;
     use crate::pipeline::StructRole;
     use crate::structure::table_extractor::{TableCell, TableRow};
+
+    #[test]
+    fn test_fence_monospace_blocks() {
+        let n = MONO_SENTINEL;
+        // Consecutive monospace paragraphs fuse into one fenced block, keeping
+        // their internal line breaks; surrounding prose is untouched.
+        let input = format!("Intro\n\n{n}line one{n}\n\n{n}line two{n}\n\nOutro");
+        assert_eq!(
+            fence_monospace_blocks(&input),
+            "Intro\n\n```\nline one\nline two\n```\n\nOutro"
+        );
+        // A lone monospace paragraph still fences.
+        assert_eq!(fence_monospace_blocks(&format!("{n}only{n}")), "```\nonly\n```");
+        // No sentinels → byte-identical.
+        assert_eq!(fence_monospace_blocks("plain\n\ntext"), "plain\n\ntext");
+        // A stray sentinel inside ordinary prose is stripped, not fenced.
+        assert_eq!(fence_monospace_blocks(&format!("a{n}b")), "ab");
+    }
+
+    #[test]
+    fn test_push_plain_paragraph_marks_monospace() {
+        let n = MONO_SENTINEL;
+        let mut out = String::new();
+        push_plain_paragraph(&mut out, "code", true);
+        assert_eq!(out, format!("{n}code{n}\n\n"));
+        let mut out2 = String::new();
+        push_plain_paragraph(&mut out2, "prose", false);
+        assert_eq!(out2, "prose\n\n");
+    }
+
+    #[test]
+    fn test_tighten_list_items_collapses_blank_lines_between_markers() {
+        // Loose list (blank lines between items) → tight list. CommonMark §5.3.
+        let loose = "- a\n\n- b\n\n- c\n\nNext paragraph.";
+        let tight = tighten_list_items(loose);
+        assert_eq!(tight, "- a\n- b\n- c\n\nNext paragraph.");
+
+        // Ordered list likewise.
+        let loose_ol = "1. one\n\n2. two\n\nDone.";
+        assert_eq!(tighten_list_items(loose_ol), "1. one\n2. two\n\nDone.");
+
+        // Blank line separating a list from following prose is preserved.
+        let mixed = "- only item\n\nA paragraph after the list.";
+        assert_eq!(tighten_list_items(mixed), mixed);
+
+        // Non-list content is untouched.
+        let prose = "# Title\n\nPara one.\n\nPara two.";
+        assert_eq!(tighten_list_items(prose), prose);
+    }
+
+    #[test]
+    fn test_is_md_list_item_line() {
+        for yes in ["- x", "* y", "+ z", "1. a", "2) b", "  - indented"] {
+            assert!(is_md_list_item_line(yes), "{yes:?} should be a list item");
+        }
+        for no in [
+            "text",
+            "-no space",
+            "1.no space",
+            "#- heading",
+            "",
+            "  plain",
+        ] {
+            assert!(!is_md_list_item_line(no), "{no:?} should NOT be a list item");
+        }
+    }
 
     #[test]
     fn test_bare_ordinal_suffix_is_not_a_heading() {
@@ -2239,6 +2520,26 @@ mod tests {
                 first_line
             );
         }
+    }
+
+    /// A heading must not be glued to the first list item that follows it
+    /// (`## Highlights - Revenue…`).
+    #[test]
+    fn test_heading_not_glued_to_following_list() {
+        let converter = MarkdownOutputConverter::new();
+        let config = TextPipelineConfig::default();
+        let mut h = make_span("Highlights", 0.0, 100.0, 12.0, FontWeight::Normal);
+        h.struct_role = Some(StructRole::Heading(2));
+        let mut a = make_span("Revenue grew steadily.", 0.0, 80.0, 12.0, FontWeight::Normal);
+        a.struct_role = Some(StructRole::ListItemBody);
+        a.block_id = Some(1);
+        let mut b = make_span("Costs remained flat.", 0.0, 64.0, 12.0, FontWeight::Normal);
+        b.struct_role = Some(StructRole::ListItemBody);
+        b.block_id = Some(2);
+        let out = converter.convert(&[h, a, b], &config).unwrap();
+        eprintln!("--- heading/list output ---\n{out}\n---");
+        assert!(!out.contains("Highlights - "), "heading glued to list:\n{out}");
+        assert!(out.contains("- Revenue grew steadily."), "first item missing bullet:\n{out}");
     }
 
     /// D1 coverage — every list-role variant (LI / Lbl / LBody) on a
@@ -2867,6 +3168,45 @@ mod tests {
                 px, pw, cx, font, expected, actual
             );
         }
+    }
+
+    /// A backward-X transition is a column boundary ONLY when it is not an
+    /// ordinary within-column line wrap. A wrap drops by ~one line; a column
+    /// jump goes up, stays on the same baseline, or drops far more.
+    #[test]
+    fn test_is_column_gap_distinguishes_wrap_from_column_jump() {
+        let font = 13.0;
+        let mk = |x: f32, y: f32| {
+            let mut s = make_span("w", x, y, font, FontWeight::Normal);
+            s.span.bbox.width = 40.0;
+            s
+        };
+        // Within-column wrap: X resets to the left margin, Y steps down one
+        // line (~13.5pt). NOT a column boundary.
+        assert!(!is_column_gap(&mk(285.0, 555.8), &mk(229.0, 542.2)));
+        // Same-baseline column transition (end of col 1 → top-ish of col 2 at
+        // the same Y, y_drop ≈ 0). IS a column boundary.
+        assert!(is_column_gap(&mk(976.7, 1013.2), &mk(192.6, 1011.7)));
+        // Column jump UP (next column resumes far above). IS a column boundary.
+        assert!(is_column_gap(&mk(500.0, 100.0), &mk(72.0, 700.0)));
+    }
+
+    /// Right-to-left flow steps left on every word, including across the space
+    /// spans between words — none of those steps is a column boundary, or an
+    /// Arabic/Hebrew line shatters into one paragraph per word.
+    #[test]
+    fn test_is_column_gap_rtl_word_and_space_steps_are_not_columns() {
+        let mk = |t: &str, x: f32| {
+            let mut s = make_span(t, x, 700.0, 13.0, FontWeight::Normal);
+            s.span.bbox.width = 30.0;
+            s
+        };
+        // Hebrew word (right) → space → Hebrew word (further left), same line.
+        let word_r = mk("\u{05D0}\u{05D1}", 300.0);
+        let space = mk(" ", 290.0);
+        let word_l = mk("\u{05D2}\u{05D3}", 250.0);
+        assert!(!is_column_gap(&word_r, &space), "RTL word→space read as a column gap");
+        assert!(!is_column_gap(&space, &word_l), "RTL space→word read as a column gap");
     }
 
     /// D5c RED — multi-column newspaper case. Two text spans on the

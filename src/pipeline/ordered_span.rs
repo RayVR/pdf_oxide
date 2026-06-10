@@ -199,6 +199,17 @@ pub struct OrderedTextSpan {
     /// drop the non-anchor spans of a multi-MCID subtree without
     /// disturbing the reading-order vector's indexing.
     pub actualtext_replacement: Option<Arc<str>>,
+
+    /// Hyperlink target for this span, if its bbox falls within a `/Link`
+    /// annotation whose action resolves to a URI (ISO 32000-1 §12.5.6.5 +
+    /// §12.6.4.7). Output converters emit `[text](uri)` / `<a href>` for runs
+    /// of spans that share a URI. None when the span carries no link.
+    pub link_uri: Option<Arc<str>>,
+
+    /// True when this span is preformatted (nested under a `Code` element in
+    /// the structure tree). Converters must preserve its line breaks and never
+    /// reflow it into a paragraph.
+    pub preformatted: bool,
 }
 
 impl OrderedTextSpan {
@@ -213,6 +224,8 @@ impl OrderedTextSpan {
             struct_role: None,
             block_id: None,
             actualtext_replacement: None,
+            link_uri: None,
+            preformatted: false,
         }
     }
 
@@ -226,6 +239,8 @@ impl OrderedTextSpan {
             struct_role: None,
             block_id: None,
             actualtext_replacement: None,
+            link_uri: None,
+            preformatted: false,
         }
     }
 

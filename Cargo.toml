@@ -60,7 +60,7 @@ manual_checked_ops = "allow"
 
 [package]
 name = "pdf_oxide"
-version = "0.3.61"
+version = "0.3.63"
 # MSRV — driven up from 1.82 for v0.3.38. Transitive deps pulled in
 # this release push the floor to 1.88:
 #   - hybrid-array 0.4.10 (via RustCrypto) → edition 2024 → 1.85
@@ -202,7 +202,7 @@ der = { version = "0.7", optional = true }            # DER encoding
 spki = { version = "0.7", optional = true }           # SubjectPublicKeyInfo — matches der 0.7
 pkcs1 = { version = "0.7", optional = true }          # PKCS#1 RSA format
 pkcs8 = { version = "0.10", optional = true }         # PKCS#8 private keys
-p12-keystore = { version = "0.2.1", optional = true } # PKCS#12 (.p12/.pfx) parsing
+p12-keystore = { version = "0.3.0", optional = true } # PKCS#12 (.p12/.pfx) parsing
 signature = { version = "2.2", optional = true }      # Signature traits
 sha1 = { version = "0.11", optional = true }          # SHA-1 for legacy signatures
 # sha2 v0.10 alias: rsa 0.9 and p256/p384 0.13 require digest 0.10 trait bounds.
@@ -326,6 +326,13 @@ default = ["icc", "legacy-crypto"]
 
 # Enable logging for the extraction pipeline
 logging = []
+
+# Bundle fallback fonts (Droid Sans Fallback for CJK + Noto Emoji) so that
+# flattening a filled form field can bake non-Latin / emoji values that the
+# field's own /DA font cannot render (ISO 32000-1 §12.7.3.3). Opt-in because
+# it adds ~4.5 MB of font data to the binary; when disabled, flattening such a
+# value falls back to the /DA font and emits a warning instead of embedding.
+cjk-form-fonts = []
 
 # FIPS 140-3 validated cryptographic backend (issue #236).
 # When enabled, opt into `AwsLcProvider` (Amazon's `aws-lc-rs` with
