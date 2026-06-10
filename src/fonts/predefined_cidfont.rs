@@ -392,10 +392,7 @@ mod tests {
         assert_eq!(is_predefined("HeiseiMin-W3"), Some(CharacterCollection::AdobeJapan1));
         assert_eq!(is_predefined("HeiseiKakuGo-W5"), Some(CharacterCollection::AdobeJapan1));
         assert_eq!(is_predefined("KozMinPro-Regular"), Some(CharacterCollection::AdobeJapan1));
-        assert_eq!(
-            is_predefined("Kozuka-Mincho-Pro-VI-R"),
-            Some(CharacterCollection::AdobeJapan1)
-        );
+        assert_eq!(is_predefined("Kozuka-Mincho-Pro-VI-R"), Some(CharacterCollection::AdobeJapan1));
     }
 
     #[test]
@@ -435,10 +432,7 @@ mod tests {
     fn suffixed_chinese_simplified_names_resolve_to_gb1() {
         assert_eq!(is_predefined("STSong-Light-GBK-EUC-H"), Some(CharacterCollection::AdobeGB1));
         assert_eq!(is_predefined("STSong-Light-UniGB-UCS2-H"), Some(CharacterCollection::AdobeGB1));
-        assert_eq!(
-            is_predefined("STHeiti-Light-Identity-V"),
-            Some(CharacterCollection::AdobeGB1)
-        );
+        assert_eq!(is_predefined("STHeiti-Light-Identity-V"), Some(CharacterCollection::AdobeGB1));
     }
 
     #[test]
@@ -461,7 +455,10 @@ mod tests {
     fn bare_korean_names_resolve_to_korea1() {
         assert_eq!(is_predefined("HYSMyeongJo-Medium"), Some(CharacterCollection::AdobeKorea1));
         assert_eq!(is_predefined("HYGoThic-Medium"), Some(CharacterCollection::AdobeKorea1));
-        assert_eq!(is_predefined("Adobe-MyungjoStd-Medium"), Some(CharacterCollection::AdobeKorea1));
+        assert_eq!(
+            is_predefined("Adobe-MyungjoStd-Medium"),
+            Some(CharacterCollection::AdobeKorea1)
+        );
         assert_eq!(is_predefined("Batang"), Some(CharacterCollection::AdobeKorea1));
     }
 

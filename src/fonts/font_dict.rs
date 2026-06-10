@@ -158,6 +158,23 @@ pub struct FontInfo {
     /// Parsed from `/DW2` (defaults to [`VerticalMetrics::SPEC_DEFAULT`] when
     /// `/DW2` is absent). Held by value because the struct is `Copy`.
     pub cid_default_vertical_metrics: VerticalMetrics,
+    /// `Some(collection)` when this is a Type0 CIDFont referencing one of
+    /// Adobe's predefined CJK base names (`Ryumin-Light`, `GothicBBB-Medium`,
+    /// `STSong-Light`, `MHei-Medium`, `HYSMyeongJo-Medium`, …) AND has no
+    /// embedded font program (`/FontFile{,2,3}` absent on the CIDFont's
+    /// descriptor). ISO 32000-2 §9.7.5.2 requires a conforming reader to
+    /// supply glyphs for these character collections; the renderer consults
+    /// this field to route the paint through a bundled covering font (see
+    /// [`super::predefined_cidfont`]) and convert each CID through the
+    /// appropriate [`super::cid_mappings`] table to a Unicode code point.
+    ///
+    /// `None` for every other font, including:
+    /// - Type0 fonts whose CIDFont embeds outlines (the embedded program
+    ///   already supplies glyphs);
+    /// - Type0 fonts whose base name is not in the predefined registry (we
+    ///   cannot safely guess a substitution);
+    /// - Simple Type1 / TrueType fonts.
+    pub cjk_substitution: Option<super::predefined_cidfont::CharacterCollection>,
 }
 
 /// Font encoding types.
@@ -1170,6 +1187,35 @@ impl FontInfo {
             }
         }
 
+        // Detect Adobe predefined CIDFont substitution candidates.
+        // Conditions (all must hold):
+        //   1. Type0 font (the only place predefined CMaps are referenced).
+        //   2. No embedded font program — `embedded_font_data` is `None` after
+        //      the Type0 wrapper AND the CIDFont descendant have both been
+        //      checked for `/FontFile{,2,3}`. With outlines the document is
+        //      self-contained and we have nothing to substitute against.
+        //   3. The base font name (after subset-prefix + CMap-suffix strip)
+        //      matches one of the registered predefined names from
+        //      Technical Notes #5078 / #5079 / #5080 / #5093.
+        // When all three hold, the renderer routes the paint through the
+        // bundled covering font; otherwise we leave `cjk_substitution` at
+        // `None` and the existing render path runs unchanged.
+        let cjk_substitution = if subtype == "Type0" && embedded_font_data.is_none() {
+            let collection = super::predefined_cidfont::is_predefined(&base_font);
+            if let Some(c) = collection {
+                log::info!(
+                    "Font '{}': flagged for CJK predefined-CIDFont substitution \
+                     (collection {:?}); no embedded outlines, base name is an \
+                     Adobe predefined CIDFont per ISO 32000-2 §9.7.5.2",
+                    base_font,
+                    c
+                );
+            }
+            collection
+        } else {
+            None
+        };
+
         Ok(FontInfo {
             base_font,
             subtype,
@@ -1206,6 +1252,7 @@ impl FontInfo {
             wmode,
             cid_vertical_metrics,
             cid_default_vertical_metrics,
+            cjk_substitution,
         })
     }
 
@@ -6008,6 +6055,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert!(font.is_bold());
 
@@ -6047,6 +6095,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert!(!font2.is_bold());
     }
@@ -6089,6 +6138,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert!(font.is_italic());
 
@@ -6128,6 +6178,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert!(font2.is_italic());
     }
@@ -6173,6 +6224,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Should use ToUnicode mapping (priority)
@@ -6219,6 +6271,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font.char_to_unicode(0x41), Some("A".to_string()));
@@ -6264,6 +6317,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Type0 without ToUnicode should use CID-as-Unicode fallback
@@ -6307,6 +6361,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Simple fonts (Type1) CAN use Identity encoding for valid Unicode codes
@@ -6448,6 +6503,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         let font2 = font.clone();
@@ -6579,6 +6635,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Should use custom encoding
@@ -6628,6 +6685,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font_with_force_bold.get_font_weight(), FontWeight::Bold);
@@ -6670,6 +6728,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font_without_force_bold.get_font_weight(), FontWeight::Normal);
@@ -6716,6 +6775,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font_heavy_stem.get_font_weight(), FontWeight::Bold);
@@ -6758,6 +6818,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font_medium_stem.get_font_weight(), FontWeight::Medium);
@@ -6800,6 +6861,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font_light_stem.get_font_weight(), FontWeight::Normal);
@@ -6846,6 +6908,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font_explicit.get_font_weight(), FontWeight::Light);
@@ -6888,6 +6951,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font_force_bold.get_font_weight(), FontWeight::Bold);
@@ -6930,6 +6994,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         assert_eq!(font_name.get_font_weight(), FontWeight::Bold);
@@ -6976,6 +7041,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_black.get_font_weight(), FontWeight::Black);
         assert!(font_black.is_bold());
@@ -7017,6 +7083,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_extrabold.get_font_weight(), FontWeight::ExtraBold);
         assert!(font_extrabold.is_bold());
@@ -7058,6 +7125,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_bold.get_font_weight(), FontWeight::Bold);
         assert!(font_bold.is_bold());
@@ -7099,6 +7167,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_semibold.get_font_weight(), FontWeight::SemiBold);
         assert!(font_semibold.is_bold());
@@ -7140,6 +7209,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_medium.get_font_weight(), FontWeight::Medium);
         assert!(!font_medium.is_bold());
@@ -7181,6 +7251,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_light.get_font_weight(), FontWeight::Light);
         assert!(!font_light.is_bold());
@@ -7222,6 +7293,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_extralight.get_font_weight(), FontWeight::ExtraLight);
         assert!(!font_extralight.is_bold());
@@ -7263,6 +7335,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_thin.get_font_weight(), FontWeight::Thin);
         assert!(!font_thin.is_bold());
@@ -7304,6 +7377,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         assert_eq!(font_normal.get_font_weight(), FontWeight::Normal);
         assert!(!font_normal.is_bold());
@@ -7593,6 +7667,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Widths from cid_widths
@@ -7646,6 +7721,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // CID 1 has explicit width
@@ -7695,6 +7771,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // All CIDs use default_width when no cid_widths and no widths array
@@ -7754,6 +7831,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Range test
@@ -7810,6 +7888,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
         overrides(&mut f);
         f
@@ -9865,6 +9944,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // 'A' = 722 in Times-Roman (not the default 500)
@@ -9915,6 +9995,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Courier is monospace — all chars 600
@@ -9961,6 +10042,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Should use explicit width (999), not standard Times width (722)
@@ -10005,6 +10087,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         // Unknown font → should fall back to default_width (500)
@@ -10055,6 +10138,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         };
 
         let table = font.get_byte_to_width_table();
@@ -10202,6 +10286,7 @@ mod tests {
             wmode: 0,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         }
     }
 

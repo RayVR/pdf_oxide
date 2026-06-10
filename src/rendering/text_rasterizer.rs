@@ -1793,6 +1793,7 @@ mod tests {
             wmode: 1,
             cid_vertical_metrics: None,
             cid_default_vertical_metrics: VerticalMetrics::SPEC_DEFAULT,
+            cjk_substitution: None,
         }
     }
 
