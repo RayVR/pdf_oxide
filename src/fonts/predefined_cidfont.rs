@@ -12,10 +12,10 @@
 //! materialise the glyphs from a covering font.
 //!
 //! This module is the name → character-collection registry. Callers consult
-//! [`is_predefined`] to decide whether a CIDFont without `/FontFile{,2,3}` is a
-//! candidate for substitution. The actual glyph paint goes through the bundled
+//! the `is_predefined` function below to decide whether a CIDFont without
+//! `/FontFile{,2,3}` is a candidate for substitution. The actual glyph paint goes through the bundled
 //! Droid Sans Fallback (gated on the `cjk-render-fallback` cargo feature) via
-//! the CID → Unicode tables in [`super::cid_mappings`].
+//! the CID → Unicode tables in [`crate::fonts::cid_mappings`].
 //!
 //! ## Style fidelity
 //!
@@ -40,8 +40,9 @@
 /// One of the four Adobe predefined character collections supported by this
 /// renderer.
 ///
-/// The variant selects which [`super::cid_mappings`] lookup table is consulted
-/// to map a CID to a Unicode code point for the substituted-glyph paint path.
+/// The variant selects which [`crate::fonts::cid_mappings`] lookup table is
+/// consulted to map a CID to a Unicode code point for the substituted-glyph
+/// paint path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CharacterCollection {
     /// Adobe-Japan1 (Japanese): JIS X 0208 / 0212, kana, kanji.
