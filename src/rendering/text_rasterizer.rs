@@ -1612,6 +1612,12 @@ impl TextRasterizer {
         let mut glyphs_missing: usize = 0;
 
         for (char_code, _) in TextCharIter::new(bytes, Some(font_info)) {
+            // code == CID holds by construction: the load-time gate in
+            // `FontInfo::from_dict` only sets `cjk_substitution` when the
+            // /Encoding resolved to `Encoding::Identity` (Identity-H/V or an
+            // Adobe-collection identity CMap stream). Non-Identity predefined
+            // CMaps (90ms-RKSJ-H, GBK-EUC-H, …) carry raw legacy multi-byte
+            // codes and are never routed here.
             let cid = char_code;
 
             // PDF advance metrics (font's own /W array) — paint position is
@@ -1706,7 +1712,16 @@ impl TextRasterizer {
                 glyphs_missing
             );
         }
-        Ok(if wmode == 0 { x_cursor } else { y_cursor })
+        // §9.4.4: tx = ((w0·Tfs)+Tc+Tw)·Th, ty has no Th factor. The paint
+        // loop above defers Th to the per-glyph `px` computation, so the
+        // returned text-space advance applies it here — matching
+        // `measure_text_bytes`, which this function falls back to when the
+        // bundled face is unavailable.
+        Ok(if wmode == 0 {
+            x_cursor * h_scale
+        } else {
+            y_cursor
+        })
     }
 
     /// Advance-only fallback used when CJK substitution is requested but the
@@ -2169,6 +2184,54 @@ mod tests {
             (total - (-21.0)).abs() < 0.01,
             "measure_tj_array total should be -21 in vertical mode, got {}",
             total
+        );
+    }
+
+    /// The advance returned by the CJK substitution paint path must include
+    /// Th (horizontal scaling) per ISO 32000-1 §9.4.4
+    /// (`tx = ((w0·Tfs)+Tc+Tw)·Th`), matching `measure_text_bytes` — which
+    /// the same function falls back to when the bundled face is unavailable.
+    /// Halving Tz must halve the returned advance.
+    #[cfg(feature = "cjk-render-fallback")]
+    #[test]
+    fn substituted_cjk_advance_applies_horizontal_scaling() {
+        let mut font = make_vertical_test_font();
+        font.wmode = 0;
+        font.cjk_substitution =
+            Some(crate::fonts::predefined_cidfont::CharacterCollection::AdobeJapan1);
+
+        let rasterizer = TextRasterizer::with_fontdb(std::sync::Arc::new(fontdb::Database::new()));
+        let mut pixmap = Pixmap::new(16, 16).expect("pixmap");
+        let paint = Paint::default();
+        // CID 1200 (一) twice — default width 1000 ⇒ 10 pt per glyph at Tfs 10.
+        let bytes: &[u8] = &[0x04, 0xB0, 0x04, 0xB0];
+
+        let advance_at = |h_scaling: f32, pixmap: &mut Pixmap| {
+            let mut gs = GraphicsState::new();
+            gs.font_size = 10.0;
+            gs.text_wmode = 0;
+            gs.horizontal_scaling = h_scaling;
+            rasterizer
+                .render_substituted_cjk(
+                    pixmap,
+                    bytes,
+                    &font,
+                    crate::fonts::predefined_cidfont::CharacterCollection::AdobeJapan1,
+                    &paint,
+                    Transform::identity(),
+                    &gs,
+                    None,
+                )
+                .expect("substituted render")
+        };
+
+        let full = advance_at(100.0, &mut pixmap);
+        let half = advance_at(50.0, &mut pixmap);
+
+        assert!((full - 20.0).abs() < 0.01, "Th=100% advance should be 20.0, got {full}");
+        assert!(
+            (half - 10.0).abs() < 0.01,
+            "Th=50% must halve the returned advance (§9.4.4 tx·Th): got {half}, full was {full}"
         );
     }
 }
