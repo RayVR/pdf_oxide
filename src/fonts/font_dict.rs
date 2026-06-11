@@ -160,17 +160,26 @@ pub struct FontInfo {
     pub cid_default_vertical_metrics: VerticalMetrics,
     /// `Some(collection)` when this is a Type0 CIDFont referencing one of
     /// Adobe's predefined CJK base names (`Ryumin-Light`, `GothicBBB-Medium`,
-    /// `STSong-Light`, `MHei-Medium`, `HYSMyeongJo-Medium`, …) AND has no
-    /// embedded font program (`/FontFile{,2,3}` absent on the CIDFont's
-    /// descriptor). ISO 32000-2 §9.7.5.2 requires a conforming reader to
-    /// supply glyphs for these character collections; the renderer consults
-    /// this field to route the paint through a bundled covering font (see
-    /// [`super::predefined_cidfont`]) and convert each CID through the
-    /// appropriate [`super::cid_mappings`] table to a Unicode code point.
+    /// `STSong-Light`, `MHei-Medium`, `HYSMyeongJo-Medium`, …), has no
+    /// embedded font program (no `/FontFile{,2,3}` key on either the Type0
+    /// wrapper's or the CIDFont descendant's descriptor), AND uses an
+    /// Identity charcode→CID `/Encoding` (Identity-H/V or an
+    /// Adobe-collection identity CMap stream). ISO 32000-2 §9.7.5.2 requires
+    /// a conforming reader to supply glyphs for these character collections;
+    /// the renderer consults this field to route the paint through a bundled
+    /// covering font (see [`super::predefined_cidfont`]) and convert each CID
+    /// through the appropriate [`super::cid_mappings`] table to a Unicode
+    /// code point. The collection follows the descendant's `/CIDSystemInfo`
+    /// Ordering when it names a known collection, falling back to the
+    /// name-derived collection for Identity/unknown orderings.
     ///
     /// `None` for every other font, including:
-    /// - Type0 fonts whose CIDFont embeds outlines (the embedded program
-    ///   already supplies glyphs);
+    /// - Type0 fonts whose CIDFont declares an embedded program — even when
+    ///   that program fails to load/decode, substitution would mask the
+    ///   decode defect; the failure is logged instead;
+    /// - Type0 fonts with a non-Identity predefined CMap (`90ms-RKSJ-H`,
+    ///   `GBK-EUC-H`, …) whose charcodes are raw legacy multi-byte values,
+    ///   not CIDs — unsupported until a charcode→CID CMap pass is wired;
     /// - Type0 fonts whose base name is not in the predefined registry (we
     ///   cannot safely guess a substitution);
     /// - Simple Type1 / TrueType fonts.
@@ -567,6 +576,7 @@ impl FontInfo {
             is_truetype_font,
             raw_ascent,
             raw_descent,
+            mut has_font_program,
         ) = if let Some(descriptor_ref) = font_dict
             .get("FontDescriptor")
             .and_then(|obj| obj.as_reference())
@@ -605,6 +615,15 @@ impl FontInfo {
 
                     // Load embedded font data from FontFile2 (TrueType), FontFile (Type 1), or FontFile3 (CFF/OpenType)
                     // IMPORTANT: Track whether font is TrueType or CFF - only TrueType fonts have cmaps!
+                    //
+                    // Key presence is recorded separately from extraction
+                    // success: a present-but-undecodable font program means
+                    // the document intended to be self-contained, which
+                    // downstream gates (CJK predefined-CIDFont substitution)
+                    // must distinguish from "no program at all".
+                    let has_font_program = descriptor_dict.contains_key("FontFile2")
+                        || descriptor_dict.contains_key("FontFile3")
+                        || descriptor_dict.contains_key("FontFile");
                     let (embedded_font, is_truetype_font) = if let Some(ff2_obj) =
                         descriptor_dict.get("FontFile2")
                     {
@@ -612,10 +631,29 @@ impl FontInfo {
                         let font_data = ff2_obj
                             .as_reference()
                             .and_then(|ff2_ref| {
-                                doc.load_object(ff2_ref).ok().map(|obj| (obj, ff2_ref))
+                                doc.load_object(ff2_ref)
+                                    .inspect_err(|e| {
+                                        log::warn!(
+                                            "Font '{}': failed to load FontFile2 object {}: {}",
+                                            base_font,
+                                            ff2_ref,
+                                            e
+                                        )
+                                    })
+                                    .ok()
+                                    .map(|obj| (obj, ff2_ref))
                             })
                             .and_then(|(ff2_stream, ff2_ref)| {
-                                doc.decode_stream_with_encryption(&ff2_stream, ff2_ref).ok()
+                                doc.decode_stream_with_encryption(&ff2_stream, ff2_ref)
+                                    .inspect_err(|e| {
+                                        log::warn!(
+                                            "Font '{}': failed to decode FontFile2 stream {}: {}",
+                                            base_font,
+                                            ff2_ref,
+                                            e
+                                        )
+                                    })
+                                    .ok()
                             })
                             .map(|data| {
                                 log::info!(
@@ -634,10 +672,29 @@ impl FontInfo {
                         let font_data = ff3_obj
                             .as_reference()
                             .and_then(|ff3_ref| {
-                                doc.load_object(ff3_ref).ok().map(|obj| (obj, ff3_ref))
+                                doc.load_object(ff3_ref)
+                                    .inspect_err(|e| {
+                                        log::warn!(
+                                            "Font '{}': failed to load FontFile3 object {}: {}",
+                                            base_font,
+                                            ff3_ref,
+                                            e
+                                        )
+                                    })
+                                    .ok()
+                                    .map(|obj| (obj, ff3_ref))
                             })
                             .and_then(|(ff3_stream, ff3_ref)| {
-                                doc.decode_stream_with_encryption(&ff3_stream, ff3_ref).ok()
+                                doc.decode_stream_with_encryption(&ff3_stream, ff3_ref)
+                                    .inspect_err(|e| {
+                                        log::warn!(
+                                            "Font '{}': failed to decode FontFile3 stream {}: {}",
+                                            base_font,
+                                            ff3_ref,
+                                            e
+                                        )
+                                    })
+                                    .ok()
                             })
                             .map(|data| {
                                 // Wrap raw CFF in OpenType container for ttf-parser
@@ -664,10 +721,29 @@ impl FontInfo {
                         let font_data = ff_obj
                             .as_reference()
                             .and_then(|ff_ref| {
-                                doc.load_object(ff_ref).ok().map(|obj| (obj, ff_ref))
+                                doc.load_object(ff_ref)
+                                    .inspect_err(|e| {
+                                        log::warn!(
+                                            "Font '{}': failed to load FontFile object {}: {}",
+                                            base_font,
+                                            ff_ref,
+                                            e
+                                        )
+                                    })
+                                    .ok()
+                                    .map(|obj| (obj, ff_ref))
                             })
                             .and_then(|(ff_stream, ff_ref)| {
-                                doc.decode_stream_with_encryption(&ff_stream, ff_ref).ok()
+                                doc.decode_stream_with_encryption(&ff_stream, ff_ref)
+                                    .inspect_err(|e| {
+                                        log::warn!(
+                                            "Font '{}': failed to decode FontFile stream {}: {}",
+                                            base_font,
+                                            ff_ref,
+                                            e
+                                        )
+                                    })
+                                    .ok()
                             })
                             .map(|data| {
                                 log::info!(
@@ -691,15 +767,16 @@ impl FontInfo {
                         is_truetype_font,
                         ascent_value,
                         descent_value,
+                        has_font_program,
                     )
                 } else {
-                    (None, None, None, None, false, None, None)
+                    (None, None, None, None, false, None, None, false)
                 }
             } else {
-                (None, None, None, None, false, None, None)
+                (None, None, None, None, false, None, None, false)
             }
         } else {
-            (None, None, None, None, false, None, None)
+            (None, None, None, None, false, None, None, false)
         };
 
         // TrueType cmap extraction is now LAZY — deferred until first access via
@@ -1024,7 +1101,7 @@ impl FontInfo {
                     dw,
                     explicit_dw,
                     tt_cmap,
-                    desc_embedded,
+                    (desc_has_font_program, desc_embedded),
                     d_ascent,
                     d_descent,
                     vmetrics,
@@ -1047,6 +1124,7 @@ impl FontInfo {
                     if desc_embedded.is_some() && embedded_font_data.is_none() {
                         embedded_font_data = desc_embedded;
                     }
+                    has_font_program |= desc_has_font_program;
                     (
                         map,
                         info,
@@ -1190,18 +1268,60 @@ impl FontInfo {
         // Detect Adobe predefined CIDFont substitution candidates.
         // Conditions (all must hold):
         //   1. Type0 font (the only place predefined CMaps are referenced).
-        //   2. No embedded font program — `embedded_font_data` is `None` after
-        //      the Type0 wrapper AND the CIDFont descendant have both been
-        //      checked for `/FontFile{,2,3}`. With outlines the document is
-        //      self-contained and we have nothing to substitute against.
-        //   3. The base font name (after subset-prefix + CMap-suffix strip)
+        //   2. No embedded font program — neither the Type0 wrapper's nor the
+        //      CIDFont descendant's FontDescriptor carries a `/FontFile{,2,3}`
+        //      KEY. Key presence (not extraction success) is what gates here:
+        //      a present-but-undecodable program means the document embeds its
+        //      own outlines and the decode failure must surface as a warning,
+        //      not be masked by a silent sans-serif substitution.
+        //   3. The /Encoding resolves to an Identity charcode→CID mapping
+        //      (Identity-H/V or an Adobe-collection identity CMap stream).
+        //      Non-Identity predefined CMaps (90ms-RKSJ-H, GBK-EUC-H, …) carry
+        //      raw legacy multi-byte codes, not CIDs — substituting would
+        //      index the CID→Unicode tables with Shift-JIS / EUC values and
+        //      paint wrong glyphs. Those CMaps stay unsubstituted until a
+        //      charcode→CID CMap pass is wired.
+        //   4. The base font name (after subset-prefix + CMap-suffix strip)
         //      matches one of the registered predefined names from
         //      Technical Notes #5078 / #5079 / #5080 / #5093.
-        // When all three hold, the renderer routes the paint through the
-        // bundled covering font; otherwise we leave `cjk_substitution` at
-        // `None` and the existing render path runs unchanged.
-        let cjk_substitution = if subtype == "Type0" && embedded_font_data.is_none() {
-            let collection = super::predefined_cidfont::is_predefined(&base_font);
+        // The character collection comes from the descendant's /CIDSystemInfo
+        // Ordering when it names a known collection (it is authoritative for
+        // CID semantics per ISO 32000-1 §9.7.3); the name-derived collection
+        // is the fallback for Identity/unknown orderings.
+        // When all hold, the renderer routes the paint through the bundled
+        // covering font; otherwise we leave `cjk_substitution` at `None` and
+        // the existing render path runs unchanged.
+        let cjk_substitution = if subtype == "Type0"
+            && !has_font_program
+            && embedded_font_data.is_none()
+            && matches!(encoding, Encoding::Identity)
+        {
+            use super::predefined_cidfont::CharacterCollection;
+            let name_collection = super::predefined_cidfont::is_predefined(&base_font);
+            let ordering_collection =
+                cid_system_info
+                    .as_ref()
+                    .and_then(|info| match info.ordering.as_str() {
+                        "Japan1" => Some(CharacterCollection::AdobeJapan1),
+                        "GB1" => Some(CharacterCollection::AdobeGB1),
+                        "CNS1" => Some(CharacterCollection::AdobeCNS1),
+                        "Korea1" => Some(CharacterCollection::AdobeKorea1),
+                        _ => None,
+                    });
+            let collection = match (name_collection, ordering_collection) {
+                (Some(n), Some(o)) if n != o => {
+                    log::info!(
+                        "Font '{}': base name implies collection {:?} but \
+                         /CIDSystemInfo Ordering says {:?}; trusting CIDSystemInfo",
+                        base_font,
+                        n,
+                        o
+                    );
+                    Some(o)
+                },
+                (Some(n), _) => Some(n),
+                (None, _) => None,
+            };
             if let Some(c) = collection {
                 log::info!(
                     "Font '{}': flagged for CJK predefined-CIDFont substitution \
@@ -1213,6 +1333,24 @@ impl FontInfo {
             }
             collection
         } else {
+            if subtype == "Type0" && super::predefined_cidfont::is_predefined(&base_font).is_some()
+            {
+                if has_font_program && embedded_font_data.is_none() {
+                    log::warn!(
+                        "Font '{}': /FontFile{{,2,3}} present but the font program \
+                         failed to load/decode (see warnings above); NOT substituting \
+                         the bundled CJK fallback — glyphs for this font will not render",
+                        base_font
+                    );
+                } else if !has_font_program && !matches!(encoding, Encoding::Identity) {
+                    log::info!(
+                        "Font '{}': Adobe predefined CIDFont without embedded outlines, \
+                         but /Encoding is a non-Identity CMap — charcodes are not CIDs, \
+                         so CJK substitution is skipped",
+                        base_font
+                    );
+                }
+            }
             None
         };
 
@@ -1320,8 +1458,12 @@ impl FontInfo {
     /// Per PDF Spec ISO 32000-1:2008, Section 9.7.1
     ///
     /// Returns: (CIDToGIDMap, CIDSystemInfo, CIDFontType, CIDWidths, DefaultWidth,
-    ///          has_explicit_dw, TrueTypeCMap, EmbeddedFontData, raw_ascent,
-    ///          raw_descent, vertical_metrics, dw2)
+    ///          has_explicit_dw, TrueTypeCMap, (has_font_program, EmbeddedFontData),
+    ///          raw_ascent, raw_descent, vertical_metrics, dw2)
+    ///
+    /// The embedded-font element pairs descriptor `/FontFile{,2,3}` key
+    /// presence with the extracted bytes so callers can tell "no program"
+    /// apart from "program present but failed to load/decode".
     #[allow(clippy::type_complexity)] // tuple grew incrementally; refactor deferred to a follow-up
     fn parse_descendant_fonts(
         font_dict: &HashMap<String, Object>,
@@ -1335,7 +1477,7 @@ impl FontInfo {
         f32,                                   // cid_default_width
         bool,                                  // has_explicit_dw (F14/F15 fix)
         Option<TrueTypeCMap>,                  // TrueType cmap from descendant's embedded font
-        Option<Arc<Vec<u8>>>,                  // Embedded font data from CIDFont's FontDescriptor
+        (bool, Option<Arc<Vec<u8>>>),          // (/FontFile{,2,3} key present, extracted data)
         Option<f32>,                           // raw_ascent from descendant FontDescriptor
         Option<f32>,                           // raw_descent from descendant FontDescriptor
         Option<HashMap<u16, VerticalMetrics>>, // /W2 per-CID vertical metrics
@@ -1775,17 +1917,30 @@ impl FontInfo {
         font_dict: &HashMap<String, Object>,
         base_font: &str,
         doc: &PdfDocument,
-    ) -> Option<Arc<Vec<u8>>> {
-        let desc_obj = font_dict.get("FontDescriptor")?;
+    ) -> (bool, Option<Arc<Vec<u8>>>) {
+        let Some(desc_obj) = font_dict.get("FontDescriptor") else {
+            return (false, None);
+        };
         let desc = if let Some(r) = desc_obj.as_reference() {
-            doc.load_object(r).ok()?
+            match doc.load_object(r) {
+                Ok(obj) => obj,
+                Err(_) => return (false, None),
+            }
         } else {
             desc_obj.clone()
         };
-        let desc_dict = desc.as_dict()?;
+        let Some(desc_dict) = desc.as_dict() else {
+            return (false, None);
+        };
 
         // Try FontFile2 (TrueType), FontFile3 (CFF/OpenType), FontFile (Type 1)
         let font_file_keys = ["FontFile2", "FontFile3", "FontFile"];
+        // Key presence ≠ extraction success: callers gating on "the document
+        // embeds its own outlines" must see `true` even when every present
+        // stream fails to load/decode below.
+        let has_font_program = font_file_keys
+            .iter()
+            .any(|key| desc_dict.contains_key(*key));
         for key in &font_file_keys {
             if let Some(ff_obj) = desc_dict.get(*key) {
                 let ff_ref = match ff_obj.as_reference() {
@@ -1834,11 +1989,11 @@ impl FontInfo {
                         key,
                         font_data.len()
                     );
-                    return Some(Arc::new(font_data));
+                    return (has_font_program, Some(Arc::new(font_data)));
                 }
             }
         }
-        None
+        (has_font_program, None)
     }
 }
 
@@ -10624,5 +10779,149 @@ mod tests {
             f.diff_glyph_names = diff_glyph_names;
         });
         assert_eq!(font_not.char_to_unicode(0x21), Some("\u{00AC}".to_string()));
+    }
+
+    /// Build a synthetic single-page PDF whose object 4 is a Type0 font with
+    /// the given base name, /Encoding name, descendant /CIDSystemInfo
+    /// Ordering, and (optionally) an extra raw entry spliced into the
+    /// descendant's FontDescriptor (e.g. `/FontFile3 99 0 R` pointing at a
+    /// non-existent object to model a present-but-unextractable program).
+    fn build_predefined_cidfont_pdf(
+        base_font: &str,
+        encoding_name: &str,
+        ordering: &str,
+        descriptor_extra: &str,
+    ) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let o1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+        let o2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+        let o3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> >> endobj\n",
+        );
+        let o4 = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj << /Type /Font /Subtype /Type0 /BaseFont /{base_font} \
+                 /Encoding /{encoding_name} /DescendantFonts [5 0 R] >> endobj\n"
+            )
+            .as_bytes(),
+        );
+        let o5 = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj << /Type /Font /Subtype /CIDFontType0 /BaseFont /{base_font} \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering ({ordering}) /Supplement 6 >> \
+                 /FontDescriptor 6 0 R /DW 1000 >> endobj\n"
+            )
+            .as_bytes(),
+        );
+        let o6 = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "6 0 obj << /Type /FontDescriptor /FontName /{base_font} /Flags 6 \
+                 /FontBBox [-170 -331 1024 903] /ItalicAngle 0 /Ascent 723 \
+                 /Descent -241 /CapHeight 709 /StemV 69 {descriptor_extra} >> endobj\n"
+            )
+            .as_bytes(),
+        );
+
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for off in [o1, o2, o3, o4, o5, o6] {
+            pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer << /Size 7 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref).as_bytes(),
+        );
+        pdf
+    }
+
+    /// Parse object 4 of a [`build_predefined_cidfont_pdf`] document through
+    /// the real `FontInfo::from_dict` path and return the resulting FontInfo.
+    fn parse_predefined_cidfont(
+        base_font: &str,
+        encoding_name: &str,
+        ordering: &str,
+        descriptor_extra: &str,
+    ) -> FontInfo {
+        let pdf =
+            build_predefined_cidfont_pdf(base_font, encoding_name, ordering, descriptor_extra);
+        let doc = crate::document::PdfDocument::from_bytes(pdf).expect("synthetic PDF must parse");
+        let font_obj = doc
+            .load_object(crate::object::ObjectRef::new(4, 0))
+            .expect("load Type0 font dict");
+        FontInfo::from_dict(&font_obj, &doc).expect("FontInfo::from_dict")
+    }
+
+    /// Control: an Identity-H predefined name with no font program is flagged
+    /// for substitution under the collection derived from the name.
+    #[test]
+    fn cjk_substitution_flags_identity_h_predefined_name() {
+        let info = parse_predefined_cidfont("Ryumin-Light", "Identity-H", "Japan1", "");
+        assert_eq!(
+            info.cjk_substitution,
+            Some(super::super::predefined_cidfont::CharacterCollection::AdobeJapan1)
+        );
+    }
+
+    /// A descriptor that *declares* a font program (here a /FontFile3 whose
+    /// target object doesn't exist, so extraction fails) must NOT be
+    /// substituted: the document intended to embed outlines and the decode
+    /// failure should surface as a warning, not be masked by a silent
+    /// sans-serif substitution.
+    #[test]
+    fn cjk_substitution_declined_when_font_program_key_present_but_unextractable() {
+        let info =
+            parse_predefined_cidfont("Ryumin-Light", "Identity-H", "Japan1", "/FontFile3 99 0 R");
+        assert!(info.embedded_font_data.is_none(), "extraction must have failed");
+        assert_eq!(
+            info.cjk_substitution, None,
+            "substitution must not mask a failed embedded-font decode"
+        );
+    }
+
+    /// Non-Identity predefined CMaps (90ms-RKSJ-H, GBK-EUC-H, …) carry raw
+    /// legacy multi-byte codes, not CIDs. Until a charcode→CID CMap pass is
+    /// wired, such fonts must not be substituted — interpreting a Shift-JIS
+    /// code as an Adobe-Japan1 CID paints wrong glyphs with no diagnostic.
+    #[test]
+    fn cjk_substitution_requires_identity_cmap_encoding() {
+        let info =
+            parse_predefined_cidfont("Ryumin-Light-90ms-RKSJ-H", "90ms-RKSJ-H", "Japan1", "");
+        assert_eq!(
+            info.cjk_substitution, None,
+            "non-Identity CMap codes are not CIDs; substitution must decline"
+        );
+    }
+
+    /// When the descendant's /CIDSystemInfo names a known collection that
+    /// disagrees with the one derived from the base-font name, the explicit
+    /// CIDSystemInfo wins — it is authoritative for CID semantics per
+    /// ISO 32000-1 §9.7.3.
+    #[test]
+    fn cjk_substitution_prefers_cid_system_info_ordering_over_name() {
+        let info = parse_predefined_cidfont("Ryumin-Light", "Identity-H", "GB1", "");
+        assert_eq!(
+            info.cjk_substitution,
+            Some(super::super::predefined_cidfont::CharacterCollection::AdobeGB1),
+            "explicit /CIDSystemInfo Ordering must override the name-derived collection"
+        );
+    }
+
+    /// An Identity (or unknown) Ordering carries no collection semantics; the
+    /// name-derived collection remains the best available signal.
+    #[test]
+    fn cjk_substitution_keeps_name_collection_for_identity_ordering() {
+        let info = parse_predefined_cidfont("Ryumin-Light", "Identity-H", "Identity", "");
+        assert_eq!(
+            info.cjk_substitution,
+            Some(super::super::predefined_cidfont::CharacterCollection::AdobeJapan1)
+        );
     }
 }

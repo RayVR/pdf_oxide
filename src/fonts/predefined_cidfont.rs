@@ -36,6 +36,14 @@
 //! producer to form synthetic CIDFonts like `Ryumin-Light-Identity-V`. The
 //! match strategy splits on the *first* known CMap suffix; anything before is
 //! the candidate base name.
+//!
+//! Name recognition is necessary but not sufficient for substitution: the
+//! load-time gate in `FontInfo::from_dict` additionally requires the font's
+//! `/Encoding` to resolve to an Identity charcode→CID mapping. Non-Identity
+//! predefined CMaps (`90ms-RKSJ-H`, `GBK-EUC-H`, `B5pc-H`, …) put raw
+//! Shift-JIS / EUC / Big5 codes — not CIDs — in the content stream, and the
+//! CID→Unicode tables would mis-decode them; those fonts are recognised here
+//! but left unsubstituted until a charcode→CID CMap pass is wired.
 
 /// One of the four Adobe predefined character collections supported by this
 /// renderer.
