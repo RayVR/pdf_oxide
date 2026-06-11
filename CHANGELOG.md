@@ -6,6 +6,7 @@ All notable changes to PDFOxide are documented here.
 
 ### Fixed
 
+- **Watermark annotations rendered as nothing in compliant viewers** — a watermark's `/AP` appearance was serialized as a stream nested *directly* inside the annotation dictionary (`/AP <</N <<…>> stream … endstream>>`). A PDF stream must be an indirect object (ISO 32000-1:2008 §7.3.8); the inline form is invalid, so spec-compliant readers (e.g. MuPDF/PyMuPDF) rejected the annotation with "invalid key in dict" and the watermark never appeared — even though the bytes were present in the file. A shared `hoist_appearance_streams` helper now lifts nested `/N`, `/D`, and `/R` appearance streams (including named-state sub-dictionaries) into freshly allocated indirect objects and replaces the slot with a reference, applied on both the `DocumentBuilder` writer and the existing-page `DocumentEditor::save_page` paths. Verified end-to-end with MuPDF: the watermark now parses and renders on both paths.
 - **Fixed Python type stubs leaking the pyo3 `Py<Self>` receiver as a positional parameter** — methods implemented in Rust with a by-value receiver (`fn page(slf_handle: Py<Self>, …)` — the idiom pyo3 uses to hand a method an owned handle to its own instance) were emitted by the rylai stub generator with that receiver re-exposed *alongside* the injected `self`.
 
 ## [0.3.63] - 2026-06-09
