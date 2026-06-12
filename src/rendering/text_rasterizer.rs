@@ -128,6 +128,20 @@ fn system_fontdb() -> std::sync::Arc<fontdb::Database> {
         .get_or_init(|| {
             let mut db = fontdb::Database::new();
             db.load_system_fonts();
+            // Guarantee a CJK-covering face exists no matter which fonts the
+            // host has installed. Registered under its real family name
+            // ("Droid Sans Fallback"), so the existing fallback resolver only
+            // reaches it as a last resort — after any system CJK font (Noto
+            // Sans/Serif CJK, SimSun, …). Without this, a composite (Type 0)
+            // font that references a glyph collection but embeds no outlines
+            // renders blank on CJK-fontless hosts. ISO 32000-2 §9.7.5.2: a
+            // processor shall support the Adobe predefined character
+            // collections even when the PDF embeds no outlines for them.
+            #[cfg(feature = "cjk-render-fallback")]
+            db.load_font_data(
+                crate::fonts::form_fallback::font_bytes(crate::fonts::form_fallback::Fallback::Cjk)
+                    .to_vec(),
+            );
             std::sync::Arc::new(db)
         })
         .clone()
@@ -1658,22 +1672,34 @@ impl TextRasterizer {
                 (0.0, 0.0, 0.0)
             };
 
-            // CID → Unicode → glyph_id. Two-stage lookup: the Adobe
-            // character collection (e.g. UniJIS-UCS2-H for Adobe-Japan1)
-            // maps the PDF's CID to a Unicode code point; the bundled
-            // font's `cmap` then maps that Unicode point to a glyph_id.
-            // Either step can miss for CIDs outside the collection
-            // tables or Unicode code points outside Droid Sans Fallback's
-            // coverage — in that case we paint nothing but still advance
-            // the cursor so the rest of the text lands correctly.
+            // CID → Unicode → glyph_id. The PDF's CID is resolved to a
+            // Unicode code point, then the bundled font's `cmap` maps that
+            // point to a glyph_id. Source of the CID → Unicode mapping,
+            // in priority order:
+            //   1. the font's /ToUnicode CMap — authoritative for this
+            //      font's CIDs (§9.10.2), and the only correct mapping for
+            //      an Identity-encoded subset whose CIDs are not the Adobe
+            //      collection's CIDs;
+            //   2. the Adobe character collection table (e.g. UniJIS-UCS2-H
+            //      for Adobe-Japan1) — the common case for the real
+            //      predefined CIDFonts (Ryumin-Light, …) this substitution
+            //      targets, which usually ship no /ToUnicode.
+            // Either step can miss for CIDs outside both sources or Unicode
+            // points outside Droid Sans Fallback's coverage — then we paint
+            // nothing but still advance the cursor so the rest lands right.
             let mut gid: u16 = 0;
             let mut ch: char = '\0';
-            if let Some(cp) = collection.cid_to_unicode(cid) {
-                if let Some(c) = char::from_u32(cp) {
-                    ch = c;
-                    if let Some(g) = ttf_face.glyph_index(c) {
-                        gid = g.0;
-                    }
+            let unicode = font_info
+                .to_unicode
+                .as_ref()
+                .and_then(|lazy| lazy.get())
+                .and_then(|cmap| cmap.get(&(cid as u32)).and_then(|s| s.chars().next()))
+                .filter(|c| !matches!(*c, '\u{FFFD}' | '\u{FFFE}' | '\u{FFFF}'))
+                .or_else(|| collection.cid_to_unicode(cid).and_then(char::from_u32));
+            if let Some(c) = unicode {
+                ch = c;
+                if let Some(g) = ttf_face.glyph_index(c) {
+                    gid = g.0;
                 }
             }
 
@@ -2044,6 +2070,62 @@ mod tests {
     use crate::content::graphics_state::GraphicsState;
     use crate::fonts::{Encoding, FontInfo, VerticalMetrics};
     use std::collections::HashMap;
+
+    /// Query helper: the family name the CJK fallback resolver looks up.
+    #[cfg(feature = "cjk-render-fallback")]
+    fn query_droid_fallback(db: &fontdb::Database) -> Option<fontdb::ID> {
+        db.query(&fontdb::Query {
+            families: &[fontdb::Family::Name("Droid Sans Fallback")],
+            weight: fontdb::Weight::NORMAL,
+            stretch: fontdb::Stretch::Normal,
+            style: fontdb::Style::Normal,
+        })
+    }
+
+    /// The bundled CJK fallback (feature `cjk-render-fallback`) must provide
+    /// real glyph coverage for the Adobe predefined character collections even
+    /// on a host with NO fonts installed. Build a database holding only the
+    /// bundled face — deliberately skipping `load_system_fonts` — and confirm
+    /// it is both discoverable under the family name the resolver queries and
+    /// able to outline representative CJK glyphs. Host-independent: it never
+    /// consults system fonts.
+    #[cfg(feature = "cjk-render-fallback")]
+    #[test]
+    fn bundled_cjk_fallback_covers_cjk_without_system_fonts() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(
+            crate::fonts::form_fallback::font_bytes(crate::fonts::form_fallback::Fallback::Cjk)
+                .to_vec(),
+        );
+        let id = query_droid_fallback(&db)
+            .expect("bundled Droid Sans Fallback must be queryable by family name");
+
+        // Representative Japanese kanji / Chinese hanzi / Korean hangul from
+        // the Adobe-Japan1 / Adobe-GB1 / Adobe-Korea1 collections.
+        let covered = db
+            .with_face_data(id, |data, index| {
+                let face = ttf_parser::Face::parse(data, index).expect("parse bundled face");
+                ['東', '中', '가']
+                    .iter()
+                    .all(|&c| face.glyph_index(c).is_some())
+            })
+            .expect("bundled face data must be present");
+        assert!(covered, "bundled CJK fallback must cover representative CJK glyphs");
+    }
+
+    /// The process-wide system font database must always expose a CJK-capable
+    /// "Droid Sans Fallback" face when the feature is on — the guaranteed
+    /// last-resort lookup key `get_cjk_fallback_cached` and `load_font_data`
+    /// rely on. Without the feature this would be absent on a CJK-fontless host
+    /// and composite fonts with no embedded outlines would render blank.
+    #[cfg(feature = "cjk-render-fallback")]
+    #[test]
+    fn system_fontdb_registers_cjk_fallback() {
+        assert!(
+            query_droid_fallback(&system_fontdb()).is_some(),
+            "system_fontdb must expose Droid Sans Fallback under cjk-render-fallback"
+        );
+    }
 
     /// Build a minimal Type0 FontInfo for advance-measurement tests.
     /// All horizontal widths are 1000 (one full em) and vertical metrics
