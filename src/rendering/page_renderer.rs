@@ -8141,6 +8141,13 @@ fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
     (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
 }
 
+// Test-only counter that records how many `apply_pending_clip` calls actually
+// materialized a clip (i.e. did real rasterization work). Used by the
+// regression probe below to lock in the per-paint-op fast path.
+#[cfg(test)]
+pub(crate) static APC_MATERIALIZED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// ISO 32000-1 §11.7.4.3 / Table 149 source colour space classes.
 ///
 /// The CompatibleOverprint blend function `B(c_b, c_s)` selects between
@@ -8397,33 +8404,33 @@ fn apply_pending_clip(
     gs_stack: &GraphicsStateStack,
 ) {
     if let Some((path, fill_rule)) = pending_clip.take() {
+        #[cfg(test)]
+        APC_MATERIALIZED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let gs = gs_stack.current();
         let transform = combine_transforms(base_transform, &gs.ctm);
 
-        if let Some(path_transformed) = path.transform(transform) {
-            let bounds = path_transformed.bounds();
-            log::debug!("Applying clip: fill_rule={:?}, bounds={:?}", fill_rule, bounds);
-
-            let mut new_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height()).unwrap();
-            new_mask.fill_path(
-                &path_transformed,
-                fill_rule,
-                true, // anti-alias
-                Transform::identity(),
-            );
-
-            if let Some(Some(current_mask)) = clip_stack.last() {
-                // Intersect with existing mask
-                let mut combined = current_mask.clone();
-                let combined_data = combined.data_mut();
-                let new_data = new_mask.data();
-                for i in 0..combined_data.len() {
-                    combined_data[i] = ((combined_data[i] as u32 * new_data[i] as u32) / 255) as u8;
-                }
-                *clip_stack.last_mut().unwrap() = Some(combined);
-            } else {
-                *clip_stack.last_mut().unwrap() = Some(new_mask);
-            }
+        let Some(slot) = clip_stack.last_mut() else {
+            return;
+        };
+        match slot {
+            // Intersect the new clip path into the current scope's mask in
+            // place. tiny_skia::Mask::intersect_path allocates one submask,
+            // rasterizes the path into it, then folds it into `self` via the
+            // library's rounded `(a*b)/255` premultiply — replacing the
+            // previous code path which additionally cloned the current mask
+            // (a full page-sized memcpy) before running an equivalent scalar
+            // multiply loop. The clone was redundant: every `q` already pushes
+            // a cloned mask onto `clip_stack`, so the top-of-stack mask at the
+            // current depth is already this scope's private copy and may be
+            // mutated in place.
+            Some(existing_mask) => {
+                existing_mask.intersect_path(&path, fill_rule, true, transform);
+            },
+            None => {
+                let mut new_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height()).unwrap();
+                new_mask.fill_path(&path, fill_rule, true, transform);
+                *slot = Some(new_mask);
+            },
         }
     }
 }
@@ -8982,6 +8989,81 @@ mod tests {
         assert!(
             r.abs() < 1.0e-3 && (g - 1.0).abs() < 1.0e-3 && (b - 1.0).abs() < 1.0e-3,
             "DeviceCMYK pure cyan must map to (0, 1, 1) under additive clamp; got ({r}, {g}, {b})"
+        );
+    }
+
+    // Perf-regression probe: apply_pending_clip's only expensive work is the
+    // path-rasterization branch that runs when `pending_clip` is Some. A naive
+    // refactor (e.g. dropping the `Option::take` short-circuit, or treating
+    // every paint op as a fresh clip) would explode the materialization count
+    // to O(paint ops). This test pins the contract by driving the function
+    // directly with K paint-op-style invocations and N clip-state changes, and
+    // asserting the materialization count equals N — not K.
+    //
+    // The probe is serialized via `APC_PROBE_LOCK` because it reads / resets a
+    // process-wide AtomicU64. No other test in this mod calls
+    // `apply_pending_clip`, but the lock keeps the contract safe under future
+    // additions and under `cargo test -- --test-threads=1` parity.
+    static APC_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn apply_pending_clip_materializes_only_per_clip_state_change() {
+        use crate::content::GraphicsStateStack;
+        use std::sync::atomic::Ordering;
+        use tiny_skia::{FillRule, PathBuilder, Pixmap, Rect, Transform};
+
+        let _guard = APC_PROBE_LOCK.lock().unwrap();
+
+        let pixmap = Pixmap::new(200, 200).expect("pixmap");
+        let gs_stack = GraphicsStateStack::new();
+        let base_transform = Transform::identity();
+
+        let make_clip_path = || {
+            let mut pb = PathBuilder::new();
+            pb.push_rect(Rect::from_xywh(10.0, 10.0, 50.0, 50.0).unwrap());
+            pb.finish().unwrap()
+        };
+
+        // Scenario A: 1 clip-state change followed by K paint-op-style calls
+        // with no pending clip. Only the first call should materialize.
+        const K: usize = 100;
+        APC_MATERIALIZED.store(0, Ordering::Relaxed);
+        let mut clip_stack: Vec<Option<tiny_skia::Mask>> = vec![None];
+        let mut pending: Option<(tiny_skia::Path, FillRule)> =
+            Some((make_clip_path(), FillRule::Winding));
+        for _ in 0..K {
+            apply_pending_clip(&mut pending, &mut clip_stack, &pixmap, base_transform, &gs_stack);
+        }
+        let after_one_clip = APC_MATERIALIZED.load(Ordering::Relaxed);
+        assert_eq!(
+            after_one_clip, 1,
+            "1 W operator followed by {K} paint ops must materialize the clip \
+             mask exactly once (got {after_one_clip})"
+        );
+
+        // Scenario B: N clip-state changes each followed by K paint ops.
+        // Materialization count must equal N, not K*N.
+        const N: usize = 5;
+        APC_MATERIALIZED.store(0, Ordering::Relaxed);
+        let mut clip_stack: Vec<Option<tiny_skia::Mask>> = vec![None];
+        for _ in 0..N {
+            let mut pending: Option<(tiny_skia::Path, FillRule)> =
+                Some((make_clip_path(), FillRule::Winding));
+            for _ in 0..K {
+                apply_pending_clip(
+                    &mut pending,
+                    &mut clip_stack,
+                    &pixmap,
+                    base_transform,
+                    &gs_stack,
+                );
+            }
+        }
+        let after_n_clips = APC_MATERIALIZED.load(Ordering::Relaxed);
+        assert_eq!(
+            after_n_clips, N as u64,
+            "{N} W operators each followed by {K} paint ops must materialize \
+             exactly {N} times (got {after_n_clips})"
         );
     }
 }
