@@ -1282,13 +1282,15 @@ impl TextRasterizer {
                     if let Some(b) = paint_bounds.as_deref_mut() {
                         b.add_path(&path, glyph_transform);
                     }
-                    pixmap.fill_path(
-                        &path,
-                        paint,
-                        tiny_skia::FillRule::Winding,
-                        glyph_transform,
-                        clip_mask,
-                    );
+                    if !paint_bounds.as_deref().is_some_and(|b| b.is_dry_run()) {
+                        pixmap.fill_path(
+                            &path,
+                            paint,
+                            tiny_skia::FillRule::Winding,
+                            glyph_transform,
+                            clip_mask,
+                        );
+                    }
                 }
             } else {
                 // FALLBACK PATH: If primary font fails, use the cluster offset to find the original character
@@ -1352,13 +1354,15 @@ impl TextRasterizer {
                                     if let Some(b) = paint_bounds.as_deref_mut() {
                                         b.add_path(&cjk_path, cjk_transform);
                                     }
-                                    pixmap.fill_path(
-                                        &cjk_path,
-                                        paint,
-                                        tiny_skia::FillRule::Winding,
-                                        cjk_transform,
-                                        clip_mask,
-                                    );
+                                    if !paint_bounds.as_deref().is_some_and(|b| b.is_dry_run()) {
+                                        pixmap.fill_path(
+                                            &cjk_path,
+                                            paint,
+                                            tiny_skia::FillRule::Winding,
+                                            cjk_transform,
+                                            clip_mask,
+                                        );
+                                    }
                                     has_outline = true;
 
                                     if let Some(adv) =
@@ -1533,13 +1537,15 @@ impl TextRasterizer {
                             if let Some(b) = paint_bounds.as_deref_mut() {
                                 b.add_path(&path, glyph_transform);
                             }
-                            pixmap.fill_path(
-                                &path,
-                                paint,
-                                tiny_skia::FillRule::Winding,
-                                glyph_transform,
-                                clip_mask,
-                            );
+                            if !paint_bounds.as_deref().is_some_and(|b| b.is_dry_run()) {
+                                pixmap.fill_path(
+                                    &path,
+                                    paint,
+                                    tiny_skia::FillRule::Winding,
+                                    glyph_transform,
+                                    clip_mask,
+                                );
+                            }
                         }
                     }
                 }
@@ -1702,13 +1708,15 @@ impl TextRasterizer {
                         if let Some(b) = paint_bounds.as_deref_mut() {
                             b.add_path(&path, glyph_transform);
                         }
-                        pixmap.fill_path(
-                            &path,
-                            paint,
-                            tiny_skia::FillRule::Winding,
-                            glyph_transform,
-                            clip_mask,
-                        );
+                        if !paint_bounds.as_deref().is_some_and(|b| b.is_dry_run()) {
+                            pixmap.fill_path(
+                                &path,
+                                paint,
+                                tiny_skia::FillRule::Winding,
+                                glyph_transform,
+                                clip_mask,
+                            );
+                        }
                         glyphs_painted += 1;
                     }
                 }
@@ -1807,13 +1815,15 @@ impl TextRasterizer {
                         if let Some(b) = paint_bounds.as_deref_mut() {
                             b.add_path(&path, transform);
                         }
-                        pixmap.fill_path(
-                            &path,
-                            paint,
-                            tiny_skia::FillRule::Winding,
-                            transform,
-                            clip_mask,
-                        );
+                        if !paint_bounds.as_deref().is_some_and(|b| b.is_dry_run()) {
+                            pixmap.fill_path(
+                                &path,
+                                paint,
+                                tiny_skia::FillRule::Winding,
+                                transform,
+                                clip_mask,
+                            );
+                        }
                     }
                 }
             }
