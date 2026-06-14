@@ -485,6 +485,10 @@ pub struct PdfDocument {
     /// OutputIntent" — distinct from `None` (not yet checked).
     output_intent_cmyk_profile_cache:
         Mutex<Option<Option<std::sync::Arc<crate::color::IccProfile>>>>,
+    /// Caller-supplied fallback CMYK profile, used as the OutputIntent when the
+    /// document declares none (uncalibrated DeviceCMYK content). `None` = use
+    /// the §10.3.5 naive DeviceCMYK→RGB conversion (the spec default).
+    fallback_cmyk_profile: Mutex<Option<std::sync::Arc<crate::color::IccProfile>>>,
     /// Accumulated extraction warnings for programmatic inspection.
     /// Populated when silent fallbacks occur (font not found, CMap absent, etc.).
     /// Retrieve with [`PdfDocument::warnings`]; drain with [`PdfDocument::take_warnings`].
@@ -1077,6 +1081,7 @@ impl PdfDocument {
             page_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
             running_artifact_signatures: Mutex::new(None),
             output_intent_cmyk_profile_cache: Mutex::new(None),
+            fallback_cmyk_profile: Mutex::new(None),
             accumulated_warnings: Mutex::new(Vec::new()),
             warning_sink: crate::extractors::warnings::WarningSink::new(),
         };
@@ -3802,6 +3807,41 @@ impl PdfDocument {
     /// Returns `None` when no output intent exists, no CMYK entry is
     /// present, or the profile stream can't be parsed as ICC.
     pub fn output_intent_cmyk_profile(&self) -> Option<std::sync::Arc<crate::color::IccProfile>> {
+        // The document's own /OutputIntents profile is authoritative; when it
+        // declares none, fall back to a caller-supplied CMYK profile (e.g. a
+        // SWOP/FOGRA press profile installed via `set_fallback_cmyk_profile`)
+        // so uncalibrated DeviceCMYK content is colour-managed instead of
+        // rendering through the oversaturated §10.3.5 naive conversion.
+        // Default: no fallback (naive conversion, unchanged behaviour).
+        self.embedded_output_intent_cmyk_profile()
+            .or_else(|| self.fallback_cmyk_profile.lock_or_recover().clone())
+    }
+
+    /// Install a fallback CMYK ICC profile, used as the OutputIntent whenever
+    /// the document declares none. The document's own `/OutputIntents` CMYK
+    /// profile, when present, always takes precedence over this fallback.
+    pub fn set_fallback_cmyk_profile(&self, profile: std::sync::Arc<crate::color::IccProfile>) {
+        *self.fallback_cmyk_profile.lock_or_recover() = Some(profile);
+    }
+
+    /// Parse `bytes` as a 4-component (CMYK) ICC profile and install it as the
+    /// fallback CMYK profile (see [`Self::set_fallback_cmyk_profile`]). Returns
+    /// an error if the bytes are not a valid CMYK-input ICC profile.
+    pub fn set_fallback_cmyk_profile_from_bytes(&self, bytes: Vec<u8>) -> crate::Result<()> {
+        let profile = crate::color::IccProfile::parse(bytes, 4).ok_or_else(|| {
+            crate::Error::Decode(
+                "fallback CMYK profile is not a valid 4-component ICC profile".to_string(),
+            )
+        })?;
+        self.set_fallback_cmyk_profile(std::sync::Arc::new(profile));
+        Ok(())
+    }
+
+    /// The document's own `/OutputIntents` CMYK profile (memoised), ignoring any
+    /// caller-supplied fallback.
+    fn embedded_output_intent_cmyk_profile(
+        &self,
+    ) -> Option<std::sync::Arc<crate::color::IccProfile>> {
         // Memoise the (potentially expensive) decode + parse: hot rendering
         // paths consult this accessor once per paint, and qcms / lcms2
         // header validation + LUT decode on a hundreds-of-KB profile is
