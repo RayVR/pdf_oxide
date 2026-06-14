@@ -905,6 +905,16 @@ pub fn extract_image_from_xobject_expanded(
 ) -> Result<PdfImage> {
     let mut image = extract_image_from_xobject(doc, xobject, obj_ref, color_space_map)?;
 
+    // Apply a caller rendering-intent override (Acrobat-style proofing intent)
+    // to every image — set before any colour transform is built, so the image's
+    // CMYK/ICC→RGB conversion honours it. Applied here, ahead of the
+    // Separation/DeviceN early-return, so plain DeviceCMYK images are covered.
+    if let Some(d) = doc {
+        if let Some(intent) = d.cmyk_rendering_intent() {
+            image.set_rendering_intent(intent);
+        }
+    }
+
     if !matches!(image.color_space, ColorSpace::Separation | ColorSpace::DeviceN) {
         return Ok(image);
     }

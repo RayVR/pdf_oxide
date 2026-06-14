@@ -89,6 +89,44 @@ fn build_constant_cmyk_icc(l_byte: u8) -> Vec<u8> {
     profile
 }
 
+/// Single 100×100pt page with a full-page DeviceCMYK fill AND an embedded
+/// `/OutputIntents` CMYK profile (object 5).
+fn build_cmyk_fill_pdf_with_output_intent(icc: &[u8]) -> Vec<u8> {
+    let content = b"0.8 0.95 0.0 0.0 k\n0 0 100 100 re f";
+    let mut buf = Vec::new();
+    let mut offs = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFX /OutputCondition (Synthetic) /DestOutputProfile 5 0 R >>] >>\nendobj\n",
+    );
+    offs.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << >> >>\nendobj\n",
+    );
+    offs.push(buf.len());
+    buf.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    buf.extend_from_slice(content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(
+        format!("5 0 obj\n<< /N 4 /Length {} >>\nstream\n", icc.len()).as_bytes(),
+    );
+    buf.extend_from_slice(icc);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref = buf.len();
+    buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for o in &offs {
+        buf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    buf
+}
+
 fn render_center_rgb(doc: &PdfDocument) -> (u8, u8, u8) {
     let mut opts = RenderOptions::with_dpi(72);
     opts.format = ImageFormat::RawRgba8;
@@ -147,4 +185,78 @@ fn non_cmyk_profile_is_rejected() {
             .is_err(),
         "garbage bytes must not be accepted as a CMYK profile"
     );
+}
+
+fn lum((r, g, b): (u8, u8, u8)) -> f32 {
+    (r as f32 + g as f32 + b as f32) / 3.0
+}
+
+/// An OVERRIDE profile must win over the document's own embedded
+/// `/OutputIntents` (soft-proofing). The doc embeds a light constant-Lab
+/// profile; overriding with a dark one must render dark — proving the override
+/// replaced the embedded profile rather than the embedded one winning.
+#[test]
+fn override_profile_beats_embedded_output_intent() {
+    let doc = PdfDocument::from_bytes(build_cmyk_fill_pdf_with_output_intent(
+        &build_constant_cmyk_icc(200),
+    ))
+    .expect("parse");
+    let embedded = render_center_rgb(&doc);
+
+    let doc2 = PdfDocument::from_bytes(build_cmyk_fill_pdf_with_output_intent(
+        &build_constant_cmyk_icc(200),
+    ))
+    .expect("parse");
+    doc2.set_override_cmyk_profile_from_bytes(build_constant_cmyk_icc(80))
+        .expect("override profile must parse");
+    let overridden = render_center_rgb(&doc2);
+
+    assert!(
+        lum(overridden) < lum(embedded) - 30.0,
+        "override profile must replace the embedded OutputIntent: embedded \
+         lum {:.0} (light), overridden lum {:.0} (should be clearly darker)",
+        lum(embedded),
+        lum(overridden)
+    );
+}
+
+/// Clearing the override restores the embedded OutputIntent.
+#[test]
+fn clearing_override_restores_embedded() {
+    let doc = PdfDocument::from_bytes(build_cmyk_fill_pdf_with_output_intent(
+        &build_constant_cmyk_icc(200),
+    ))
+    .expect("parse");
+    let embedded = render_center_rgb(&doc);
+    doc.set_override_cmyk_profile_from_bytes(build_constant_cmyk_icc(80))
+        .expect("parse");
+    let overridden = render_center_rgb(&doc);
+    doc.set_override_cmyk_profile(None);
+    let restored = render_center_rgb(&doc);
+    assert_ne!(embedded, overridden, "override should change the colour");
+    assert_eq!(embedded, restored, "clearing override should restore embedded");
+}
+
+/// The CMYK rendering-intent override round-trips through the accessor and a
+/// render under each intent succeeds (plumbing for an Acrobat-style intent
+/// selector; the colorimetric effect depends on the profile/gamut).
+#[test]
+fn cmyk_rendering_intent_override_roundtrips() {
+    use pdf_oxide::color::RenderingIntent;
+    let doc = PdfDocument::from_bytes(build_cmyk_fill_pdf()).expect("parse");
+    assert_eq!(doc.cmyk_rendering_intent(), None, "default: no intent override");
+    doc.set_fallback_cmyk_profile_from_bytes(build_constant_cmyk_icc(128))
+        .expect("parse");
+    for intent in [
+        RenderingIntent::Perceptual,
+        RenderingIntent::RelativeColorimetric,
+        RenderingIntent::Saturation,
+        RenderingIntent::AbsoluteColorimetric,
+    ] {
+        doc.set_cmyk_rendering_intent(Some(intent));
+        assert_eq!(doc.cmyk_rendering_intent(), Some(intent));
+        let _ = render_center_rgb(&doc); // must not panic under any intent
+    }
+    doc.set_cmyk_rendering_intent(None);
+    assert_eq!(doc.cmyk_rendering_intent(), None, "intent override clears");
 }

@@ -489,6 +489,16 @@ pub struct PdfDocument {
     /// document declares none (uncalibrated DeviceCMYK content). `None` = use
     /// the §10.3.5 naive DeviceCMYK→RGB conversion (the spec default).
     fallback_cmyk_profile: Mutex<Option<std::sync::Arc<crate::color::IccProfile>>>,
+    /// Caller-supplied OVERRIDE CMYK profile: when set, used as the OutputIntent
+    /// even if the document declares its own `/OutputIntents` — for soft-proofing
+    /// a file against an arbitrary press profile (Acrobat Output-Preview style).
+    /// Takes precedence over both the embedded profile and the fallback.
+    override_cmyk_profile: Mutex<Option<std::sync::Arc<crate::color::IccProfile>>>,
+    /// Caller-supplied rendering-intent override for output-intent CMYK
+    /// conversion (vector DeviceCMYK fills and CMYK images). `None` = use the
+    /// per-paint graphics-state / per-image `/Intent` (default
+    /// RelativeColorimetric).
+    cmyk_rendering_intent: Mutex<Option<crate::color::RenderingIntent>>,
     /// Accumulated extraction warnings for programmatic inspection.
     /// Populated when silent fallbacks occur (font not found, CMap absent, etc.).
     /// Retrieve with [`PdfDocument::warnings`]; drain with [`PdfDocument::take_warnings`].
@@ -1082,6 +1092,8 @@ impl PdfDocument {
             running_artifact_signatures: Mutex::new(None),
             output_intent_cmyk_profile_cache: Mutex::new(None),
             fallback_cmyk_profile: Mutex::new(None),
+            override_cmyk_profile: Mutex::new(None),
+            cmyk_rendering_intent: Mutex::new(None),
             accumulated_warnings: Mutex::new(Vec::new()),
             warning_sink: crate::extractors::warnings::WarningSink::new(),
         };
@@ -3807,14 +3819,54 @@ impl PdfDocument {
     /// Returns `None` when no output intent exists, no CMYK entry is
     /// present, or the profile stream can't be parsed as ICC.
     pub fn output_intent_cmyk_profile(&self) -> Option<std::sync::Arc<crate::color::IccProfile>> {
-        // The document's own /OutputIntents profile is authoritative; when it
-        // declares none, fall back to a caller-supplied CMYK profile (e.g. a
-        // SWOP/FOGRA press profile installed via `set_fallback_cmyk_profile`)
-        // so uncalibrated DeviceCMYK content is colour-managed instead of
-        // rendering through the oversaturated §10.3.5 naive conversion.
-        // Default: no fallback (naive conversion, unchanged behaviour).
+        // Resolution order:
+        //   1. caller OVERRIDE  — force a profile for soft-proofing/simulation,
+        //      even over an embedded /OutputIntents (Acrobat Output-Preview).
+        //   2. embedded /OutputIntents — the document's own authoritative profile.
+        //   3. caller FALLBACK — assumed press profile for uncalibrated content.
+        // With neither override nor fallback set, behaviour is the embedded
+        // profile or (when none) the §10.3.5 naive conversion — unchanged.
+        if let Some(over) = self.override_cmyk_profile.lock_or_recover().clone() {
+            return Some(over);
+        }
         self.embedded_output_intent_cmyk_profile()
             .or_else(|| self.fallback_cmyk_profile.lock_or_recover().clone())
+    }
+
+    /// Force a CMYK profile as the OutputIntent regardless of what the document
+    /// declares — for soft-proofing / simulation. Overrides both the embedded
+    /// `/OutputIntents` profile and any fallback. `None` clears the override.
+    pub fn set_override_cmyk_profile(
+        &self,
+        profile: Option<std::sync::Arc<crate::color::IccProfile>>,
+    ) {
+        *self.override_cmyk_profile.lock_or_recover() = profile;
+    }
+
+    /// Parse `bytes` as a 4-component (CMYK) ICC profile and install it as the
+    /// override CMYK profile (see [`Self::set_override_cmyk_profile`]). Returns
+    /// an error if the bytes are not a valid CMYK-input ICC profile.
+    pub fn set_override_cmyk_profile_from_bytes(&self, bytes: Vec<u8>) -> crate::Result<()> {
+        let profile = crate::color::IccProfile::parse(bytes, 4).ok_or_else(|| {
+            crate::Error::Decode(
+                "override CMYK profile is not a valid 4-component ICC profile".to_string(),
+            )
+        })?;
+        self.set_override_cmyk_profile(Some(std::sync::Arc::new(profile)));
+        Ok(())
+    }
+
+    /// Force the rendering intent used for output-intent CMYK conversion (vector
+    /// DeviceCMYK fills and CMYK images), overriding the per-paint /per-image
+    /// intent from the PDF. `None` restores the document's own intents. Lets a
+    /// viewer expose an Acrobat-style intent selector.
+    pub fn set_cmyk_rendering_intent(&self, intent: Option<crate::color::RenderingIntent>) {
+        *self.cmyk_rendering_intent.lock_or_recover() = intent;
+    }
+
+    /// The active CMYK rendering-intent override, if any.
+    pub fn cmyk_rendering_intent(&self) -> Option<crate::color::RenderingIntent> {
+        *self.cmyk_rendering_intent.lock_or_recover()
     }
 
     /// Install a fallback CMYK ICC profile, used as the OutputIntent whenever

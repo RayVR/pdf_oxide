@@ -7680,9 +7680,9 @@ impl PageRenderer {
         // transform 1000×" into "cache miss once, hit 999×".
         let ctx = ResolutionContext::new(doc, color_spaces)
             .with_output_intent(output_intent.as_ref())
-            .with_rendering_intent(crate::color::RenderingIntent::from_pdf_name(
-                &gs.rendering_intent,
-            ))
+            .with_rendering_intent(doc.cmyk_rendering_intent().unwrap_or_else(|| {
+                crate::color::RenderingIntent::from_pdf_name(&gs.rendering_intent)
+            }))
             .with_defaults(
                 color_spaces.get("DefaultGray"),
                 color_spaces.get("DefaultRGB"),
