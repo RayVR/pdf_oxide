@@ -4036,24 +4036,19 @@ impl PageRenderer {
         mask_obj: Option<Object>,
         gs: &GraphicsState,
     ) -> Result<()> {
-        use crate::extractors::images::{
-            extract_image_from_xobject, extract_image_from_xobject_expanded,
-        };
+        use crate::extractors::images::extract_image_from_xobject;
 
-        // Use robust image extractor to handle various formats and color spaces.
-        // The composite path uses the *expanded* extractor so a Separation /
-        // DeviceN image is mapped through its tint transform into the
-        // alternate colour space (§8.6.6.4) instead of being painted as raw
-        // grayscale / CMYK channels.
+        // Decode the base image through the document's decode cache. The cache
+        // uses the *expanded* extractor so a Separation / DeviceN image is
+        // mapped through its tint transform into the alternate colour space
+        // (§8.6.6.4) instead of being painted as raw grayscale / CMYK channels,
+        // and it reuses the decoded result across pages/paints that reference
+        // the same image (the dominant cost in many-page image-reuse jobs).
         let color_space_map = self.color_spaces.clone();
-        let pdf_image = extract_image_from_xobject_expanded(
-            Some(doc),
-            xobject,
-            obj_ref,
-            Some(&color_space_map),
-        )?;
-        let dynamic_image = pdf_image.to_dynamic_image()?;
-        let mut rgba_image = dynamic_image.to_rgba8();
+        let cached_rgba = doc.decode_image_rgba_cached(xobject, obj_ref, Some(&color_space_map))?;
+        // Clone the cached base image: the /Mask + /SMask handling below mutates
+        // it in place, and the Arc is shared with other pages / paints.
+        let mut rgba_image = (*cached_rgba).clone();
 
         // Handle /Mask (stencil mask image) — PDF spec section 8.9.6.2
         // The mask is a separate image whose samples define opacity (1=opaque, 0=transparent)

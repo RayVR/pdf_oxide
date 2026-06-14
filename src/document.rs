@@ -110,6 +110,12 @@ const DEFAULT_OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Default maximum number of entries for the XObject span/image caches.
 const DEFAULT_XOBJECT_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// Default byte budget for the decoded-image cache (256 MB). A decoded image
+/// is large (a full-page CMYK raster is tens of MB), so this cache is bounded
+/// by bytes rather than entry count; LRU eviction keeps the active images
+/// resident across a many-page job.
+const DEFAULT_IMAGE_DECODE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
 /// Heuristic multiplier for the forward-gap guard in the main
 /// assembly loop's compound newline predicate
 /// (`y_diff > 2.0 && gap > K * max(fs)`). Visual gap-sweep over
@@ -452,6 +458,21 @@ pub struct PdfDocument {
     /// Bounded at [`DEFAULT_XOBJECT_CACHE_MAX_ENTRIES`] entries with FIFO eviction.
     pub(crate) form_xobject_images_cache:
         Mutex<BoundedEntryCache<ObjectRef, Vec<crate::extractors::PdfImage>>>,
+    /// LRU cache of fully decoded image XObjects — base RGBA after inflate and
+    /// colour conversion, before any per-placement mask/SMask or resample.
+    /// Keyed by the image object reference plus a fingerprint of its resolved
+    /// colour space: the object ref pins the stream + dict, while the
+    /// fingerprint guards the one per-page variable (a `/ColorSpace` *name*
+    /// resolved through the page resource map). Decode is deterministic for a
+    /// given key, so a hit returns identical pixels — byte-equivalent to
+    /// decoding afresh. Byte-budget-bounded with LRU eviction so a many-page
+    /// job that reuses a working set of images decodes each one once.
+    image_decode_cache:
+        Mutex<crate::cache::ByteBoundedCache<(ObjectRef, u64), std::sync::Arc<image::RgbaImage>>>,
+    /// Count of actual image decodes (cache misses) by
+    /// [`Self::decode_image_rgba_cached`]. Lets tests assert that repeated
+    /// references to one image decode exactly once.
+    image_decode_misses: AtomicUsize,
     /// Regions marked for erasure per page. Mutex for `&self` write-path methods (#398).
     pub(crate) erase_regions: Mutex<HashMap<usize, Vec<crate::geometry::Rect>>>,
     /// LRU cache of decompressed page content streams, keyed by page index.
@@ -1072,6 +1093,10 @@ impl PdfDocument {
             form_xobject_images_cache: Mutex::new(BoundedEntryCache::new(
                 DEFAULT_XOBJECT_CACHE_MAX_ENTRIES,
             )),
+            image_decode_cache: Mutex::new(crate::cache::ByteBoundedCache::new(
+                DEFAULT_IMAGE_DECODE_CACHE_MAX_BYTES,
+            )),
+            image_decode_misses: AtomicUsize::new(0),
             erase_regions: Mutex::new(HashMap::new()),
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
             page_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
@@ -3783,6 +3808,110 @@ impl PdfDocument {
     /// it does not change extraction behaviour.
     pub fn prefers_structure_reading_order(&self) -> bool {
         self.struct_tree_trustworthy().is_some()
+    }
+
+    /// Decode an image XObject to base RGBA (after inflate + colour conversion,
+    /// before any per-placement mask/SMask or resample), caching the result so
+    /// repeated references to the same image decode once. This is the dominant
+    /// cost in many-page jobs that reuse images (the RIP case): without it,
+    /// every page re-inflates and re-colour-converts the same image.
+    ///
+    /// A cache hit returns the shared `Arc`; the caller MUST clone before
+    /// mutating (e.g. applying a per-page mask), since the buffer is shared
+    /// across pages and paints.
+    pub(crate) fn decode_image_rgba_cached(
+        &self,
+        xobject: &Object,
+        obj_ref: Option<ObjectRef>,
+        color_space_map: Option<&HashMap<String, Object>>,
+    ) -> crate::Result<std::sync::Arc<image::RgbaImage>> {
+        // Inline images (no object ref) can't be keyed; decode uncached.
+        let Some(oref) = obj_ref else {
+            return self.decode_image_rgba_uncached(xobject, obj_ref, color_space_map);
+        };
+        let key = (oref, self.image_colorspace_fingerprint(xobject, color_space_map));
+
+        // Fast path: warm cache hit.
+        {
+            let mut cache = self.image_decode_cache.lock_or_recover();
+            if let Some(arc) = cache.get(&key) {
+                return Ok(arc.clone());
+            }
+        }
+        // Cold: decode without holding the cache lock (the extractor re-enters
+        // `&self` to resolve colour spaces / load objects). A concurrent miss on
+        // the same key may decode twice; the last insert wins, which is correct.
+        let arc = self.decode_image_rgba_uncached(xobject, obj_ref, color_space_map)?;
+        let size = arc.as_raw().len();
+        {
+            let mut cache = self.image_decode_cache.lock_or_recover();
+            cache.insert(key, std::sync::Arc::clone(&arc), size);
+        }
+        Ok(arc)
+    }
+
+    /// Decode an image XObject to base RGBA without consulting the cache.
+    fn decode_image_rgba_uncached(
+        &self,
+        xobject: &Object,
+        obj_ref: Option<ObjectRef>,
+        color_space_map: Option<&HashMap<String, Object>>,
+    ) -> crate::Result<std::sync::Arc<image::RgbaImage>> {
+        let pdf_image = crate::extractors::images::extract_image_from_xobject_expanded(
+            Some(self),
+            xobject,
+            obj_ref,
+            color_space_map,
+        )?;
+        let rgba = pdf_image.to_dynamic_image()?.to_rgba8();
+        self.image_decode_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(std::sync::Arc::new(rgba))
+    }
+
+    /// Fingerprint the resolved colour space of an image XObject for the decode
+    /// cache key. The image's `/ColorSpace` entry is intrinsic to its object —
+    /// so the object reference already pins it — EXCEPT when it is a *name*
+    /// resolved through the page resource map, which can differ from page to
+    /// page. Returns a 64-bit hash capturing that per-page resolution, or 0
+    /// when the colour space is page-independent (direct array / indirect ref /
+    /// absent), so same-object references collapse to one cache entry.
+    fn image_colorspace_fingerprint(
+        &self,
+        xobject: &Object,
+        color_space_map: Option<&HashMap<String, Object>>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let Some(dict) = xobject.as_dict() else {
+            return 0;
+        };
+        match dict.get("ColorSpace").or_else(|| dict.get("CS")) {
+            Some(Object::Name(name)) => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                name.hash(&mut h);
+                // Hash whatever the page maps the name to, so two pages mapping
+                // the same name to different colour spaces get distinct keys.
+                // Builtin device names (not in the map) hash to a stable,
+                // page-independent value.
+                if let Some(obj) = color_space_map.and_then(|m| m.get(name)) {
+                    format!("{obj:?}").hash(&mut h);
+                }
+                h.finish()
+            },
+            // Direct array / indirect ref / no colour space (ImageMask): the
+            // resolution is intrinsic to the object dict (already pinned by the
+            // object ref) and page-independent.
+            _ => 0,
+        }
+    }
+
+    /// Number of image decodes (cache misses) performed by
+    /// [`Self::decode_image_rgba_cached`]. Test-support introspection — pins
+    /// that repeated references to one image decode exactly once.
+    #[cfg(feature = "test-support")]
+    pub fn image_decode_count(&self) -> usize {
+        self.image_decode_misses
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Find the document's default CMYK output-intent profile.
